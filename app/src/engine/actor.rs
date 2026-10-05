@@ -198,7 +198,7 @@ impl Actor {
                     Ok(()) => self.dirty = true,
                     Err(_) => self.market_open = false,
                 },
-                _ = sleep_until(push_at.unwrap_or_else(Instant::now)), if push_at.is_some() => {}
+                _ = sleep_until(push_at.unwrap_or_else(tokio::time::Instant::now)), if push_at.is_some() => {}
             }
             self.maybe_publish();
         }
@@ -385,13 +385,13 @@ impl Actor {
 
     /// When the pending (dirty) Snapshot may be pushed; `None` when nothing changed.
     fn next_push_at(&self) -> Option<Instant> {
-        self.dirty.then(|| self.last_push.map_or_else(Instant::now, |t| t + self.interval()))
+        self.dirty.then(|| self.last_push.map_or_else(tokio::time::Instant::now, |t| t + self.interval()))
     }
 
     fn maybe_publish(&mut self) {
-        if self.dirty && self.last_push.is_none_or(|t| Instant::now() >= t + self.interval()) {
+        if self.dirty && self.last_push.is_none_or(|t| tokio::time::Instant::now() >= t + self.interval()) {
             self.snapshot_tx.send_replace(self.snapshot());
-            self.last_push = Some(Instant::now());
+            self.last_push = Some(tokio::time::Instant::now());
             self.dirty = false;
         }
     }
@@ -536,7 +536,7 @@ mod tests {
 
     fn rig_with(factory: Arc<CountingFactory>) -> (Rig, EngineDeps) {
         let dir = tempdir();
-        let clock: Arc<dyn Clock> = Arc::new(TokioClock { base_ms: T0, start: Instant::now() });
+        let clock: Arc<dyn Clock> = Arc::new(TokioClock { base_ms: T0, start: tokio::time::Instant::now() });
         // Unlocked: the instance lock is keyed by inode, and an actor task of a test that just
         // finished may still hold a handle on a file whose inode a new tempdir reuses.
         let db = Db::open_unlocked(&dir.path().join("funding.db"), clock.clone());

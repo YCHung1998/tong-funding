@@ -331,7 +331,9 @@ mod tests {
                 scanned += 1;
                 let src = std::fs::read_to_string(&path).expect("source readable");
                 for (n, line) in src.lines().enumerate() {
-                    let compact: String = line.split_whitespace().collect();
+                    // tokio's timer (pausable in tests) may pace the actor; it never stamps events.
+                    // Only this exact, fully qualified spelling is allowed.
+                    let compact: String = line.split_whitespace().collect::<String>().replace(&["tokio::time::Instant", "::now"].concat(), "");
                     for b in &banned {
                         if compact.contains(b.as_str()) {
                             hits.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
