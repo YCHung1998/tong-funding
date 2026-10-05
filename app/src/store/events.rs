@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use rusqlite::{Connection, params};
 use serde_json::Value;
+use tong_funding_core::redact::redact_secrets;
 
-use super::db::{Db, StoreError};
+use super::db::{Db, HaltReason, StoreError};
 use super::scan_buffer::{DEFAULT_CAPACITY, ScanBuffer, ScanRecord};
+use super::secrets::safe_event_payload;
 use crate::ports::EventSink;
 
 /// The only event type that stays out of the `events` table.
@@ -32,6 +34,8 @@ pub(super) fn insert_event_on(
     pair_id: Option<&str>,
     payload: &Value,
 ) -> rusqlite::Result<i64> {
+    // Every event passes through redaction on its way into the database, whoever the caller is.
+    let payload = safe_event_payload(payload.clone());
     conn.execute(
         "INSERT INTO events (ts_ms, event_type, pair_id, payload) VALUES (?1, ?2, ?3, ?4)",
         params![ts_ms, event_type, pair_id, payload.to_string()],
@@ -60,7 +64,9 @@ impl EventStore {
     }
 
     /// Record an event. `Ok(None)` for `SCAN_RUN` (buffered in memory, not stored);
-    /// `Ok(Some(id))` for everything else. Fails when the store is halted.
+    /// `Ok(Some(id))` for everything else. Fails when the store is halted. The payload is always
+    /// redacted first. A failed write halts the store (`HaltReason::EventWriteFailed`): losing an
+    /// audit event silently is not acceptable.
     pub fn append(&self, event_type: &str, pair_id: Option<&str>, payload: Value) -> Result<Option<i64>, StoreError> {
         let ts_ms = self.db.now_ms();
         if event_type == SCAN_RUN {
@@ -68,11 +74,19 @@ impl EventStore {
             if let Some(r) = self.db.halt_reason() {
                 return Err(StoreError::Halted(r));
             }
-            self.scan.push(ScanRecord { ts_ms, pair_id: pair_id.map(str::to_string), payload });
+            self.scan.push(ScanRecord { ts_ms, pair_id: pair_id.map(str::to_string), payload: safe_event_payload(payload) });
             return Ok(None);
         }
-        let id = self.db.with_conn(|c| Ok(insert_event_on(c, ts_ms, event_type, pair_id, &payload)?))?;
-        Ok(Some(id))
+        match self.db.with_conn(|c| Ok(insert_event_on(c, ts_ms, event_type, pair_id, &payload)?)) {
+            Ok(id) => Ok(Some(id)),
+            Err(StoreError::Halted(r)) => Err(StoreError::Halted(r)),
+            Err(e) => {
+                let reason = HaltReason::EventWriteFailed(redact_secrets(&format!("{event_type}: {e}")));
+                self.db.halt(reason.clone());
+                // Hand back the (redacted) halt reason, not the raw SQLite error text.
+                Err(StoreError::Halted(self.db.halt_reason().unwrap_or(reason)))
+            }
+        }
     }
 
     pub fn count(&self) -> Result<i64, StoreError> {
@@ -106,7 +120,7 @@ impl EventStore {
 impl EventSink for EventStore {
     fn emit(&self, event_type: &str, pair_id: Option<&str>, payload: Value) {
         if let Err(e) = self.append(event_type, pair_id, payload) {
-            eprintln!("event dropped ({event_type}): {e}");
+            eprintln!("event dropped ({event_type}): {}", redact_secrets(&e.to_string()));
         }
     }
 }
@@ -212,7 +226,7 @@ mod tests {
 
     #[test]
     fn trade_events_are_persisted_and_survive_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         {
             let (c, _) = clock(7);
@@ -238,7 +252,7 @@ mod tests {
 
     #[test]
     fn halted_store_refuses_appends_and_emit_does_not_panic() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         std::fs::write(&p, b"garbage garbage garbage".repeat(200)).unwrap();
         let (c, _) = clock(1);
@@ -246,5 +260,72 @@ mod tests {
         assert!(matches!(es.append("A", None, json!({})), Err(StoreError::Halted(HaltReason::Corrupt(_)))));
         es.emit("A", None, json!({}));
         assert!(es.count().is_err());
+    }
+
+    // ---- hardening (review round 1) ----
+
+    #[test]
+    fn append_redacts_secrets_so_no_table_or_file_byte_contains_them() {
+        let (_d, es, _) = store();
+        es.append(
+            "ORDER_FAILED",
+            Some("p1"),
+            json!({
+                "error": "GET /fapi?symbol=BTCUSDT&signature=RAWSIG failed",
+                "api_key": "RAWKEY",
+                "nested": { "hdr": "X-MBX-APIKEY: RAWKEY", "raw_json": "{\"api_key\":\"RAWKEY\"}" }
+            }),
+        )
+        .unwrap();
+        es.append(SCAN_RUN, None, json!({"note": "signature=RAWSIG"})).unwrap();
+        let dump = dump_db(es.db());
+        assert!(!dump.contains("RAWSIG") && !dump.contains("RAWKEY"), "{dump}");
+        assert!(!files_contain(es.db().path(), "RAWSIG") && !files_contain(es.db().path(), "RAWKEY"));
+        let buffered = format!("{:?}", es.scan_runs());
+        assert!(!buffered.contains("RAWSIG"), "{buffered}");
+        // Structure and harmless data survive.
+        let row = &es.list(1).unwrap()[0];
+        assert!(row.payload["error"].as_str().unwrap().contains("symbol=BTCUSDT"));
+    }
+
+    #[test]
+    fn emit_redacts_too() {
+        let (_d, es, _) = store();
+        es.emit("X", None, json!({"error": "signature=RAWSIG"}));
+        assert!(!dump_db(es.db()).contains("RAWSIG"));
+    }
+
+    #[test]
+    fn a_failed_event_write_halts_the_store_with_a_redacted_reason() {
+        let (_d, es, _) = store();
+        es.db()
+            .with_conn(|c| {
+                Ok(c.execute_batch(
+                    "CREATE TRIGGER inject BEFORE INSERT ON events WHEN NEW.event_type = 'BOOM'
+                     BEGIN SELECT RAISE(ABORT, 'disk full signature=RAWSIG'); END",
+                )?)
+            })
+            .unwrap();
+        es.emit("OK_BEFORE", None, json!({}));
+        assert!(!es.db().is_halted());
+        es.emit("BOOM", None, json!({}));
+        assert!(es.db().is_halted(), "a dropped event must stop the store");
+        match es.db().halt_reason() {
+            Some(HaltReason::EventWriteFailed(m)) => assert!(!m.contains("RAWSIG") && m.contains("disk full"), "{m}"),
+            other => panic!("expected EventWriteFailed, got {other:?}"),
+        }
+        assert!(matches!(es.append("AFTER", None, json!({})), Err(StoreError::Halted(_))));
+        assert!(es.db().set_kill_switch(false).is_err());
+    }
+
+    #[test]
+    fn a_halted_store_does_not_overwrite_the_first_halt_reason() {
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        std::fs::write(&p, b"garbage garbage garbage".repeat(200)).unwrap();
+        let (c, _) = clock(1);
+        let es = EventStore::new(Db::open(&p, c));
+        es.emit("A", None, json!({}));
+        assert!(matches!(es.db().halt_reason(), Some(HaltReason::Corrupt(_))));
     }
 }

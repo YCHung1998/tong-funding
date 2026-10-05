@@ -10,6 +10,7 @@ use tong_funding_core::pair::PairState;
 
 use super::db::{Db, HaltReason, StoreError};
 use super::events::insert_event_on;
+use tong_funding_core::redact::redact_secrets;
 
 pub const FLAG_KILL_SWITCH: &str = "kill_switch";
 pub const FLAG_TRIGGER_MODE: &str = "trigger_mode";
@@ -82,6 +83,33 @@ impl IntentState {
             IntentState::Failed => "FAILED",
         }
     }
+    pub fn parse(s: &str) -> Option<IntentState> {
+        [
+            IntentState::Intended,
+            IntentState::Submitted,
+            IntentState::Acknowledged,
+            IntentState::Filled,
+            IntentState::Cancelled,
+            IntentState::Failed,
+        ]
+        .into_iter()
+        .find(|st| st.as_str() == s)
+    }
+
+    /// The order lifecycle: `Intended -> Submitted | Failed | Cancelled`;
+    /// `Submitted -> Acknowledged | Filled | Cancelled | Failed`;
+    /// `Acknowledged -> Filled | Cancelled | Failed`; terminal states never move again.
+    /// (Staying in the same state is handled by the caller as an idempotent no-op.)
+    pub const fn can_transition_to(self, to: IntentState) -> bool {
+        use IntentState::*;
+        matches!(
+            (self, to),
+            (Intended, Submitted | Failed | Cancelled)
+                | (Submitted, Acknowledged | Filled | Cancelled | Failed)
+                | (Acknowledged, Filled | Cancelled | Failed)
+        )
+    }
+
     /// Not yet in a terminal state: the engine must reconcile it with the exchange after a restart.
     pub const fn is_unfinished(self) -> bool {
         matches!(self, IntentState::Intended | IntentState::Submitted | IntentState::Acknowledged)
@@ -179,7 +207,12 @@ impl Db {
         self.fail_closed(res, HaltReason::ConfigReadFailed)
     }
 
+    /// Set a flag. The `kill_switch` key is reserved: it can only change through
+    /// [`Db::set_kill_switch`], which also writes the audit event.
     pub fn flag_set(&self, key: &str, value: &str) -> Result<(), StoreError> {
+        if key.eq_ignore_ascii_case(FLAG_KILL_SWITCH) {
+            return Err(StoreError::ReservedFlag(key.to_string()));
+        }
         self.with_conn(|c| {
             upsert_flag(c, key, value, self.now_ms())?;
             Ok(())
@@ -193,7 +226,11 @@ impl Db {
             Ok(c.query_row("SELECT value FROM system_flags WHERE key = ?1", [FLAG_KILL_SWITCH], |r| r.get::<_, String>(0)).optional()?)
         });
         match self.fail_closed(res, HaltReason::KillSwitchReadFailed) {
-            Ok(None) => false,
+            // The row is seeded by the schema; if it is gone the data was tampered with: stay stopped.
+            Ok(None) => {
+                self.halt(HaltReason::KillSwitchReadFailed("kill_switch row is missing".into()));
+                true
+            }
             Ok(Some(v)) if v == KILL_OFF => false,
             Ok(Some(v)) if v == KILL_ON => true,
             Ok(Some(other)) => {
@@ -315,6 +352,17 @@ impl Db {
             let Some((from, pair_uuid)) = prev else {
                 return Err(StoreError::IntentNotFound(client_order_id.to_string()));
             };
+            let from_state = IntentState::parse(&from);
+            if from_state == Some(state) {
+                return Ok(()); // idempotent: same state again writes nothing and records no event
+            }
+            if !from_state.is_some_and(|f| f.can_transition_to(state)) {
+                return Err(StoreError::IllegalIntentTransition { from, to: state.as_str().to_string() });
+            }
+            // An exchange order id is an opaque id, but it comes from the network: keep it out of
+            // both the row and the event if it ever carries something secret-looking.
+            let exchange_order_id = exchange_order_id.map(redact_secrets);
+            let exchange_order_id = exchange_order_id.as_deref();
             tx.execute(
                 "UPDATE order_intents SET state = ?2, exchange_order_id = COALESCE(?3, exchange_order_id), updated_ms = ?4
                  WHERE client_order_id = ?1",
@@ -435,6 +483,14 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Barrier};
 
+    /// Make every INSERT into `events` fail, like a full disk or a constraint failure would.
+    fn break_event_inserts(db: &Db) {
+        db.with_conn(|c| {
+            Ok(c.execute_batch("CREATE TRIGGER inject_fail BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'injected failure'); END")?)
+        })
+        .unwrap();
+    }
+
     fn event_count(db: &Db) -> i64 {
         db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?)).unwrap()
     }
@@ -464,7 +520,7 @@ mod tests {
 
     #[test]
     fn config_survives_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         {
             let (c, _) = clock(1);
@@ -533,18 +589,19 @@ mod tests {
     #[test]
     fn corrupt_config_json_halts_the_store() {
         let (_d, db, _) = open_tmp();
-        db.with_conn(|c| {
-            c.execute_batch("PRAGMA ignore_check_constraints = ON; INSERT INTO config VALUES ('bad', '{not json', 1, 1);")?;
-            Ok(())
-        })
-        .unwrap();
+        // The store's own connection forbids ignore_check_constraints; use a separate plain one.
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        plain
+            .execute_batch("PRAGMA ignore_check_constraints = ON; INSERT INTO config VALUES ('bad', '{not json', 1, 1);")
+            .unwrap();
+        drop(plain);
         assert!(matches!(db.config_get("bad"), Err(StoreError::Halted(HaltReason::ConfigReadFailed(_)))));
         assert!(db.is_halted());
     }
 
     #[test]
     fn halted_store_refuses_config_writes_and_reads() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         std::fs::write(&p, b"garbage garbage garbage".repeat(200)).unwrap();
         let (c, _) = clock(1);
@@ -576,7 +633,7 @@ mod tests {
         assert_eq!(ev.len(), 1);
         assert_eq!(ev[0].1["on"], json!(true));
         // If the event cannot be written, the flag must not change either.
-        db.with_conn(|c| Ok(c.execute_batch("DROP TABLE events")?)).unwrap();
+        break_event_inserts(&db);
         assert!(db.set_kill_switch(false).is_err());
         assert!(db.kill_switch_halted(), "flag unchanged after the failed transaction");
     }
@@ -594,13 +651,13 @@ mod tests {
     #[test]
     fn unrecognised_kill_switch_value_counts_as_halted() {
         let (_d, db, _) = open_tmp();
-        db.flag_set(FLAG_KILL_SWITCH, "maybe").unwrap();
+        db.with_conn(|c| Ok(c.execute("UPDATE system_flags SET value = 'maybe' WHERE key = 'kill_switch'", [])?)).unwrap();
         assert!(db.kill_switch_halted());
     }
 
     #[test]
     fn kill_switch_on_a_halted_store_is_halted() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         std::fs::write(&p, b"garbage garbage garbage".repeat(200)).unwrap();
         let (c, _) = clock(1);
@@ -646,11 +703,11 @@ mod tests {
 
     #[test]
     fn concurrent_adds_for_the_same_symbol_succeed_exactly_once() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         let (c, _) = clock(1);
         let a = Db::open(&p, c.clone());
-        let b = Db::open(&p, c); // a second connection: contention is resolved by the index, not by our mutex
+        let b = Db::open_unlocked(&p, c); // a second connection: contention is resolved by the index, not by our mutex
         assert!(!a.is_halted() && !b.is_halted());
         for round in 0..25 {
             let symbol = format!("SYM{round}");
@@ -730,8 +787,8 @@ mod tests {
     fn if_the_event_cannot_be_written_the_state_does_not_change() {
         let (_d, db, _) = open_tmp();
         db.create_intent(&intent("c1")).unwrap();
-        db.with_conn(|c| Ok(c.execute_batch("DROP TABLE events")?)).unwrap();
-        assert!(db.update_intent_state("c1", IntentState::Filled, None).is_err());
+        break_event_inserts(&db);
+        assert!(db.update_intent_state("c1", IntentState::Submitted, None).is_err());
         assert_eq!(db.get_intent("c1").unwrap().unwrap().state, "INTENDED");
     }
 
@@ -745,7 +802,7 @@ mod tests {
 
     #[test]
     fn unfinished_intents_are_listed_after_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         {
             let (c, clock) = clock(100);
@@ -755,9 +812,11 @@ mod tests {
             db.create_intent(&intent("submitted")).unwrap();
             db.update_intent_state("submitted", IntentState::Submitted, Some("E1")).unwrap();
             db.create_intent(&intent("acked")).unwrap();
-            db.update_intent_state("acked", IntentState::Acknowledged, Some("E2")).unwrap();
+            db.update_intent_state("acked", IntentState::Submitted, Some("E2")).unwrap();
+            db.update_intent_state("acked", IntentState::Acknowledged, None).unwrap();
             db.create_intent(&intent("filled")).unwrap();
-            db.update_intent_state("filled", IntentState::Filled, Some("E3")).unwrap();
+            db.update_intent_state("filled", IntentState::Submitted, Some("E3")).unwrap();
+            db.update_intent_state("filled", IntentState::Filled, None).unwrap();
             db.create_intent(&intent("cancelled")).unwrap();
             db.update_intent_state("cancelled", IntentState::Cancelled, None).unwrap();
             db.create_intent(&intent("failed")).unwrap();
@@ -836,5 +895,135 @@ mod tests {
         clock.set(PORTFOLIO_RETENTION_MS + 10);
         assert!(db.purge_portfolio_history().is_err());
         assert_eq!(db.portfolio_history().unwrap().len(), 2, "nothing deleted when the purge fails midway");
+    }
+
+    // ---- hardening (review round 1) ----
+
+    #[test]
+    fn flag_set_refuses_the_reserved_kill_switch_key() {
+        let (_d, db, _) = open_tmp();
+        for key in ["kill_switch", "KILL_SWITCH", "Kill_Switch"] {
+            let r = db.flag_set(key, "ON");
+            assert!(matches!(r, Err(StoreError::ReservedFlag(_))), "{key}: {r:?}");
+        }
+        assert!(!db.kill_switch_halted(), "kill switch untouched");
+        db.flag_set("trigger_mode", "auto").unwrap();
+        assert_eq!(db.flag_get("trigger_mode").unwrap().as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn a_new_database_has_an_explicit_kill_switch_off_row_and_is_not_halted() {
+        let (_d, db, _) = open_tmp();
+        assert_eq!(db.flag_get(FLAG_KILL_SWITCH).unwrap().as_deref(), Some("OFF"));
+        assert!(!db.kill_switch_halted());
+        assert!(!db.is_halted());
+    }
+
+    #[test]
+    fn a_missing_kill_switch_row_means_halted_fail_closed() {
+        let (_d, db, _) = open_tmp();
+        db.with_conn(|c| Ok(c.execute("DELETE FROM system_flags WHERE key = 'kill_switch'", [])?)).unwrap();
+        assert!(db.kill_switch_halted(), "a missing row means someone touched the data: stay stopped");
+    }
+
+    const ALL: [IntentState; 6] = [
+        IntentState::Intended,
+        IntentState::Submitted,
+        IntentState::Acknowledged,
+        IntentState::Filled,
+        IntentState::Cancelled,
+        IntentState::Failed,
+    ];
+
+    fn legal(from: IntentState, to: IntentState) -> bool {
+        use IntentState::*;
+        matches!(
+            (from, to),
+            (Intended, Submitted | Failed | Cancelled)
+                | (Submitted, Acknowledged | Filled | Cancelled | Failed)
+                | (Acknowledged, Filled | Cancelled | Failed)
+        )
+    }
+
+    /// Walk a fresh intent to `target` along legal transitions only.
+    fn intent_in_state(db: &Db, id: &str, target: IntentState) {
+        use IntentState::*;
+        db.create_intent(&intent(id)).unwrap();
+        let path: &[IntentState] = match target {
+            Intended => &[],
+            Submitted => &[Submitted],
+            Acknowledged => &[Submitted, Acknowledged],
+            Filled => &[Submitted, Filled],
+            Cancelled => &[Cancelled],
+            Failed => &[Failed],
+        };
+        for st in path {
+            db.update_intent_state(id, *st, None).unwrap();
+        }
+    }
+
+    #[test]
+    fn every_intent_transition_is_checked_against_the_state_machine() {
+        let (_d, db, clock) = open_tmp();
+        let mut n = 0;
+        for from in ALL {
+            for to in ALL {
+                n += 1;
+                let id = format!("c{n}");
+                intent_in_state(&db, &id, from);
+                clock.set(1_000_000 + n);
+                let events_before = event_count(&db);
+                let updated_before = db.get_intent(&id).unwrap().unwrap().updated_ms;
+                let r = db.update_intent_state(&id, to, None);
+                let row = db.get_intent(&id).unwrap().unwrap();
+                if from == to {
+                    r.unwrap_or_else(|e| panic!("{from:?}->{to:?} should be an idempotent no-op: {e}"));
+                    assert_eq!(row.state, from.as_str());
+                    assert_eq!(event_count(&db), events_before, "{from:?}->{to:?}: no-op writes no event");
+                    assert_eq!(row.updated_ms, updated_before, "{from:?}->{to:?}: no-op touches nothing");
+                } else if legal(from, to) {
+                    r.unwrap_or_else(|e| panic!("{from:?}->{to:?} should be legal: {e}"));
+                    assert_eq!(row.state, to.as_str());
+                    assert_eq!(event_count(&db), events_before + 1);
+                } else {
+                    match r {
+                        Err(StoreError::IllegalIntentTransition { from: f, to: t }) => {
+                            assert_eq!((f.as_str(), t.as_str()), (from.as_str(), to.as_str()));
+                        }
+                        other => panic!("{from:?}->{to:?} must be IllegalIntentTransition, got {other:?}"),
+                    }
+                    assert_eq!(row.state, from.as_str(), "{from:?}->{to:?}: state unchanged");
+                    assert_eq!(event_count(&db), events_before, "{from:?}->{to:?}: no event");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_filled_intent_cannot_come_back_to_the_unfinished_list() {
+        let (_d, db, _) = open_tmp();
+        intent_in_state(&db, "c1", IntentState::Filled);
+        assert!(db.update_intent_state("c1", IntentState::Intended, None).is_err());
+        assert!(db.list_unfinished_intents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_tampered_unknown_stored_state_is_an_illegal_transition_not_a_panic() {
+        let (_d, db, _) = open_tmp();
+        db.create_intent(&intent("c1")).unwrap();
+        db.with_conn(|c| Ok(c.execute("UPDATE order_intents SET state = 'WEIRD'", [])?)).unwrap();
+        let r = db.update_intent_state("c1", IntentState::Filled, None);
+        assert!(matches!(r, Err(StoreError::IllegalIntentTransition { .. })), "{r:?}");
+    }
+
+    #[test]
+    fn state_and_kill_switch_events_and_rows_never_contain_raw_secrets() {
+        let (_d, db, _) = open_tmp();
+        db.create_intent(&intent("c1")).unwrap();
+        db.update_intent_state("c1", IntentState::Submitted, Some("EX-1 signature=RAWSIG")).unwrap();
+        db.set_kill_switch(true).unwrap();
+        let dump = crate::store::db::test_support::dump_db(&db);
+        assert!(!dump.contains("RAWSIG"), "{dump}");
+        assert!(!crate::store::db::test_support::files_contain(db.path(), "RAWSIG"));
     }
 }
