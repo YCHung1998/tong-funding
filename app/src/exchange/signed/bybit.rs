@@ -2,7 +2,7 @@
 //! orders, with lists fetched across all pages. Spec: signed-read-access.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tong_funding_core::redact::redact_secrets;
@@ -13,9 +13,12 @@ use super::endpoints::{
 };
 use super::models::{Balance, Completeness, Listing, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
-    ClockOffsetSource, RECV_WINDOW_MS, SIGNED_TIMEOUT, bybit_signature, check_status, encode_query, load_credentials, parse_json, sanitize_error,
-    signed_timestamp,
+    ClockOffsetSource, NotConnectedReason, RECV_WINDOW_MS, Resync, SIGNED_TIMEOUT, bybit_signature, check_status, encode_query, load_credentials, parse_json, sanitize_error,
+    encode_cursor, is_timestamp_rejected, require_offset,
 };
+
+/// Bybit `retCode` for "Too many visits" (rate limit), delivered with HTTP 200.
+const BYBIT_RATE_LIMIT_RET_CODE: i64 = 10006;
 use crate::exchange::error::AdapterError;
 use crate::exchange::transport::{HttpRequest, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
@@ -33,15 +36,31 @@ pub struct BybitSignedClient<T> {
     secrets: Arc<dyn SecretProvider>,
     clock: Arc<dyn Clock>,
     offset: Arc<dyn ClockOffsetSource>,
+    resync: Arc<dyn Resync>,
     host: BybitHost,
     account_type: BybitAccountType,
+    reason: Mutex<Option<NotConnectedReason>>,
 }
 
 impl<T: HttpTransport> BybitSignedClient<T> {
     pub const EXCHANGE: Exchange = Exchange::Bybit;
 
-    pub fn new(transport: Arc<T>, secrets: Arc<dyn SecretProvider>, clock: Arc<dyn Clock>, offset: Arc<dyn ClockOffsetSource>, demo_env: BybitHost) -> Self {
-        BybitSignedClient { transport, secrets, clock, offset, host: demo_env, account_type: BybitAccountType::Unified }
+    /// `clock` + `offset` produce the calibrated exchange time used for signing and `fetched_at`;
+    /// `resync` is called once when a timestamp is rejected.
+    pub fn new(
+        transport: Arc<T>,
+        secrets: Arc<dyn SecretProvider>,
+        clock: Arc<dyn Clock>,
+        offset: Arc<dyn ClockOffsetSource>,
+        resync: Arc<dyn Resync>,
+        demo_env: BybitHost,
+    ) -> Self {
+        BybitSignedClient { transport, secrets, clock, offset, resync, host: demo_env, account_type: BybitAccountType::Unified, reason: Mutex::new(None) }
+    }
+
+    /// Why the most recent signed call answered `NotConnected` (`None` if it did not, or no call yet).
+    pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {
+        self.reason.lock().ok().and_then(|g| *g)
     }
 
     pub fn with_account_type(mut self, account_type: BybitAccountType) -> Self {
@@ -55,7 +74,7 @@ impl<T: HttpTransport> BybitSignedClient<T> {
             BybitAccountType::Unified => "UNIFIED",
             BybitAccountType::Contract => "CONTRACT",
         };
-        let (body, at) = self.signed_get(BYBIT_BALANCE_PATH, &[("accountType", account_type.to_string())]).await?;
+        let (body, at) = self.signed_get(BYBIT_BALANCE_PATH, &encode_query(&[("accountType", account_type.to_string())])).await?;
         let mut out = Vec::new();
         for account in result_list(&body)? {
             let coins = account.get("coin").and_then(Value::as_array).ok_or_else(|| AdapterError::parse("missing coin list"))?;
@@ -82,11 +101,12 @@ impl<T: HttpTransport> BybitSignedClient<T> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut cursor: Option<String> = None;
         for page in 1..=MAX_PAGES {
-            let mut params = vec![("category", "linear".to_string()), ("settleCoin", "USDT".to_string()), ("limit", limit.to_string())];
+            let mut query = encode_query(&[("category", "linear".to_string()), ("settleCoin", "USDT".to_string()), ("limit", limit.to_string())]);
             if let Some(c) = &cursor {
-                params.push(("cursor", c.clone()));
+                query.push_str("&cursor=");
+                query.push_str(&encode_cursor(c));
             }
-            let fetched = self.signed_get(path, &params).await.and_then(|(body, at)| {
+            let fetched = self.signed_get(path, &query).await.and_then(|(body, at)| {
                 let mut rows = Vec::new();
                 for r in result_list(&body)? {
                     if let Some(x) = parse_row(r, at)? {
@@ -115,13 +135,40 @@ impl<T: HttpTransport> BybitSignedClient<T> {
         Ok(incomplete(items, format!("page cap of {MAX_PAGES} reached")))
     }
 
+    /// One attempt; if the exchange rejects the timestamp, re-sync the clock once and send exactly
+    /// one more request (a second rejection, or a failed re-sync, is returned as is).
+    /// `query` is the final, already-encoded query string: the same text is signed and sent.
+    async fn signed_get(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
+        match self.attempt(path, query).await {
+            Err(e) if is_timestamp_rejected(&e) => {
+                self.resync.resync().await.map_err(sanitize_error)?;
+                self.attempt(path, query).await
+            }
+            other => other,
+        }
+    }
+
+    fn set_reason(&self, reason: Option<NotConnectedReason>) {
+        if let Ok(mut g) = self.reason.lock() {
+            *g = reason;
+        }
+    }
+
     /// Order of checks matters: secrets, then calibrated time, and only then a request is built.
-    /// Returns the whole parsed body (retCode already checked) and the local receive time.
-    async fn signed_get(&self, path: &str, params: &[(&str, String)]) -> Result<(Value, i64), AdapterError> {
-        let creds = load_credentials(self.secrets.as_ref(), Self::EXCHANGE)?;
-        let timestamp = signed_timestamp(self.clock.as_ref(), self.offset.as_ref())?;
-        let query = encode_query(params);
-        let signature = bybit_signature(&creds.api_secret, timestamp, &creds.api_key, RECV_WINDOW_MS, &query)?;
+    /// Returns the whole parsed body (retCode already checked) and the exchange time (local clock +
+    /// offset) at which the response arrived, using the same offset as the signature.
+    async fn attempt(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
+        let prepared = load_credentials(self.secrets.as_ref(), Self::EXCHANGE, false).and_then(|c| require_offset(self.offset.as_ref()).map(|o| (c, o)));
+        let (creds, offset_ms) = match prepared {
+            Ok(v) => v,
+            Err(reason) => {
+                self.set_reason(Some(reason));
+                return Err(reason.into());
+            }
+        };
+        self.set_reason(None);
+        let timestamp = self.clock.now_ms().saturating_add(offset_ms);
+        let signature = bybit_signature(&creds.api_secret, timestamp, &creds.api_key, RECV_WINDOW_MS, query)?;
         let url = format!("{}{}?{}", self.host.base_url(), path, query);
         let request = HttpRequest::get(url, SIGNED_TIMEOUT)
             .header("X-BAPI-API-KEY", &creds.api_key)
@@ -129,10 +176,14 @@ impl<T: HttpTransport> BybitSignedClient<T> {
             .header("X-BAPI-TIMESTAMP", &timestamp.to_string())
             .header("X-BAPI-RECV-WINDOW", &RECV_WINDOW_MS.to_string());
         let response = self.transport.get(request).await.map_err(sanitize_error)?;
-        let fetched_at = self.clock.now_ms();
+        let fetched_at = self.clock.now_ms().saturating_add(offset_ms);
         let response = check_status(response)?;
         let body = parse_json(&response.body)?;
         let code = body.get("retCode").and_then(Value::as_i64).ok_or_else(|| AdapterError::parse("missing retCode"))?;
+        if code == BYBIT_RATE_LIMIT_RET_CODE {
+            // HTTP 200 whose body says "too many visits"; no Retry-After is given.
+            return Err(AdapterError::RateLimited { retry_after_ms: None });
+        }
         if code != 0 {
             let msg = body.get("retMsg").and_then(Value::as_str).unwrap_or("");
             return Err(AdapterError::exchange(code.to_string(), msg));
@@ -221,6 +272,9 @@ fn parse_order(r: &Value, fetched_at: i64) -> Result<OpenOrder, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use serde_json::{Value, json};
@@ -247,10 +301,154 @@ mod tests {
         MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiKey, KEY).with(Exchange::Bybit, SecretName::ApiSecret, SECRET)
     }
 
-    fn client_with(t: FakeTransport, secrets: MemorySecrets, offset: Option<i64>) -> (Arc<FakeTransport>, BybitSignedClient<FakeTransport>) {
+    struct FakeResync {
+        calls: AtomicUsize,
+        result: Result<(), AdapterError>,
+    }
+
+    impl FakeResync {
+        fn ok() -> Arc<Self> {
+            Arc::new(FakeResync { calls: AtomicUsize::new(0), result: Ok(()) })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Resync for FakeResync {
+        fn resync(&self) -> Pin<Box<dyn Future<Output = Result<(), AdapterError>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(self.result.clone()))
+        }
+    }
+
+    struct FailingSecrets;
+    impl SecretProvider for FailingSecrets {
+        fn get(&self, _e: Exchange, _n: SecretName) -> Result<Option<String>, crate::ports::SecretError> {
+            Err(crate::ports::SecretError::Unavailable("keychain locked".into()))
+        }
+    }
+
+    fn client_full(t: FakeTransport, secrets: Arc<dyn SecretProvider>, offset: Option<i64>, resync: Arc<FakeResync>) -> (Arc<FakeTransport>, BybitSignedClient<FakeTransport>) {
         let t = Arc::new(t);
-        let c = BybitSignedClient::new(t.clone(), Arc::new(secrets), Arc::new(ManualClock::new(NOW)), Arc::new(move || offset), BybitHost::Demo);
+        let c = BybitSignedClient::new(t.clone(), secrets, Arc::new(ManualClock::new(NOW)), Arc::new(move || offset), resync, BybitHost::Demo);
         (t, c)
+    }
+
+    fn client_with(t: FakeTransport, secrets: MemorySecrets, offset: Option<i64>) -> (Arc<FakeTransport>, BybitSignedClient<FakeTransport>) {
+        client_full(t, Arc::new(secrets), offset, FakeResync::ok())
+    }
+
+    fn ret_code(code: i64, msg: &str) -> Result<HttpResponse, AdapterError> {
+        Ok(HttpResponse::ok(json!({"retCode":code,"retMsg":msg,"result":{}}).to_string()))
+    }
+
+    // ---- timestamp rejection: resync once, retry exactly once ----
+
+    #[test]
+    fn a_rejected_timestamp_is_resynced_once_and_the_request_resent_once() {
+        let t = FakeTransport::new().on("/v5/position/list", ret_code(10002, "invalid request, please check your server timestamp")).on("/v5/position/list", page(vec![pos("BTCUSDT", "Buy", "1")], ""));
+        let resync = FakeResync::ok();
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), resync.clone());
+        assert_eq!(block_on(c.get_positions()).unwrap().items.len(), 1);
+        assert_eq!(t.requests().len(), 2);
+        assert_eq!(resync.calls(), 1);
+    }
+
+    #[test]
+    fn a_second_rejection_is_returned_and_there_is_no_third_request() {
+        let t = FakeTransport::new().on("/v5/account/wallet-balance", ret_code(10002, "ts"));
+        let resync = FakeResync::ok();
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), resync.clone());
+        assert!(matches!(block_on(c.get_balances()), Err(AdapterError::Exchange { code, .. }) if code == "10002"));
+        assert_eq!(t.requests().len(), 2);
+        assert_eq!(resync.calls(), 1);
+    }
+
+    #[test]
+    fn a_failed_resync_returns_its_error_and_does_not_resend() {
+        let t = FakeTransport::new().on("/v5/order/realtime", ret_code(10002, "ts"));
+        let resync = Arc::new(FakeResync { calls: AtomicUsize::new(0), result: Err(AdapterError::Timeout) });
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), resync.clone());
+        assert_eq!(block_on(c.get_open_orders()).unwrap_err(), AdapterError::Timeout);
+        assert_eq!(t.requests().len(), 1);
+        assert_eq!(resync.calls(), 1);
+    }
+
+    #[test]
+    fn a_rejection_on_a_later_page_is_retried_once_too() {
+        let t = FakeTransport::new()
+            .on("/v5/order/realtime", page(vec![], "c1"))
+            .on("/v5/order/realtime", ret_code(10002, "ts"))
+            .on("/v5/order/realtime", page(vec![], ""));
+        let resync = FakeResync::ok();
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), resync.clone());
+        assert!(block_on(c.get_open_orders()).unwrap().is_complete());
+        assert_eq!((t.requests().len(), resync.calls()), (3, 1));
+    }
+
+    #[test]
+    fn other_errors_do_not_trigger_a_resync() {
+        let t = FakeTransport::new().on("/v5/account/wallet-balance", ret_code(10003, "invalid key"));
+        let resync = FakeResync::ok();
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), resync.clone());
+        assert!(block_on(c.get_balances()).is_err());
+        assert_eq!((t.requests().len(), resync.calls()), (1, 0));
+    }
+
+    // ---- rate limits ----
+
+    #[test]
+    fn retcode_10006_in_a_200_body_is_rate_limited() {
+        let (_, c) = client(FakeTransport::new().on("/v5/position/list", ret_code(10006, "Too many visits. Exceeded the API Rate Limit.")));
+        assert_eq!(block_on(c.get_positions()).unwrap_err(), AdapterError::RateLimited { retry_after_ms: None });
+    }
+
+    #[test]
+    fn retry_after_is_parsed_as_whole_seconds() {
+        for (value, expected) in [("3", Some(3000)), (" 12 ", Some(12_000)), ("1.5", None), ("Wed, 21 Oct 2026 07:28:00 GMT", None)] {
+            let mut r = HttpResponse::with_status(429, "");
+            r.headers.push(("Retry-After".into(), value.into()));
+            let (_, c) = client(FakeTransport::new().on("/v5/account/wallet-balance", Ok(r)));
+            assert_eq!(block_on(c.get_balances()).unwrap_err(), AdapterError::RateLimited { retry_after_ms: expected }, "Retry-After: {value}");
+        }
+    }
+
+    // ---- NotConnected reasons, fetched_at ----
+
+    #[test]
+    fn the_not_connected_reason_distinguishes_every_cause() {
+        let reason_for = |secrets: Arc<dyn SecretProvider>, offset: Option<i64>| {
+            let (t, c) = client_full(FakeTransport::new(), secrets, offset, FakeResync::ok());
+            assert_eq!(c.last_not_connected_reason(), None, "no call yet");
+            assert_eq!(block_on(c.get_positions()).unwrap_err(), AdapterError::NotConnected);
+            assert_eq!(t.requests().len(), 0);
+            c.last_not_connected_reason()
+        };
+        let key_only = MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiKey, KEY);
+        assert_eq!(reason_for(Arc::new(MemorySecrets::default()), Some(0)), Some(NotConnectedReason::NoKey));
+        assert_eq!(reason_for(Arc::new(key_only), Some(0)), Some(NotConnectedReason::NoSecret));
+        assert_eq!(reason_for(Arc::new(FailingSecrets), Some(0)), Some(NotConnectedReason::SecretStoreError));
+        assert_eq!(reason_for(Arc::new(full_secrets()), None), Some(NotConnectedReason::ClockUnsynced));
+    }
+
+    #[test]
+    fn the_reason_clears_after_a_successful_call() {
+        let t = Arc::new(FakeTransport::new().on("/v5/position/list", page(vec![], "")));
+        let ready = Arc::new(AtomicBool::new(false));
+        let r2 = ready.clone();
+        let c = BybitSignedClient::new(t, Arc::new(full_secrets()), Arc::new(ManualClock::new(NOW)), Arc::new(move || r2.load(Ordering::SeqCst).then_some(0)), FakeResync::ok(), BybitHost::Demo);
+        assert!(block_on(c.get_positions()).is_err());
+        assert_eq!(c.last_not_connected_reason(), Some(NotConnectedReason::ClockUnsynced));
+        ready.store(true, Ordering::SeqCst);
+        assert!(block_on(c.get_positions()).is_ok());
+        assert_eq!(c.last_not_connected_reason(), None);
+    }
+
+    #[test]
+    fn fetched_at_is_exchange_time_from_the_same_offset_as_the_signature() {
+        let (_, c) = client_with(FakeTransport::new().on("/v5/position/list", page(vec![pos("BTCUSDT", "Buy", "1")], "")), full_secrets(), Some(-300));
+        assert_eq!(block_on(c.get_positions()).unwrap().items[0].fetched_at, NOW - 300);
     }
 
     fn client(t: FakeTransport) -> (Arc<FakeTransport>, BybitSignedClient<FakeTransport>) {
@@ -314,7 +512,7 @@ mod tests {
     fn contract_account_type_can_be_selected() {
         let bal = json!({"retCode":0,"retMsg":"OK","result":{"list":[]}});
         let t = Arc::new(FakeTransport::new().on("/v5/account/wallet-balance", Ok(HttpResponse::ok(bal.to_string()))));
-        let c = BybitSignedClient::new(t.clone(), Arc::new(full_secrets()), Arc::new(ManualClock::new(NOW)), Arc::new(|| Some(0)), BybitHost::Demo).with_account_type(BybitAccountType::Contract);
+        let c = BybitSignedClient::new(t.clone(), Arc::new(full_secrets()), Arc::new(ManualClock::new(NOW)), Arc::new(|| Some(0)), FakeResync::ok(), BybitHost::Demo).with_account_type(BybitAccountType::Contract);
         block_on(c.get_balances()).unwrap();
         assert!(t.requests()[0].url.ends_with("?accountType=CONTRACT"));
     }
@@ -334,7 +532,7 @@ mod tests {
         let btc = &b[0];
         assert_eq!((btc.asset.as_str(), btc.amount, btc.usdt_value, btc.available), ("BTC", d("0.05"), None, None));
         assert_eq!((b[1].usdt_value, b[1].available), (Some(d("5000.25")), Some(d("1.5"))));
-        assert_eq!((b[2].usdt_value, b[2].exchange, b[2].fetched_at), (Some(d("100")), Exchange::Bybit, NOW));
+        assert_eq!((b[2].usdt_value, b[2].exchange, b[2].fetched_at), (Some(d("100")), Exchange::Bybit, NOW + 1200));
     }
 
     #[test]
@@ -349,7 +547,7 @@ mod tests {
         let p = &r.items[1];
         assert_eq!((p.entry_price, p.mark_price, p.leverage), (Some(d("100.5")), Some(d("101.5")), Some(d("10"))));
         assert_eq!((p.unrealized_pnl, p.margin, p.notional), (Some(d("1.25")), Some(d("10.05")), Some(d("1005"))));
-        assert_eq!((p.mode, p.exchange, p.fetched_at), (PositionMode::OneWay, Exchange::Bybit, NOW));
+        assert_eq!((p.mode, p.exchange, p.fetched_at), (PositionMode::OneWay, Exchange::Bybit, NOW + 1200));
     }
 
     #[test]

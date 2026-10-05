@@ -1,7 +1,7 @@
 //! Binance USDS-M Futures signed GET client (demo/testnet hosts only). Read-only: balances,
 //! positions and open orders. Spec: openspec/changes/exchange-readonly-adapters/specs/signed-read-access.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tong_funding_core::types::{Exchange, Side};
@@ -9,8 +9,8 @@ use tong_funding_core::types::{Exchange, Side};
 use super::endpoints::{BINANCE_BALANCE_PATH, BINANCE_OPEN_ORDERS_PATH, BINANCE_POSITIONS_PATH, BinanceHost};
 use super::models::{Balance, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
-    ClockOffsetSource, RECV_WINDOW_MS, SIGNED_TIMEOUT, binance_signature, check_status, encode_query, load_credentials, parse_json, sanitize_error,
-    signed_timestamp,
+    ClockOffsetSource, NotConnectedReason, RECV_WINDOW_MS, Resync, SIGNED_TIMEOUT, binance_signature, check_status, encode_query, load_credentials, parse_json, sanitize_error,
+    is_timestamp_rejected, require_offset,
 };
 use crate::exchange::error::AdapterError;
 use crate::exchange::transport::{HttpRequest, HttpResponse, HttpTransport};
@@ -21,16 +21,31 @@ pub struct BinanceSignedClient<T> {
     secrets: Arc<dyn SecretProvider>,
     clock: Arc<dyn Clock>,
     offset: Arc<dyn ClockOffsetSource>,
+    resync: Arc<dyn Resync>,
     host: BinanceHost,
+    reason: Mutex<Option<NotConnectedReason>>,
 }
 
 impl<T: HttpTransport> BinanceSignedClient<T> {
     pub const EXCHANGE: Exchange = Exchange::Binance;
 
-    /// `clock` + `offset` produce the calibrated signing time; `host` selects one of the
+    /// `clock` + `offset` produce the calibrated exchange time used for signing and `fetched_at`;
+    /// `resync` is called once when a timestamp is rejected; `demo_env` selects one of the
     /// compile-time demo/testnet hosts (there is no way to pass a URL).
-    pub fn new(transport: Arc<T>, secrets: Arc<dyn SecretProvider>, clock: Arc<dyn Clock>, offset: Arc<dyn ClockOffsetSource>, demo_env: BinanceHost) -> Self {
-        BinanceSignedClient { transport, secrets, clock, offset, host: demo_env }
+    pub fn new(
+        transport: Arc<T>,
+        secrets: Arc<dyn SecretProvider>,
+        clock: Arc<dyn Clock>,
+        offset: Arc<dyn ClockOffsetSource>,
+        resync: Arc<dyn Resync>,
+        demo_env: BinanceHost,
+    ) -> Self {
+        BinanceSignedClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None) }
+    }
+
+    /// Why the most recent signed call answered `NotConnected` (`None` if it did not, or no call yet).
+    pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {
+        self.reason.lock().ok().and_then(|g| *g)
     }
 
     /// `GET /fapi/v2/balance`: every asset the exchange lists (zero balances included).
@@ -57,17 +72,44 @@ impl<T: HttpTransport> BinanceSignedClient<T> {
         rows(&body)?.iter().map(|r| parse_order(r, at)).collect()
     }
 
-    /// Order of checks matters: secrets, then calibrated time, and only then a request is built.
-    /// Returns the parsed body and the local time at which the response arrived.
+    /// One attempt; if the exchange rejects the timestamp, re-sync the clock once and send exactly
+    /// one more request (a second rejection, or a failed re-sync, is returned as is).
     async fn signed_get(&self, path: &str) -> Result<(Value, i64), AdapterError> {
-        let creds = load_credentials(self.secrets.as_ref(), Self::EXCHANGE)?;
-        let timestamp = signed_timestamp(self.clock.as_ref(), self.offset.as_ref())?;
+        match self.attempt(path).await {
+            Err(e) if is_timestamp_rejected(&e) => {
+                self.resync.resync().await.map_err(sanitize_error)?;
+                self.attempt(path).await
+            }
+            other => other,
+        }
+    }
+
+    fn set_reason(&self, reason: Option<NotConnectedReason>) {
+        if let Ok(mut g) = self.reason.lock() {
+            *g = reason;
+        }
+    }
+
+    /// Order of checks matters: secrets, then calibrated time, and only then a request is built.
+    /// Returns the parsed body and the exchange time (local clock + offset) at which the response
+    /// arrived, using the same offset as the signature.
+    async fn attempt(&self, path: &str) -> Result<(Value, i64), AdapterError> {
+        let prepared = load_credentials(self.secrets.as_ref(), Self::EXCHANGE, false).and_then(|c| require_offset(self.offset.as_ref()).map(|o| (c, o)));
+        let (creds, offset_ms) = match prepared {
+            Ok(v) => v,
+            Err(reason) => {
+                self.set_reason(Some(reason));
+                return Err(reason.into());
+            }
+        };
+        self.set_reason(None);
+        let timestamp = self.clock.now_ms().saturating_add(offset_ms);
         let query = encode_query(&[("timestamp", timestamp.to_string()), ("recvWindow", RECV_WINDOW_MS.to_string())]);
         let signature = binance_signature(&creds.api_secret, &query)?;
         let url = format!("{}{}?{}&signature={}", self.host.base_url(), path, query, signature);
         let request = HttpRequest::get(url, SIGNED_TIMEOUT).header("X-MBX-APIKEY", &creds.api_key);
         let response = self.transport.get(request).await.map_err(sanitize_error)?;
-        let fetched_at = self.clock.now_ms();
+        let fetched_at = self.clock.now_ms().saturating_add(offset_ms);
         Ok((interpret(response)?, fetched_at))
     }
 }
@@ -159,6 +201,9 @@ fn parse_order(r: &Value, fetched_at: i64) -> Result<OpenOrder, AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use serde_json::{Value, json};
@@ -185,10 +230,141 @@ mod tests {
         MemorySecrets::default().with(Exchange::Binance, SecretName::ApiKey, KEY).with(Exchange::Binance, SecretName::ApiSecret, SECRET)
     }
 
-    fn client_with(t: FakeTransport, secrets: MemorySecrets, offset: Option<i64>, host: BinanceHost) -> (Arc<FakeTransport>, BinanceSignedClient<FakeTransport>) {
+    struct FakeResync {
+        calls: AtomicUsize,
+        result: Result<(), AdapterError>,
+    }
+
+    impl FakeResync {
+        fn ok() -> Arc<Self> {
+            Arc::new(FakeResync { calls: AtomicUsize::new(0), result: Ok(()) })
+        }
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Resync for FakeResync {
+        fn resync(&self) -> Pin<Box<dyn Future<Output = Result<(), AdapterError>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(self.result.clone()))
+        }
+    }
+
+    struct FailingSecrets;
+    impl SecretProvider for FailingSecrets {
+        fn get(&self, _e: Exchange, _n: SecretName) -> Result<Option<String>, crate::ports::SecretError> {
+            Err(crate::ports::SecretError::Unavailable("keychain locked".into()))
+        }
+    }
+
+    fn client_full(
+        t: FakeTransport,
+        secrets: Arc<dyn SecretProvider>,
+        offset: Option<i64>,
+        host: BinanceHost,
+        resync: Arc<FakeResync>,
+    ) -> (Arc<FakeTransport>, BinanceSignedClient<FakeTransport>) {
         let t = Arc::new(t);
-        let c = BinanceSignedClient::new(t.clone(), Arc::new(secrets), Arc::new(ManualClock::new(NOW)), Arc::new(move || offset), host);
+        let c = BinanceSignedClient::new(t.clone(), secrets, Arc::new(ManualClock::new(NOW)), Arc::new(move || offset), resync, host);
         (t, c)
+    }
+
+    fn client_with(t: FakeTransport, secrets: MemorySecrets, offset: Option<i64>, host: BinanceHost) -> (Arc<FakeTransport>, BinanceSignedClient<FakeTransport>) {
+        client_full(t, Arc::new(secrets), offset, host, FakeResync::ok())
+    }
+
+    fn rejection() -> Result<HttpResponse, AdapterError> {
+        let body = json!({"code":-1021,"msg":"Timestamp for this request is outside of the recvWindow."}).to_string();
+        Ok(HttpResponse::with_status(400, body))
+    }
+
+    // ---- timestamp rejection: resync once, retry exactly once ----
+
+    #[test]
+    fn a_rejected_timestamp_is_resynced_once_and_the_request_resent_once() {
+        let t = FakeTransport::new().on("/fapi/v2/balance", rejection()).on("/fapi/v2/balance", ok_json(balance_rows()));
+        let resync = FakeResync::ok();
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), BinanceHost::Testnet, resync.clone());
+        assert_eq!(block_on(c.get_balances()).unwrap().len(), 2);
+        assert_eq!(t.requests().len(), 2);
+        assert_eq!(resync.calls(), 1);
+    }
+
+    #[test]
+    fn a_second_rejection_is_returned_and_there_is_no_third_request() {
+        let t = FakeTransport::new().on("/fapi/v2/positionRisk", rejection());
+        let resync = FakeResync::ok();
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), BinanceHost::Testnet, resync.clone());
+        assert!(matches!(block_on(c.get_positions()), Err(AdapterError::Exchange { code, .. }) if code == "-1021"));
+        assert_eq!(t.requests().len(), 2);
+        assert_eq!(resync.calls(), 1);
+    }
+
+    #[test]
+    fn a_failed_resync_returns_its_error_and_does_not_resend() {
+        let t = FakeTransport::new().on("/fapi/v1/openOrders", rejection());
+        let resync = Arc::new(FakeResync { calls: AtomicUsize::new(0), result: Err(AdapterError::Timeout) });
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), BinanceHost::Testnet, resync.clone());
+        assert_eq!(block_on(c.get_open_orders()).unwrap_err(), AdapterError::Timeout);
+        assert_eq!(t.requests().len(), 1);
+        assert_eq!(resync.calls(), 1);
+    }
+
+    #[test]
+    fn other_errors_do_not_trigger_a_resync() {
+        let body = json!({"code":-2015,"msg":"Invalid API-key"}).to_string();
+        let t = FakeTransport::new().on("/fapi/v2/balance", Ok(HttpResponse::with_status(401, body)));
+        let resync = FakeResync::ok();
+        let (t, c) = client_full(t, Arc::new(full_secrets()), Some(1200), BinanceHost::Testnet, resync.clone());
+        assert!(block_on(c.get_balances()).is_err());
+        assert_eq!((t.requests().len(), resync.calls()), (1, 0));
+    }
+
+    // ---- NotConnected reasons ----
+
+    #[test]
+    fn the_not_connected_reason_distinguishes_every_cause_and_clears_on_success() {
+        let reason_for = |secrets: Arc<dyn SecretProvider>, offset: Option<i64>| {
+            let (t, c) = client_full(FakeTransport::new(), secrets, offset, BinanceHost::Testnet, FakeResync::ok());
+            assert_eq!(c.last_not_connected_reason(), None, "no call yet");
+            assert_eq!(block_on(c.get_balances()).unwrap_err(), AdapterError::NotConnected);
+            assert_eq!(t.requests().len(), 0);
+            c.last_not_connected_reason()
+        };
+        let key_only = MemorySecrets::default().with(Exchange::Binance, SecretName::ApiKey, KEY);
+        let secret_only = MemorySecrets::default().with(Exchange::Binance, SecretName::ApiSecret, SECRET);
+        assert_eq!(reason_for(Arc::new(MemorySecrets::default()), Some(0)), Some(NotConnectedReason::NoKey));
+        assert_eq!(reason_for(Arc::new(secret_only), Some(0)), Some(NotConnectedReason::NoKey));
+        assert_eq!(reason_for(Arc::new(key_only), Some(0)), Some(NotConnectedReason::NoSecret));
+        assert_eq!(reason_for(Arc::new(FailingSecrets), Some(0)), Some(NotConnectedReason::SecretStoreError));
+        assert_eq!(reason_for(Arc::new(full_secrets()), None), Some(NotConnectedReason::ClockUnsynced));
+
+        // a later successful call clears it
+        let t = FakeTransport::new().on("/fapi/v2/balance", ok_json(balance_rows()));
+        let offset = Arc::new(AtomicI64::new(-1));
+        let o2 = offset.clone();
+        let c = BinanceSignedClient::new(
+            Arc::new(t),
+            Arc::new(full_secrets()),
+            Arc::new(ManualClock::new(NOW)),
+            Arc::new(move || Some(o2.load(Ordering::SeqCst)).filter(|v| *v >= 0)),
+            FakeResync::ok(),
+            BinanceHost::Testnet,
+        );
+        assert!(block_on(c.get_balances()).is_err());
+        assert_eq!(c.last_not_connected_reason(), Some(NotConnectedReason::ClockUnsynced));
+        offset.store(0, Ordering::SeqCst);
+        assert!(block_on(c.get_balances()).is_ok());
+        assert_eq!(c.last_not_connected_reason(), None);
+    }
+
+    #[test]
+    fn fetched_at_is_exchange_time_from_the_same_offset_as_the_signature() {
+        let t = FakeTransport::new().on("/fapi/v2/balance", ok_json(balance_rows()));
+        let (_, c) = client_with(t, full_secrets(), Some(-300), BinanceHost::Testnet);
+        let b = block_on(c.get_balances()).unwrap();
+        assert!(b.iter().all(|x| x.fetched_at == NOW - 300));
     }
 
     fn client(t: FakeTransport) -> (Arc<FakeTransport>, BinanceSignedClient<FakeTransport>) {
@@ -255,7 +431,7 @@ mod tests {
         assert_eq!(btc.amount, d("0.05"));
         assert_eq!(btc.usdt_value, None, "BTC must not be read as 50000 or 0.05 USDT");
         assert_eq!(btc.exchange, Exchange::Binance);
-        assert_eq!(btc.fetched_at, NOW);
+        assert_eq!(btc.fetched_at, NOW + 1200, "exchange time: local clock + calibrated offset");
         let usdt = b.iter().find(|x| x.asset == "USDT").unwrap();
         assert_eq!((usdt.amount, usdt.available, usdt.usdt_value), (d("1000.5"), Some(d("900.25")), Some(d("1000.5"))));
     }
@@ -282,7 +458,7 @@ mod tests {
         assert_eq!(short.notional, Some(d("13.0")));
         assert_eq!(short.margin, None, "cross margin: isolatedMargin is not a margin figure");
         assert_eq!(short.mode, PositionMode::OneWay);
-        assert_eq!((short.exchange, short.fetched_at), (Exchange::Binance, NOW));
+        assert_eq!((short.exchange, short.fetched_at), (Exchange::Binance, NOW + 1200));
     }
 
     #[test]

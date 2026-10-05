@@ -1,5 +1,7 @@
 //! Signing and request plumbing shared by the Binance and Bybit signed clients.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -75,21 +77,66 @@ pub fn encode_query(params: &[(&str, String)]) -> String {
     params.iter().map(|(k, v)| format!("{k}={}", percent_encode(v))).collect::<Vec<_>>().join("&")
 }
 
-/// Both values must exist and be non-empty; a missing value, an empty one or a store error all mean
-/// "not connected" (no default, no empty-string signing).
-pub fn load_credentials(secrets: &dyn SecretProvider, exchange: Exchange) -> Result<Credentials, AdapterError> {
-    let get = |name| match secrets.get(exchange, name) {
-        Ok(Some(v)) if !v.is_empty() => Ok(v),
-        _ => Err(AdapterError::NotConnected),
-    };
-    Ok(Credentials { api_key: get(SecretName::ApiKey)?, api_secret: get(SecretName::ApiSecret)? })
+/// Why a signed method answered `NotConnected` (the error type itself has no reason field).
+/// Contains no secret content, so a UI may show it as is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotConnectedReason {
+    NoKey,
+    NoSecret,
+    /// OKX only; never produced by the Binance/Bybit clients.
+    NoPassphrase,
+    ClockUnsynced,
+    SecretStoreError,
 }
 
-/// Local clock plus the calibrated offset. Not calibrated yet: `NotConnected` (the error type has
-/// no reason field, so "clock not calibrated" and "no secrets" look the same to callers).
-pub fn signed_timestamp(clock: &dyn Clock, offset: &dyn ClockOffsetSource) -> Result<i64, AdapterError> {
-    let off = offset.offset_ms().ok_or(AdapterError::NotConnected)?;
-    Ok(clock.now_ms().saturating_add(off))
+impl From<NotConnectedReason> for AdapterError {
+    fn from(_: NotConnectedReason) -> Self {
+        AdapterError::NotConnected
+    }
+}
+
+/// Re-synchronises the exchange clock offset (feed-health `clock_sync`). Called once when an
+/// exchange rejects a timestamp. Boxed future so the trait can be used as `Arc<dyn Resync>`.
+pub trait Resync: Send + Sync {
+    fn resync(&self) -> Pin<Box<dyn Future<Output = Result<(), AdapterError>> + Send + '_>>;
+}
+
+/// The exchange refused the request's timestamp: Binance code -1021, Bybit retCode 10002.
+pub fn is_timestamp_rejected(e: &AdapterError) -> bool {
+    matches!(e, AdapterError::Exchange { code, .. } if code == "-1021" || code == "10002")
+}
+
+/// Bybit pagination cursors are percent-encoded once more when placed in the query string (same as
+/// the Python reference; whether the exchange wants that is UNVERIFIED). The same string is signed.
+pub fn encode_cursor(cursor: &str) -> String {
+    percent_encode(cursor)
+}
+
+/// Key and secret must exist and be non-empty (and the passphrase too when `require_passphrase`);
+/// a missing value, an empty one or a store error means "not connected" (no default value, no
+/// empty-string signing). Checked in the order key, secret, passphrase.
+pub fn load_credentials(secrets: &dyn SecretProvider, exchange: Exchange, require_passphrase: bool) -> Result<Credentials, NotConnectedReason> {
+    let get = |name, missing| match secrets.get(exchange, name) {
+        Ok(Some(v)) if !v.is_empty() => Ok(v),
+        Ok(_) => Err(missing),
+        Err(_) => Err(NotConnectedReason::SecretStoreError),
+    };
+    let api_key = get(SecretName::ApiKey, NotConnectedReason::NoKey)?;
+    let api_secret = get(SecretName::ApiSecret, NotConnectedReason::NoSecret)?;
+    if require_passphrase {
+        get(SecretName::Passphrase, NotConnectedReason::NoPassphrase)?;
+    }
+    Ok(Credentials { api_key, api_secret })
+}
+
+/// The calibrated offset, or `ClockUnsynced` when the exchange was never calibrated.
+pub fn require_offset(offset: &dyn ClockOffsetSource) -> Result<i64, NotConnectedReason> {
+    offset.offset_ms().ok_or(NotConnectedReason::ClockUnsynced)
+}
+
+/// Local clock plus the calibrated offset (exchange time): the signing timestamp and `fetched_at`.
+pub fn signed_timestamp(clock: &dyn Clock, offset: &dyn ClockOffsetSource) -> Result<i64, NotConnectedReason> {
+    Ok(clock.now_ms().saturating_add(require_offset(offset)?))
 }
 
 /// Re-applies redaction to any error that crosses the client boundary, even if a transport built
@@ -172,18 +219,59 @@ mod tests {
     #[test]
     fn credentials_require_both_values_and_never_default() {
         let both = MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiKey, KEY).with(Exchange::Bybit, SecretName::ApiSecret, SECRET);
-        let c = load_credentials(&both, Exchange::Bybit).unwrap();
+        let c = load_credentials(&both, Exchange::Bybit, false).unwrap();
         assert_eq!((c.api_key.as_str(), c.api_secret.as_str()), (KEY, SECRET));
 
         let only_key = MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiKey, KEY);
-        assert_eq!(load_credentials(&only_key, Exchange::Bybit).unwrap_err(), AdapterError::NotConnected);
+        assert_eq!(load_credentials(&only_key, Exchange::Bybit, false).unwrap_err(), NotConnectedReason::NoSecret);
+        let only_secret = MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiSecret, SECRET);
+        assert_eq!(load_credentials(&only_secret, Exchange::Bybit, false).unwrap_err(), NotConnectedReason::NoKey);
         let none = MemorySecrets::default();
-        assert_eq!(load_credentials(&none, Exchange::Bybit).unwrap_err(), AdapterError::NotConnected);
-        assert_eq!(load_credentials(&FailingSecrets, Exchange::Bybit).unwrap_err(), AdapterError::NotConnected);
-        let empty = MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiKey, "").with(Exchange::Bybit, SecretName::ApiSecret, SECRET);
-        assert_eq!(load_credentials(&empty, Exchange::Bybit).unwrap_err(), AdapterError::NotConnected);
+        assert_eq!(load_credentials(&none, Exchange::Bybit, false).unwrap_err(), NotConnectedReason::NoKey);
+        assert_eq!(load_credentials(&FailingSecrets, Exchange::Bybit, false).unwrap_err(), NotConnectedReason::SecretStoreError);
+        let empty_key = MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiKey, "").with(Exchange::Bybit, SecretName::ApiSecret, SECRET);
+        assert_eq!(load_credentials(&empty_key, Exchange::Bybit, false).unwrap_err(), NotConnectedReason::NoKey);
+        let empty_secret = MemorySecrets::default().with(Exchange::Bybit, SecretName::ApiKey, KEY).with(Exchange::Bybit, SecretName::ApiSecret, "");
+        assert_eq!(load_credentials(&empty_secret, Exchange::Bybit, false).unwrap_err(), NotConnectedReason::NoSecret);
         // another exchange's secrets are never used
-        assert_eq!(load_credentials(&both, Exchange::Binance).unwrap_err(), AdapterError::NotConnected);
+        assert_eq!(load_credentials(&both, Exchange::Binance, false).unwrap_err(), NotConnectedReason::NoKey);
+    }
+
+    #[test]
+    fn passphrase_is_checked_last_and_only_when_required() {
+        let no_pass = MemorySecrets::default().with(Exchange::Okx, SecretName::ApiKey, KEY).with(Exchange::Okx, SecretName::ApiSecret, SECRET);
+        assert!(load_credentials(&no_pass, Exchange::Okx, false).is_ok());
+        assert_eq!(load_credentials(&no_pass, Exchange::Okx, true).unwrap_err(), NotConnectedReason::NoPassphrase);
+        let with_pass = MemorySecrets::default().with(Exchange::Okx, SecretName::ApiKey, KEY).with(Exchange::Okx, SecretName::ApiSecret, SECRET).with(Exchange::Okx, SecretName::Passphrase, "TEST_PASS_NOT_REAL");
+        assert!(load_credentials(&with_pass, Exchange::Okx, true).is_ok());
+    }
+
+    #[test]
+    fn every_reason_maps_to_not_connected_and_the_variant_names_hold_no_secret() {
+        for r in [NotConnectedReason::NoKey, NotConnectedReason::NoSecret, NotConnectedReason::NoPassphrase, NotConnectedReason::ClockUnsynced, NotConnectedReason::SecretStoreError] {
+            assert_eq!(AdapterError::from(r), AdapterError::NotConnected);
+        }
+    }
+
+    #[test]
+    fn timestamp_rejection_is_recognised_by_code() {
+        let ex = |c: &str| AdapterError::Exchange { code: c.into(), message: "m".into() };
+        assert!(is_timestamp_rejected(&ex("-1021")));
+        assert!(is_timestamp_rejected(&ex("10002")));
+        assert!(!is_timestamp_rejected(&ex("-2015")));
+        assert!(!is_timestamp_rejected(&ex("10003")));
+        assert!(!is_timestamp_rejected(&AdapterError::Timeout));
+        assert!(!is_timestamp_rejected(&AdapterError::Http { status: 400 }));
+    }
+
+    #[test]
+    fn cursor_encoding_rule_is_percent_encoding_of_every_reserved_character() {
+        assert_eq!(encode_cursor("page_token%3D1%26"), "page_token%253D1%2526");
+        assert_eq!(encode_cursor("a=b&c"), "a%3Db%26c");
+        assert_eq!(encode_cursor("100%"), "100%25");
+        assert_eq!(encode_cursor("AZaz09-._~"), "AZaz09-._~");
+        // must agree with what encode_query does to a value
+        assert_eq!(format!("cursor={}", encode_cursor("x=%&")), encode_query(&[("cursor", "x=%&".to_string())]));
     }
 
     #[test]
@@ -198,7 +286,7 @@ mod tests {
         let clock = ManualClock::new(1_700_000_000_000);
         assert_eq!(signed_timestamp(&clock, &|| Some(1200)).unwrap(), 1_700_000_001_200);
         assert_eq!(signed_timestamp(&clock, &|| Some(-300)).unwrap(), 1_699_999_999_700);
-        assert_eq!(signed_timestamp(&clock, &|| None).unwrap_err(), AdapterError::NotConnected);
+        assert_eq!(signed_timestamp(&clock, &|| None).unwrap_err(), NotConnectedReason::ClockUnsynced);
     }
 
     #[test]
