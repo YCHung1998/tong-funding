@@ -48,7 +48,8 @@ use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::alert::{self, AlertNotice, AlertReason, Notifier, PAIR_ALERT};
 use super::command::{
-    Alert, Blocker, Command, CommandReply, Event, FlatReport, ManualOrder, NewPreparedPair, Notice, PairUuid, PairView, Snapshot,
+    Alert, Blocker, CONTRACT_SETTINGS_UPDATED, Command, CommandReply, Event, FlatReport, ManualOrder, NewPreparedPair, Notice, PairUuid,
+    PairView, RISK_CONFIG_UPDATED, Snapshot,
 };
 use super::latency::{self, ORDER_LATENCY};
 use super::fill::{self, AutoCancel, FillDecision, LegFill, LegSizing, PreparedRecheck, SubmitPlan};
@@ -67,7 +68,7 @@ use super::transition::{self, TransitionError};
 use crate::ports::Clock;
 use crate::store::db::{Db, HaltReason};
 use crate::store::events::EventStore;
-use crate::store::state::{AddPairOutcome, FLAG_EXECUTION_MODE, IntentState, NewPair};
+use crate::store::state::{AddPairOutcome, ConfigChange, FLAG_EXECUTION_MODE, IntentState, NewPair};
 
 #[cfg(test)]
 mod flow_tests;
@@ -104,11 +105,16 @@ pub const RECONCILIATION_RESULT: &str = "RECONCILIATION_RESULT";
 pub const ORDER_CANCEL_RESULT: &str = "ORDER_CANCEL_RESULT";
 /// Result of "confirm closed" (accepted after the system re-query, or refused with positions).
 pub const MANUAL_CONFIRM_RESULT: &str = "MANUAL_CONFIRM_RESULT";
+/// Result of a manual cancel (manual order page): the executor's answer, unchanged.
+pub const MANUAL_CANCEL_RESULT: &str = "MANUAL_CANCEL_RESULT";
 
 /// `config` key of the global `RiskConfig` JSON. Missing = defaults (incomplete: Node 0 blocks).
 pub const CONFIG_RISK: &str = "risk";
 /// `config` key of the per-exchange overrides (`{"Bybit": {...}}`). Missing = none.
 pub const CONFIG_RISK_OVERRIDES: &str = "risk_overrides";
+/// `config` key of the contract template `{"notional_usdt": "...", "leverage": "..."}` (per leg).
+/// Missing = the Python defaults (1000 / 5), applied by the UI view-model.
+pub const CONFIG_CONTRACT_TEMPLATE: &str = "contract_template";
 
 /// PREPARED auto-cancel re-fetch period (AUTO only). It runs only while the pair is more than one
 /// period before its baseline time; from the baseline on, the baseline data and Node 0 decide.
@@ -675,7 +681,9 @@ impl Actor {
             Command::AddPrepared(p) => self.add_prepared(p),
             Command::EntryTrigger { pair } => self.start_entry(&pair, "scheduler"),
             Command::ManualEnter { pair } => self.start_entry(&pair, "user"),
+            Command::EnterSelected { pairs } => self.enter_selected(pairs),
             Command::ManualOrder(o) => self.manual_order(o),
+            Command::ManualCancel { exchange, symbol, client_order_id } => self.manual_cancel(exchange, symbol, client_order_id),
             Command::AutoExit { pair } => self.begin_close(&pair, SystemEvent::ScheduledClose.into(), "scheduler"),
             Command::ManualExit { pair } => self.begin_close(&pair, ManualEvent::RequestClose.into(), "user exit"),
             Command::ManualClose { pair } => self.begin_close(&pair, ManualEvent::RequestClose.into(), "user close"),
@@ -690,6 +698,8 @@ impl Actor {
             Command::SetTriggerMode(m) => self.set_trigger_mode(m),
             Command::SetExecutionMode(m) => self.set_execution_mode(m),
             Command::UpdateConfig { key, value } => self.update_config(&key, value),
+            Command::SaveRiskSettings { risk, overrides } => self.save_risk_settings(risk, overrides),
+            Command::SaveContractTemplate { notional_usdt, leverage } => self.save_contract_template(notional_usdt, leverage),
             Command::SetKillSwitch { on } => match self.db.set_kill_switch(on) {
                 Ok(()) => CommandReply::Accepted,
                 Err(e) => CommandReply::Rejected(format!("cannot save kill switch: {e}")),
@@ -1515,6 +1525,44 @@ impl Actor {
         CommandReply::Accepted
     }
 
+    /// Manual cancel by `client_order_id` on the current executor; never gated (only reduces
+    /// exposure). The answer is recorded as is (`MANUAL_CANCEL_RESULT`), never shown as success
+    /// unless the executor said so.
+    fn manual_cancel(&mut self, exchange: Exchange, symbol: String, client_order_id: String) -> CommandReply {
+        if client_order_id.trim().is_empty() {
+            return CommandReply::Rejected("order id is empty".into());
+        }
+        let (executor, tx) = (self.executor.clone(), self.event_tx.clone());
+        tokio::spawn(async move {
+            let outcome = executor.cancel(exchange, &symbol, &client_order_id).await;
+            let _ = tx.send(Event::ManualCancelled { exchange, symbol, client_order_id, outcome }).await;
+        });
+        CommandReply::Accepted
+    }
+
+    /// One-click submit (ui-trading-pages 1.2): each pair goes through `start_entry`, whose
+    /// land-then-act PREPARED → PRE_TRADE_CHECK can succeed only once per pair, so a pair the
+    /// AUTO scheduler already took is refused without any order. Accepted only when every pair
+    /// was; otherwise the reply names each refused pair (the others still proceed).
+    fn enter_selected(&mut self, pairs: Vec<PairUuid>) -> CommandReply {
+        if pairs.is_empty() {
+            return CommandReply::Rejected("no pair selected".into());
+        }
+        let mut refused = Vec::new();
+        for p in &pairs {
+            match self.start_entry(p, "user one-click") {
+                CommandReply::Accepted => {}
+                CommandReply::AlreadyPending => refused.push(format!("{p}: already pending")),
+                CommandReply::Rejected(why) => refused.push(format!("{p}: {why}")),
+            }
+        }
+        if refused.is_empty() {
+            CommandReply::Accepted
+        } else {
+            CommandReply::Rejected(format!("{}/{} entered; refused: {}", pairs.len() - refused.len(), pairs.len(), refused.join("; ")))
+        }
+    }
+
     // ---- events ----
 
     /// Results of spawned I/O. Only here may they change state.
@@ -1609,6 +1657,14 @@ impl Actor {
                 payload["client_order_id"] = json!(client_order_id);
                 payload["simulated"] = json!(self.executor.is_simulated());
                 self.note(MANUAL_ORDER_RESULT, None, payload);
+            }
+            Event::ManualCancelled { exchange, symbol, client_order_id, outcome } => {
+                let mut payload = query_json(&outcome);
+                payload["exchange"] = json!(exchange.name());
+                payload["symbol"] = json!(symbol);
+                payload["client_order_id"] = json!(client_order_id);
+                payload["simulated"] = json!(self.executor.is_simulated());
+                self.note(MANUAL_CANCEL_RESULT, None, payload);
             }
             Event::ClosePositionsFetched { pair, long, short, long_recorded, short_recorded } => {
                 self.on_close_positions(&pair, [long, short], [long_recorded, short_recorded]);
@@ -1812,6 +1868,54 @@ impl Actor {
                 CommandReply::Accepted
             }
             Err(e) => CommandReply::Rejected(format!("cannot save {key}: {e}")),
+        }
+    }
+
+    /// Risk page save: both values validated by core first, then stored with one
+    /// `RISK_CONFIG_UPDATED` (before / after) in a single transaction. Nothing changes on failure.
+    fn save_risk_settings(&mut self, risk: Value, overrides: Value) -> CommandReply {
+        if let Err(e) = RiskConfig::from_json(&risk.to_string()) {
+            return CommandReply::Rejected(format!("risk: {e}"));
+        }
+        if let Err(e) = parse_overrides(&overrides) {
+            return CommandReply::Rejected(format!("risk_overrides: {e}"));
+        }
+        let (old_risk, old_ov) = match (self.db.config_get(CONFIG_RISK), self.db.config_get(CONFIG_RISK_OVERRIDES)) {
+            (Ok(r), Ok(o)) => (r, o),
+            (Err(e), _) | (_, Err(e)) => return CommandReply::Rejected(format!("cannot read settings: {e}")),
+        };
+        let payload = json!({
+            "before": { "risk": old_risk.as_ref().map(|e| e.value.clone()), "overrides": old_ov.as_ref().map(|e| e.value.clone()) },
+            "after": { "risk": risk, "overrides": overrides },
+        });
+        let changes = [
+            ConfigChange { key: CONFIG_RISK.into(), value: risk, expected_version: old_risk.map(|e| e.version) },
+            ConfigChange { key: CONFIG_RISK_OVERRIDES.into(), value: overrides, expected_version: old_ov.map(|e| e.version) },
+        ];
+        match self.db.config_set_many_with_event(&changes, RISK_CONFIG_UPDATED, &payload) {
+            Ok(_) => CommandReply::Accepted,
+            Err(e) => CommandReply::Rejected(format!("cannot save risk settings: {e}")),
+        }
+    }
+
+    /// Contract page save: per-leg notional and leverage must be > 0; stored with
+    /// `CONTRACT_SETTINGS_UPDATED` (before / after). Existing pairs are not touched.
+    fn save_contract_template(&mut self, notional_usdt: Decimal, leverage: Decimal) -> CommandReply {
+        for (name, v) in [("notional_usdt", notional_usdt), ("leverage", leverage)] {
+            if v <= Decimal::ZERO {
+                return CommandReply::Rejected(format!("{name} must be > 0"));
+            }
+        }
+        let old = match self.db.config_get(CONFIG_CONTRACT_TEMPLATE) {
+            Ok(e) => e,
+            Err(e) => return CommandReply::Rejected(format!("cannot read {CONFIG_CONTRACT_TEMPLATE}: {e}")),
+        };
+        let value = json!({ "notional_usdt": dstr(notional_usdt), "leverage": dstr(leverage) });
+        let payload = json!({ "before": old.as_ref().map(|e| e.value.clone()), "after": value });
+        let change = ConfigChange { key: CONFIG_CONTRACT_TEMPLATE.into(), value, expected_version: old.map(|e| e.version) };
+        match self.db.config_set_many_with_event(&[change], CONTRACT_SETTINGS_UPDATED, &payload) {
+            Ok(_) => CommandReply::Accepted,
+            Err(e) => CommandReply::Rejected(format!("cannot save contract template: {e}")),
         }
     }
 
@@ -2413,7 +2517,9 @@ fn command_name(c: &Command) -> &'static str {
         Command::AddPrepared(_) => "AddPrepared",
         Command::EntryTrigger { .. } => "EntryTrigger",
         Command::ManualEnter { .. } => "ManualEnter",
+        Command::EnterSelected { .. } => "EnterSelected",
         Command::ManualOrder(_) => "ManualOrder",
+        Command::ManualCancel { .. } => "ManualCancel",
         Command::AutoExit { .. } => "AutoExit",
         Command::ManualExit { .. } => "ManualExit",
         Command::ManualClose { .. } => "ManualClose",
@@ -2422,6 +2528,8 @@ fn command_name(c: &Command) -> &'static str {
         Command::SetTriggerMode(_) => "SetTriggerMode",
         Command::SetExecutionMode(_) => "SetExecutionMode",
         Command::UpdateConfig { .. } => "UpdateConfig",
+        Command::SaveRiskSettings { .. } => "SaveRiskSettings",
+        Command::SaveContractTemplate { .. } => "SaveContractTemplate",
         Command::SetKillSwitch { .. } => "SetKillSwitch",
     }
 }
@@ -2438,9 +2546,13 @@ fn pair_of(c: &Command) -> Option<&str> {
         Command::AddPrepared(p) => Some(&p.internal_uuid),
         Command::Tick
         | Command::ManualOrder(_)
+        | Command::EnterSelected { .. }
+        | Command::ManualCancel { .. }
         | Command::SetTriggerMode(_)
         | Command::SetExecutionMode(_)
         | Command::UpdateConfig { .. }
+        | Command::SaveRiskSettings { .. }
+        | Command::SaveContractTemplate { .. }
         | Command::SetKillSwitch { .. } => None,
     }
 }

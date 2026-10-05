@@ -2004,3 +2004,8 @@ async fn a_rejected_close_leg_is_partial_failure_and_a_manual_close_handles_only
     assert_eq!((new[0].exchange, new[0].side, new[0].quantity, new[0].reduce_only), (Exchange::Bybit, OrderSide::Buy, dec("10"), true));
     assert_eq!(status(&rig.db, UUID), "FINALIZED");
 }
+
+// ui-trading-pages: engine side of the trading pages (one-click submit vs the scheduler, manual
+// cancel, settings saves).
+#[path = "ui_command_tests.rs"]
+mod ui_command_tests;

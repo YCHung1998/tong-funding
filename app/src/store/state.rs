@@ -184,6 +184,17 @@ impl Db {
 
     /// All-or-nothing: if any change conflicts, none is applied. Returns the new versions in order.
     pub fn config_set_many(&self, changes: &[ConfigChange]) -> Result<Vec<i64>, StoreError> {
+        self.config_write(changes, None)
+    }
+
+    /// [`Db::config_set_many`] plus one audit event in the same transaction (ui-trading-pages:
+    /// `RISK_CONFIG_UPDATED` / `CONTRACT_SETTINGS_UPDATED` with before / after). A failed event
+    /// write halts the store and leaves every key unchanged.
+    pub fn config_set_many_with_event(&self, changes: &[ConfigChange], event_type: &str, payload: &Value) -> Result<Vec<i64>, StoreError> {
+        self.config_write(changes, Some((event_type, payload)))
+    }
+
+    fn config_write(&self, changes: &[ConfigChange], event: Option<(&str, &Value)>) -> Result<Vec<i64>, StoreError> {
         for ch in changes {
             reject_secret_json(&ch.key, &ch.value)?;
         }
@@ -204,6 +215,9 @@ impl Db {
                     params![ch.key, ch.value.to_string(), next, now],
                 )?;
                 versions.push(next);
+            }
+            if let Some((event_type, payload)) = event {
+                insert_event_on(&tx, now, event_type, None, payload).map_err(|e| self.event_write_failed(event_type, &e))?;
             }
             tx.commit()?;
             Ok(versions)
@@ -670,6 +684,25 @@ mod tests {
     }
 
     // ---- config ----
+
+    /// ui-trading-pages 3.1: settings and their audit event land together or not at all.
+    #[test]
+    fn config_with_event_writes_both_keys_and_the_event_or_nothing() {
+        let (_d, db, _) = open_tmp();
+        let ch = |k: &str, v: Value, ver: Option<i64>| ConfigChange { key: k.into(), value: v, expected_version: ver };
+        let payload = json!({"before": null, "after": {"risk": {"max_leverage": "4"}}});
+        db.config_set_many_with_event(&[ch("risk", json!({"max_leverage": "4"}), None), ch("risk_overrides", json!({}), None)], "RISK_CONFIG_UPDATED", &payload).unwrap();
+        assert_eq!(events_of(&db, "RISK_CONFIG_UPDATED"), vec![(None, payload)]);
+        assert_eq!(db.config_get("risk_overrides").unwrap().unwrap().version, 1);
+
+        break_event_inserts(&db);
+        let r = db.config_set_many_with_event(&[ch("risk", json!({"max_leverage": "3"}), Some(1))], "RISK_CONFIG_UPDATED", &json!({}));
+        assert!(r.is_err());
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        let v: String = plain.query_row("SELECT value_json FROM config WHERE key = 'risk'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, json!({"max_leverage": "4"}).to_string(), "rolled back with the failed event");
+        assert!(db.is_halted(), "a failed audit event halts the store");
+    }
 
     #[test]
     fn config_roundtrips_with_versions() {

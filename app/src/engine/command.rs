@@ -8,6 +8,12 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::ports::{FreshQuote, Leg, OrderAction, OrderRules, OrderSide, QueryOutcome, SubmitOutcome};
 
+/// Saved risk settings (global + overrides), with before / after values, in the same transaction
+/// as the settings (ui-trading-pages 3.1).
+pub const RISK_CONFIG_UPDATED: &str = "RISK_CONFIG_UPDATED";
+/// Saved contract template, with before / after values, in the same transaction (ui-trading-pages 2.1).
+pub const CONTRACT_SETTINGS_UPDATED: &str = "CONTRACT_SETTINGS_UPDATED";
+
 /// Engine-internal id of a pair (`pairs.internal_uuid`).
 pub type PairUuid = String;
 
@@ -44,7 +50,13 @@ pub enum Command {
     EntryTrigger { pair: PairUuid },
     /// User pressed "enter now" for a PREPARED pair.
     ManualEnter { pair: PairUuid },
+    /// Staged-orders page one-click submit, after the user confirmed every leg (ui-trading-pages
+    /// 1.2): one command for all selected pairs; each is entered like `ManualEnter`. Allowed in
+    /// AUTO too: a pair the scheduler already moved out of PREPARED is refused (land-then-act).
+    EnterSelected { pairs: Vec<PairUuid> },
     ManualOrder(ManualOrder),
+    /// Manual order page cancel by `client_order_id`, on the executor of the current mode.
+    ManualCancel { exchange: Exchange, symbol: String, client_order_id: String },
     /// Scheduler-internal exit at `T + exit_delay_ms`.
     AutoExit { pair: PairUuid },
     ManualExit { pair: PairUuid },
@@ -57,6 +69,11 @@ pub enum Command {
     SetExecutionMode(ExecutionMode),
     /// New global risk config / overrides as JSON (validated by `core::risk` before use).
     UpdateConfig { key: String, value: Value },
+    /// Risk page save: global config and overrides validated by core, stored together with one
+    /// `RISK_CONFIG_UPDATED` event (before / after) in one transaction.
+    SaveRiskSettings { risk: Value, overrides: Value },
+    /// Contract page save (per-leg notional and leverage, both > 0) with `CONTRACT_SETTINGS_UPDATED`.
+    SaveContractTemplate { notional_usdt: Decimal, leverage: Decimal },
     SetKillSwitch { on: bool },
 }
 
@@ -66,7 +83,7 @@ impl Command {
     /// true. Exhaustive on purpose: no wildcard arm (guarded by a source-scan test below).
     pub fn opens_exposure(&self) -> bool {
         match self {
-            Command::EntryTrigger { .. } | Command::ManualEnter { .. } => true,
+            Command::EntryTrigger { .. } | Command::ManualEnter { .. } | Command::EnterSelected { .. } => true,
             Command::ManualOrder(o) => !o.reduce_only,
             Command::Tick
             | Command::AddPrepared(_)
@@ -78,6 +95,9 @@ impl Command {
             | Command::SetTriggerMode(_)
             | Command::SetExecutionMode(_)
             | Command::UpdateConfig { .. }
+            | Command::ManualCancel { .. }
+            | Command::SaveRiskSettings { .. }
+            | Command::SaveContractTemplate { .. }
             | Command::SetKillSwitch { .. } => false,
         }
     }
@@ -94,6 +114,8 @@ pub enum Event {
     Queried { pair: Option<PairUuid>, client_order_id: String, outcome: QueryOutcome },
     /// Manual order (not part of a pair) finished.
     ManualSubmitted { client_order_id: String, outcome: SubmitOutcome },
+    /// Manual cancel finished: what the executor of the current mode said, unchanged.
+    ManualCancelled { exchange: Exchange, symbol: String, client_order_id: String, outcome: QueryOutcome },
     /// Node 0 / Node 1 context fetched with the pre-trade prices: order rules per leg and whether
     /// the leg's symbol already carries a position or open order that is not this pair's
     /// (`Err` = could not be read; treated as foreign exposure, fail closed).
@@ -236,7 +258,7 @@ mod tests {
     #[test]
     fn every_variant_has_the_design_d5_classification() {
         let p = || "u1".to_string();
-        let opens = [Command::EntryTrigger { pair: p() }, Command::ManualEnter { pair: p() }];
+        let opens = [Command::EntryTrigger { pair: p() }, Command::ManualEnter { pair: p() }, Command::EnterSelected { pairs: vec![p()] }];
         let not = [
             Command::Tick,
             Command::AddPrepared(NewPreparedPair {
@@ -256,6 +278,9 @@ mod tests {
             Command::SetTriggerMode(TriggerMode::Auto),
             Command::SetExecutionMode(ExecutionMode::ExchangeDemo),
             Command::UpdateConfig { key: "risk".into(), value: serde_json::json!({}) },
+            Command::ManualCancel { exchange: Exchange::Bybit, symbol: "BTCUSDT".into(), client_order_id: "x".into() },
+            Command::SaveRiskSettings { risk: serde_json::json!({}), overrides: serde_json::json!({}) },
+            Command::SaveContractTemplate { notional_usdt: Decimal::ONE, leverage: Decimal::ONE },
             Command::SetKillSwitch { on: false },
         ];
         for c in &opens {
