@@ -77,3 +77,26 @@
   3. `TONG_FUNDING_FRAME_STATS=60 ./target/release/tong-funding`，切到「掃幣」頁並保持視窗可見（量測期間每幀都重繪，是最壞情況；Binance WebSocket 每秒、Bybit/OKX 每 10 秒更新）。
      每 60 秒 stdout 會印一行 `FRAMES page=scanner rows=… frames=… p50_ms=… p95_ms=… max_ms=… dropped=… paused=…`；收集至少 3 行，另外各捲動表格一次、開關「只顯示達標」一次。
   4. 把結果（含 `rows=` 實際列數、電源狀態）填進 `openspec/changes/archive/2026-10-05-bootstrap-gpui-shell/design.md` 的量測紀錄表；預算 p95 ≤ 16.7 ms（或該 change 放寬後的值）。未達標就照該 change 的緩解順序處理並回報。
+
+## ui-trading-pages：需要在 Mac 上做的驗證（task 5.1；agent 無顯示器、連不到交易所）
+在 `/Users/eason.hung/Documents/github/tong-funding`、分支 `feat/ui-trading-pages` 上操作。前置：demo 金鑰已在 Keychain（`cargo run -q -p tong-funding -- secrets status` 全部 `present`），且已依上節 4.1 設好費率與門檻（`config show` 最後一行 `required fields: complete`）。App 開著時不要跑 `config set`（單一資料庫實例）。截圖存到 `openspec/changes/ui-trading-pages/screenshots/`。
+
+- [ ] **5.1-a 啟動與組裝根**
+  1. `cargo run --release -p tong-funding`（Binance 主機若授權失敗改 `TONG_FUNDING_BINANCE_HOST=demo`）。
+  2. 等約 40 秒：狀態列徽章顯示 `SIMULATION`；系統日誌應出現行情 `SCAN_RUN`，且**沒有** `MODE_LOAD_WARNING` 以外的錯誤。若之前存過 `EXCHANGE_DEMO` 而金鑰失效，頂部應有 `EXECUTION_MODE_FALLBACK` 橫幅。
+  3. 終端機沒有任何金鑰字樣（`grep -i secret` 應無輸出）。
+- [ ] **5.1-b 四頁截圖並與 Figma 對照**（各一張，`staged-orders.png`、`contract-settings.png`、`risk-settings.png`、`manual-order.png`，再加 `scanner-candidates.png`）
+  - 合約設定：輸入 1200 / 3 → 顯示「1,200 ÷ 3 = 400 / leg」、雙腿 2,400 / 800；切「用保證金反推槓桿」輸入 400 → 3×；試算 BTCUSDT 三所數量（Binance 若在 1 秒內更新應有數量；**Bybit / OKX 每 10 秒輪詢，預設 `stale_data_threshold_ms` 1000，預期顯示「價格已過期」**——回報實際情況，決定是否接受，見 design.md 實作紀錄 #7）。按「儲存模板」，系統日誌出現 `CONTRACT_SETTINGS_UPDATED`（含 before / after）。
+  - 風控設定：確認沒有 Funding Threshold / Max Concurrent Trades / Hedge Threshold、有「最大價格漂移」與「估計滑價」兩欄、`Min Expected Net PnL %` 預設 0.03 與 Net Edge 門檻並存；把 `max_leverage` 改 0 → 欄位錯誤且儲存禁用；改回並儲存 → `RISK_CONFIG_UPDATED`（含前後值）。Bybit 開 `max_leverage` 覆寫 = 4，看預覽 Binance×Bybit 為 4。
+  - 逐項列出與 Figma 的刻意差異，核對 design.md 差異表。
+- [ ] **5.1-c SIMULATION 一輪「掃幣 → 交易單 → 持倉」**
+  1. 掃幣頁勾一個「達標」列的「加入交易單」→ Candidate List 出現（每腿 Notional / 槓桿 / Margin 等於模板）→「加入並前往交易單 →」。系統日誌出現 `PAIR_PREPARED`，沒有任何 `ORDER_SUBMITTED`。
+  2. 交易單頁：該列數量為取整後的值；把 `trigger_mode` 切成 MANUAL（日誌 `TRIGGER_MODE_CHANGED`）；勾選 →「一鍵送出已選取」→ 確認面板列出 2 腿與「SIMULATION：由模擬器成交，不會送出真實訂單」→ 先按取消（日誌無變化）→ 再送出並確認。
+  3. 預期：`PRE_TRADE_CHECK` → `ORDER_SUBMIT` → `RECONCILED`（或 BLOCKED 並在「上次執行結果」列出全部未通過檢查名稱）；`ORDER_SUBMITTED` 的 `simulated` 為 true。RECONCILED 後在 MANUAL 下按「立即平倉」→ 確認 → `FINALIZED`。截圖 `sim-round-*.png`。
+  4. AUTO 防重複：再加一個配對、`trigger_mode` 切 AUTO，在進場時點（T−10 秒）前後各按一次一鍵送出：只應有一次 `PRE_TRADE_CHECK` 與兩張開倉單；第二次的回覆顯示「not PREPARED」。
+- [ ] **5.1-d EXCHANGE_DEMO 一輪與單腿失敗的人工處理**
+  1. 風控頁選 `EXCHANGE_DEMO` → 確認面板 → 確認；徽章變 `EXCHANGE_DEMO`，日誌 `EXECUTION_MODE_CHANGED`。（設定不完整或金鑰缺時選項應禁用並說明原因，各截一張。）
+  2. 用最小數量重複 5.1-c 的一輪；`ORDER_SUBMITTED` 的 `simulated` 為 false，「上次執行結果」顯示交易所 order id；持倉頁看到兩腿；平倉後兩所帳戶皆為 0。
+  3. 單腿失敗：在 Bybit demo 先把可用保證金降到不足（或把該標的槓桿設到交易所會拒絕的值），再送一輪 → 配對應為 `PARTIAL_FAILURE`，交易單頁「需人工處理」區塊顯示兩腿持倉；「人工確認已平倉」在仍有持倉時禁用並寫「Binance 仍有持倉」；按「人工要求平倉」→ 確認 → 平掉剩下一腿 → 約 15 秒後（帳戶讀取週期）「人工確認已平倉」可按 → 配對 `FINALIZED`。截圖 `partial-failure-*.png`，並回報入口是否夠用（design.md Risks：Python 版 47 筆單腿失敗）。
+- [ ] **5.1-e 手動下單頁**：SIMULATION 下送 Binance BTCUSDT BUY 0.0014 → 確認面板顯示 0.001，結果列「[模擬] 下單成功」；切 EXCHANGE_DEMO 送同一筆 → 交易所 order id；用結果中的 client_order_id 撤單（已成交時應顯示「訂單已是 Filled，未撤銷」而不是成功）；開 kill switch 後非 reduce-only 的 Submit 禁用並顯示「緊急停止中」，勾 reduce_only 可送。
+- [ ] **5.1-f rate limit**：運行 30 分鐘後到系統日誌確認沒有 `RATE_LIMITED`（交易頁每 15 秒讀一次兩所持倉 / 委託 / 保證金，另有 30 秒的帳戶輪詢）；若有，回報次數。

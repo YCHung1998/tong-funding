@@ -43,9 +43,9 @@
 手動下單頁、交易單頁一律以 Command 與 engine 溝通，才能做到「系統只有一條下單路徑」，`execution_mode`、kill switch、停機狀態、`opens_exposure` 都在 engine 一處把關。
 驗收：以依賴檢查證明 UI 模組不依賴 exchange client（task 4.1）。
 
-**D3　手動下單頁改為受 `execution_mode` 約束（與 Python 版刻意不同）。**
-Python 版的手動下單永遠真送單，使「SIMULATION 很安全」這個承諾有漏洞。新版 `SIMULATION` 下手動下單禁用，要真的下單必須先明確切到 `EXCHANGE_DEMO`。
-副作用：想在 `SIMULATION` 下手動平掉遺留倉位，必須先切模式（列入 Open Questions）。
+**D3　手動下單頁受 `execution_mode` 約束（與 Python 版刻意不同）。**
+Python 版的手動下單永遠真送單，使「SIMULATION 很安全」這個承諾有漏洞。新版手動單一律經 engine 的單一下單路徑，由 engine 依模式選執行器：`SIMULATION` 下送往 `SimulatedExecutor`（標示為模擬、不送到任何交易所），`EXCHANGE_DEMO` 下才送 demo 帳戶。
+（更正：原稿寫「`SIMULATION` 下手動下單禁用」，與已合併的 `engine-simulation` spec「SIMULATION 下的手動下單 → SimulatedExecutor」及使用者先前決定衝突；依 engine spec 修正，見實作紀錄 #1。）
 
 **D4　送出前的二次確認清單由純函式產生，且與送給 engine 的命令使用同一份資料。**
 避免「畫面列的」與「實際送的」不一致：確認視窗的每一腿與 Command 內容由同一個結構產生，測試以腿數與內容相等性驗證。
@@ -70,7 +70,7 @@ Python 版只在 MANUAL 顯示「立即執行」。Figma 的一鍵送出沒有�
 | 項目 | Figma 或 Python 版 | 本 change | 原因 |
 |---|---|---|---|
 | 風控：Funding Threshold、Max Concurrent Trades（legs）、Hedge Threshold | Figma 有 | 移除 | 使用者拍板；與 `risk-config` 一致 |
-| 風控：Min Expected Net PnL % | Figma 有 | 由 `net_edge_threshold_pct` 取代 | 達標改由 Net Edge 決定（需使用者確認為取代關係） |
+| 風控：Min Expected Net PnL % | Figma 有 | 保留為 `min_expected_net_pnl_pct`（預設 0.03，只在全域），與 `net_edge_threshold_pct` 並存 | 使用者 2026-10-05 晚拍板 |
 | 風控：Max Slippage % | 單一欄位 | 拆成「最大價格漂移」與「估計滑價」 | `risk-config` D3 |
 | 風控：Stale Data Threshold | 5 sec | 1000 ms | 使用者拍板 |
 | 風控：Order Timeout | 1,500 ms | 15 秒 | 使用者拍板 |
@@ -85,7 +85,7 @@ Python 版只在 MANUAL 顯示「立即執行」。Figma 的一鍵送出沒有�
 | 交易單：人工處理入口、`trigger_mode`、立即平倉 | Figma 無 | 新增 | 完全人工決策；Python 版既有功能 |
 | 合約設定：預期 Quantity 0.019934（六位小數） | 未取整 | 顯示依 lot size 向下取整後的數量與低於最小量提示 | `quantity-precision` |
 | 合約設定：OKX | 無 | 數量以合約張數顯示 | 使用者拍板 |
-| 手動下單：受模式約束 | Python 版不受約束 | 受約束，`SIMULATION` 下禁用 | 使用者拍板 |
+| 手動下單：受模式約束 | Python 版不受約束，一律真送 | 經 engine 單一路徑；`SIMULATION` 下由模擬器成交並標示模擬 | engine-simulation spec、使用者拍板 |
 | 手動下單：環境說明 | 寫死「無外部請求」 | 依模式如實顯示 | 避免不實說明 |
 
 ## Risks / Trade-offs
@@ -123,3 +123,19 @@ Python 版只在 MANUAL 顯示「立即執行」。Figma 的一鍵送出沒有�
 - **AUTO 模式也提供一鍵送出**（Open Question 4），仍需二次確認；送出前檢查該配對沒有被排程器觸發中，避免重複進場。
 - **「Min Expected Net PnL %」與 `net_edge_threshold_pct` 兩個都保留**（Open Question 1）：需在 `core` 的 `risk-config` 新增 `min_expected_net_pnl_pct` 並納入送單前檢查（作為本 change 對 `risk-config` / `pretrade-validation` 的 MODIFIED）。
 - 手動下單已有 `reduce_only`，kill switch 啟動時 reduce-only 手動單仍可送出（`engine-simulation` D5，Open Question 3 已解）。
+
+## 實作紀錄（2026-10-05，實作 agent）
+
+1. **手動下單在 SIMULATION 下可送出（更正 task 4.1 / spec 原文）。** 依已合併的 `engine-simulation` spec（`execution-modes`：「手動下單頁在 SIMULATION 下 SHALL 送往 SimulatedExecutor」）與使用者先前決定，頁面在兩種模式下都送出同一個 `ManualOrder` Command，由 engine 選執行器；事件 `MANUAL_ORDER_RESULT` 帶 `simulated`。已改寫 `manual-order-page` spec 與 task 4.1、D3、差異表。
+2. **`min_expected_net_pnl_pct` 選「有文件化的預設值 0.03」而非必填。** 理由：必填會改變 `RiskConfig::missing_fields` 的封閉清單與既有 core 測試（指示要保持精確）；0.03（Python 預設）比 0（不設限）保守。只存在於全域：不加入九個可覆寫欄位、也不加入五個 global-only 名單（兩張封閉表都不動），覆寫中出現它會以 `UnknownField` 指名拒絕。定義為「funding 收入 − 手續費 − 估計滑價（未扣安全邊際）」÷ 每腿名目本金；併入 `NetEdgeQualified`，十項檢查不變。掃幣頁「達標」同樣需要兩個門檻（`scanner.rs`）。測試 fixture `testkit::complete_settings` 把它設為 0，讓既有掃幣測試仍只測 Net Edge 門檻。
+3. **一鍵送出 = 一個 `Command::EnterSelected { pairs }`**（spec「恰好一個包含所選配對的執行命令」）。engine 對每個配對走 `start_entry`，`PREPARED → PRE_TRADE_CHECK` 先落庫再行動，只能轉出一次：AUTO 下排程器已觸發的配對被拒（「not PREPARED」），兩種先後順序皆經測試只有兩張開倉單。部分被拒時回覆 `Rejected("1/2 entered; refused: …")`，其餘配對照常進行；頁面如實顯示。頁面不另做互斥（D8）。
+4. **新增 engine Command**（`command.rs` 是共享契約）：`EnterSelected`（opens_exposure = true）、`ManualCancel`、`SaveRiskSettings`、`SaveContractTemplate`（皆 false）。`opens_exposure` 仍無 wildcard。撤單以本系統送單時的 `client_order_id` 為 Order ID（`Executor::cancel` 的介面）；撤單永不被 kill switch 擋。
+5. **風控儲存走 engine**：`SaveRiskSettings` 由 core 驗證後以新增的 `Db::config_set_many_with_event` 在同一 transaction 寫 `risk`、`risk_overrides` 與 `RISK_CONFIG_UPDATED`（含前後值）；事件寫入失敗則回滾並停機。模式（`execution_mode` / `trigger_mode`）仍以 flags 為準，只能經各自的 Command 改變；風控 JSON 中的這兩欄沿用儲存值。
+6. **合約模板** 存在 `config.contract_template`（`{"notional_usdt","leverage"}`），由 `SaveContractTemplate` 寫入並附 `CONTRACT_SETTINGS_UPDATED`（前後值）；未儲存時用 Python 預設 1000 / 5；讀取失敗時顯示原因並禁止加入候選。
+7. **交易單的數量**以最新行情價（不檢查新鮮度）與該所市價單 lot rules 取整；規則或價格未知時該列**不可勾選**（保守：看不到數量就不能確認）。合約設定頁的試算則依 spec 檢查 `stale_data_threshold_ms`。注意：Bybit / OKX 行情每 10 秒輪詢一次，而預設門檻 1000 ms，試算頁在 Bybit / OKX 大多會顯示「價格已過期」——依 spec 行為，Mac 上實測後再決定是否需要調整（列入 TODO）。
+8. **「人工確認已平倉」** 只在最新一次經 engine `AccountView` 讀到的持倉與委託清單皆完整、該標的持倉為 0 且無未成交委託時可用（模擬配對讀模擬帳本，demo 配對讀 demo 帳戶）；查詢失敗、清單不完整或尚未查詢一律禁用並顯示原因。engine 收到 `ConfirmClosed` 後仍會自行重查。「人工要求平倉」在持倉未知時也禁用（保守）。帳戶讀取每 15 秒一次（`LEG_ACCOUNT_POLL_MS`），未驗證是否吃到 rate limit。
+9. **上次執行結果** 由事件重建（`PAIR_TRANSITION` 進 `PRE_TRADE_CHECK` 開始一次嘗試，`ORDER_SUBMITTED` open 補每腿），列出最近 5 個配對各自最新的一次嘗試、各自標示模式；模擬腿以「模擬 · client_order_id」呈現，不顯示成真實 order id。BLOCKED 事件新增 `failed_checks` 欄位以列出全部未通過檢查。
+10. **確認視窗** 以頁面內的確認面板實作（GPUI dialog 元件未驗證，Risks 所述）。
+11. **候選清單只在記憶體**，重啟後清空；新配對的 `internal_uuid` 為 `ui-<ms>-<序號>-<symbol>`、`pair_id` 為 `<SYMBOL>-<ms>`（時間取自 UI 唯一允許讀牆鐘的地方，view-model 由參數注入）。
+12. **組裝根**：`main.rs` 只開一次 `Db`，交給 `LiveSource`；`LiveSource` 在同一個 runtime 上建 `EngineDeps`（`SimulatedExecutor` + `SimPriceBook` 由行情輪詢與 Binance WS 疊加持續餵價、`DemoExecutorFactory` 讀 Keychain、`DemoAccountView` 與模擬帳戶、`RecoveryReconciler`、`PublicMarketData`、`ClockOffsets`、`LogNotifier`）並啟動 engine。engine 運行時配對清單改以 engine snapshot 為準（store 輪詢不再推 Pairs）。沒有資料庫時 engine 不啟動，所有交易動作顯示「引擎未啟動」。headless 子命令仍在建立視窗前結束（source-check 測試）。
+13. **demo 金鑰檢查** 每 30 秒以 `load_credentials` 讀 Keychain（只保留原因字串，不保留或印出任何值）。
