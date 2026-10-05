@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use tong_funding_core::funding::FundingObservation;
+use tong_funding_core::quantity::LotSize;
 use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::{Decimal, Exchange, Price, Side};
 
@@ -54,7 +55,10 @@ impl OrderSide {
     }
 }
 
-/// One market order. Quantities are base-coin units already rounded by `core::quantity`.
+/// One market order. `quantity` is in the exchange's ORDER UNIT, already floored by
+/// `core::quantity`: base coin on Binance / Bybit, CONTRACTS on OKX (one contract is `ct_val` of
+/// the base coin). The engine converts to base coin (`fill::SizedLeg::base_qty`, `fill::LegFill`)
+/// only to compare legs across exchanges; it never sends a base-coin amount to OKX.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OrderRequest {
     pub client_order_id: String,
@@ -70,6 +74,7 @@ pub struct OrderRequest {
 pub struct OrderStatus {
     pub client_order_id: String,
     pub exchange_order_id: Option<String>,
+    /// Same unit as `OrderRequest::quantity` (contracts on OKX).
     pub filled_quantity: Decimal,
     pub avg_price: Option<Price>,
     pub state: OrderState,
@@ -117,7 +122,8 @@ pub trait ExecutorFactory: Send + Sync {
     fn create(&self, mode: ExecutionMode) -> Result<Arc<dyn Executor>, String>;
 }
 
-/// A position on one symbol: signed quantity, long positive / short negative.
+/// A position on one symbol: signed quantity, long positive / short negative, in the exchange's
+/// order unit (contracts on OKX), like `OrderRequest::quantity`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AccountPosition {
     pub exchange: Exchange,
@@ -159,12 +165,50 @@ pub struct FreshQuote {
     pub listed: bool,
 }
 
+/// Order-size rules of one instrument, in the exchange's order unit (contracts on OKX).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OrderRules {
+    /// Market-order lot filter.
+    pub lot: LotSize,
+    /// OKX contract value (base coin per contract); `None` elsewhere. Required on OKX.
+    pub okx_ct_val: Option<Decimal>,
+}
+
 /// Single-symbol re-fetch for the baseline and pre-trade prices (adapters `refetch`).
 pub trait MarketData: Send + Sync {
     fn refetch(&self, exchange: Exchange, symbol: &str) -> BoxFut<'_, Result<FreshQuote, String>>;
+    /// Lot filter and OKX contract value for Node 1 sizing (adapters' instrument rules).
+    /// `Err` = unknown: the submission is aborted before anything is sent.
+    fn order_rules(&self, exchange: Exchange, symbol: &str) -> BoxFut<'_, Result<OrderRules, String>>;
 }
 
 /// `serverTime` offsets (exchange minus local, ms). `None` = not calibrated -> no entry (fail closed).
 pub trait ServerOffsets: Send + Sync {
     fn offset_ms(&self, exchange: Exchange) -> Option<i64>;
+}
+
+/// Startup reconciliation hook (crash-recovery spec; implemented by `engine::recovery`). When the
+/// store holds unfinished order intents, or pairs that were in flight at shutdown
+/// (PRE_TRADE_CHECK, ORDER_SUBMIT, FILL_MONITOR, CLOSING), the actor sets
+/// `reconciliation_pending` before it handles anything and calls [`StartupReconciler::reconcile`]
+/// once from a spawned task. Until that returns `Ok`, every `opens_exposure()` command is refused
+/// and the scheduler leaves the in-flight pairs alone (it has no fills for them in memory).
+///
+/// Contract: read-only towards exchanges (query by `client_order_id`, positions, open orders; never
+/// submit, cancel or close); every pair change is landed with `transition::land_then_act` on
+/// `ctx.db`. `Ok` = done: the actor reloads the pairs from the store and lifts the block.
+/// `Err(reason)` = not finished (exchange unreachable, keys unavailable, ...): the block stays and
+/// `reason` is shown (`Blocker::ReconciliationPending`).
+pub trait StartupReconciler: Send + Sync {
+    fn reconcile(&self, ctx: ReconcileContext) -> BoxFut<'static, Result<(), String>>;
+}
+
+/// What the actor hands to the reconciler: the store, and the executor and account view of the
+/// current `execution_mode` (the simulator and the simulated ledger in SIMULATION).
+#[derive(Clone)]
+pub struct ReconcileContext {
+    pub db: crate::store::db::Db,
+    pub executor: Arc<dyn Executor>,
+    pub account: Arc<dyn AccountView>,
+    pub execution_mode: ExecutionMode,
 }

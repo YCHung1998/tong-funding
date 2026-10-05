@@ -6,7 +6,7 @@ use tong_funding_core::pair::PairState;
 use tong_funding_core::risk::{ExecutionMode, TriggerMode};
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::ports::{FreshQuote, Leg, OrderAction, OrderSide, QueryOutcome, SubmitOutcome};
+use super::ports::{FreshQuote, Leg, OrderAction, OrderRules, OrderSide, QueryOutcome, SubmitOutcome};
 
 /// Engine-internal id of a pair (`pairs.internal_uuid`).
 pub type PairUuid = String;
@@ -94,6 +94,25 @@ pub enum Event {
     Queried { pair: Option<PairUuid>, client_order_id: String, outcome: QueryOutcome },
     /// Manual order (not part of a pair) finished.
     ManualSubmitted { client_order_id: String, outcome: SubmitOutcome },
+    /// Node 0 / Node 1 context fetched with the pre-trade prices: order rules per leg and whether
+    /// the leg's symbol already carries a position or open order that is not this pair's
+    /// (`Err` = could not be read; treated as foreign exposure, fail closed).
+    EntryContextFetched {
+        pair: PairUuid,
+        long_rules: Result<OrderRules, String>,
+        short_rules: Result<OrderRules, String>,
+        long_foreign: Result<bool, String>,
+        short_foreign: Result<bool, String>,
+    },
+    /// Periodic re-fetch for the PREPARED auto-cancel evaluation (AUTO only).
+    RecheckFetched { pair: PairUuid, long: Result<FreshQuote, String>, short: Result<FreshQuote, String> },
+    /// Signed positions (exchange order unit) of both legs' symbol, read before closing.
+    ClosePositionsFetched { pair: PairUuid, long: Result<Decimal, String>, short: Result<Decimal, String> },
+    /// Closed-confirmation read: `Ok(true)` = both legs' positions are 0 and no open order is
+    /// left on the symbol (complete lists only).
+    FlatChecked { pair: PairUuid, flat: Result<bool, String> },
+    /// The startup reconciler finished (`ports::StartupReconciler`).
+    ReconciliationDone { result: Result<(), String> },
 }
 
 /// Read-only view of one pair for the UI.
