@@ -28,6 +28,8 @@
 ## 4. 恢復
 
 - [x] 4.1 送單前落地意圖與 `client_order_id` 規則（≤ 36 字元、`[A-Za-z0-9_-]`、決定性）；結果未知不換 id 重送、以原 id 查詢。驗收：先寫「意圖先於呼叫」「意圖寫入失敗不呼叫」「逾時後只查詢不重送」測試，紅燈後實作
-- [ ] 4.2 重啟對帳（唯讀）與啟動關卡：未結束意圖逐一查詢、依規則表轉 `CANCELLED` / `PARTIAL_FAILURE` / `UNRESOLVED` / 正常、對帳完成前拒絕增加曝險、`sim` 意圖轉 `UNRESOLVED`。驗收：崩潰測試在「意圖已寫入未呼叫」與「已呼叫未寫回」兩時點終止並以同一資料庫檔重啟，斷言未重複下單、狀態符合規則、警示已觸發；回報指令與測試檔路徑
+- [x] 4.2 重啟對帳（唯讀）與啟動關卡：未結束意圖逐一查詢、依規則表轉 `CANCELLED` / `PARTIAL_FAILURE` / `UNRESOLVED` / 正常、對帳完成前拒絕增加曝險、`sim` 意圖轉 `UNRESOLVED`。驗收：崩潰測試在「意圖已寫入未呼叫」與「已呼叫未寫回」兩時點終止並以同一資料庫檔重啟，斷言未重複下單、狀態符合規則、警示已觸發；回報指令與測試檔路徑
   - 4.1 完成：`client_order_id`、意圖先落地（意圖先於呼叫、寫入失敗 0 次呼叫、結果未知只查不重送）並已接進 actor 的所有送單路徑（進場、出場、人工平倉、手動下單）
-  - 4.2 進度：對帳邏輯已完成（`recovery.rs`，23+1 個規則表測試）；接進 actor 啟動流程、「只擋 demo」與兩個崩潰時點測試進行中
+  - 4.2 完成：`recovery.rs`（規則表測試）＋接進 actor 啟動流程（失敗每 30 秒重試、對帳未完成只擋 EXCHANGE_DEMO 的開倉）。崩潰測試（`app/src/engine/actor/flow_tests.rs`，完整 actor、同一個資料庫檔、以丟棄 tokio runtime 模擬程序終止）：
+    demo 終止點 (a) 兩腿 → `CANCELLED`、2 筆 `ORDER_INTENT_NOT_SENT`、無警示；demo 終止點 (b) 兩腿 → `FILL_MONITOR` → `RECONCILED`、意圖 FILLED；demo 一腿 (b) 一腿 (a) → `PARTIAL_FAILURE` + 1 筆警示；模擬 (a)(b) → `UNRESOLVED` + `SIMULATION_INTERRUPTED`、0 次查詢、0 次工廠呼叫。每個測試重啟後送單 0 次。
+    指令：`cargo test -p tong-funding engine::`（188 passed，連跑 3 次）

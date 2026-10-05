@@ -753,12 +753,25 @@ impl Actor {
 
     // ---- entry: PREPARED -> PRE_TRADE_CHECK -> Node 0 -> ORDER_SUBMIT ----
 
+    /// A pair's orders must go to the executor of the mode it was created in: a demo pair is never
+    /// traded through the simulator (e.g. after a startup fallback to SIMULATION) and vice versa.
+    fn executor_mismatch(&self, view: &PairView) -> Option<String> {
+        match (view.simulated, self.executor.is_simulated()) {
+            (true, true) | (false, false) => None,
+            (false, true) => Some("pair belongs to EXCHANGE_DEMO but the demo executor is not available (未連線); switch to EXCHANGE_DEMO first".into()),
+            (true, false) => Some("pair belongs to SIMULATION but the engine is in EXCHANGE_DEMO; switch back to SIMULATION first".into()),
+        }
+    }
+
     fn start_entry(&mut self, pair: &str, source: &str) -> CommandReply {
         let Some(view) = self.pairs.get(pair).cloned() else {
             return CommandReply::Rejected(format!("unknown pair {pair}"));
         };
         if view.state != PairState::Prepared {
             return CommandReply::Rejected(format!("pair is {}, not PREPARED", view.state));
+        }
+        if let Some(why) = self.executor_mismatch(&view) {
+            return CommandReply::Rejected(why);
         }
         // Never enter without calibrated exchange time, never at or after settlement (D9).
         match self.reading(&view, self.clock.now_ms()).exchange_now_range() {
@@ -1043,6 +1056,9 @@ impl Actor {
     // ---- exit: -> CLOSING -> close orders -> flat check -> FINALIZED ----
 
     fn begin_close(&mut self, pair: &str, event: PairEvent, source: &str) -> CommandReply {
+        if let Some(why) = self.pairs.get(pair).and_then(|v| self.executor_mismatch(v)) {
+            return CommandReply::Rejected(why);
+        }
         if let Err(e) = self.land(pair, event, json!({ "source": source })) {
             return CommandReply::Rejected(e);
         }
@@ -2152,6 +2168,25 @@ mod tests {
         assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::Simulation);
         assert_eq!(rig.db.flag_get(FLAG_EXECUTION_MODE).unwrap().as_deref(), Some("SIMULATION"));
         assert_eq!(count_events(&rig.db, crate::engine::gate::EXECUTION_MODE_FALLBACK), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_demo_pair_is_never_closed_through_the_simulator() {
+        // Stored EXCHANGE_DEMO whose executor cannot be built falls back to SIMULATION; a close of
+        // a real demo pair must not be routed to the simulator (it would close nothing on the
+        // exchange while looking closed).
+        let (rig, deps) = rig_with(CountingFactory::failing("no keys"));
+        rig.db.flag_set(FLAG_EXECUTION_MODE, "EXCHANGE_DEMO").unwrap();
+        seed(&rig.db, "u1", "BTCUSDT", PairState::Reconciled);
+        rig.db.with_conn(|c| Ok(c.execute("UPDATE pairs SET entry_json = json_set(entry_json, '$.simulated', json('false')) WHERE internal_uuid = 'u1'", [])?)).unwrap();
+        let h = start(deps);
+        assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::Simulation);
+        for cmd in [Command::ManualClose { pair: "u1".into() }, Command::ManualExit { pair: "u1".into() }] {
+            let r = ask(&h, cmd).await;
+            assert!(matches!(&r, CommandReply::Rejected(m) if m.contains("EXCHANGE_DEMO")), "{r:?}");
+        }
+        assert_eq!(status(&rig.db, "u1"), "RECONCILED", "no transition landed");
+        assert!(rig.db.list_unfinished_intents().unwrap().is_empty(), "no close order intent was written");
     }
 
     #[tokio::test(start_paused = true)]

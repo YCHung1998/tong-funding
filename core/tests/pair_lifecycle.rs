@@ -61,8 +61,8 @@ fn run(state: S, e: Event) -> Result<S, IllegalTransition> {
 
 #[test]
 fn table_has_expected_row_count() {
-    // 17 single rows + 3 in-flight * 2 + 3 locked * 2 = 29
-    assert_eq!(table().len(), 29);
+    // 18 single rows (incl. RECONCILED restart, engine-simulation) + 3 in-flight * 2 + 3 locked * 2 = 30
+    assert_eq!(table().len(), 30);
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn everything_outside_the_table_is_rejected_exhaustively() {
             }
         }
     }
-    assert_eq!(rejected, 12 * 24 - 29);
+    assert_eq!(rejected, 12 * 24 - 30);
 }
 
 #[test]

@@ -156,7 +156,19 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 
 **尚待正式接線（不在本 change 的測試範圍）**：`SimPriceBook` 需由行情 `watch` 持續餵價，否則模擬執行器因無價格而拒單；`MarketData::order_rules` 需要真實的 adapter 實作。
 
+## 實作時的決定（wave 3，2026-10-05）
+
+- **對帳範圍（scope）固定在啟動當下**：啟動時進行中的配對與所有未結束意圖所屬的配對；之後新增的配對不會被重試的對帳誤判為崩潰殘留。scope 內的配對排程器不處理（包含模擬的 RECONCILED 配對，不會被自動出場）。配對在對帳改變其狀態、對帳成功或使用者指令落地時離開 scope。
+- **對帳失敗每 30 秒重試**（注入時鐘），同時最多一個，成功後不再執行。
+- **重啟時 PRE_TRADE_CHECK 的配對 → BLOCKED**（`CheckFailed`，寫 `PRE_TRADE_CHECK_INTERRUPTED`）：尚未送單，模擬與 demo 皆不需交易所存取。
+- **重啟時兩腿皆完整成交的 demo 配對**由對帳直接以 `fill_decision`（幣本位）判定 RECONCILED / IMBALANCED，否則它會永遠停在 FILL_MONITOR。
+- **手動下單的意圖（`manual-*`）**：查詢並記錄；查無且該標的無曝險 → 標為未送達；查無但有曝險 → 警示交給人工。
+- **配對只能用建立時的模式下單**：demo 配對在 SIMULATION 下（例如啟動時 EXCHANGE_DEMO 退回 SIMULATION）的進場、出場、人工平倉一律拒絕並說明原因，不會送到模擬執行器；反之亦然。否則 demo 倉位會「看似平倉」但交易所上仍在。
+- **崩潰測試的終止點 (a)** 以「送單永遠沒有到達交易所」模擬（`intent` 的寫入與呼叫之間沒有另設測試掛鉤）。
+
 ## Open Questions
+
+- **demo 配對在 SIMULATION 下可能一直卡住（需使用者決定）**：啟動時 EXCHANGE_DEMO 因金鑰不可用退回 SIMULATION 並持久化後，未對帳的 demo 配對每次重啟都維持未對帳；而有已開啟配對時不允許切換模式，修好金鑰重啟也仍在 SIMULATION。可選：(1) 只剩未對帳的 demo 配對時允許切換到 EXCHANGE_DEMO；(2) 啟動時若儲存的模式是 EXCHANGE_DEMO 而建不出執行器，不持久化退回值（下次啟動再試）。
 
 - Snapshot 最小間隔 250 毫秒、`client_order_id` 長度 36 與字元集、交易所查單保留期限、SQLite 寫入延遲、actor panic 行為皆**未驗證**，分別在 task 1.2、4.1、`exchange-demo-execution` 的驗證中確認。
 - Node 0 發現結算時間或週期改變時是否另行 BLOCK（D10），目前不另設檢查。
