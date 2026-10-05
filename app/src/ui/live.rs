@@ -2,7 +2,13 @@
 //! `refresh_sources` the "refresh now" button uses), the Binance mark-price WebSocket overlaid on
 //! the Binance poll, clock sync, signed account polls (every 30 s) and the store (settings, pairs,
 //! halt / kill switch, events, `SCAN_RUN` buffer). Everything runs on its own tokio runtime; the
-//! UI only drains [`SourceUpdate`]s. Replaced by the engine snapshot in `engine-simulation`.
+//! UI only drains [`SourceUpdate`]s.
+//!
+//! Composition root (ui-trading-pages A): on the same runtime and with the same single `Db`, it
+//! builds the real `EngineDeps` (simulator fed from these market polls, demo executor factory over
+//! the Keychain, demo / simulated account views, `RecoveryReconciler`, public `MarketData`, clock
+//! offsets) and starts the engine. Engine snapshots are forwarded as `SourceUpdate::Engine`; page
+//! commands go to the engine through [`CommandSink`] (no page holds an exchange client).
 //!
 //! Untested against the network here (no exchange access in CI); verified by task 4.1 on a Mac.
 
@@ -13,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot, watch};
 use tong_funding_core::funding::FundingObservation;
 use tong_funding_core::pair::PairState;
 use tong_funding_core::risk::{RiskConfig, RiskOverrides, parse_overrides};
@@ -21,8 +27,22 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::banner::read_system_flags;
 use super::bridge::{
-    AccountData, AccountState, AssetInput, ClockState, ContractTemplate, PairInfo, ReadOnlyDataSource, RefreshRequest, Settings, SourceHealth, SourceId, SourceUpdate,
+    AccountData, AccountState, AssetInput, ClockState, CommandOutcome, CommandSink, ContractTemplate, LegAccount, PairInfo, ReadOnlyDataSource, RefreshRequest, Settings,
+    SourceHealth, SourceId, SourceUpdate,
 };
+use super::wiring::{self, ClockOffsets, NoAccount, PublicMarketData};
+use crate::engine::actor::{self as engine_actor, CommandMsg, EngineDeps, MarketPrices};
+use crate::engine::alert::LogNotifier;
+use crate::engine::command::{Command, CommandReply};
+use crate::engine::ports::{AccountView, ExecutorFactory, StartupReconciler};
+use crate::engine::recovery::RecoveryReconciler;
+use crate::engine::sim::{MarginFromAccount, SimPriceBook, SimulatedExecutor};
+use crate::engine::timings::EngineTimings;
+use crate::exchange::execution::account::DemoAccountView;
+use crate::exchange::execution::factory::DemoExecutorFactory;
+use crate::exchange::execution::http::ReqwestOrderTransport;
+use crate::exchange::public::adapter::ExchangeAdapter;
+use crate::exchange::signed::signing::load_credentials;
 use super::scanner_refresh::{RefreshGate, RefreshGuard, RefreshOutcome, refresh_sources};
 use crate::exchange::error::AdapterError;
 use crate::exchange::health::cache::MarkPriceCache;
@@ -151,6 +171,10 @@ pub fn load_settings(db: &Db) -> Settings {
 
 struct Shared {
     updates: Mutex<Vec<SourceUpdate>>,
+    /// Set once the engine runs: its command queue and the runtime to send from.
+    engine: std::sync::OnceLock<(mpsc::Sender<CommandMsg>, tokio::runtime::Handle)>,
+    /// "Fetch the lot rules of this symbol" requests from the pages.
+    rules_tx: std::sync::OnceLock<mpsc::UnboundedSender<(Exchange, String)>>,
 }
 
 impl Shared {
@@ -190,6 +214,34 @@ impl ReadOnlyDataSource for LiveSource {
             None => Err("資料庫不可用".into()),
         }
     }
+
+    fn request_rules(&self, exchange: Exchange, symbol: &str) {
+        if let Some(tx) = self.shared.rules_tx.get() {
+            let _ = tx.send((exchange, symbol.trim().to_ascii_uppercase()));
+        }
+    }
+}
+
+impl CommandSink for LiveSource {
+    /// Sends `command` to the engine on the data runtime; the reply comes back as
+    /// `SourceUpdate::CommandResult`. Without a running engine the command is refused, never queued.
+    fn send(&self, label: String, command: Command) {
+        let shared = self.shared.clone();
+        match shared.engine.get().cloned() {
+            None => shared.push(SourceUpdate::CommandResult(CommandOutcome { label, reply: CommandReply::Rejected("引擎未啟動".into()), at: clock_now(&SystemClock) })),
+            Some((tx, rt)) => {
+                rt.spawn(async move {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let reply = if tx.send(CommandMsg { command, reply: Some(reply_tx) }).await.is_err() {
+                        CommandReply::Rejected("engine stopped".into())
+                    } else {
+                        reply_rx.await.unwrap_or_else(|_| CommandReply::Rejected("engine stopped before replying".into()))
+                    };
+                    shared.push(SourceUpdate::CommandResult(CommandOutcome { label, reply, at: clock_now(&SystemClock) }));
+                });
+            }
+        }
+    }
 }
 
 type PublicT = GatedTransport<ReqwestTransport>;
@@ -208,11 +260,11 @@ impl Resync for ClockResync {
 }
 
 impl LiveSource {
-    /// Opens the store and starts every feed on a background runtime. Never blocks the UI.
-    pub fn start() -> Arc<LiveSource> {
+    /// Starts every feed and the engine on a background runtime over the ONE store instance the
+    /// composition root opened (`None` = no store: the engine does not start). Never blocks the UI.
+    pub fn start(db: Option<Db>) -> Arc<LiveSource> {
         let clock: Arc<SystemClock> = Arc::new(SystemClock);
-        let db = Db::open_default(clock.clone()).ok();
-        let shared = Arc::new(Shared { updates: Mutex::new(Vec::new()) });
+        let shared = Arc::new(Shared { updates: Mutex::new(Vec::new()), engine: std::sync::OnceLock::new(), rules_tx: std::sync::OnceLock::new() });
         let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
         let gate = RefreshGate::default();
         let source = Arc::new(LiveSource { shared: shared.clone(), gate: gate.clone(), refresh_tx, db: db.clone() });
@@ -245,6 +297,8 @@ struct Ctx {
     marks: Mutex<BTreeMap<Exchange, HashMap<String, Decimal>>>,
     enabled: Mutex<BTreeSet<Exchange>>,
     last_accounts: Mutex<BTreeMap<Exchange, (AccountData, i64)>>,
+    /// Simulator price book and the engine's market watch, once the engine runs.
+    feed: std::sync::OnceLock<(Arc<SimPriceBook>, watch::Sender<MarketPrices>)>,
 }
 
 struct NullSink;
@@ -285,6 +339,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         marks: Mutex::new(BTreeMap::new()),
         enabled: Mutex::new(settings.risk.allowed_exchanges.iter().copied().collect()),
         last_accounts: Mutex::new(BTreeMap::new()),
+        feed: std::sync::OnceLock::new(),
     });
 
     let public = match ReqwestTransport::public_production() {
@@ -352,9 +407,11 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         });
     }
 
-    // Account polls.
+    // Account polls (the same signed clients back the engine's demo account view).
+    let secrets: Arc<dyn SecretProvider> = Arc::new(KeychainSecrets::system());
+    let mut signed_clients = None;
     if let Some(t) = signed.clone() {
-        let secrets: Arc<dyn SecretProvider> = Arc::new(KeychainSecrets::system());
+        let secrets = secrets.clone();
         let offset = |sync: Arc<ClockSync>| {
             move || match sync.status() {
                 ClockStatus::Synced { offset_ms, .. } => Some(offset_ms),
@@ -362,8 +419,9 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
             }
         };
         let resync = |ex: Exchange, base: &'static str| Arc::new(ClockResync { sync: ctx.clocks[&ex].clone(), transport: t.clone(), exchange: ex, base_url: base });
-        let binance = BinanceSignedClient::new(t.clone(), secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost);
-        let bybit = BybitSignedClient::new(t.clone(), secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo);
+        let binance = Arc::new(BinanceSignedClient::new(t.clone(), secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost));
+        let bybit = Arc::new(BybitSignedClient::new(t.clone(), secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo));
+        signed_clients = Some((binance.clone(), bybit.clone()));
         let ctx = ctx.clone();
         tokio::spawn(async move {
             // Give clock sync a moment so the first poll is not refused as "unsynced".
@@ -381,10 +439,43 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         }
     }
 
+    // The engine (composition root): same runtime, same store, real ports.
+    let engine_running = match &db {
+        Some(db) => start_engine(&ctx, db, adapters.clone(), signed_clients, secrets.clone(), dyn_clock.clone(), time.clone(), bhost),
+        None => {
+            shared.push(SourceUpdate::EngineUnavailable("資料庫不可用，引擎未啟動".into()));
+            false
+        }
+    };
+
+    // Lot-rule requests from the pages (answered from the adapters' cached catalogs).
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(Exchange, String)>();
+        let _ = shared.rules_tx.set(tx);
+        let (ctx, adapters) = (ctx.clone(), adapters.clone());
+        tokio::spawn(async move {
+            let mut asked: BTreeSet<(Exchange, String)> = BTreeSet::new();
+            while let Some((ex, symbol)) = rx.recv().await {
+                // One successful lookup per symbol and run is enough (rules change rarely).
+                if symbol.is_empty() || asked.contains(&(ex, symbol.clone())) {
+                    continue;
+                }
+                let market = PublicMarketData { adapters: adapters.clone() };
+                let rules = crate::engine::ports::MarketData::order_rules(&market, ex, &symbol).await;
+                if rules.is_ok() {
+                    asked.insert((ex, symbol.clone()));
+                }
+                ctx.shared.push(SourceUpdate::Rules { exchange: ex, symbol, rules });
+            }
+        });
+    }
+
     // Store + health refresher.
     {
         let (ctx, db, feed_health) = (ctx.clone(), db.clone(), feed.health());
+        let secrets = secrets.clone();
         tokio::spawn(async move {
+            let mut ticks: u64 = 0;
             loop {
                 if let Some(db) = &db {
                     let settings = load_settings(db);
@@ -392,9 +483,27 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                     ctx.shared.push(SourceUpdate::Settings(settings));
                     ctx.shared.push(SourceUpdate::System(read_system_flags(db, clock_now(&ctx.clock))));
                     if let Ok(rows) = db.list_pairs() {
-                        ctx.shared.push(SourceUpdate::Pairs(pair_infos(&rows)));
+                        // With the engine running, its snapshot is the source of the pairs.
+                        if !engine_running {
+                            ctx.shared.push(SourceUpdate::Pairs(pair_infos(&rows)));
+                        }
+                        ctx.shared.push(SourceUpdate::PairEntries(pair_entries(&rows)));
+                        if let Some(tx) = ctx.shared.rules_tx.get() {
+                            for r in rows.iter().filter(|r| r.status != "FINALIZED" && r.status != "CANCELLED") {
+                                for ex in Exchange::ALL {
+                                    let _ = tx.send((ex, r.symbol.clone()));
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(page) = db.query_events(&trade_events_query()) {
+                        ctx.shared.push(SourceUpdate::TradeEvents(page.rows));
                     }
                 }
+                if ticks % 15 == 0 {
+                    ctx.shared.push(SourceUpdate::DemoKeys(demo_keys(secrets.as_ref())));
+                }
+                ticks += 1;
                 push_health(&ctx, &feed_health);
                 tokio::time::sleep(Duration::from_millis(STORE_POLL_MS)).await;
             }
@@ -428,6 +537,127 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     }
 }
 
+/// Event types the trading pages read (newest first).
+fn trade_events_query() -> EventQuery {
+    let types = [
+        crate::engine::transition::PAIR_TRANSITION,
+        engine_actor::ORDER_SUBMITTED,
+        engine_actor::MANUAL_ORDER_RESULT,
+        engine_actor::MANUAL_CANCEL_RESULT,
+        crate::engine::latency::ORDER_LATENCY,
+    ];
+    EventQuery { types: Some(types.iter().map(|t| t.to_string()).collect()), before: None, limit: 300 }
+}
+
+/// `pairs.entry_json.scan` by internal uuid (the engine's envelope keeps the scan snapshot there).
+pub fn pair_entries(rows: &[PairRow]) -> BTreeMap<String, serde_json::Value> {
+    rows.iter().map(|r| (r.internal_uuid.clone(), r.entry.get("scan").cloned().unwrap_or(serde_json::Value::Null))).collect()
+}
+
+/// Binance AND Bybit demo keys readable (no value is kept or printed, only the reason).
+fn demo_keys(secrets: &dyn SecretProvider) -> Result<(), String> {
+    for ex in [Exchange::Binance, Exchange::Bybit] {
+        if let Err(reason) = load_credentials(secrets, ex, false) {
+            return Err(format!("{} keys unavailable ({reason:?})", ex.name()));
+        }
+    }
+    Ok(())
+}
+
+/// Builds the real `EngineDeps` and starts the engine on this runtime. Returns whether it runs.
+#[allow(clippy::too_many_arguments)]
+fn start_engine<B, Y, O>(
+    ctx: &Arc<Ctx>,
+    db: &Db,
+    adapters: Arc<(B, Y, O)>,
+    signed_clients: Option<(Arc<BinanceSignedClient<ReqwestTransport>>, Arc<BybitSignedClient<ReqwestTransport>>)>,
+    secrets: Arc<dyn SecretProvider>,
+    clock: Arc<dyn crate::ports::Clock>,
+    time: Arc<dyn TimeSource>,
+    bhost: BinanceHost,
+) -> bool
+where
+    B: ExchangeAdapter + 'static,
+    Y: ExchangeAdapter + 'static,
+    O: ExchangeAdapter + 'static,
+{
+    let prices = Arc::new(SimPriceBook::default());
+    let simulator = Arc::new(SimulatedExecutor::new(prices.clone()));
+    let account: Arc<dyn AccountView> = match signed_clients {
+        Some((b, y)) => Arc::new(DemoAccountView::new(b, y)),
+        None => Arc::new(NoAccount("簽名傳輸層無法建立".into())),
+    };
+    // SIMULATION positions from the simulated ledger; margin from the demo account (decision 6).
+    let sim_account: Arc<dyn AccountView> = Arc::new(simulator.account_view(Arc::new(MarginFromAccount(account.clone()))));
+    let market: Arc<dyn crate::engine::ports::MarketData> = Arc::new(PublicMarketData { adapters });
+    let offsets: Arc<dyn crate::engine::ports::ServerOffsets> = Arc::new(ClockOffsets { clocks: ctx.clocks.clone() });
+    let factory: Arc<dyn ExecutorFactory> = match ReqwestOrderTransport::signed_demo() {
+        Ok(t) => Arc::new(DemoExecutorFactory::new(Arc::new(t), secrets, time, offsets.clone(), Arc::new(db.clone()), ctx.limiter.clone(), bhost)),
+        Err(e) => Arc::new(NoFactory(format!("order transport unavailable: {e}"))),
+    };
+    let reconciler: Arc<dyn StartupReconciler> = Arc::new(RecoveryReconciler::new(market.clone(), clock.clone()));
+    let deps = EngineDeps {
+        db: db.clone(),
+        clock,
+        timings: EngineTimings::default(),
+        simulator,
+        factory,
+        market,
+        offsets,
+        account: account.clone(),
+        sim_account: sim_account.clone(),
+        reconciler: Some(reconciler),
+        notifier: Arc::new(LogNotifier),
+    };
+    let handle = engine_actor::start(deps);
+    let _ = ctx.feed.set((prices, handle.market.clone()));
+    let _ = ctx.shared.engine.set((handle.commands.clone(), tokio::runtime::Handle::current()));
+    // Snapshot forwarder: every engine snapshot reaches the pages as `SourceUpdate::Engine`.
+    {
+        let (shared, mut rx) = (ctx.shared.clone(), handle.snapshots.clone());
+        tokio::spawn(async move {
+            loop {
+                let state = super::engine_view::engine_state(&rx.borrow_and_update());
+                shared.push(SourceUpdate::Engine(state));
+                if rx.changed().await.is_err() {
+                    shared.push(SourceUpdate::EngineUnavailable("引擎已停止".into()));
+                    break;
+                }
+            }
+        });
+    }
+    // Account reads through the engine's read-only views (manual handling, available margin).
+    {
+        let (ctx, account, sim_account) = (ctx.clone(), account, sim_account);
+        tokio::spawn(async move {
+            loop {
+                for (simulated, view) in [(true, &sim_account), (false, &account)] {
+                    for ex in [Exchange::Binance, Exchange::Bybit] {
+                        let (positions, open_orders, available_margin) = tokio::join!(view.positions(ex), view.open_orders(ex), view.available_margin(ex));
+                        let acc = LegAccount { positions, open_orders, available_margin, fetched_at: clock_now(&ctx.clock) };
+                        ctx.shared.push(SourceUpdate::LegAccount { simulated, exchange: ex, account: acc });
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(LEG_ACCOUNT_POLL_MS)).await;
+            }
+        });
+    }
+    // The handle's own command sender stays alive in `shared.engine`; dropping the rest is fine.
+    drop(handle);
+    true
+}
+
+/// Account reads for the trading pages (positions, open orders, margin).
+const LEG_ACCOUNT_POLL_MS: u64 = 15_000;
+
+/// The executor factory when no order transport could be built: EXCHANGE_DEMO stays refused.
+struct NoFactory(String);
+impl ExecutorFactory for NoFactory {
+    fn create(&self, _: tong_funding_core::risk::ExecutionMode) -> Result<Arc<dyn crate::engine::ports::Executor>, String> {
+        Err(self.0.clone())
+    }
+}
+
 fn clock_now(c: &SystemClock) -> i64 {
     crate::ports::Clock::now_ms(c)
 }
@@ -439,6 +669,9 @@ fn apply_outcome(ctx: &Ctx, out: &RefreshOutcome, trigger: &str) {
         match r {
             Ok(obs) => {
                 h.on_success();
+                if let Some((book, market)) = ctx.feed.get() {
+                    wiring::feed_prices(book, market, obs);
+                }
                 let marks: HashMap<String, Decimal> = obs.iter().map(|o| (o.symbol.clone(), o.mark_price)).collect();
                 ctx.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(*ex, marks);
                 if *ex == Exchange::Binance {
@@ -483,6 +716,9 @@ fn overlay_mark_prices(ctx: &Ctx, cache: &MarkPriceCache) {
         changed.push(o);
     }
     if !changed.is_empty() {
+        if let Some((book, market)) = ctx.feed.get() {
+            wiring::feed_prices(book, market, &changed);
+        }
         ctx.shared.push(SourceUpdate::MarketPartial { exchange: Exchange::Binance, observations: changed, at: latest });
     }
 }

@@ -40,8 +40,13 @@ fn main() {
                 gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| ui::bench::DonutBench)).expect("failed to open window");
             }
             _ => {
-                let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = ui::live::LiveSource::start();
-                gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| ui::shell::Shell::new(source, window, cx))).expect("failed to open window");
+                // Composition root: ONE store instance for the data source and the engine; the
+                // engine starts with the window (headless subcommands above never reach this).
+                let db = store::db::Db::open_default(std::sync::Arc::new(ports::SystemClock)).ok();
+                let live = ui::live::LiveSource::start(db);
+                let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = live.clone();
+                let sink: std::sync::Arc<dyn ui::bridge::CommandSink> = live;
+                gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| ui::shell::Shell::new(source, sink, window, cx))).expect("failed to open window");
             }
         }
         cx.activate(true);

@@ -13,7 +13,8 @@ use tong_funding_core::types::Exchange;
 
 use super::alerts::{self, Alert, FreshStatus};
 use super::banner::{self, AlertKey, LoadView, Region};
-use super::bridge::{Bridge, KillSwitchState, ReadOnlyDataSource, SourceId, UiSnapshot};
+use super::bridge::{Bridge, CommandSink, KillSwitchState, ReadOnlyDataSource, SourceId, SourceUpdate, UiSnapshot};
+use super::trading_pages::TradingState;
 use super::clock::{now_unix_secs, read_clock};
 use super::dashboard::{self, DashboardVm};
 use super::fonts::app_font;
@@ -32,14 +33,18 @@ use crate::store::event_query::EventQuery;
 const UI_TICK_MS: u64 = 100;
 
 pub struct Shell {
-    page: Page,
+    pub(crate) page: Page,
     now_secs: i64,
-    now_ms: i64,
+    pub(crate) now_ms: i64,
     status: StatusModel,
-    source: Arc<dyn ReadOnlyDataSource>,
+    pub(crate) source: Arc<dyn ReadOnlyDataSource>,
+    /// Commands to the engine (the only way a page changes trading state).
+    pub(crate) sink: Arc<dyn CommandSink>,
     bridge: Bridge,
-    snap: UiSnapshot,
-    scanner: ScannerVm,
+    pub(crate) snap: UiSnapshot,
+    pub(crate) scanner: ScannerVm,
+    /// Trading pages' inputs, selections and pending confirmations (ui-trading-pages).
+    pub(crate) trading: TradingState,
     dashboard: DashboardVm,
     positions: PositionsVm,
     pos_filter: positions::Filter,
@@ -109,16 +114,19 @@ fn wall_ms() -> i64 {
 }
 
 impl Shell {
-    pub fn new(source: Arc<dyn ReadOnlyDataSource>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(source: Arc<dyn ReadOnlyDataSource>, sink: Arc<dyn CommandSink>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let now_ms = wall_ms();
         let snap = UiSnapshot::default();
-        let table = cx.new(|cx| TableState::new(ScannerTable { rows: Vec::new(), now_ms, clocks: Default::default() }, window, cx));
+        let trading = TradingState::new(window, cx);
+        let table = cx.new(|cx| TableState::new(ScannerTable { rows: Vec::new(), now_ms, clocks: Default::default(), candidates: Vec::new(), toggles: trading.toggles.clone() }, window, cx));
         let mut shell = Shell {
             page: Page::default_page(),
             now_secs: now_unix_secs(),
             now_ms,
             status: StatusModel::default(),
             source,
+            sink,
+            trading,
             bridge: Bridge::default(),
             scanner: scanner::build(&snap, now_ms),
             dashboard: dashboard::build(&snap, now_ms),
@@ -152,7 +160,15 @@ impl Shell {
     fn tick(&mut self, cx: &mut Context<Self>) {
         self.now_ms = wall_ms();
         for u in self.source.drain_updates() {
+            self.trading.observe(&u);
+            if matches!(u, SourceUpdate::Settings(_)) {
+                self.trading.settings_seen = true;
+            }
             self.bridge.push(u);
+        }
+        if self.drain_candidate_toggles() {
+            self.sync_table(cx);
+            cx.notify();
         }
         let mut repaint = false;
         if let Some(snap) = self.bridge.take_if_due(self.now_ms) {
@@ -187,17 +203,19 @@ impl Shell {
         self.sync_table(cx);
     }
 
-    fn sync_table(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sync_table(&mut self, cx: &mut Context<Self>) {
         let rows: Vec<_> = match self.scanner.visible(self.only_qualified) {
             RowsView::Rows(r) => r.into_iter().cloned().collect(),
             RowsView::NoneQualified => Vec::new(),
         };
         let (now, clocks) = (self.now_ms, self.snap.clocks.clone());
+        let candidates = self.candidate_cells(&rows);
         self.table.update(cx, |t, cx| {
             let d = t.delegate_mut();
             d.rows = rows;
             d.now_ms = now;
             d.clocks = clocks;
+            d.candidates = candidates;
             t.refresh(cx);
             cx.notify();
         });
@@ -205,6 +223,11 @@ impl Shell {
 
     fn status_model(&self) -> StatusModel {
         let mut s = StatusModel::default();
+        // The badge shows the engine's mode (SIMULATION while the engine is not running).
+        s.mode = match self.snap.engine.as_ref().map(|e| e.execution_mode) {
+            Some(tong_funding_core::risk::ExecutionMode::ExchangeDemo) => super::status::ExecutionMode::ExchangeDemo,
+            Some(tong_funding_core::risk::ExecutionMode::Simulation) | None => super::status::ExecutionMode::Simulation,
+        };
         for (name, conn) in &mut s.exchanges {
             let ex = Exchange::ALL.into_iter().find(|e| e.name() == *name).unwrap_or(Exchange::Okx);
             let online = self.snap.health_of(SourceId::MarketPoll(ex)).is_some_and(|h| alerts::source_status(h, self.now_ms) == FreshStatus::Online);
@@ -241,7 +264,7 @@ impl Shell {
         }
     }
 
-    fn go(&mut self, page: Page) {
+    pub(crate) fn go(&mut self, page: Page) {
         self.page = page;
         if page == Page::SystemLogs {
             self.load_log(None);
@@ -426,6 +449,7 @@ impl Shell {
             .child(div().flex().gap_3().items_center().child(sources).child(small(format!("最新掃描 {} UTC", format::utc_hms(vm.computed_at)), theme::TEXT_MUTED)).child(refresh));
 
         let mut body = div().flex().flex_col().gap_2();
+        let candidate_list = self.candidate_panel(cx);
         for (e, msg) in &vm.source_errors {
             body = body.child(small(format!("{} 行情更新失敗（顯示的是舊資料）：{msg}", e.name()), theme::WARNING));
         }
@@ -442,7 +466,7 @@ impl Shell {
         } else if !matches!(vm.state, ScanState::Loading) {
             body = body.child(div().h(px(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
         }
-        div().flex().flex_col().gap_3().child(header).child(cards).child(controls).child(body)
+        div().flex().flex_col().gap_3().child(header).child(cards).child(controls).child(body).child(candidate_list)
     }
 
     fn positions_page(&self, cx: &mut Context<Self>) -> Div {
@@ -504,20 +528,20 @@ impl Shell {
         pages::system_log_page(self.log_vm.as_ref(), self.log_error.as_ref(), &selected, &on_type, on_older)
     }
 
-    fn content(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+        self.trading.load_forms(&self.snap, window, cx);
         let inner = match self.page {
             Page::Overview => pages::dashboard_page(&self.dashboard),
             Page::Scanner => self.scanner_page(cx),
             Page::Positions => self.positions_page(cx),
             Page::SystemLogs => self.system_log_page(cx),
-            other => div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(pages::title(other.zh(), other.en()))
-                .child(div().mt_4().text_color(rgb(theme::TEXT_MUTED)).child("（尚未實作）")),
+            Page::StagedOrders => self.staged_orders_page(cx),
+            Page::ContractSettings => self.contract_settings_page(cx),
+            Page::RiskSettings => self.risk_settings_page(cx),
+            Page::ManualOrder => self.manual_order_page(cx),
         };
-        div().id("content").flex_1().p_6().overflow_y_scroll().child(inner)
+        let replies = self.replies_strip();
+        div().id("content").flex_1().p_6().overflow_y_scroll().child(replies).child(inner)
     }
 
     fn status_bar(&self) -> Div {
@@ -581,7 +605,10 @@ impl Render for Shell {
                     Some(b) => root.child(b),
                     None => root,
                 },
-                Region::Content => root.child(div().flex().flex_1().min_h_0().child(self.sidebar(cx)).child(self.content(cx))),
+                Region::Content => {
+                    let content = self.content(window, cx);
+                    root.child(div().flex().flex_1().min_h_0().child(self.sidebar(cx)).child(content))
+                }
                 Region::StatusBar => root.child(self.status_bar()),
             };
         }

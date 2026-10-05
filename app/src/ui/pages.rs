@@ -413,9 +413,13 @@ pub struct ScannerTable {
     pub rows: Vec<ScanRow>,
     pub now_ms: i64,
     pub clocks: BTreeMap<Exchange, ClockState>,
+    /// "加入交易單" cell per row (same order as `rows`).
+    pub candidates: Vec<super::trading_pages::CandidateCell>,
+    /// Clicked symbols, drained by the shell (the table cannot reach the shell directly).
+    pub toggles: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
 }
 
-const SCAN_COLS: [(&str, &str, f32); 11] = [
+const SCAN_COLS: [(&str, &str, f32); 12] = [
     ("rank", "Rank", 50.0),
     ("symbol", "Symbol", 120.0),
     ("cov", "覆蓋", 50.0),
@@ -427,6 +431,7 @@ const SCAN_COLS: [(&str, &str, f32); 11] = [
     ("gross", "Gross Spread %", 120.0),
     ("net", "Net Edge %", 200.0),
     ("ok", "達標", 60.0),
+    ("add", "加入交易單", 130.0),
 ];
 
 fn rate_cell(c: &RateCell) -> Div {
@@ -470,6 +475,22 @@ impl TableDelegate for ScannerTable {
                 d
             }
             9 => small(r.net_edge.text(), tone(r.net_edge.tone())),
+            11 => {
+                let cell = self.candidates.get(row).cloned().unwrap_or_default();
+                let (mark, color) = match (&cell.blocked, cell.checked) {
+                    (_, true) => ("☑ 已加入".to_string(), theme::ACCENT),
+                    (None, false) => ("☐ 加入".to_string(), theme::TEXT_PRIMARY),
+                    (Some(why), false) => (format!("☐ {why}"), theme::TEXT_MUTED),
+                };
+                let (toggles, symbol) = (self.toggles.clone(), r.symbol.clone());
+                div().child(
+                    div()
+                        .id(("cand", row))
+                        .cursor_pointer()
+                        .on_click(move |_, _, _| toggles.borrow_mut().push(symbol.clone()))
+                        .child(small(mark, color)),
+                )
+            }
             _ => small(r.qualified.text(), if r.qualified == scanner::Qualified::Yes { theme::POSITIVE } else { theme::TEXT_MUTED }),
         }
     }

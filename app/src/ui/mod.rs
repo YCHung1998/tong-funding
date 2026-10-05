@@ -13,6 +13,8 @@ pub mod pages;
 pub mod shell;
 pub mod status;
 pub mod theme;
+pub mod trading_pages;
+pub mod wiring;
 
 // Page view-models (ui-readonly-pages, design D1): pure, no GPUI types. Files live in `vm/`,
 // module paths stay `ui::<page>` so `cargo test -p tong-funding ui::<page>` selects them.
