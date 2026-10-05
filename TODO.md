@@ -117,11 +117,11 @@
   5. 跑 `cargo test -p tong-funding funding_parse`；與文件不符處修正解析器、spec 與 design。
 
 - [ ] **4.1 持倉頁截圖對照 Figma**（view-model 與畫面已完成，只差截圖）
-  1. App 目前沒有啟動引擎（見 design 實作紀錄 #17），持倉頁的 Funding 欄在沒有配對時都顯示「—（尚未取得）」或「—」（未配對）是預期。
+  1. App 已啟動引擎與流水迴圈（見 design 實作紀錄 #17；每 15 秒檢查一次、到期才取）。沒有 demo 配對時持倉頁的 Funding 欄都顯示「—（尚未取得）」或「—」（未配對）是預期；金鑰不可用時不會發請求，狀態維持「未取得」。
   2. 啟動 `cargo run --release -p tong-funding`，持倉頁截 `openspec/changes/funding-pnl/screenshots/positions-funding.png`；與 Figma 持倉頁並排，把差異（Funding 收到欄、「價差，未含 funding 與手續費」註記、配對卡的已付開倉手續費／進行中合計／結算時間軸／預期對實際面板）列進 design.md。
-  3. 若要看到有資料的畫面，等引擎接上 App 後在 demo 跑一組配對（5.1）再截一次。
+  3. 若要看到有資料的畫面，在 demo 跑一組配對（5.1）後再截一次。
 
-- [ ] **5.1 demo 帳戶走完一組配對跨過至少一次結算**（需要引擎接上 App，或 exchange-demo-execution 的實測工具）
+- [ ] **5.1 demo 帳戶走完一組配對跨過至少一次結算**（引擎與流水迴圈已接上 App；PnL 記錄後約 60 秒應出現一筆 `PNL_RECONCILIATION`，見 design 實作紀錄 #17）
   1. 在結算前約 1 分鐘進場、結算後平倉（EXCHANGE_DEMO）。
   2. 平倉確認後，確認系統日誌依序出現：`CLOSE_CONFIRMED` →（流水未齊時）`PNL_PENDING` → `FUNDING_LEDGER_FETCHED`（兩所各一筆以上）→ `PAIR_PNL_COMPUTED` → `FINALIZED`；最多等 10 分鐘（`PNL_RETRY_WINDOW_MS`，暫定）。
   3. 記下：結算到流水出現的實際延遲（校正 `FETCH_DELAY_MS`／`FETCH_RETRY_MS`／`PNL_RETRY_WINDOW_MS`）、`PAIR_PNL_COMPUTED` 的狀態與原因（平倉參考價已在送平倉單前記錄，design 實作紀錄 #6；兩所流水齊全、手續費有回報時應為 COMPLETE；若出現「無參考價」，查平倉 `ORDER_SUBMITTED` 的 `reference_error`）、各分量數字、對帳 `PNL_RECONCILIATION` 結果、預期對實際的差異。

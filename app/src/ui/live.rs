@@ -10,6 +10,10 @@
 //! offsets) and starts the engine. Engine snapshots are forwarded as `SourceUpdate::Engine`; page
 //! commands go to the engine through [`CommandSink`] (no page holds an exchange client).
 //!
+//! funding-pnl: the same root starts the funding ledger loop (`funding::runner`, real signed
+//! ledger sources over the Keychain keys): due fetches, the reconciliation schedule, and an
+//! immediate `SourceUpdate::Funding` after anything was written.
+//!
 //! Untested against the network here (no exchange access in CI); verified by task 4.1 on a Mac.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -43,6 +47,9 @@ use crate::exchange::execution::factory::DemoExecutorFactory;
 use crate::exchange::execution::http::ReqwestOrderTransport;
 use crate::exchange::public::adapter::ExchangeAdapter;
 use crate::exchange::signed::signing::load_credentials;
+use crate::exchange::signed::ledger::{BinanceLedgerClient, BybitLedgerClient};
+use crate::funding::fetch::{BinanceLedgerSource, BybitLedgerSource, TokioPause};
+use crate::funding::runner::{self as funding_runner, FundingLoop};
 use super::scanner_refresh::{RefreshGate, RefreshGuard, RefreshOutcome, refresh_sources};
 use crate::exchange::error::AdapterError;
 use crate::exchange::health::cache::MarkPriceCache;
@@ -410,7 +417,9 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     // Account polls (the same signed clients back the engine's demo account view).
     let secrets: Arc<dyn SecretProvider> = Arc::new(KeychainSecrets::system());
     let mut signed_clients = None;
+    let mut ledger_sources = None;
     if let Some(t) = signed.clone() {
+        let ledger_secrets = secrets.clone();
         let secrets = secrets.clone();
         let offset = |sync: Arc<ClockSync>| {
             move || match sync.status() {
@@ -422,6 +431,10 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         let binance = Arc::new(BinanceSignedClient::new(t.clone(), secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost));
         let bybit = Arc::new(BybitSignedClient::new(t.clone(), secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo));
         signed_clients = Some((binance.clone(), bybit.clone()));
+        // funding-pnl: the signed ledger clients (same transport, Keychain keys, clock offsets).
+        let ledger_binance = BinanceLedgerClient::new(t.clone(), ledger_secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost);
+        let ledger_bybit = BybitLedgerClient::new(t.clone(), ledger_secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo);
+        ledger_sources = Some((BinanceLedgerSource(Arc::new(ledger_binance)), BybitLedgerSource(Arc::new(ledger_bybit))));
         let ctx = ctx.clone();
         tokio::spawn(async move {
             // Give clock sync a moment so the first poll is not refused as "unsynced".
@@ -447,6 +460,13 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
             false
         }
     };
+
+    // funding-pnl: ledger fetches and reconciliation (design D9 schedule, `funding::runner`).
+    match (&db, ledger_sources) {
+        (Some(db), Some(sources)) => start_funding_loop(&ctx, db.clone(), sources, secrets.clone()),
+        (Some(_), None) => eprintln!("funding ledger loop not started: signed transport unavailable"),
+        (None, _) => {}
+    }
 
     // Lot-rule requests from the pages (answered from the adapters' cached catalogs).
     {
@@ -647,6 +667,33 @@ where
     // The handle's own command sender stays alive in `shared.engine`; dropping the rest is fine.
     drop(handle);
     true
+}
+
+/// Runs `funding::runner::tick` every `LOOP_TICK_MS` with the real signed ledger sources. Keys
+/// are checked through `load_credentials` (only the reason is kept, never a value); every
+/// decision inside the tick uses the `now_ms` passed in. After a tick that wrote anything the
+/// positions page's funding data is re-read at once (the store poll also refreshes it).
+fn start_funding_loop(ctx: &Arc<Ctx>, db: Db, sources: (BinanceLedgerSource<ReqwestTransport>, BybitLedgerSource<ReqwestTransport>), secrets: Arc<dyn SecretProvider>) {
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        // Let clock sync run first so the first signed request is not refused as "unsynced".
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let mut state = FundingLoop::default();
+        let ready = move |ex: Exchange| load_credentials(secrets.as_ref(), ex, false).map(|_| ()).map_err(|reason| format!("{} keys unavailable ({reason:?})", ex.name()));
+        loop {
+            let now = clock_now(&ctx.clock);
+            let report = funding_runner::tick(&db, &[&sources.0, &sources.1], &ready, &TokioPause, &mut state, now).await;
+            for e in &report.errors {
+                eprintln!("funding ledger loop: {e}");
+            }
+            if report.wrote()
+                && let Ok(rows) = db.list_pairs()
+            {
+                ctx.shared.push(SourceUpdate::Funding(crate::ui::funding::load_pair_funding(&db, &rows, clock_now(&ctx.clock))));
+            }
+            tokio::time::sleep(Duration::from_millis(funding_runner::LOOP_TICK_MS)).await;
+        }
+    });
 }
 
 /// Account reads for the trading pages (positions, open orders, margin).

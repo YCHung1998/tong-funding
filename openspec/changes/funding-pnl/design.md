@@ -152,5 +152,11 @@ Bybit 流水有 `orderId`、`size`，但 funding 結算並非由訂單產生；B
 14. **其他 INCOMPLETE 判定**：funding 流水幣別不是 USDT 也算無法換算；沒有任何成交紀錄的配對（`NoFillsRecorded`）不會被算成完整的 0。
 15. **預期結算次數**：以 `entry_snapshot` 的 `next_funding_time` 與 `funding_interval_secs` 推格點，計 `開倉最後成交 < t ≤ 平倉最後成交`；持倉期間交易所改週期時會算錯（保守地可能誤報缺少）。預期對實際的「實際結算次數」取兩腿中較多者。時間軸以 ±60 秒容差把流水對到時段（未驗證）。
 16. **持倉頁**：`ui-readonly-pages` 的 `pair_infos` 不顯示 `FINALIZED` 配對，因此 PnL 面板只在 `CLOSING`／鎖定狀態的配對卡上看得到；已結束配對的歷史／詳情頁不在本 change 範圍（需使用者決定是否另開）。資料問題警示新增不可關閉的 `FundingData` 類別，連到系統日誌並帶事件編號。
-17. **尚未接上執行中的迴圈**：`funding::fetch::plan_fetches`（何時該取）、真實 `LedgerSource`（包簽名客戶端）與 `reconcile_pair` 都已實作與測試，但 App 目前沒有啟動引擎（`EngineDeps` 只在測試建立），所以也沒有啟動流水排程；接上引擎時一併接上（每 `FETCH_RETRY_MS` 跑一次 `plan_fetches` → `fetch_and_store`，平倉確認後跑 `reconcile_pair`）。
+17. **已接上執行中的迴圈（2026-10-05，與 ui-trading-pages 整合時）**：`ui::live` 在引擎啟動後啟動 `funding::runner` 迴圈（每 `LOOP_TICK_MS` = 15 秒醒一次；所有判斷用傳入的 `now_ms`，不讀牆鐘），來源是真實簽名的 `BinanceLedgerSource`／`BybitLedgerSource`（與帳戶輪詢同一個簽名傳輸層、Keychain 金鑰、校時 offset）。排程（D9 暫定值，未驗證）：
+    - **取得**：`plan_fetches` 決定哪些腿到期；同一個查詢合併成一次（Binance 依 symbol、Bybit 一次涵蓋所有 symbol），窗取聯集；每個查詢最多每 `FETCH_RETRY_MS` 一次（節流只在記憶體，重啟後立即再取一次，寫入是冪等的）。流水經 `fetch_and_store` 寫入事件表。
+    - **對帳**：每個非模擬配對在第一筆 PnL 事件之後 `RECONCILE_DELAY_MS`（= `FETCH_DELAY_MS`，60 秒）跑一次 `reconcile_pair`；`OK` 與 `MISMATCH` 為最終（差異保持警示，不自動修正、不重跑）；`FAILED` 每 `FETCH_RETRY_MS` 重試，直到第一次失敗後 `PNL_RETRY_WINDOW_MS`，之後保留最後一筆 `FAILED`。排程依事件表判定，重啟後延續。
+    - **金鑰不可用**：該交易所不發請求、不寫事件（流水狀態維持「未取得」，spec funding-history-fetch）；需要該所的對帳也延後，金鑰恢復後再到期。
+    - kill switch 不擋（唯讀）；停機不取、不對帳；模擬配對永不取得、不對帳。
+    - 迴圈寫入後立即推一次 `SourceUpdate::Funding`（store 輪詢每 2 秒也會推）。
+    - 純邏輯測試：`app/src/funding/runner_tests.rs`（合併、節流、對帳排程、對一組已平倉配對跑 tick、缺金鑰、kill switch／停機、模擬配對）；迴圈本身只在 Mac 上驗證（task 5.1）。
 18. **未改的檔案**：沒有修改 `exchange/static_checks.rs` 與既有簽名客戶端；新程式在 `exchange/signed/ledger.rs`、`funding/**`、`store/funding_ledger.rs`、`engine/actor/pnl_gate.rs`。
