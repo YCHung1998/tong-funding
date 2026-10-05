@@ -520,6 +520,16 @@ impl Db {
         })
     }
 
+    /// Every intent of one pair (any state), oldest first. Restart reconciliation uses it to see
+    /// the legs of an in-flight pair, including intents that already reached a terminal state.
+    pub fn list_intents_for_pair(&self, pair_uuid: &str) -> Result<Vec<IntentRow>, StoreError> {
+        self.with_conn(|c| {
+            let mut st = c.prepare(&format!("{INTENT_SELECT} WHERE pair_uuid = ?1 ORDER BY created_ms, rowid"))?;
+            let rows = st.query_map([pair_uuid], intent_row)?;
+            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+        })
+    }
+
     // ---- asset history ----------------------------------------------------------------
 
     /// Record a total at the current (injected) time.
@@ -953,6 +963,19 @@ mod tests {
         let db = Db::open(&p, c);
         let ids: Vec<String> = db.list_unfinished_intents().unwrap().into_iter().map(|r| r.client_order_id).collect();
         assert_eq!(ids, vec!["intended", "submitted", "acked"]);
+    }
+
+    #[test]
+    fn intents_of_one_pair_are_listed_in_every_state_oldest_first() {
+        let (_d, db, clock) = open_tmp();
+        clock.set(100);
+        intent_in_state(&db, "a-filled", IntentState::Filled);
+        clock.set(200);
+        db.create_intent(&intent("b-intended")).unwrap();
+        db.create_intent(&NewIntent { pair_uuid: "pair-2".into(), ..intent("other-pair") }).unwrap();
+        let ids: Vec<String> = db.list_intents_for_pair("pair-1").unwrap().into_iter().map(|r| r.client_order_id).collect();
+        assert_eq!(ids, vec!["a-filled", "b-intended"]);
+        assert!(db.list_intents_for_pair("nope").unwrap().is_empty());
     }
 
     // ---- asset history ----
