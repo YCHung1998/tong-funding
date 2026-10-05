@@ -1,0 +1,8 @@
+[package]
+name = "tong-funding"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui-kit = "=0.7.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
