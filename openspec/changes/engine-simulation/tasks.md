@@ -6,7 +6,6 @@
 - [x] 1.1 `Command` / `Event` / `Snapshot` 型別與 `opens_exposure()` 窮舉 match。驗收：先寫「新增變體未分類即編譯失敗」的測試（trybuild 或 clippy `wildcard_enum_match_arm` 於 CI，二選一，先驗證所選方式真的會失敗）與「手動下單依 `reduce_only` 分類」的測試，紅燈後實作；`cargo test -p app engine::command`
 - [x] 1.2 actor 主迴圈：單一擁有者、I/O 以 spawn task 執行並回送 Event、行情走獨立 `watch`、Snapshot 限頻。驗收：先寫三個測試（下單呼叫永遠不回應時 tick 仍被處理、1 秒 1,000 筆行情只推 ≤ 4 份 Snapshot、UI 停止讀取時記憶體不線性成長）並確認紅燈，再實作；使用 tokio 暫停時間，不實際等待
 - [x] 1.3 「先落地再生效」的轉移執行器：呼叫 core `next()`、與 store 同一 transaction 寫狀態與事件、寫入失敗即停機；原子 `add_if_not_pending` 與「已開啟配對」定義。驗收：先寫故障注入測試（寫入失敗時 `Executor` 呼叫 0 次、之後 `opens_exposure` Command 被拒）與「兩 Command 對同標的只成功一個」測試，紅燈後實作
-  - 進度（wave 1）：2.1–2.4 的純邏輯已完成（`schedule.rs`、`node0.rs`、`fill.rs`，含時鐘掃描）；接進 actor 與完整一輪事件序列在 wave 2
 
 ## 2. 排程與流程
 
@@ -14,6 +13,7 @@
 - [ ] 2.2 基準價與送單前價格分離抓取；Node 0 呼叫 core 送單前檢查並使用 `effective_for_pair`；設定不完整即 BLOCK。驗收：先寫「兩次抓取各有 `observed_at`」「第二次未更新被擋」「Bybit 覆寫槓桿 4 使 Node 0 失敗」「缺 `est_slippage_pct` 被擋」測試，紅燈後實作
 - [ ] 2.3 Node 1–5：數量經 `Quantity`、兩腿送出、成交等待、讀取生效 `order_timeout_seconds`、逾時依 `next()` 分流且零自動補單。驗收：先寫「逾時 7 秒真的在第 7 秒觸發」「一腿 100%、一腿 70% 時 `Executor` 只收到原兩筆」「低於 `min_qty` 的腿不送單」測試，紅燈後實作
 - [ ] 2.4 Node 6–8 與 PREPARED 自動撤銷：出場、已平倉確認、停機時仍撤銷、不碰已有曝險的配對。驗收：先寫測試後實作；並以假時鐘跑完整一輪進場至出場，輸出事件序列（貼出）供使用者檢視
+  - 進度（wave 1）：2.1–2.4 的純邏輯已完成（`schedule.rs`、`node0.rs`、`fill.rs`，含時鐘掃描）；接進 actor 與完整一輪事件序列在 wave 2
 
 ## 3. 模式與安全
 
