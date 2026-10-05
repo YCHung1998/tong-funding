@@ -1,0 +1,3 @@
+Recorded 2026-10-05T11:54Z from the PUBLIC unsigned endpoint (no API key, no signature).
+Command: curl -s "https://api.bybit.com/v5/market/instruments-info?category=linear&cursor=first%3D0GUSDT%26last%3DMOCAUSDT"  (real second page: 390 rows, empty cursor)
+TRIMMED: 390 rows -> ZSUSDT,MONUSDT.

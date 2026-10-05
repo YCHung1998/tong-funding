@@ -1,0 +1,3 @@
+Recorded 2026-10-05T11:54Z from the PUBLIC unsigned endpoint (no API key, no signature).
+Command: curl -s "https://api.bybit.com/v5/market/instruments-info?category=linear"  (default page size: 500 rows + non-empty nextPageCursor)
+TRIMMED: 500 rows -> BTCUSDT,ETHUSDT,BTCUSDT-09OCT26,ARKUSDT,1000BONKPERP,0GUSDT,1000000BABYDOGEUSDT. The real nextPageCursor value is kept so the paging test sees a real cursor. NOTE: the row count is NOT 500 any more; the "500-row first page" shape is exercised by synthetic padding in the test code.
