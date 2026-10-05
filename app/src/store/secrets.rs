@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use serde_json::Value;
-use tong_funding_core::redact::{PLACEHOLDER, is_sensitive_name, redact_secrets};
+use tong_funding_core::redact::{PLACEHOLDER, is_sensitive_name, redact_secrets, register_secret};
 use tong_funding_core::types::Exchange;
 
 use crate::ports::{SecretError, SecretName, SecretProvider};
@@ -110,6 +110,7 @@ impl<S: KeyStore> KeychainSecrets<S> {
         if value.is_empty() {
             return Err(SecretError::Unavailable("refusing to store an empty secret".into()));
         }
+        register_secret(value);
         self.store.set(&account_name(exchange, name), value).map_err(|e| match scrub(e) {
             // a store may echo the value it failed to write; drop it verbatim too
             SecretError::Unavailable(m) => SecretError::Unavailable(m.replace(value, PLACEHOLDER)),
@@ -125,39 +126,106 @@ impl<S: KeyStore> KeychainSecrets<S> {
 impl<S: KeyStore> SecretProvider for KeychainSecrets<S> {
     fn get(&self, exchange: Exchange, name: SecretName) -> Result<Option<String>, SecretError> {
         // An empty stored value is never usable: report it as missing, not as a credential.
-        Ok(self.store.get(&account_name(exchange, name)).map_err(scrub)?.filter(|v| !v.is_empty()))
+        let value = self.store.get(&account_name(exchange, name)).map_err(scrub)?.filter(|v| !v.is_empty());
+        if let Some(v) = &value {
+            // every secret that leaves the Keychain is tracked by exact value from now on
+            register_secret(v);
+        }
+        Ok(value)
+    }
+}
+
+/// Deepest nesting kept; anything below is replaced by [`PLACEHOLDER`] (and torn down iteratively,
+/// because dropping a very deep `Value` recursively would overflow the stack).
+pub const MAX_PAYLOAD_DEPTH: usize = 64;
+
+/// Object keys that name a field (`{"name": "X-MBX-APIKEY", "value": ...}`).
+const NAME_FIELDS: [&str; 6] = ["name", "key", "header", "field", "param", "parameter"];
+/// Object keys that carry the value of a name/value pair.
+const VALUE_FIELDS: [&str; 6] = ["value", "val", "data", "v", "content", "contents"];
+
+fn placeholder() -> Value {
+    Value::String(PLACEHOLDER.to_string())
+}
+
+/// A string that IS a sensitive name (not text that merely mentions one, like `api_key=abc`, which
+/// the leaf redaction already handles).
+fn is_sensitive_str(v: &Value) -> bool {
+    matches!(v, Value::String(s) if !s.contains(['=', ':', '&', '?', '/']) && is_sensitive_name(s))
+}
+
+/// Drops a possibly very deep value without recursion.
+fn drop_iteratively(v: Value) {
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Array(a) => stack.extend(a),
+            Value::Object(o) => stack.extend(o.into_iter().map(|(_, v)| v)),
+            _ => {}
+        }
     }
 }
 
 /// Returns `value` made safe to store in `events.payload`, recursively:
-/// - an object entry whose KEY is a sensitive name (case/whitespace-insensitive) has its whole
-///   value (string, number, array or object) replaced by [`PLACEHOLDER`];
-/// - object keys and every string leaf go through `redact_secrets` (a key may be a URL);
-/// - a `[name, value]` pair array with a sensitive name has its value replaced.
+/// - an object entry whose KEY is a sensitive name (same normalised rule as the text redactor:
+///   case, punctuation, whitespace, zero-width and full-width forms are ignored) has its whole value
+///   (string, number, array or object) replaced by [`PLACEHOLDER`];
+/// - an object that names a field in one entry and carries its value in another
+///   (`{"name": "X-MBX-APIKEY", "value": ...}`) has the value entry replaced;
+/// - in an array, an element that is a sensitive name masks the element after it
+///   (`["X-MBX-APIKEY", "S", "other", "v"]`); when the array has 2 or 3 elements and starts with
+///   such a name, everything after the name is masked;
+/// - object keys and every string leaf go through `redact_secrets` (a key may be a URL; registered
+///   secrets are masked by exact value);
+/// - nesting deeper than [`MAX_PAYLOAD_DEPTH`] is replaced by [`PLACEHOLDER`].
 ///
 /// Structure and non-sensitive non-string values are kept. Idempotent. If two keys collapse to the
 /// same text after redaction the later one wins (never reached for ordinary payloads).
 pub fn safe_event_payload(value: Value) -> Value {
+    safe_at(value, 0)
+}
+
+fn safe_at(value: Value, depth: usize) -> Value {
+    if depth > MAX_PAYLOAD_DEPTH {
+        drop_iteratively(value);
+        return placeholder();
+    }
     match value {
         Value::String(s) => Value::String(redact_secrets(&s)),
         Value::Array(a) => {
-            let is_pair = a.len() == 2 && matches!(&a[0], Value::String(n) if is_sensitive_name(n));
-            let mut it = a.into_iter();
-            if is_pair {
-                let name = it.next().map(safe_event_payload).unwrap_or(Value::Null);
-                Value::Array(vec![name, Value::String(PLACEHOLDER.to_string())])
-            } else {
-                Value::Array(it.map(safe_event_payload).collect())
+            let short_pair = (2..=3).contains(&a.len()) && is_sensitive_str(&a[0]);
+            let mut out = Vec::with_capacity(a.len());
+            let mut mask_next = false;
+            for (i, el) in a.into_iter().enumerate() {
+                if short_pair && i > 0 || mask_next {
+                    drop_iteratively(el);
+                    out.push(placeholder());
+                    mask_next = false;
+                } else {
+                    mask_next = is_sensitive_str(&el);
+                    out.push(safe_at(el, depth + 1));
+                }
             }
+            Value::Array(out)
         }
-        Value::Object(o) => Value::Object(
-            o.into_iter()
-                .map(|(k, v)| {
-                    let masked = if is_sensitive_name(&k) { Value::String(PLACEHOLDER.to_string()) } else { safe_event_payload(v) };
-                    (redact_secrets(&k), masked)
-                })
-                .collect(),
-        ),
+        Value::Object(o) => {
+            // `{"name": "<sensitive>", "value": ...}`: the value entry is the secret
+            let names_a_secret = o.iter().any(|(k, v)| NAME_FIELDS.iter().any(|f| k.trim().eq_ignore_ascii_case(f)) && is_sensitive_str(v));
+            Value::Object(
+                o.into_iter()
+                    .map(|(k, v)| {
+                        let sensitive = is_sensitive_name(&k) || (names_a_secret && VALUE_FIELDS.iter().any(|f| k.trim().eq_ignore_ascii_case(f)));
+                        let masked = if sensitive {
+                            drop_iteratively(v);
+                            placeholder()
+                        } else {
+                            safe_at(v, depth + 1)
+                        };
+                        (redact_secrets(&k), masked)
+                    })
+                    .collect(),
+            )
+        }
         other => other,
     }
 }
@@ -435,6 +503,81 @@ mod tests {
         let SecretError::Unavailable(m) = unavailable(e);
         assert!(!m.contains("S3CR3T"), "{m}");
         assert!(m.contains("boom"), "{m}");
+    }
+
+    // ---- second round ----
+
+    #[test]
+    fn secrets_read_from_the_keychain_are_tracked_by_exact_value() {
+        let s = KeychainSecrets::new(MemStore::default());
+        s.store.set("Binance:api_secret", "kc-get-Zx81-unique").unwrap();
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiSecret).unwrap().as_deref(), Some("kc-get-Zx81-unique"));
+        for text in ["x kc-get-Zx81-unique y", "weird_field\t=kc-get-Zx81-unique", "kc%2Dget%2DZx81%2Dunique"] {
+            assert!(!redact_secrets(text).contains("Zx81"), "{text}");
+        }
+        // and therefore in any payload field, under any name
+        let out = safe_event_payload(json!({"harmless_name": "see kc-get-Zx81-unique here", "n": ["kc-get-Zx81-unique"]}));
+        assert!(!out.to_string().contains("Zx81"), "{out}");
+    }
+
+    #[test]
+    fn secrets_written_to_the_keychain_are_tracked_too() {
+        let s = KeychainSecrets::new(MemStore::default());
+        s.set_secret(Exchange::Okx, SecretName::Passphrase, "kc-set-Qp44-unique pass").unwrap();
+        assert!(!redact_secrets("a kc-set-Qp44-unique pass b").contains("Qp44"));
+    }
+
+    #[test]
+    fn name_and_value_in_separate_fields_is_masked() {
+        let out = assert_no_leak(json!({"name": "X-MBX-APIKEY", "value": "S3CR3T"}), "S3CR3T");
+        assert_eq!(out["name"], "X-MBX-APIKEY");
+        assert_no_leak(json!({"header": "OK-ACCESS-SIGN", "val": {"deep": ["S3CR3T"]}}), "S3CR3T");
+        assert_no_leak(json!({"key": "binanceApiKey", "data": 123456789}), "123456789");
+        assert_no_leak(json!([{"name": "Authorization", "value": "Bearer S3CR3T"}]), "S3CR3T");
+        let ok = safe_event_payload(json!({"name": "symbol", "value": "BTCUSDT"}));
+        assert_eq!(ok["value"], "BTCUSDT");
+    }
+
+    #[test]
+    fn name_followed_by_values_in_arrays_is_masked() {
+        let out = assert_no_leak(json!(["X-MBX-APIKEY", "S3CR3T", "other", "visible"]), "S3CR3T");
+        assert_eq!(out[3], "visible");
+        assert_no_leak(json!(["signature", "S3CR3T", "x"]), "S3CR3T");
+        assert_no_leak(json!(["a", "b", "OK-ACCESS-KEY", "S3CR3T"]), "S3CR3T");
+        assert_no_leak(json!(["X-BAPI-SIGN", {"k": "S3CR3T"}]), "S3CR3T");
+        assert_no_leak(json!(["Authorization", "S3CR3T", "x", "y"]), "S3CR3T");
+    }
+
+    #[test]
+    fn normalised_sensitive_key_names_are_masked() {
+        for k in ["binanceApiKey", "Authorization", "clientSecret", "access_token", "X-BAPI-SIGN", "api-key", "sign", "PASSWORD", "sig\u{200B}nature"] {
+            let out = safe_event_payload(json!({ k: {"x": "S3CR3T"} }));
+            assert!(!out.to_string().contains("S3CR3T"), "key {k:?}: {out}");
+        }
+    }
+
+    #[test]
+    fn deep_nesting_is_cut_without_overflowing_the_stack() {
+        let mut v = json!("S3CR3T-deep");
+        for _ in 0..50_000 {
+            v = Value::Array(vec![v]);
+        }
+        let out = safe_event_payload(v);
+        let s = out.to_string();
+        assert!(!s.contains("S3CR3T-deep") && s.contains(PLACEHOLDER), "deep leaf survived");
+        let mut o = json!({"k": "S3CR3T-deep-obj"});
+        for _ in 0..50_000 {
+            let mut m = serde_json::Map::new();
+            m.insert("n".to_string(), o);
+            o = Value::Object(m);
+        }
+        assert!(!safe_event_payload(o).to_string().contains("S3CR3T-deep-obj"));
+        // moderate depth is kept intact
+        let mut ok = json!("leaf");
+        for _ in 0..40 {
+            ok = Value::Array(vec![ok]);
+        }
+        assert_eq!(safe_event_payload(ok.clone()), ok);
     }
 
     fn mem_db() -> Connection {
