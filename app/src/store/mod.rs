@@ -5,6 +5,7 @@
 
 pub mod db;
 pub mod events;
+pub mod import_cli;
 pub mod legacy_import;
 pub mod scan_buffer;
 pub mod schema;

@@ -7,6 +7,10 @@ use gpui_kit::*;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // Headless subcommands run before any window is created.
+    if args.get(1).map(String::as_str) == Some(store::import_cli::SUBCOMMAND) {
+        std::process::exit(store::import_cli::run(&args[2..], &mut std::io::stdout(), &mut std::io::stderr()));
+    }
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         ui::component_theme::apply(cx);
