@@ -18,6 +18,7 @@ use tong_funding_core::quantity::LotSize;
 use tong_funding_core::risk::{RiskConfig, RiskOverride, RiskOverrides};
 
 use super::*;
+use crate::engine::alert::RecordingNotifier;
 use crate::engine::command::NewPreparedPair;
 use crate::engine::ids::{IdPrefix, client_order_id};
 use crate::engine::ports::{
@@ -183,12 +184,15 @@ impl AccountView for DemoAccount {
     }
 }
 
-/// A simulator stand-in that accepts every order and never fills it (for the timeout test).
+/// A simulator stand-in that accepts every order and never fills it (for the timeout test). A
+/// cancel works like on an exchange: the order is then reported cancelled (with no fill).
 #[derive(Default)]
 struct NeverFills {
     submits: AtomicUsize,
     queries: AtomicUsize,
+    cancels: AtomicUsize,
     ids: Mutex<Vec<String>>,
+    cancelled: Mutex<BTreeSet<String>>,
 }
 impl NeverFills {
     fn status(id: &str) -> OrderStatus {
@@ -202,6 +206,13 @@ impl NeverFills {
             state: OrderState::Open,
         }
     }
+    fn current(&self, id: &str) -> OrderStatus {
+        let mut s = NeverFills::status(id);
+        if self.cancelled.lock().unwrap().contains(id) {
+            s.state = OrderState::Cancelled;
+        }
+        s
+    }
 }
 impl Executor for NeverFills {
     fn is_simulated(&self) -> bool {
@@ -212,12 +223,14 @@ impl Executor for NeverFills {
         self.ids.lock().unwrap().push(req.client_order_id.clone());
         Box::pin(std::future::ready(SubmitOutcome::Accepted(NeverFills::status(&req.client_order_id))))
     }
-    fn cancel(&self, _: Exchange, _: &str, _: &str) -> BoxFut<'_, QueryOutcome> {
-        Box::pin(std::future::ready(QueryOutcome::NotFound))
+    fn cancel(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        self.cancelled.lock().unwrap().insert(id.to_string());
+        Box::pin(std::future::ready(QueryOutcome::Found(self.current(id))))
     }
     fn query(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
         self.queries.fetch_add(1, Ordering::SeqCst);
-        Box::pin(std::future::ready(QueryOutcome::Found(NeverFills::status(id))))
+        Box::pin(std::future::ready(QueryOutcome::Found(self.current(id))))
     }
 }
 
@@ -269,6 +282,7 @@ struct Rig {
     sim: Arc<SimulatedExecutor>,
     factory: CountingFactory,
     demo: Arc<FakeDemo>,
+    notifier: Arc<RecordingNotifier>,
 }
 
 struct Opts {
@@ -278,11 +292,22 @@ struct Opts {
     margin: Result<Decimal, String>,
     simulator: Option<Arc<dyn Executor>>,
     reconciler: Option<Arc<dyn StartupReconciler>>,
+    /// Binance position reads that still show the pre-close position after a close order was
+    /// sent (a lagging account update).
+    stale_position_reads: usize,
 }
 
 impl Default for Opts {
     fn default() -> Self {
-        Opts { start_ms: T - 20_000, trigger: "AUTO", demo: false, margin: Ok(dec("10000")), simulator: None, reconciler: None }
+        Opts {
+            start_ms: T - 20_000,
+            trigger: "AUTO",
+            demo: false,
+            margin: Ok(dec("10000")),
+            simulator: None,
+            reconciler: None,
+            stale_position_reads: 0,
+        }
     }
 }
 
@@ -322,7 +347,10 @@ fn rig(o: Opts) -> (Rig, EngineDeps) {
         }
     }
     let sim = Arc::new(SimulatedExecutor::new(prices));
-    let sim_account: Arc<dyn AccountView> = Arc::new(sim.account_view(Arc::new(FixedMargin(o.margin.clone()))));
+    let mut sim_account: Arc<dyn AccountView> = Arc::new(sim.account_view(Arc::new(FixedMargin(o.margin.clone()))));
+    if o.stale_position_reads > 0 {
+        sim_account = Arc::new(LaggingAccount { inner: sim_account, sim: sim.clone(), stale_left: AtomicUsize::new(o.stale_position_reads) });
+    }
     let demo = Arc::new(FakeDemo::default());
     let factory = CountingFactory::returning(demo.clone());
     if o.demo {
@@ -330,6 +358,7 @@ fn rig(o: Opts) -> (Rig, EngineDeps) {
     }
     let market = FakeMarket::new(clock.clone());
     let offsets = FakeOffsets::zero();
+    let notifier = Arc::new(RecordingNotifier::default());
     let deps = EngineDeps {
         db: db.clone(),
         clock: shared,
@@ -341,8 +370,9 @@ fn rig(o: Opts) -> (Rig, EngineDeps) {
         account: Arc::new(DemoAccount(demo.clone())),
         sim_account,
         reconciler: o.reconciler,
+        notifier: notifier.clone(),
     };
-    (Rig { _dir: dir, db, clock, market, offsets, sim, factory, demo }, deps)
+    (Rig { _dir: dir, db, clock, market, offsets, sim, factory, demo, notifier }, deps)
 }
 
 fn pair_at(uuid: &str, symbol: &str, settlement_ms: i64) -> NewPreparedPair {
@@ -739,6 +769,7 @@ async fn an_effective_timeout_of_7_seconds_fires_at_7_seconds() {
     assert_eq!(ts_of(&rig.db, "CANCELLED"), vec![T - 3_000], "fires at sent + 7 s, not + 15 s");
     assert_eq!(never.submits.load(Ordering::SeqCst), 2, "no order besides the original two");
     assert!(never.queries.load(Ordering::SeqCst) > 0, "fills were polled");
+    assert_eq!(never.cancels.load(Ordering::SeqCst), 2, "both own unfilled orders cancelled at the timeout");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1477,6 +1508,7 @@ fn crash_deps(path: &std::path::Path, clock: &ManualClock, exchange: &Arc<CrashE
         account: exchange.clone(),
         sim_account: exchange.clone(),
         reconciler: Some(Arc::new(RecoveryReconciler::new(market, shared))),
+        notifier: Arc::new(RecordingNotifier::default()),
     };
     (db, factory, deps)
 }
@@ -1587,4 +1619,388 @@ fn simulation_kill_points_a_and_b_end_unresolved_without_any_exchange_request() 
         assert_eq!(count(&r.db, SIMULATION_INTERRUPTED), 1, "{on:?}");
         assert!(r.blockers.is_empty(), "{on:?}: {:?}", r.blockers);
     }
+}
+
+// ---- exchange-demo-execution: timeout cancel, alerts, manual exits, close ------------------
+
+/// An account whose Binance position reads lag: after a close order was sent, the first
+/// `stale_left` reads still show the position as it was before the close.
+struct LaggingAccount {
+    inner: Arc<dyn AccountView>,
+    sim: Arc<SimulatedExecutor>,
+    stale_left: AtomicUsize,
+}
+impl AccountView for LaggingAccount {
+    fn positions(&self, exchange: Exchange) -> BoxFut<'_, Result<Listed<AccountPosition>, String>> {
+        Box::pin(async move {
+            let mut l = self.inner.positions(exchange).await?;
+            let closing = self.sim.submitted().iter().any(|r| r.reduce_only && r.exchange == exchange);
+            if exchange == Exchange::Binance && closing && self.stale_left.load(Ordering::SeqCst) > 0 {
+                self.stale_left.fetch_sub(1, Ordering::SeqCst);
+                l.items.retain(|p| p.symbol != SYM);
+                l.items.push(AccountPosition { exchange, symbol: SYM.into(), quantity: dec("10") });
+            }
+            Ok(l)
+        })
+    }
+    fn open_orders(&self, exchange: Exchange) -> BoxFut<'_, Result<Listed<AccountOrder>, String>> {
+        self.inner.open_orders(exchange)
+    }
+    fn available_margin(&self, exchange: Exchange) -> BoxFut<'_, Result<Decimal, String>> {
+        self.inner.available_margin(exchange)
+    }
+}
+
+/// Wraps a simulator and counts submit / cancel calls.
+struct Counting {
+    inner: Arc<SimulatedExecutor>,
+    submits: AtomicUsize,
+    cancels: AtomicUsize,
+}
+impl Counting {
+    fn new() -> Arc<Counting> {
+        let p = Arc::new(SimPriceBook::default());
+        p.set(Exchange::Binance, SYM, dec("100"));
+        p.set(Exchange::Bybit, SYM, dec("100"));
+        Arc::new(Counting { inner: Arc::new(SimulatedExecutor::new(p)), submits: AtomicUsize::new(0), cancels: AtomicUsize::new(0) })
+    }
+    fn counts(&self) -> (usize, usize) {
+        (self.submits.load(Ordering::SeqCst), self.cancels.load(Ordering::SeqCst))
+    }
+}
+impl Executor for Counting {
+    fn is_simulated(&self) -> bool {
+        true
+    }
+    fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        self.inner.submit(req)
+    }
+    fn cancel(&self, e: Exchange, s: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        self.inner.cancel(e, s, id)
+    }
+    fn query(&self, e: Exchange, s: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        self.inner.query(e, s, id)
+    }
+}
+
+/// Accepts every order with no fill; what a cancel does is scripted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CancelScript {
+    /// The cancel loses the race: "unknown order" error, and the order is in fact fully filled.
+    RacesAFill,
+    /// The cancel times out and every lookup after it fails.
+    Unconfirmable,
+}
+struct TimeoutExchange {
+    script: CancelScript,
+    submits: AtomicUsize,
+    cancels: AtomicUsize,
+    orders: Mutex<HashMap<String, (Decimal, OrderState, Decimal)>>,
+}
+impl TimeoutExchange {
+    fn new(script: CancelScript) -> Arc<TimeoutExchange> {
+        Arc::new(TimeoutExchange { script, submits: AtomicUsize::new(0), cancels: AtomicUsize::new(0), orders: Mutex::default() })
+    }
+    fn status(id: &str, state: OrderState, filled: Decimal) -> OrderStatus {
+        OrderStatus { client_order_id: id.into(), exchange_order_id: Some("x-1".into()), filled_quantity: filled, avg_price: None, fee: None, fee_asset: None, state }
+    }
+}
+impl Executor for TimeoutExchange {
+    fn is_simulated(&self) -> bool {
+        true
+    }
+    fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        self.orders.lock().unwrap().insert(req.client_order_id.clone(), (req.quantity, OrderState::Open, Decimal::ZERO));
+        Box::pin(std::future::ready(SubmitOutcome::Accepted(TimeoutExchange::status(&req.client_order_id, OrderState::Open, Decimal::ZERO))))
+    }
+    fn cancel(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
+        let mut orders = self.orders.lock().unwrap();
+        let out = match (self.script, orders.get_mut(id)) {
+            (CancelScript::RacesAFill, Some(o)) => {
+                *o = (o.0, OrderState::Filled, o.0);
+                QueryOutcome::Failed { reason: "-2011: Unknown order sent (already filled)".into() }
+            }
+            (CancelScript::Unconfirmable, Some(o)) => {
+                o.1 = OrderState::Cancelled; // never visible: every later lookup fails
+                QueryOutcome::Failed { reason: "request timed out".into() }
+            }
+            (_, None) => QueryOutcome::NotFound,
+        };
+        Box::pin(std::future::ready(out))
+    }
+    fn query(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        let o = self.orders.lock().unwrap().get(id).copied();
+        let out = match (self.script, o) {
+            (CancelScript::Unconfirmable, Some((_, OrderState::Cancelled, _))) => QueryOutcome::Failed { reason: "request timed out".into() },
+            (_, Some((_, state, filled))) => QueryOutcome::Found(TimeoutExchange::status(id, state, filled)),
+            (_, None) => QueryOutcome::NotFound,
+        };
+        Box::pin(std::future::ready(out))
+    }
+}
+
+fn payloads(db: &Db, label: &str) -> Vec<Value> {
+    events(db).into_iter().filter(|(_, l, _)| l == label).map(|(_, _, p)| p).collect()
+}
+
+// -- 2.2 fill timeout
+
+#[tokio::test(start_paused = true)]
+async fn fills_complete_before_the_timeout_send_no_cancel() {
+    let counting = Counting::new();
+    let (rig, _h) = started(Opts { simulator: Some(counting.clone()), ..Opts::default() }).await;
+    run_until(&rig.clock, T + 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED");
+    assert_eq!(counting.counts(), (2, 0), "two orders, no cancel");
+    assert_eq!(count(&rig.db, ORDER_CANCEL_RESULT), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn at_the_timeout_the_unfilled_rest_of_a_seventy_percent_leg_is_cancelled_and_only_two_orders_exist() {
+    let (rig, _h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Partial(dec("0.7")));
+    run_until(&rig.clock, T + 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    let cancels = payloads(&rig.db, ORDER_CANCEL_RESULT);
+    assert_eq!(cancels.len(), 1, "only the short leg (the long one is filled): {cancels:?}");
+    assert_eq!(cancels[0]["client_order_id"], json!(sim_id(Leg::Short, OrderAction::Open)));
+    assert_eq!((cancels[0]["after"]["state"].clone(), cancels[0]["after"]["filled_quantity"].clone()), (json!("Cancelled"), json!("7")));
+    assert_eq!(rig.sim.submitted().len(), 2, "no top-up, no sell-off: still exactly two order requests");
+    assert_eq!(rig.sim.position(Exchange::Bybit, SYM), dec("-7"), "positions untouched by the timeout handling");
+    let pf = events(&rig.db).into_iter().find(|(_, l, _)| l == "PARTIAL_FAILURE").unwrap();
+    assert!(pf.2.to_string().contains("Terminal"), "decided on the final (post-cancel) fill: {}", pf.2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_that_races_a_fill_counts_the_leg_as_filled() {
+    let x = TimeoutExchange::new(CancelScript::RacesAFill);
+    let (rig, _h) = started(Opts { simulator: Some(x.clone()), ..Opts::default() }).await;
+    run_until(&rig.clock, T + 5_000).await;
+    assert_eq!(x.cancels.load(Ordering::SeqCst), 2);
+    assert_eq!(status(&rig.db, UUID), "RECONCILED", "both legs turned out filled: {:?}", labels(&rig.db));
+    assert_eq!(x.submits.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_whose_result_cannot_be_confirmed_is_unresolved_with_an_alert() {
+    let x = TimeoutExchange::new(CancelScript::Unconfirmable);
+    let (rig, h) = started(Opts { simulator: Some(x.clone()), ..Opts::default() }).await;
+    run_until(&rig.clock, T + 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "UNRESOLVED", "{:?}", labels(&rig.db));
+    let alert = payloads(&rig.db, PAIR_ALERT);
+    assert_eq!(alert.len(), 1);
+    assert_eq!(alert[0]["reason"], json!("FILL_UNCONFIRMED"));
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.snapshots.borrow().alerts.len(), 1);
+}
+
+// -- 2.1 fill confirmation by order
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_lookup_keeps_polling_and_never_counts_as_unfilled() {
+    let (rig, _h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Unknown { executed: true });
+    rig.sim.fail_queries(Some("rate limited (retry after Some(1000) ms)".into()));
+    run_until(&rig.clock, T - 6_000).await;
+    assert_eq!(status(&rig.db, UUID), "FILL_MONITOR", "an unknown leg is not 'not filled'");
+    rig.sim.fail_queries(None);
+    run_until(&rig.clock, T - 4_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED", "{:?}", labels(&rig.db));
+    assert_eq!(rig.sim.submitted().len(), 2);
+}
+
+// -- 3.1 alerts
+
+#[tokio::test(start_paused = true)]
+async fn a_rejected_leg_raises_one_alert_on_all_three_channels_and_keeps_the_filled_leg() {
+    let (rig, h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Reject("insufficient margin (scripted)".into()));
+    run_until(&rig.clock, T - 8_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    let alerts = payloads(&rig.db, PAIR_ALERT);
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    assert_eq!(alerts[0]["reason"], json!("SUBMIT_REJECTED"));
+    let long = alerts[0]["legs"]["open"].as_array().unwrap().iter().find(|l| l["leg"] == json!("long")).unwrap().clone();
+    assert_eq!((long["filled_quantity"].clone(), long["state"].clone()), (json!("10"), json!("Filled")), "{long}");
+    let calls = rig.notifier.calls();
+    assert_eq!(calls.len(), 1, "notified once");
+    assert_eq!((calls[0].state, calls[0].reason), (PairState::PartialFailure, AlertReason::SubmitRejected));
+    sleep(Duration::from_millis(300)).await;
+    let snap = h.snapshots.borrow().clone();
+    assert_eq!(snap.alerts.len(), 1);
+    assert_eq!((snap.alerts[0].pair.as_str(), snap.alerts[0].reason.as_deref()), (UUID, Some("SUBMIT_REJECTED")));
+    assert_eq!(count(&rig.db, alert::ALERT_NOTIFIED), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_hour_in_partial_failure_sends_and_cancels_nothing_and_the_alert_stays() {
+    let counting = Counting::new();
+    counting.inner.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Reject("scripted".into()));
+    let (rig, h) = started(Opts { simulator: Some(counting.clone()), ..Opts::default() }).await;
+    run_until(&rig.clock, T - 8_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    let before = counting.counts();
+    run_until(&rig.clock, T - 8_000 + 3_600_000).await;
+    assert_eq!(counting.counts(), before, "no automatic order or cancel while the alert stands");
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    assert_eq!(h.snapshots.borrow().alerts.len(), 1, "time does not clear the alert");
+    assert_eq!(rig.notifier.calls().len(), 1, "and does not notify again");
+}
+
+/// Deps for a second process on the same database (in-memory state, including the simulated
+/// ledger, is gone).
+fn restarted(rig: &Rig, notifier: Arc<RecordingNotifier>) -> EngineDeps {
+    let shared: Arc<dyn Clock> = Arc::new(rig.clock.clone());
+    let sim = Arc::new(SimulatedExecutor::new(Arc::new(SimPriceBook::default())));
+    let sim_account: Arc<dyn AccountView> = Arc::new(sim.account_view(Arc::new(FixedMargin(Ok(dec("10000"))))));
+    EngineDeps {
+        db: rig.db.clone(),
+        clock: shared,
+        timings: EngineTimings::default(),
+        simulator: sim,
+        factory: Arc::new(rig.factory.clone()),
+        market: rig.market.clone(),
+        offsets: rig.offsets.clone(),
+        account: Arc::new(DemoAccount(rig.demo.clone())),
+        sim_account,
+        reconciler: None,
+        notifier,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_restart_the_alert_is_in_the_first_snapshot_and_is_not_notified_again() {
+    let (rig, h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Reject("scripted".into()));
+    run_until(&rig.clock, T - 8_000).await;
+    assert_eq!(rig.notifier.calls().len(), 1);
+    drop(h); // process 1 ends
+    sleep(Duration::from_millis(50)).await;
+
+    let second = Arc::new(RecordingNotifier::default());
+    let h2 = start(restarted(&rig, second.clone()));
+    let first = h2.snapshots.borrow().clone();
+    assert_eq!(first.alerts.len(), 1, "the very first snapshot carries the alert");
+    assert_eq!(first.alerts[0].state, PairState::PartialFailure);
+    run_until(&rig.clock, T + 30_000).await;
+    assert!(second.calls().is_empty(), "no second notification for the same entry");
+    assert_eq!(count(&rig.db, PAIR_ALERT), 1, "no second alert event either");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_notifier_writes_one_event_and_changes_nothing_else() {
+    let (rig, h) = started(Opts::default()).await;
+    *rig.notifier.fail_with.lock().unwrap() = Some("osascript not available".into());
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Reject("scripted".into()));
+    run_until(&rig.clock, T - 8_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    let failed = payloads(&rig.db, alert::ALERT_NOTIFY_FAILED);
+    assert_eq!(failed.len(), 1);
+    assert!(failed[0]["error"].as_str().unwrap().contains("osascript"));
+    assert_eq!(count(&rig.db, PAIR_ALERT), 1);
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.snapshots.borrow().alerts.len(), 1, "the banner is unaffected");
+    run_until(&rig.clock, T + 10_000).await;
+    assert_eq!(rig.notifier.calls().len(), 1, "a failed notification is not retried in a loop");
+}
+
+#[tokio::test(start_paused = true)]
+async fn alert_events_are_counted_by_reason() {
+    let (rig, _h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Reject("scripted".into()));
+    run_until(&rig.clock, T - 8_000).await;
+    let counts = alert::count_by_reason(&rig.db, 0, i64::MAX).unwrap();
+    assert_eq!(counts["SUBMIT_REJECTED"], 1);
+    assert_eq!(counts.values().sum::<i64>(), count(&rig.db, PAIR_ALERT) as i64, "every alert in exactly one class");
+}
+
+// -- 3.2 manual exits
+
+#[tokio::test(start_paused = true)]
+async fn confirm_closed_is_refused_while_a_leg_still_holds_a_position_and_accepted_once_flat() {
+    let (rig, h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Reject("scripted".into()));
+    run_until(&rig.clock, T - 8_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+
+    // The user says "verified flat", but the long leg still holds 10: refused with the position.
+    let r = ask(&h, Command::ConfirmClosed { pair: UUID.into(), verified_flat: true }).await;
+    assert!(matches!(&r, CommandReply::Rejected(why) if why.contains("long position 10")), "{r:?}");
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.snapshots.borrow().alerts.len(), 1, "alert stays");
+    assert_eq!(payloads(&rig.db, MANUAL_CONFIRM_RESULT)[0]["accepted"], json!(false));
+
+    // The user flattens the long leg by hand (reduce-only, same executor), then confirms again.
+    user_order(&rig, OrderSide::Sell, "10", true).await;
+    let r = ask(&h, Command::ConfirmClosed { pair: UUID.into(), verified_flat: false }).await;
+    assert_eq!(r, CommandReply::Accepted, "accepted on the system's re-query, not the user's flag");
+    assert_eq!(status(&rig.db, UUID), "FINALIZED");
+    sleep(Duration::from_millis(300)).await;
+    assert!(h.snapshots.borrow().alerts.is_empty(), "the alert disappears with the manual exit");
+    let results = payloads(&rig.db, MANUAL_CONFIRM_RESULT);
+    assert_eq!(results.last().unwrap()["accepted"], json!(true));
+}
+
+// -- 3.3 close
+
+#[tokio::test(start_paused = true)]
+async fn a_lagging_position_update_is_confirmed_on_the_second_read() {
+    let (rig, _h) = started(Opts { stale_position_reads: 1, ..Opts::default() }).await;
+    run_until(&rig.clock, T + 20_000).await;
+    assert_eq!(status(&rig.db, UUID), "FINALIZED", "{:?}", labels(&rig.db));
+    let closed = ts_of(&rig.db, "FINALIZED")[0];
+    assert!(closed > T + 15_000, "the first flat check saw the stale position and was retried");
+    assert_eq!(count(&rig.db, "PARTIAL_FAILURE"), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_open_order_left_on_the_symbol_blocks_finalized_and_ends_in_partial_failure() {
+    let (rig, _h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Long, OrderAction::Close), SimBehavior::Partial(dec("0.5")));
+    run_until(&rig.clock, T + 25_000).await;
+    assert_ne!(status(&rig.db, UUID), "FINALIZED");
+    run_until(&rig.clock, T + 31_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "{:?}", labels(&rig.db));
+    assert_eq!(count(&rig.db, "FINALIZED"), 0);
+}
+
+/// User decision 2026-10-05 evening (close = min(recorded, actual); a difference beyond
+/// `max_leg_imbalance_pct` goes to the user) overrides the pair-close scenario "one leg
+/// liquidated -> close only the other leg": a leg at 0 against a recorded 10 is a 100 %
+/// difference, so NOTHING is closed and the pair goes to PARTIAL_FAILURE with the mismatch alert.
+#[tokio::test(start_paused = true)]
+async fn a_liquidated_leg_is_a_quantity_mismatch_and_nothing_is_closed_per_the_user_decision() {
+    let (rig, _h) = started(Opts::default()).await;
+    run_until(&rig.clock, T - 5_000).await;
+    user_order(&rig, OrderSide::Sell, "10", true).await; // the long leg is gone (e.g. liquidated)
+    run_until(&rig.clock, T + 16_000).await;
+    assert!(pair_closes(&rig).is_empty(), "{:?}", pair_closes(&rig));
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    assert_eq!(count(&rig.db, CLOSE_QUANTITY_MISMATCH), 1);
+    assert_eq!(payloads(&rig.db, PAIR_ALERT)[0]["reason"], json!("CLOSE_LEG_FAILED"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rejected_close_leg_is_partial_failure_and_a_manual_close_handles_only_the_remaining_leg() {
+    let (rig, h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Close), SimBehavior::Reject("110090 risk limit (scripted)".into()));
+    run_until(&rig.clock, T + 16_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "{:?}", labels(&rig.db));
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO, "the long leg closed");
+    assert_eq!(rig.sim.position(Exchange::Bybit, SYM), dec("-10"));
+    let sent_before = rig.sim.submitted().len();
+    run_until(&rig.clock, T + 40_000).await;
+    assert_eq!(rig.sim.submitted().len(), sent_before, "no automatic retry");
+
+    assert_eq!(ask(&h, Command::ManualClose { pair: UUID.into() }).await, CommandReply::Accepted);
+    run_until(&rig.clock, T + 42_000).await;
+    let new: Vec<OrderRequest> = rig.sim.submitted().into_iter().skip(sent_before).collect();
+    assert_eq!(new.len(), 1, "only the remaining (short) leg: {new:?}");
+    assert_eq!((new[0].exchange, new[0].side, new[0].quantity, new[0].reduce_only), (Exchange::Bybit, OrderSide::Buy, dec("10"), true));
+    assert_eq!(status(&rig.db, UUID), "FINALIZED");
 }

@@ -1,9 +1,11 @@
 //! Exchange access (changes: exchange-readonly-adapters, later exchange-demo-execution).
+//! `execution/**` = signed order execution on demo/testnet (the only POST / DELETE path).
 //! Ownership while built in parallel: `public/**` = public REST adapters, `signed/**` and
 //! `health/**` and `reqwest_transport.rs` = signed GET clients, feeds, clock sync, rate limiting.
 #![allow(dead_code)]
 
 pub mod error;
+pub mod execution;
 pub mod health;
 pub mod public;
 pub mod reqwest_transport;
