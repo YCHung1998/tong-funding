@@ -46,7 +46,7 @@ Fixtures SHALL NOT 以人工修改來讓測試通過；有意的行為差異 SHA
 - **WHEN** 執行 `cargo test -p core`
 - **THEN** 所有 fixtures 案例通過，輸出列出載入的案例總數
 
-#### Scenario: 有意差異必須登記
+#### Scenario: 有意差異必須登記並仍被驗證
 
-- **WHEN** Rust 實作與 Python 輸出在某案例上刻意不同（例如 Rust 版用 Decimal 而沒有 epsilon）
-- **THEN** 該案例必須出現在 `design.md` 的差異對照表與測試例外清單中，否則測試失敗
+- **WHEN** Rust 實作與 Python 輸出在某案例上刻意不同（例如 Python 在基準價為 0 時靜默略過檢查、Rust 判定失敗）
+- **THEN** fixtures 中該案例帶有 `known_difference` 識別碼並仍記錄 Python 的答案，測試例外清單登記該識別碼與理由，測試改為驗證 Rust 的預期行為；識別碼與例外清單必須互相對應，缺漏或多餘皆使測試失敗

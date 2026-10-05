@@ -124,6 +124,14 @@ impl Default for RiskConfig {
 
 impl RiskConfig {
     /// Checks every field rule; the error names the first offending field.
+    /// Parses AND validates. Use this to load stored settings: plain `serde` deserialization
+    /// accepts values such as `max_leverage = 0` that `validate` rejects.
+    pub fn from_json(json: &str) -> Result<RiskConfig, RiskError> {
+        let cfg: RiskConfig = serde_json::from_str(json).map_err(|e| RiskError::Malformed(e.to_string()))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     pub fn validate(&self) -> Result<(), RiskError> {
         positive("max_leverage", self.max_leverage)?;
         if self.max_concurrent_pairs < 1 {

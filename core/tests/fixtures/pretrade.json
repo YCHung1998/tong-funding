@@ -1,5 +1,5 @@
 {
- "case_count": 150,
+ "case_count": 151,
  "cases": [
   {
    "expected": {
@@ -3117,10 +3117,30 @@
     "short_baseline": "68362.6",
     "short_latest": "68498.26"
    }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "0",
+    "long_latest": "100",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "100",
+    "short_latest": "100"
+   },
+   "known_difference": "baseline_price_zero"
   }
  ],
  "header": {
-  "exported_at": "2026-10-05T10:30:05Z",
+  "exported_at": "2026-10-05T11:33:45Z",
   "source": {
    "files_sha256": {
     "pretrade_check.py": "a7b0df71bb095a77ac0f8495b8eac3f83c28034a1410b3ee143a99a9866bb7b2"

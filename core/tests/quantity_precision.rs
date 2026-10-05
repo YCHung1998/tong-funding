@@ -1,6 +1,6 @@
 use rust_decimal::Decimal;
 use std::str::FromStr;
-use tong_funding_core::quantity::{LotSize, Quantity, QuantityError};
+use tong_funding_core::quantity::{ClosingQuantity, LotSize, Quantity, QuantityError};
 
 fn d(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap()
@@ -97,21 +97,21 @@ fn okx_below_min_contracts_is_error() {
 
 #[test]
 fn closing_quantity_uses_absolute_position_without_rounding() {
-    let q = Quantity::from_exchange_position(d("-0.019")).unwrap();
+    let q = ClosingQuantity::from_exchange_position(d("-0.019")).unwrap();
     assert_eq!(q.value(), d("0.019"));
-    let q = Quantity::from_exchange_position(d("0.0191234")).unwrap();
+    let q = ClosingQuantity::from_exchange_position(d("0.0191234")).unwrap();
     assert_eq!(q.value(), d("0.0191234"));
 }
 
 #[test]
 fn closing_string_never_truncates_position_digits() {
     let l = lot("0.001", "0.001");
-    let q = Quantity::from_exchange_position(d("-0.0191234")).unwrap();
+    let q = ClosingQuantity::from_exchange_position(d("-0.0191234")).unwrap();
     assert_eq!(q.to_order_string(&l), "0.0191234");
 }
 
 #[test]
 fn no_position_is_error() {
-    let e = Quantity::from_exchange_position(d("0")).unwrap_err();
+    let e = ClosingQuantity::from_exchange_position(d("0")).unwrap_err();
     assert_eq!(e, QuantityError::NoPosition);
 }

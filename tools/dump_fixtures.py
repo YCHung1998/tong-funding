@@ -81,6 +81,14 @@ def quantity_cases(qp) -> list[dict]:
         else:
             case["expected"] = {"below_min": False, "qty": plain(adjusted), "formatted": qp.format_quantity(adjusted, lot)}
         cases.append(case)
+    # --- known, intentional differences (Rust returns an error where Python silently continues) ---
+    lot0 = {"step_size": 0.0, "min_qty": 0.1}
+    adjusted0 = qp.apply_lot_size(2.5, lot0)
+    cases.append({
+        "known_difference": "step_size_zero",
+        "input": {"qty": "2.5", "step_size": "0", "min_qty": "0.1"},
+        "expected": {"below_min": False, "qty": plain(adjusted0), "formatted": qp.format_quantity(adjusted0, lot0)},
+    })
     return cases
 
 
@@ -101,6 +109,14 @@ def okx_cases(qp) -> list[dict]:
         case = {"input": {"base_qty": base, "ct_val": ct_val, "lot_sz": lot_sz, "min_sz": min_sz}}
         case["expected"] = {"below_min": True} if adjusted == 0.0 else {"below_min": False, "contracts": plain(adjusted)}
         cases.append(case)
+    # known difference: ct_val <= 0 -> Python returns 0.0 contracts (then "below minimum"), Rust: InvalidContractValue
+    contracts0 = qp.okx_base_qty_to_contracts(0.02, 0.0)
+    adjusted0 = qp.apply_lot_size(contracts0, {"step_size": 1.0, "min_qty": 1.0})
+    cases.append({
+        "known_difference": "ct_val_zero",
+        "input": {"base_qty": "0.02", "ct_val": "0", "lot_sz": "1", "min_sz": "1"},
+        "expected": {"below_min": adjusted0 == 0.0},
+    })
     return cases
 
 
@@ -170,6 +186,21 @@ def pretrade_cases(pc) -> list[dict]:
             },
             "expected": {"pass": res["pass"], "failed_checks": failed},
         })
+    # known difference: a baseline price of 0 -> Python SKIPS the drift check (falsy), Rust FAILS it
+    entry = {"margin_usdt": 400, "leverage": 3, "long_exchange": "Binance", "short_exchange": "Bybit",
+             "long_price": 0.0, "short_price": 100.0}
+    res = pc.evaluate_pretrade(entry, 100.0, 100.0, 5000.0, 5000.0, 0.05, 5.0)
+    failed = sorted({classify(r) for r in res["reasons"]})
+    cases.append({
+        "known_difference": "baseline_price_zero",
+        "input": {
+            "baseline_source": "scan", "long_baseline": "0", "short_baseline": "100",
+            "long_latest": "100", "short_latest": "100", "margin_needed": "400",
+            "available_margin_long": "5000", "available_margin_short": "5000",
+            "leverage": "3", "max_leverage": "5", "max_price_drift_pct": "0.05",
+        },
+        "expected": {"pass": res["pass"], "failed_checks": failed},
+    })
     return cases
 
 

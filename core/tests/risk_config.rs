@@ -218,3 +218,19 @@ fn json_roundtrip_keeps_decimal_exact() {
     assert_eq!(serde_json::from_str::<RiskConfig>(&s).unwrap(), c);
     assert!(s.contains("\"0.05\"")); // Decimal serialized as string
 }
+
+#[test]
+fn from_json_validates_what_serde_alone_would_accept() {
+    // serde accepts these values; loading must not.
+    let bad = r#"{"max_leverage":"0","max_concurrent_pairs":0,"allowed_exchanges":[]}"#;
+    let err = RiskConfig::from_json(bad).unwrap_err();
+    assert!(err.field().is_some(), "error should name a field: {err:?}");
+    assert!(serde_json::from_str::<RiskConfig>(bad).is_ok(), "premise: plain serde does not validate");
+}
+
+#[test]
+fn from_json_accepts_a_valid_roundtrip_and_rejects_garbage() {
+    let json = serde_json::to_string(&RiskConfig::default()).unwrap();
+    assert_eq!(RiskConfig::from_json(&json).unwrap(), RiskConfig::default());
+    assert!(matches!(RiskConfig::from_json("not json"), Err(RiskError::Malformed(_))));
+}

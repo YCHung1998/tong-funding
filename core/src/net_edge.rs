@@ -2,7 +2,7 @@
 //! Funding rates are fractions; every `_pct` value is a percentage number (0.01 = 0.01%).
 //! No defaults for fees/slippage/threshold: missing ones are errors, never 0.
 
-use crate::funding::{pair_settlement, DataStatus, FundingObservation};
+use crate::funding::{is_consistent_listed, pair_settlement, FundingObservation};
 use crate::types::{Decimal, Exchange, Notional, Pct};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -57,18 +57,6 @@ pub struct Opportunity {
     pub qualifies: bool,
 }
 
-/// Lower rate becomes long, higher becomes short; on a tie `a` is long.
-pub fn assign_legs<'a>(
-    a: &'a FundingObservation,
-    b: &'a FundingObservation,
-) -> (&'a FundingObservation, &'a FundingObservation) {
-    if b.funding_rate < a.funding_rate {
-        (b, a)
-    } else {
-        (a, b)
-    }
-}
-
 /// Computes Net Edge for an already-assigned (long, short) pair with per-leg notional `notional`.
 pub fn compute_net_edge(
     long: &FundingObservation,
@@ -118,24 +106,21 @@ pub fn compute_net_edge(
     })
 }
 
-/// Assigns legs by rate, computes Net Edge and applies the qualification rules.
-pub fn evaluate_pair(
-    a: &FundingObservation,
-    b: &FundingObservation,
+/// Evaluates one fixed orientation (`long` / `short`) and applies the qualification rules.
+fn evaluate_oriented(
+    long: &FundingObservation,
+    short: &FundingObservation,
     notional: Notional,
     params: &NetEdgeParams,
+    threshold: Pct,
 ) -> Result<Opportunity, NetEdgeError> {
-    let (long, short) = assign_legs(a, b);
     let edge = compute_net_edge(long, short, notional, params)?;
-    let threshold = params
-        .net_edge_threshold_pct
-        .ok_or(NetEdgeError::MissingThreshold)?;
     let volume_ok = |o: &FundingObservation| {
         o.volume_24h_quote.unwrap_or(Decimal::ZERO) >= params.min_24h_volume_usdt
     };
     let qualifies = edge.net_edge_pct >= threshold
-        && long.data_status == DataStatus::Listed
-        && short.data_status == DataStatus::Listed
+        && is_consistent_listed(long)
+        && is_consistent_listed(short)
         && volume_ok(long)
         && volume_ok(short)
         && params.allowed_exchanges.contains(&long.exchange)
@@ -144,11 +129,39 @@ pub fn evaluate_pair(
     Ok(Opportunity { edge, qualifies })
 }
 
-/// Evaluates every cross-exchange pair of the same symbol and returns the highest Net Edge.
-pub fn best_opportunity(
-    observations: &[FundingObservation],
+/// The better of two opportunities: a qualifying one beats a non-qualifying one, then the higher
+/// Net Edge wins; on a tie `first` is kept.
+fn better(first: Opportunity, second: Opportunity) -> Opportunity {
+    let take_second = match (first.qualifies, second.qualifies) {
+        (false, true) => true,
+        (true, false) => false,
+        _ => second.edge.net_edge_usdt > first.edge.net_edge_usdt,
+    };
+    if take_second { second } else { first }
+}
+
+/// Evaluates BOTH orientations of the pair and returns the better one. The direction is not
+/// fixed by rate order: under the single-settlement model only the leg(s) settling at `T` earn
+/// or pay, so the profitable orientation depends on settlement times as well as rates.
+pub fn evaluate_pair(
+    a: &FundingObservation,
+    b: &FundingObservation,
     notional: Notional,
     params: &NetEdgeParams,
+) -> Result<Opportunity, NetEdgeError> {
+    let threshold = params.net_edge_threshold_pct.ok_or(NetEdgeError::MissingThreshold)?;
+    let a_long = evaluate_oriented(a, b, notional, params, threshold)?;
+    let b_long = evaluate_oriented(b, a, notional, params, threshold)?;
+    Ok(better(a_long, b_long))
+}
+
+/// Evaluates every cross-exchange pair of the same symbol, using `params_for(x, y)` for the pair
+/// of exchanges involved (so per-exchange overrides apply per pair), and returns the best:
+/// a qualifying pair beats a non-qualifying one, then the highest Net Edge wins.
+pub fn best_opportunity_with(
+    observations: &[FundingObservation],
+    notional: Notional,
+    params_for: &dyn Fn(Exchange, Exchange) -> NetEdgeParams,
 ) -> Result<Option<Opportunity>, NetEdgeError> {
     let mut best: Option<Opportunity> = None;
     for (i, a) in observations.iter().enumerate() {
@@ -156,14 +169,21 @@ pub fn best_opportunity(
             if a.symbol != b.symbol || a.exchange == b.exchange {
                 continue;
             }
-            let cand = evaluate_pair(a, b, notional, params)?;
-            if best
-                .as_ref()
-                .is_none_or(|cur| cand.edge.net_edge_pct > cur.edge.net_edge_pct)
-            {
-                best = Some(cand);
-            }
+            let cand = evaluate_pair(a, b, notional, &params_for(a.exchange, b.exchange))?;
+            best = Some(match best {
+                Some(cur) => better(cur, cand),
+                None => cand,
+            });
         }
     }
     Ok(best)
+}
+
+/// [`best_opportunity_with`] using the same params for every pair.
+pub fn best_opportunity(
+    observations: &[FundingObservation],
+    notional: Notional,
+    params: &NetEdgeParams,
+) -> Result<Option<Opportunity>, NetEdgeError> {
+    best_opportunity_with(observations, notional, &|_, _| params.clone())
 }

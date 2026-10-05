@@ -231,3 +231,11 @@ fn everything_failing_lists_all_ten() {
         [DataFresh, CoinListed, ExchangeAllowed, NetEdgeQualified, PriceDrift, Liquidity, Margin, Leverage, ExistingExposure, RiskLimits]
     );
 }
+
+#[test]
+fn extreme_timestamps_do_not_overflow() {
+    let mut i = input();
+    i.long.price_observed_at_ms = i64::MIN;
+    i.now_ms = i64::MAX;
+    assert!(failed(&i).contains(&Check::DataFresh));
+}

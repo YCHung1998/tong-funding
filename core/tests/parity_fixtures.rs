@@ -1,7 +1,9 @@
 //! Parity with the Python reference (spec: parity-fixtures). Loads every fixture exported by
 //! `tools/dump_fixtures.py` and compares the Rust implementation case by case.
-//! Fixtures are never edited by hand; an intentional difference must be listed in
-//! `INTENTIONAL_DIFFERENCES` with a reason (and in design.md's difference table).
+//! Fixtures are never edited by hand. A case where Rust deliberately differs from Python carries a
+//! `known_difference` id in the fixture (so the Python answer is still recorded), must be listed in
+//! `INTENTIONAL_DIFFERENCES` with a reason (and in design.md's difference table), and is checked
+//! against Rust's documented behaviour instead of Python's.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -14,8 +16,12 @@ use tong_funding_core::pretrade::{evaluate_pretrade, Check, LegInput, PretradeIn
 use tong_funding_core::quantity::{LotSize, Quantity, QuantityError};
 use tong_funding_core::types::Exchange;
 
-/// (fixture file, case index, reason). Empty = Rust matches Python on every exported case.
-const INTENTIONAL_DIFFERENCES: &[(&str, usize, &str)] = &[];
+/// (known_difference id, reason). Rust must differ from Python on exactly these.
+const INTENTIONAL_DIFFERENCES: &[(&str, &str)] = &[
+    ("step_size_zero", "Python returns the quantity unchanged for step_size <= 0; Rust returns InvalidStepSize"),
+    ("ct_val_zero", "Python returns 0.0 contracts for ct_val <= 0; Rust returns InvalidContractValue"),
+    ("baseline_price_zero", "Python skips the drift check when the baseline is 0 (silent pass); Rust fails PriceDrift"),
+];
 
 fn dec(v: &Value) -> Decimal {
     Decimal::from_str(v.as_str().unwrap_or_else(|| panic!("expected string, got {v}"))).unwrap()
@@ -30,8 +36,11 @@ fn load(name: &str) -> (Value, Vec<Value>) {
     (doc["header"].clone(), cases)
 }
 
-fn skipped(file: &str, idx: usize) -> bool {
-    INTENTIONAL_DIFFERENCES.iter().any(|(f, i, _)| *f == file && *i == idx)
+/// The `known_difference` id of a case, asserting it is registered.
+fn known(case: &Value) -> Option<&str> {
+    let id = case.get("known_difference")?.as_str()?;
+    assert!(INTENTIONAL_DIFFERENCES.iter().any(|(i, _)| *i == id), "known_difference {id:?} is not registered in INTENTIONAL_DIFFERENCES");
+    Some(id)
 }
 
 fn exchange(s: &str) -> Exchange {
@@ -45,9 +54,23 @@ fn exchange(s: &str) -> Exchange {
 
 #[test]
 fn every_intentional_difference_has_a_reason() {
-    for (file, idx, reason) in INTENTIONAL_DIFFERENCES {
-        assert!(!reason.trim().is_empty(), "{file}[{idx}] is excluded without a reason");
+    for (id, reason) in INTENTIONAL_DIFFERENCES {
+        assert!(!reason.trim().is_empty(), "{id} is excluded without a reason");
     }
+}
+
+#[test]
+fn every_registered_difference_appears_in_a_fixture_and_vice_versa() {
+    let mut seen = BTreeSet::new();
+    for f in ["quantity.json", "quantity_okx.json", "pretrade.json", "grouping.json"] {
+        for c in load(f).1 {
+            if let Some(id) = known(&c) {
+                seen.insert(id.to_string());
+            }
+        }
+    }
+    let registered: BTreeSet<String> = INTENTIONAL_DIFFERENCES.iter().map(|(i, _)| i.to_string()).collect();
+    assert_eq!(seen, registered, "stale or missing known_difference entries");
 }
 
 #[test]
@@ -66,11 +89,14 @@ fn quantity_matches_python() {
     let (_, cases) = load("quantity.json");
     let mut checked = 0;
     for (i, c) in cases.iter().enumerate() {
-        if skipped("quantity.json", i) {
-            continue;
-        }
         let lot = LotSize { step_size: dec(&c["input"]["step_size"]), min_qty: dec(&c["input"]["min_qty"]) };
         let got = Quantity::round_down(dec(&c["input"]["qty"]), &lot);
+        if let Some(id) = known(c) {
+            assert_eq!(id, "step_size_zero");
+            assert!(matches!(got, Err(QuantityError::InvalidStepSize(_))), "case {i}: {got:?}");
+            checked += 1;
+            continue;
+        }
         let exp = &c["expected"];
         if exp["below_min"].as_bool().unwrap() {
             assert!(matches!(got, Err(QuantityError::BelowMinimum { .. })), "case {i} {}: expected below-min, got {got:?}", c["input"]);
@@ -89,12 +115,15 @@ fn okx_contract_conversion_matches_python() {
     let (_, cases) = load("quantity_okx.json");
     let mut checked = 0;
     for (i, c) in cases.iter().enumerate() {
-        if skipped("quantity_okx.json", i) {
-            continue;
-        }
         let i_ = &c["input"];
         let lot = LotSize { step_size: dec(&i_["lot_sz"]), min_qty: dec(&i_["min_sz"]) };
         let got = Quantity::okx_contracts(dec(&i_["base_qty"]), dec(&i_["ct_val"]), &lot);
+        if let Some(id) = known(c) {
+            assert_eq!(id, "ct_val_zero");
+            assert!(matches!(got, Err(QuantityError::InvalidContractValue(_))), "case {i}: {got:?}");
+            checked += 1;
+            continue;
+        }
         if c["expected"]["below_min"].as_bool().unwrap() {
             assert!(matches!(got, Err(QuantityError::BelowMinimum { .. })), "case {i} {i_}: expected below-min, got {got:?}");
         } else {
@@ -128,9 +157,6 @@ fn pretrade_drift_margin_leverage_match_python() {
     let in_scope: BTreeSet<&str> = ["PriceDrift", "Margin", "Leverage"].into();
     let mut checked = 0;
     for (i, c) in cases.iter().enumerate() {
-        if skipped("pretrade.json", i) {
-            continue;
-        }
         let x = &c["input"];
         let (lb, sb) = (dec(&x["long_baseline"]), dec(&x["short_baseline"]));
         let from_pretrade = x["baseline_source"].as_str().unwrap() == "pretrade";
@@ -161,6 +187,13 @@ fn pretrade_drift_margin_leverage_match_python() {
         let verdict = evaluate_pretrade(&input, &limits);
         let names: Vec<String> = verdict.failed().iter().map(|ch: &Check| format!("{ch:?}")).collect();
         let got: BTreeSet<&str> = names.iter().map(String::as_str).collect();
+        if let Some(id) = known(c) {
+            assert_eq!(id, "baseline_price_zero");
+            assert!(got.contains("PriceDrift"), "case {i}: Rust must fail PriceDrift when the baseline is 0, got {got:?}");
+            assert!(c["expected"]["pass"].as_bool().unwrap(), "case {i}: the fixture must record Python's silent pass");
+            checked += 1;
+            continue;
+        }
         assert!(got.is_subset(&in_scope), "case {i}: a check outside the exported scope failed: {names:?}");
         let want: BTreeSet<&str> = c["expected"]["failed_checks"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(got, want, "case {i} {x}");
@@ -175,9 +208,6 @@ fn grouping_matches_python() {
     let (_, cases) = load("grouping.json");
     let mut checked = 0;
     for (i, c) in cases.iter().enumerate() {
-        if skipped("grouping.json", i) {
-            continue;
-        }
         let rows: Vec<PositionRow> = c["input"]["rows"]
             .as_array()
             .unwrap()

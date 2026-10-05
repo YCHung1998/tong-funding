@@ -90,10 +90,23 @@ pub fn is_stale(obs: &FundingObservation, now_ms: i64, stale_threshold_ms: i64) 
     now_ms.saturating_sub(obs.observed_at) > stale_threshold_ms
 }
 
-/// Status after applying staleness: a `Listed` observation that is stale becomes `Stale`.
+/// True when a `Listed` observation carries a usable interval. Struct literals and
+/// deserialization can bypass `FundingObservation::new`, so consumers must not trust the stored status alone.
+pub fn is_consistent_listed(obs: &FundingObservation) -> bool {
+    obs.data_status == DataStatus::Listed && obs.funding_interval_secs.is_some_and(|s| s > 0)
+}
+
+/// Status after applying consistency and staleness: a `Listed` observation without a valid
+/// interval becomes `DataError`; a stale one becomes `Stale`.
 pub fn effective_status(obs: &FundingObservation, now_ms: i64, stale_threshold_ms: i64) -> DataStatus {
-    if obs.data_status == DataStatus::Listed && is_stale(obs, now_ms, stale_threshold_ms) {
-        DataStatus::Stale
+    if obs.data_status == DataStatus::Listed {
+        if !is_consistent_listed(obs) {
+            DataStatus::DataError
+        } else if is_stale(obs, now_ms, stale_threshold_ms) {
+            DataStatus::Stale
+        } else {
+            DataStatus::Listed
+        }
     } else {
         obs.data_status
     }

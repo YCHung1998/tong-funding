@@ -114,3 +114,24 @@ fn settlement_long_earlier_only_long_settles() {
     let s = pair_settlement(&long, &short);
     assert_eq!(s, PairSettlement { time: 4 * 3_600_000, long_settles: true, short_settles: false });
 }
+
+#[test]
+fn effective_status_downgrades_an_inconsistent_listed_observation() {
+    // Built by struct literal (bypassing `new`): Listed but no interval is a contradiction.
+    let mut o = tong_funding_core::funding::FundingObservation::new(
+        tong_funding_core::types::Exchange::Binance,
+        "BTCUSDT",
+        rust_decimal::Decimal::ZERO,
+        Some(28800),
+        0,
+        rust_decimal::Decimal::ONE,
+        None,
+        0,
+        0,
+        DataStatus::Listed,
+    );
+    o.funding_interval_secs = None;
+    assert_eq!(effective_status(&o, 0, 5000), DataStatus::DataError);
+    o.funding_interval_secs = Some(0);
+    assert_eq!(effective_status(&o, 0, 5000), DataStatus::DataError);
+}

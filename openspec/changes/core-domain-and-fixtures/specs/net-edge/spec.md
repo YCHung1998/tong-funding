@@ -43,7 +43,7 @@
 ### Requirement: 達標判定
 
 一個機會 SHALL 僅在下列條件全部成立時為「達標」：`net_edge_pct ≥ net_edge_threshold_pct`；
-兩腿的 `data_status` 皆為 `LISTED`；兩腿的 `volume_24h_quote` 皆不小於 `min_24h_volume_usdt`；
+兩腿的 `data_status` 皆為 `LISTED` 且各自帶有有效的 funding 週期（以 struct 欄位或反序列化繞過建構子產生的「LISTED 但無週期」觀測 SHALL 視為不達標）；兩腿的 `volume_24h_quote` 皆不小於 `min_24h_volume_usdt`；
 兩個交易所皆在 `allowed_exchanges`；若 `allowed_coins` 非空，該標的在其中。
 缺少成交量資料 SHALL 視為 0（失敗即封閉），不得視為無限大。
 
@@ -62,16 +62,44 @@
 - **WHEN** gross spread 很大但 `net_edge_pct` 低於門檻
 - **THEN** 不達標
 
-### Requirement: 多空方向由 rate 決定
+### Requirement: 多空方向取 Net Edge 較高者，不由 rate 高低固定
 
-給定同一標的在兩個交易所的 rate，系統 SHALL 指定 rate 較低者為 long 腿、較高者為 short 腿（對應在 rate 為正時，short 收錢較多）。
+對同一標的在兩個交易所的觀測，系統 SHALL 兩個方向都計算 Net Edge，並回傳較高者；兩者相同時保留第一個參數為 long。
+方向 SHALL NOT 單純由 rate 高低決定：單次結算模型下只有在 `T` 結算的腿會收付，因此較划算的方向同時取決於各腿的結算時間與 rate。
 系統 SHALL 同時回傳 gross spread（兩 rate 差的絕對值，僅供顯示）。
-覆蓋三所時，SHALL 對所有可配對的組合計算並回傳 Net Edge 最高的組合，而不是只看 gross spread。
+
+覆蓋三所時，SHALL 對所有可配對的組合計算：**達標者優先於不達標者，其次取 Net Edge 最高者**；沒有任何組合達標時，回傳 Net Edge 最高者並標示不達標。
+各配對 SHALL 使用該配對生效的參數（涉及的兩個交易所的覆寫合併後的值），而不是所有配對共用同一組。
+
+#### Scenario: 兩個 rate 皆為正且週期不同時方向由結算腿決定
+
+- **WHEN** a 為 +0.0002（下次結算 4 小時後）、b 為 +0.0005（下次結算 8 小時後），成本皆為 0，`N = 1000`
+- **THEN** 只有 a 會在 `T` 結算；a 作 long 會付 0.2 USDT、a 作 short 會收 0.2 USDT，因此回傳 a 為 short、b 為 long，Net Edge 為 0.2 USDT，且參數交換順序結果相同
+
+#### Scenario: 兩腿同時結算時 rate 較低者為 long
+
+- **WHEN** a 為 +0.0003、b 為 −0.0001，兩腿皆在同一時間結算，成本為 0，`N = 1000`
+- **THEN** b 為 long、a 為 short，Net Edge 為 0.4 USDT
 
 #### Scenario: 三所取 Net Edge 最高的配對
 
 - **WHEN** 同一標的有 Binance、Bybit、OKX 三筆觀測
-- **THEN** 對三種配對各自計算 Net Edge，回傳最高者及其 long / short 指定
+- **THEN** 對三種配對各自計算，回傳達標者中 Net Edge 最高者及其 long / short
+
+#### Scenario: 達標者優先於較高但不達標者
+
+- **WHEN** OKX 配對的 Net Edge 最高但缺少成交量資料而不達標，Binance 與 Bybit 配對較低但達標
+- **THEN** 回傳 Binance 與 Bybit 配對，且標示達標
+
+#### Scenario: 沒有任何組合達標
+
+- **WHEN** 所有組合都不達標
+- **THEN** 回傳 Net Edge 最高的組合並標示不達標
+
+#### Scenario: 每個配對套用自己的參數
+
+- **WHEN** 涉及 OKX 的配對有較高的 `est_slippage_pct` 覆寫，其餘配對沒有
+- **THEN** 涉及 OKX 的配對以較高滑價計算 Net Edge，選擇結果可能因此不同於共用單一參數時
 
 ### Requirement: 手續費與滑價為必填設定
 

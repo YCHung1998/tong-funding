@@ -68,12 +68,44 @@ impl Quantity {
         Quantity::round_down(base_qty / ct_val, lot)
     }
 
-    /// Builds a closing quantity from the exchange-reported position (absolute value, no rounding).
-    pub fn from_exchange_position(position: Decimal) -> Result<Quantity, QuantityError> {
+    /// The underlying decimal value.
+    pub fn value(self) -> Decimal {
+        self.0
+    }
+
+    /// The order string: decimal places derived from `step_size`.
+    pub fn to_order_string(self, lot: &LotSize) -> String {
+        format_decimal(self.0, lot)
+    }
+}
+
+/// Decimal places come from `step_size`; digits finer than the step are never truncated.
+fn format_decimal(value: Decimal, lot: &LotSize) -> String {
+    let step_decimals = lot.step_size.normalize().scale();
+    let own = value.normalize();
+    if own.scale() > step_decimals {
+        own.to_string()
+    } else {
+        let mut v = own;
+        v.rescale(step_decimals);
+        v.to_string()
+    }
+}
+
+/// A quantity for CLOSING a position, taken from the exchange-reported position (absolute value,
+/// never rounded). It is a different type from [`Quantity`] on purpose: opening orders accept only
+/// `Quantity` (which can only come from lot-size rounding), so a position-derived, unrounded
+/// amount can never be used to open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ClosingQuantity(Decimal);
+
+impl ClosingQuantity {
+    /// Absolute value of the position; zero is an error (nothing to close).
+    pub fn from_exchange_position(position: Decimal) -> Result<ClosingQuantity, QuantityError> {
         if position.is_zero() {
             return Err(QuantityError::NoPosition);
         }
-        Ok(Quantity(position.abs()))
+        Ok(ClosingQuantity(position.abs()))
     }
 
     /// The underlying decimal value.
@@ -81,17 +113,8 @@ impl Quantity {
         self.0
     }
 
-    /// The order string: decimal places derived from `step_size` (never truncates extra digits).
+    /// The order string (never truncates position digits).
     pub fn to_order_string(self, lot: &LotSize) -> String {
-        let step_decimals = lot.step_size.normalize().scale();
-        let own = self.0.normalize();
-        if own.scale() > step_decimals {
-            // e.g. a position-derived quantity finer than the step: never truncate it.
-            own.to_string()
-        } else {
-            let mut v = own;
-            v.rescale(step_decimals);
-            v.to_string()
-        }
+        format_decimal(self.0, lot)
     }
 }

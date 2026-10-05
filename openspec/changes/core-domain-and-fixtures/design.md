@@ -56,6 +56,20 @@ Python 版的持倉模型是「結算前 15 秒進、結算後 15 秒出」，�
 | 資料過期檢查 | 無（`app.py:_get_latest_price` 不看連線狀態） | `DataFresh` | red-team |
 | 持倉衝突檢查 | 無（`confirm_fills` 只看有無持倉） | `ExistingExposure` | red-team |
 | 風控覆寫 | 只存不讀（Fragility #1） | 純函式合併，供執行路徑呼叫 | 使用者保留此功能 |
+| `Liquidity` 檢查 | 無（只有掃描時的成交量門檻） | 兩腿 24h 成交量須 ≥ `min_24h_volume_usdt`，缺資料失敗 | 使用者授權；原 spec 未定義失敗條件 |
+| 基準價為 0 | 略過漂移檢查（靜默通過） | `PriceDrift` 失敗 | 無法計算漂移不得放行；以 fixtures 的 `known_difference` 驗證 |
+| `step_size <= 0` | 原數量不變 | `InvalidStepSize` 錯誤 | 同上 |
+| `ct_val <= 0`（OKX） | 0 張（之後「低於最小量」） | `InvalidContractValue` 錯誤 | 同上 |
+| 多空方向 | 由 rate 高低決定 | 兩方向都算，取 Net Edge 較高者 | 單次結算模型下只有結算腿收付（獨立審查發現） |
+| 平倉數量 | 同一個數量型別 | `ClosingQuantity` 獨立型別 | 防止未取整的持倉數量被用來開倉 |
+
+## 已知限制（獨立審查後接受，未在 core 內強制）
+
+- **人工事件可被偽造**：`ManualEvent` 是公開型別，系統路徑理論上可以直接呼叫 `next(PartialFailure, ManualEvent::RequestClose)`。Rust 無法在型別上禁止，防線在 `engine-simulation`：人工事件只能由來自 UI 的 Command 產生，並由 `opens_exposure`／Command 分類把關。
+- **結算時間以精確相等判定**：兩所 `next_funding_time` 差 1 ms 就只會計入一腿（若被排除的是付錢那腿會高估 edge）。假設各所回報對齊到整點毫秒；`exchange-readonly-adapters` 的週期一致性檢查（容差 60 秒）是第一道防線。
+- **未來的 `observed_at` 視為新鮮**（時鐘偏移或測試資料）；`exchange-readonly-adapters` 的校時負責偵測偏移。
+- **`Decimal` 除法在第 28 位四捨五入**：極端構造的價格可能讓 `notional / price` 往上進位；實際價格範圍內不會發生。
+- **`ReconciledPair` 沒有狀態欄位**：「只配 `RECONCILED`」由呼叫端過濾；「成功那一腿的資料保留」屬引擎層，core 無對應表示。
 
 ## Risks / Trade-offs
 

@@ -46,6 +46,16 @@ OKX 使用 `nextFundingTime − fundingTime`（毫秒）換算為秒。
 - **WHEN** 距離恰為 5000 毫秒
 - **THEN** 不判定為 `STALE`
 
+### Requirement: 有效狀態須同時檢查一致性與過期
+
+取得觀測的「有效狀態」時，系統 SHALL 先檢查一致性：`data_status` 為 `LISTED` 但沒有有效的 funding 週期（缺失、零或負）者，有效狀態 SHALL 為 `DATA_ERROR`，不得信任儲存的狀態欄位。
+其次才套用過期判定。一致性檢查 SHALL 不依賴觀測是經由建構函式、欄位指定或反序列化產生。
+
+#### Scenario: 繞過建構子造出的不一致觀測
+
+- **WHEN** 以欄位指定產生 `data_status = LISTED` 但 `funding_interval_secs` 為空的觀測
+- **THEN** 其有效狀態為 `DATA_ERROR`
+
 ### Requirement: 8h 等效 rate 僅供顯示
 
 系統 SHALL 提供「8h 等效 rate」函式，定義為 `funding_rate × 28800 ÷ funding_interval_secs`。

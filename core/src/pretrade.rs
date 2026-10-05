@@ -90,7 +90,7 @@ pub fn evaluate_pretrade(input: &PretradeInput, limits: &PretradeLimits) -> Pret
         }
     };
 
-    let stale = |at: i64| input.now_ms - at > limits.stale_data_threshold_ms;
+    let stale = |at: i64| input.now_ms.saturating_sub(at) > limits.stale_data_threshold_ms;
     flag(
         Check::DataFresh,
         legs.iter().any(|l| stale(l.price_observed_at_ms) || stale(l.funding_observed_at_ms)),

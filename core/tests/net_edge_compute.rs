@@ -129,25 +129,37 @@ fn non_positive_notional_is_error() {
 }
 
 #[test]
-fn legs_assigned_by_rate_and_tie_keeps_first_as_long() {
+fn evaluate_pair_picks_the_better_orientation_regardless_of_argument_order() {
     let a = listed(Exchange::Binance, "0.0003", 8);
     let b = listed(Exchange::Bybit, "-0.0001", 8);
-    let (l, s) = assign_legs(&a, &b);
-    assert_eq!((l.exchange, s.exchange), (Exchange::Bybit, Exchange::Binance));
-    let (l, s) = assign_legs(&b, &a);
-    assert_eq!((l.exchange, s.exchange), (Exchange::Bybit, Exchange::Binance));
-    let c = listed(Exchange::Okx, "0.0003", 8);
-    let (l, s) = assign_legs(&a, &c);
-    assert_eq!((l.exchange, s.exchange), (Exchange::Binance, Exchange::Okx));
+    let p = params("0", "0", "0", "0");
+    for (x, y) in [(&a, &b), (&b, &a)] {
+        let o = evaluate_pair(x, y, d("1000"), &p).unwrap();
+        assert_eq!((o.edge.long, o.edge.short), (Exchange::Bybit, Exchange::Binance));
+        assert_eq!(o.edge.net_edge_usdt, d("0.4"));
+    }
 }
 
 #[test]
-fn evaluate_pair_orients_legs_regardless_of_argument_order() {
-    let a = listed(Exchange::Binance, "0.0003", 8);
-    let b = listed(Exchange::Bybit, "-0.0001", 8);
+fn orientation_follows_settlement_not_rate_order() {
+    // Reviewer counter-example: both rates positive, only `a` settles (4h vs 8h).
+    // Putting the LOWER rate long would pay 0.2; the other way earns 0.2.
+    let a = listed(Exchange::Binance, "0.0002", 4);
+    let b = listed(Exchange::Bybit, "0.0005", 8);
+    let p = params("0", "0", "0", "0");
+    for (x, y) in [(&a, &b), (&b, &a)] {
+        let o = evaluate_pair(x, y, d("1000"), &p).unwrap();
+        assert_eq!((o.edge.long, o.edge.short), (Exchange::Bybit, Exchange::Binance), "short must be the settling leg");
+        assert_eq!(o.edge.net_edge_usdt, d("0.2"));
+    }
+}
+
+#[test]
+fn equal_orientations_keep_the_first_argument_as_long() {
+    let a = listed(Exchange::Binance, "0.0002", 8);
+    let b = listed(Exchange::Okx, "0.0002", 8);
     let o = evaluate_pair(&a, &b, d("1000"), &params("0", "0", "0", "0")).unwrap();
-    assert_eq!((o.edge.long, o.edge.short), (Exchange::Bybit, Exchange::Binance));
-    assert_eq!(o.edge.net_edge_usdt, d("0.4"));
+    assert_eq!((o.edge.long, o.edge.short), (Exchange::Binance, Exchange::Okx));
 }
 
 #[test]
@@ -186,4 +198,56 @@ fn best_opportunity_propagates_missing_fee() {
     let mut p = params("0.02", "0", "0", "0");
     p.taker_fee_pct.remove(&Exchange::Okx);
     assert_eq!(best_opportunity(&obs, d("1000"), &p), Err(NetEdgeError::MissingTakerFee(Exchange::Okx)));
+}
+
+#[test]
+fn best_opportunity_with_applies_params_per_pair() {
+    // Uniform params pick Okx/Bybit (0.6). Making any pair that involves Okx expensive must
+    // move the choice to Binance/Bybit (0.4), which only a per-pair params function can do.
+    let obs = vec![
+        listed(Exchange::Binance, "0.0010", 8),
+        listed(Exchange::Bybit, "0.0004", 4),
+        listed(Exchange::Okx, "-0.0002", 4),
+    ];
+    let cheap = params("0", "0", "0", "0");
+    let mut pricey = cheap.clone();
+    pricey.est_slippage_pct = Some(d("0.1")); // 4 fills * 0.1% = 0.4% of 1000 = 4 USDT
+    let params_for = |x: Exchange, y: Exchange| if x == Exchange::Okx || y == Exchange::Okx { pricey.clone() } else { cheap.clone() };
+    let best = best_opportunity_with(&obs, d("1000"), &params_for).unwrap().unwrap();
+    assert_eq!((best.edge.long, best.edge.short), (Exchange::Binance, Exchange::Bybit));
+    assert_eq!(best.edge.net_edge_usdt, d("0.4"));
+}
+
+#[test]
+fn best_prefers_a_qualifying_pair_over_a_higher_non_qualifying_one() {
+    // Okx pair has the larger edge but no volume data, so it cannot qualify.
+    let mut okx = listed(Exchange::Okx, "-0.0010", 8);
+    okx.volume_24h_quote = None;
+    let obs = vec![listed(Exchange::Binance, "0.0005", 8), listed(Exchange::Bybit, "0.0001", 8), okx];
+    let p = params("0", "0", "0", "0");
+    let best = best_opportunity(&obs, d("1000"), &p).unwrap().unwrap();
+    assert!(best.qualifies);
+    assert_eq!((best.edge.long, best.edge.short), (Exchange::Bybit, Exchange::Binance));
+}
+
+#[test]
+fn best_returns_the_highest_edge_when_nothing_qualifies() {
+    let mut a = listed(Exchange::Binance, "0.0005", 8);
+    let mut b = listed(Exchange::Okx, "-0.0010", 8);
+    a.volume_24h_quote = None;
+    b.volume_24h_quote = None;
+    let best = best_opportunity(&[a, b], d("1000"), &params("0", "0", "0", "0")).unwrap().unwrap();
+    assert!(!best.qualifies);
+    assert_eq!(best.edge.net_edge_usdt, d("1.5"));
+}
+
+#[test]
+fn listed_observation_without_interval_never_qualifies_even_if_built_by_literal() {
+    // Struct-literal construction bypasses `FundingObservation::new`; the evaluator must not trust it.
+    let mut broken = listed(Exchange::Bybit, "-0.0010", 8);
+    broken.funding_interval_secs = None;
+    assert_eq!(broken.data_status, DataStatus::Listed);
+    let good = listed(Exchange::Binance, "0.0010", 8);
+    let o = evaluate_pair(&good, &broken, d("1000"), &params("0", "0", "0", "-100")).unwrap();
+    assert!(!o.qualifies);
 }

@@ -1,5 +1,5 @@
 {
- "case_count": 163,
+ "case_count": 164,
  "cases": [
   {
    "expected": {
@@ -1950,10 +1950,23 @@
     "qty": "4359.57980929",
     "step_size": "0.0001"
    }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2.500000",
+    "qty": "2.5"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2.5",
+    "step_size": "0"
+   },
+   "known_difference": "step_size_zero"
   }
  ],
  "header": {
-  "exported_at": "2026-10-05T10:30:05Z",
+  "exported_at": "2026-10-05T11:33:45Z",
   "source": {
    "files_sha256": {
     "quantity_precision.py": "ff78b5c9297f2239056db85dcdba2b5dcfa0e18cef017b3b6ede4ad0944a1648"
