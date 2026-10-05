@@ -10,6 +10,7 @@
 //!   `client_order_id`, intent-first submission (tasks 3.1, 4.1).
 //! - `schedule`, `node0`, `fill`: pure scheduling, Node 0 input assembly and fill / timeout
 //!   decisions (tasks 2.1–2.3 logic).
+//! - `recovery`: read-only restart reconciliation and its report for the startup gate (task 4.2).
 #![allow(dead_code)]
 
 pub mod actor;
@@ -20,6 +21,7 @@ pub mod ids;
 pub mod intent;
 pub mod node0;
 pub mod ports;
+pub mod recovery;
 pub mod schedule;
 pub mod sim;
 pub mod timings;
