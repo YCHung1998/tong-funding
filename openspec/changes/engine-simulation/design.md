@@ -140,6 +140,22 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 - **`client_order_id`**：`<sim|demo><l|s><o|c><seq base36 4 碼><uuid 的 FNV-1a 13 碼><uuid 前 0–8 個英數字>`，只用小寫英數、≤ 31 字元（比 spec 的 36 更保守，也落在 OKX `clOrdId` 32 字元以內，**OKX 規則未查證**）。
 - **系統時鐘掃描**只放行 `tokio::time::Instant::now`（可在測試中暫停的計時器，只用於 Snapshot 推送間隔，不蓋事件時間戳）。
 
+## 實作時的決定（wave 2，2026-10-05）
+
+- **自動出場不受 `trigger_mode` 影響**：MANUAL 模式下 RECONCILED 配對到 `T + exit_delay_ms` 仍自動出場（晚平倉比不平倉好），也不受 kill switch 影響。
+- **進場視窗在進場處理內再檢查一次**：`EntryTrigger` 與 `ManualEnter` 在偏移不可用、或時鐘最超前的一腿已到 `T` 時一律拒絕；人工進場可以早於 `T − entry_lead_ms`。
+- **PREPARED 自動撤銷只在 AUTO 執行**：使用基準價資料，外加每 30 秒一次的重新抓取（只在距基準價時點 30 秒以上時進行），讓進場視窗內恰好只有兩次抓取（基準價與送單前）。
+- **送單永遠不回應**：在 `ORDER_SUBMIT` 超過生效的 `order_timeout_seconds` 即視為「結果未知」，進 `FILL_MONITOR` 後以同一 id 查詢，查不到則 `UNRESOLVED`。
+- **平倉數量取自帳戶持倉**（`AccountView`，SIMULATION 時為模擬帳），不取記憶體中的成交量，因此重啟後的人工平倉也正確。沒有持倉的腿略過；方向不符或帳戶不可讀 → `CloseFailed` → `PARTIAL_FAILURE`；平倉後仍有持倉或委託 → `PARTIAL_FAILURE`。
+- **殘留委託不自動撤單**（逾時與平倉前都不撤）：符合「單腿與不平衡完全人工處理」；部分成交後仍掛著的委託會使已平倉確認失敗而轉 `PARTIAL_FAILURE`。
+- **帳戶列表不可讀或不完整視為有外部曝險**（Node 0 的 `ExistingExposure` 失敗）。
+- **kill switch 讀取失敗時不寫 `COMMAND_REFUSED`**：讀取失敗會讓 store 停機，事件無法寫入；停機原因本身即是紀錄。
+- **手動下單的意圖**以 `manual-<now_ms>-<n>` 作為 `pair_uuid`（`pairs` 表沒有對應列）；Buy 視為 long、Sell 視為 short，reduce-only 為 Close，否則 Open。
+- **單位**：`OrderRequest.quantity`、`OrderStatus.filled_quantity`、`AccountPosition.quantity` 一律為交易所下單單位（OKX 為張數）；成交比較一律換成幣本位（張數 × `ct_val`）。
+- **風控設定來源**：store 的 config key `risk`（`RiskConfig`）與 `risk_overrides`；缺少時用預設值，而預設值不完整，所以 Node 0 會 BLOCK（不會用 0 計算）。
+
+**尚待正式接線（不在本 change 的測試範圍）**：`SimPriceBook` 需由行情 `watch` 持續餵價，否則模擬執行器因無價格而拒單；`MarketData::order_rules` 需要真實的 adapter 實作。
+
 ## Open Questions
 
 - Snapshot 最小間隔 250 毫秒、`client_order_id` 長度 36 與字元集、交易所查單保留期限、SQLite 寫入延遲、actor panic 行為皆**未驗證**，分別在 task 1.2、4.1、`exchange-demo-execution` 的驗證中確認。
