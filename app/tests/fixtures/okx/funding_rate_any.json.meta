@@ -1,0 +1,3 @@
+Recorded 2026-10-05T11:55Z from the PUBLIC unsigned endpoint (no API key, no signature).
+Command: curl -s "https://www.okx.com/api/v5/public/funding-rate?instId=ANY"
+TRIMMED: 729 rows -> BTC-USDT-SWAP,ETH-USDT-SWAP,CHIP-USDT-SWAP,BTC-USD-SWAP,XAU-USD_UM_XPERP-310502 (a FUTURES row is kept to test that non-SWAP rows are ignored).

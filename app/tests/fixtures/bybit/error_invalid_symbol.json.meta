@@ -1,0 +1,3 @@
+Recorded 2026-10-05T11:54Z from the PUBLIC unsigned endpoint (no API key, no signature).
+Command: curl -s "https://api.bybit.com/v5/market/tickers?category=linear&symbol=NOPEUSDT"  (HTTP 200 with retCode 10001)
+Untrimmed. Real example of "HTTP 200 but the body says failed".

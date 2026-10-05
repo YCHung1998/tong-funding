@@ -1,0 +1,3 @@
+Recorded 2026-10-05T11:54Z from the PUBLIC unsigned endpoint (no API key, no signature).
+Command: curl -s "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"
+Untrimmed.
