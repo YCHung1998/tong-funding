@@ -28,7 +28,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tong_funding_core::redact::redact_secrets;
 
 use super::events::insert_event_on;
-use super::schema::SCHEMA_V1;
+use super::schema::{FUNDING_LEDGER_INDEX, SCHEMA_V1, SCHEMA_V2};
 use crate::ports::Clock;
 
 /// One schema migration step. `version` must be strictly increasing within a list.
@@ -38,7 +38,10 @@ pub struct Migration {
 }
 
 /// Every migration this build knows about; the last version is the highest supported schema.
-pub const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: SCHEMA_V1 }];
+pub const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }];
+
+/// The highest schema version this build writes.
+pub const LATEST_SCHEMA_VERSION: i64 = 2;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
@@ -258,8 +261,20 @@ const REQUIRED_OBJECTS: &[(&str, &str)] = &[
 const ALLOWED_EVENT_TRIGGERS: &[&str] =
     &["events_no_update", "events_no_delete", "events_no_overwrite", "events_legacy_hash_dedupe"];
 
-fn verify_required_objects(conn: &Connection) -> Result<(), HaltReason> {
-    for (kind, name) in REQUIRED_OBJECTS {
+/// Objects required once the funding-pnl v2 migration of this build has been applied (the
+/// generic migration tests run other v2 SQL, which does not create them).
+fn required_from_v2(migrations: &[Migration], version: i64) -> &'static [(&'static str, &'static str)] {
+    let applied = migrations.iter().any(|m| m.version <= version && m.sql == SCHEMA_V2);
+    if applied { &[("index", FUNDING_LEDGER_INDEX)] } else { &[] }
+}
+
+fn current_version(conn: &Connection) -> Result<i64, HaltReason> {
+    conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0)).map_err(classify)
+}
+
+fn verify_required_objects(conn: &Connection, migrations: &[Migration]) -> Result<(), HaltReason> {
+    let version = current_version(conn)?;
+    for (kind, name) in REQUIRED_OBJECTS.iter().chain(required_from_v2(migrations, version)) {
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2", [kind, name], |r| r.get(0))
             .map_err(classify)?;
@@ -407,7 +422,7 @@ fn open_inner(path: &Path, migrations: &[Migration], existing: bool, perm_events
         if current > supported {
             return Err(HaltReason::SchemaTooNew { found: current, supported });
         }
-        verify_required_objects(&ro)?;
+        verify_required_objects(&ro, migrations)?;
     }
 
     let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(classify)?;
@@ -424,7 +439,7 @@ fn open_inner(path: &Path, migrations: &[Migration], existing: bool, perm_events
     conn.pragma_update(None, "checkpoint_fullfsync", true).map_err(classify)?;
 
     migrate(&mut conn, migrations, current).map_err(|e| HaltReason::MigrationFailed(e.to_string()))?;
-    verify_required_objects(&conn)?;
+    verify_required_objects(&conn, migrations)?;
 
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).map_err(classify)?;
     if !mode.eq_ignore_ascii_case("wal") {
@@ -727,14 +742,80 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_is_created_with_schema_v1() {
+    fn fresh_database_is_created_with_the_latest_schema() {
+        // funding-pnl: the latest schema is v2 (v1 + the funding ledger dedupe index).
         let (dir, db, _) = open_tmp();
         assert!(!db.is_halted());
         for t in ["events", "pairs", "order_intents", "config", "system_flags", "portfolio_history", "schema_version"] {
             assert!(table_exists(&db, t), "missing table {t}");
         }
+        assert!(index_exists(&db, crate::store::schema::FUNDING_LEDGER_INDEX));
         drop(db);
-        assert_eq!(schema_version(&dir.path().join("funding.db")), 1);
+        assert_eq!(schema_version(&dir.path().join("funding.db")), 2);
+    }
+
+    fn index_exists(db: &Db, name: &str) -> bool {
+        db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1", [name], |r| r.get::<_, i64>(0))? == 1))
+            .unwrap()
+    }
+
+    /// A database at schema v1 exactly (as written by the previous release), with `extra` SQL run on it.
+    fn v1_database(path: &Path, extra: &str) {
+        let (c, _) = clock(5);
+        let db = Db::open_with(path, c, &[Migration { version: 1, sql: SCHEMA_V1 }]);
+        assert!(!db.is_halted(), "{:?}", db.halt_reason());
+        drop(db);
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(extra).unwrap();
+    }
+
+    #[test]
+    fn funding_ledger_store_a_v1_database_is_upgraded_to_v2_and_keeps_its_data() {
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        v1_database(&p, "INSERT INTO events (ts_ms, event_type, payload) VALUES (1, 'FUNDING_LEDGER_ENTRY', '{\"dedupe_key\":\"bybit:1\"}');");
+        assert_eq!(schema_version(&p), 1);
+        let (c, _) = clock(9);
+        let db = Db::open(&p, c);
+        assert!(!db.is_halted(), "{:?}", db.halt_reason());
+        assert!(index_exists(&db, crate::store::schema::FUNDING_LEDGER_INDEX));
+        let n: i64 = db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?)).unwrap();
+        assert_eq!(n, 1, "existing events preserved");
+        // From now on the database itself refuses a second event with the same key.
+        let dup = db.with_conn(|c| {
+            Ok(c.execute("INSERT INTO events (ts_ms, event_type, payload) VALUES (2, 'FUNDING_LEDGER_ENTRY', '{\"dedupe_key\":\"bybit:1\"}')", [])?)
+        });
+        assert!(dup.is_err(), "{dup:?}");
+        drop(db);
+        assert_eq!(schema_version(&p), 2);
+    }
+
+    #[test]
+    fn funding_ledger_store_a_failing_v2_migration_rolls_back_and_halts() {
+        // Two v1 events with the same key: the unique index cannot be built.
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        let row = "INSERT INTO events (ts_ms, event_type, payload) VALUES (1, 'FUNDING_LEDGER_ENTRY', '{\"dedupe_key\":\"bybit:1\"}');";
+        v1_database(&p, &format!("{row}{row}"));
+        let before = std::fs::read(&p).unwrap();
+        let (c, _) = clock(9);
+        let db = Db::open(&p, c);
+        assert!(matches!(db.halt_reason(), Some(HaltReason::MigrationFailed(_))), "{:?}", db.halt_reason());
+        drop(db);
+        assert_eq!(schema_version(&p), 1, "rolled back");
+        let conn = Connection::open(&p).unwrap();
+        let idx: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='uniq_funding_ledger_dedupe'", [], |r| r.get(0)).unwrap();
+        assert_eq!(idx, 0, "no half-applied migration");
+        drop(conn);
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    #[test]
+    fn funding_ledger_store_the_authorizer_blocks_dropping_the_dedupe_index() {
+        let (_d, db, _) = open_tmp();
+        let r = db.with_conn(|c| Ok(c.execute_batch("DROP INDEX uniq_funding_ledger_dedupe")?));
+        assert!(r.is_err());
+        assert!(index_exists(&db, crate::store::schema::FUNDING_LEDGER_INDEX));
     }
 
     #[test]
@@ -850,14 +931,15 @@ mod tests {
         let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
-        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 2", []).unwrap();
+        // funding-pnl: this build supports v2, so "newer" is now 3.
+        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 3", []).unwrap();
         let before = std::fs::read(&p).unwrap();
         let (c, _) = clock(9);
         let db = Db::open(&p, c);
-        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 2, supported: 1 }));
+        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 3, supported: 2 }));
         drop(db);
         assert_eq!(std::fs::read(&p).unwrap(), before, "file must not be modified");
-        assert_eq!(schema_version(&p), 2, "no downgrade");
+        assert_eq!(schema_version(&p), 3, "no downgrade");
     }
 
     #[test]
@@ -915,11 +997,13 @@ mod tests {
         assert!(matches!(r, Err(StoreError::Halted(_))));
     }
 
-    const GOOD_V2: &str = "CREATE TABLE v2_added (x INTEGER);";
-    const BAD_V2: &str = "CREATE TABLE half_applied (x INTEGER); THIS IS NOT SQL;";
+    // The generic framework tests add a hypothetical next migration on top of this build's list
+    // (funding-pnl made the real list v1 + v2, so "next" is v3).
+    const GOOD_NEXT: &str = "CREATE TABLE next_added (x INTEGER);";
+    const BAD_NEXT: &str = "CREATE TABLE half_applied (x INTEGER); THIS IS NOT SQL;";
 
-    fn migrations(v2: &'static str) -> Vec<Migration> {
-        vec![Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: v2 }]
+    fn migrations(next: &'static str) -> Vec<Migration> {
+        vec![Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: next }]
     }
 
     #[test]
@@ -928,13 +1012,13 @@ mod tests {
         let p = dir.path().join("funding.db");
         populated(&p);
         let (c, _) = clock(9);
-        let db = Db::open_with(&p, c, &migrations(GOOD_V2));
+        let db = Db::open_with(&p, c, &migrations(GOOD_NEXT));
         assert!(!db.is_halted(), "{:?}", db.halt_reason());
-        assert!(table_exists(&db, "v2_added"));
+        assert!(table_exists(&db, "next_added"));
         let n: i64 = db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM events WHERE event_type='X'", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 400, "existing data preserved");
         drop(db);
-        assert_eq!(schema_version(&p), 2);
+        assert_eq!(schema_version(&p), 3);
     }
 
     #[test]
@@ -944,10 +1028,10 @@ mod tests {
         populated(&p);
         let before = std::fs::read(&p).unwrap();
         let (c, _) = clock(9);
-        let db = Db::open_with(&p, c, &migrations(BAD_V2));
+        let db = Db::open_with(&p, c, &migrations(BAD_NEXT));
         assert!(matches!(db.halt_reason(), Some(HaltReason::MigrationFailed(_))), "{:?}", db.halt_reason());
         drop(db);
-        assert_eq!(schema_version(&p), 1);
+        assert_eq!(schema_version(&p), 2);
         let c = Connection::open(&p).unwrap();
         let n: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='half_applied'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "no half-applied migration");
@@ -987,13 +1071,14 @@ mod tests {
         std::fs::read(p).unwrap_or_default()
     }
 
-    /// A v1 database whose newest data sits only in the `-wal` (as after a crash), schema bumped to 2.
+    /// A database whose newest data sits only in the `-wal` (as after a crash), schema bumped to 3
+    /// (newer than this build's v2; funding-pnl).
     fn crashed_v2_with_wal(p: &Path) {
         populated(p);
         let c = Connection::open(p).unwrap();
         c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
         c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)).unwrap();
-        c.execute("UPDATE schema_version SET version = 2", []).unwrap();
+        c.execute("UPDATE schema_version SET version = 3", []).unwrap();
         drop(c);
         assert!(std::fs::metadata(sidecar(p, "-wal")).unwrap().len() > 0, "fixture must leave a -wal behind");
     }
@@ -1006,7 +1091,7 @@ mod tests {
         let (main_before, wal_before) = (bytes_of(&p), bytes_of(&sidecar(&p, "-wal")));
         let (c, _) = clock(9);
         let db = Db::open(&p, c);
-        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 2, supported: 1 }));
+        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 3, supported: 2 }));
         drop(db);
         assert!(bytes_of(&p) == main_before, "main file must be byte-identical");
         assert!(bytes_of(&sidecar(&p, "-wal")) == wal_before, "-wal must be byte-identical (and still exist)");
@@ -1118,6 +1203,8 @@ mod tests {
             ("TRIGGER", "events_no_update"),
             ("TRIGGER", "events_no_overwrite"),
             ("INDEX", "uniq_prepared_symbol"),
+            // funding-pnl: required from schema v2 on.
+            ("INDEX", "uniq_funding_ledger_dedupe"),
         ] {
             let dir = crate::store::db::test_support::tempdir();
             let p = dir.path().join("funding.db");
@@ -1184,6 +1271,8 @@ mod tests {
         let (c, _) = clock(9);
         let db = Db::open_with(&p, c, &migrations("ALTER TABLE events ADD COLUMN extra TEXT;"));
         assert!(!db.is_halted(), "{:?}", db.halt_reason());
+        drop(db);
+        assert_eq!(schema_version(&p), 3, "the migration really ran");
     }
 
     #[test]

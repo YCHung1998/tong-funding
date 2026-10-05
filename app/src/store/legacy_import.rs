@@ -240,7 +240,8 @@ fn check_connection(conn: &Connection) -> Result<(), ImportError> {
         return Err(ImportError::ConnectionNotConfigured);
     }
     let found: i64 = conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0))?;
-    if found != 1 {
+    // funding-pnl v2 only adds an index; the importer's writes are the same on v1 and v2.
+    if !(1..=super::db::LATEST_SCHEMA_VERSION).contains(&found) {
         return Err(ImportError::UnsupportedSchema { found });
     }
     Ok(())
@@ -845,9 +846,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_src(&dir, &[ev(1791090102.0, "A")]);
         let mut c = mem_db();
-        c.execute("UPDATE schema_version SET version = 2", []).unwrap();
+        // funding-pnl: v2 is supported now, so the unsupported example is 3.
+        c.execute("UPDATE schema_version SET version = 3", []).unwrap();
         let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
-        assert!(matches!(err, ImportError::UnsupportedSchema { found: 2 }), "{err:?}");
+        assert!(matches!(err, ImportError::UnsupportedSchema { found: 3 }), "{err:?}");
         assert_eq!(count(&c), 0);
     }
 
