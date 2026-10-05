@@ -7,12 +7,39 @@ use std::time::Duration;
 
 use super::error::AdapterError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     /// Full URL including the query string.
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub timeout: Duration,
+}
+
+const REDACTED: &str = "[REDACTED]";
+
+/// Header names are useful in logs, header values are where API keys and signatures live: never print them.
+fn redacted_headers(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+    headers.iter().map(|(n, _)| (n.as_str(), REDACTED)).collect()
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("url", &tong_funding_core::redact::redact_secrets(&self.url))
+            .field("headers", &redacted_headers(&self.headers))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for HttpResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("headers", &redacted_headers(&self.headers))
+            .field("body", &self.body)
+            .finish()
+    }
 }
 
 impl HttpRequest {
@@ -25,7 +52,7 @@ impl HttpRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
@@ -125,5 +152,49 @@ mod fake {
             assert!(matches!(get("https://h/zzz"), Err(AdapterError::Network(_))));
             assert_eq!(t.requests().len(), 5);
         }
+    }
+}
+
+#[cfg(test)]
+mod debug_tests {
+    use super::*;
+
+    #[test]
+    fn request_debug_never_prints_header_values_but_keeps_names_url_and_timeout() {
+        let req = HttpRequest::get("https://h/x?symbol=BTC", Duration::from_secs(2))
+            .header("X-MBX-APIKEY", "SUPERSECRETKEY")
+            .header("X-BAPI-SIGN", "deadbeefsig")
+            .header("Authorization", "Bearer tok123");
+        let out = format!("{req:?} / {req:#?}");
+        for secret in ["SUPERSECRETKEY", "deadbeefsig", "tok123"] {
+            assert!(!out.contains(secret), "{secret} leaked: {out}");
+        }
+        assert!(out.contains("X-MBX-APIKEY") && out.contains("X-BAPI-SIGN") && out.contains("[REDACTED]"));
+        assert!(out.contains("https://h/x?symbol=BTC") && out.contains("symbol=BTC"));
+    }
+
+    #[test]
+    fn request_debug_redacts_a_signature_in_the_url_too() {
+        let req = HttpRequest::get("https://h/x?timestamp=1&signature=cafebabe", Duration::from_secs(1));
+        let out = format!("{req:?}");
+        assert!(!out.contains("cafebabe"), "{out}");
+        assert!(out.contains("timestamp=1"));
+    }
+
+    #[test]
+    fn response_debug_hides_header_values_but_shows_status_and_body() {
+        let mut r = HttpResponse::with_status(429, "slow down");
+        r.headers.push(("Set-Cookie".into(), "session=SECRETCOOKIE".into()));
+        r.headers.push(("Retry-After".into(), "5".into()));
+        let out = format!("{r:?}");
+        assert!(!out.contains("SECRETCOOKIE"), "{out}");
+        assert!(out.contains("Set-Cookie") && out.contains("Retry-After") && out.contains("429") && out.contains("slow down"));
+    }
+
+    #[test]
+    fn request_equality_and_clone_still_work() {
+        let a = HttpRequest::get("https://h/", Duration::from_secs(1)).header("A", "1");
+        assert_eq!(a.clone(), a);
+        assert_ne!(a, HttpRequest::get("https://h/", Duration::from_secs(1)).header("A", "2"));
     }
 }

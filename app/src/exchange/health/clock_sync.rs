@@ -11,7 +11,7 @@ use tong_funding_core::types::Exchange;
 
 use crate::exchange::error::AdapterError;
 use crate::exchange::transport::{HttpRequest, HttpTransport};
-use crate::ports::Clock;
+use crate::ports::TimeSource;
 
 /// Server-time paths (host is supplied by the caller; hosts live in the endpoint modules).
 pub const BINANCE_TIME_PATH: &str = "/fapi/v1/time";
@@ -22,6 +22,10 @@ pub const OKX_TIME_PATH: &str = "/api/v5/public/time";
 pub const RESYNC_INTERVAL_MS: i64 = 300_000;
 /// Time-sync request timeout (proposal, unverified).
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(2);
+/// A sample older than this (monotonic time) no longer counts: the state becomes `Unsynced`.
+pub const MAX_SAMPLE_AGE_MS: i64 = 3_600_000;
+/// Samples claiming a clock error beyond one day are rejected as garbage.
+pub const MAX_ABS_OFFSET_MS: i64 = 86_400_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockSample {
@@ -39,9 +43,19 @@ pub enum ClockStatus {
     Synced { offset_ms: i64, rtt_ms: i64, age_ms: i64 },
 }
 
-/// offset = exchange − (sent + received) / 2, rtt = received − sent.
-pub fn compute_sample(sent_ms: i64, received_ms: i64, exchange_ms: i64) -> ClockSample {
-    ClockSample { offset_ms: exchange_ms - (sent_ms + received_ms).div_euclid(2), rtt_ms: received_ms - sent_ms, synced_at_ms: received_ms }
+/// offset = exchange − (sent + received) / 2, rtt = received − sent. All arithmetic is checked;
+/// a sample is rejected if the exchange time is not positive, the RTT is negative or the offset
+/// exceeds one day in either direction.
+pub fn compute_sample(sent_ms: i64, received_ms: i64, exchange_ms: i64) -> Result<ClockSample, AdapterError> {
+    let bad = |why: &str| AdapterError::parse(format!("rejected clock sample: {why}"));
+    if exchange_ms <= 0 {
+        return Err(bad("server time is not positive"));
+    }
+    let rtt_ms = received_ms.checked_sub(sent_ms).filter(|r| *r >= 0).ok_or_else(|| bad("negative or overflowing RTT"))?;
+    // sent + rtt / 2 cannot overflow once rtt is known to be non-negative and received is valid.
+    let midpoint = sent_ms.checked_add(rtt_ms / 2).ok_or_else(|| bad("midpoint overflow"))?;
+    let offset_ms = exchange_ms.checked_sub(midpoint).filter(|o| o.abs() <= MAX_ABS_OFFSET_MS).ok_or_else(|| bad("offset beyond one day"))?;
+    Ok(ClockSample { offset_ms, rtt_ms, synced_at_ms: received_ms })
 }
 
 /// Extracts the exchange's server time (ms) from its time endpoint body.
@@ -73,44 +87,51 @@ pub fn is_timestamp_rejection(e: &AdapterError) -> bool {
 }
 
 pub struct ClockSync {
-    clock: Arc<dyn Clock>,
-    last: Mutex<Option<ClockSample>>,
+    clock: Arc<dyn TimeSource>,
+    /// The sample and the monotonic time at which it was recorded.
+    last: Mutex<Option<(ClockSample, i64)>>,
 }
 
 impl ClockSync {
-    pub fn new(clock: Arc<dyn Clock>) -> Self {
+    pub fn new(clock: Arc<dyn TimeSource>) -> Self {
         Self { clock, last: Mutex::new(None) }
     }
 
-    fn last(&self) -> Option<ClockSample> {
-        *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The current sample, or `None` if never synced or older than [`MAX_SAMPLE_AGE_MS`]
+    /// (monotonic age, so wall-clock steps cannot keep an old offset alive or kill a new one).
+    fn last(&self) -> Option<(ClockSample, i64)> {
+        let (sample, at) = (*self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        let age = self.clock.mono_ms().saturating_sub(at);
+        (0..=MAX_SAMPLE_AGE_MS).contains(&age).then_some((sample, age))
     }
 
     pub fn record_success(&self, sample: ClockSample) {
-        *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(sample);
+        let at = self.clock.mono_ms();
+        *self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((sample, at));
     }
 
     pub fn status(&self) -> ClockStatus {
         match self.last() {
             None => ClockStatus::Unsynced,
-            Some(s) => ClockStatus::Synced { offset_ms: s.offset_ms, rtt_ms: s.rtt_ms, age_ms: self.clock.now_ms() - s.synced_at_ms },
+            Some((s, age_ms)) => ClockStatus::Synced { offset_ms: s.offset_ms, rtt_ms: s.rtt_ms, age_ms },
         }
     }
 
-    /// Local time converted to exchange time; `None` while unsynced.
+    /// Local time converted to exchange time; `None` while unsynced (or on overflow).
     pub fn exchange_now_ms(&self) -> Option<i64> {
-        self.last().map(|s| self.clock.now_ms() + s.offset_ms)
+        let (s, _) = self.last()?;
+        self.clock.now_ms().checked_add(s.offset_ms)
     }
 
     /// True when |offset| > recvWindow / 2 (feeds `alert-banner`).
     pub fn skew_warning(&self, recv_window_ms: i64) -> bool {
-        self.last().is_some_and(|s| s.offset_ms.abs() > recv_window_ms / 2)
+        self.last().is_some_and(|(s, _)| s.offset_ms.unsigned_abs() > (recv_window_ms / 2).unsigned_abs())
     }
 
     pub fn resync_due(&self, interval_ms: i64) -> bool {
         match self.last() {
             None => true,
-            Some(s) => self.clock.now_ms() - s.synced_at_ms >= interval_ms,
+            Some((_, age)) => age >= interval_ms,
         }
     }
 
@@ -122,12 +143,16 @@ impl ClockSync {
             Exchange::Okx => OKX_TIME_PATH,
         };
         let sent = self.clock.now_ms();
+        let sent_mono = self.clock.mono_ms();
         let resp = transport.get(HttpRequest::get(format!("{base_url}{path}"), SYNC_TIMEOUT)).await?;
-        let received = self.clock.now_ms();
+        // RTT from the monotonic clock (immune to wall steps mid-request); the midpoint is placed
+        // on the wall timeline so the offset stays "exchange − local wall".
+        let rtt = self.clock.mono_ms().saturating_sub(sent_mono);
+        let received = sent.saturating_add(rtt);
         if resp.status != 200 {
             return Err(AdapterError::Http { status: resp.status });
         }
-        let sample = compute_sample(sent, received, parse_server_time(exchange, &resp.body)?);
+        let sample = compute_sample(sent, received, parse_server_time(exchange, &resp.body)?)?;
         self.record_success(sample);
         Ok(sample)
     }
@@ -170,13 +195,13 @@ mod tests {
     #[test]
     fn offset_and_rtt_follow_the_spec_example() {
         // sent 1000, received 1200, exchange 1700 => offset 600, rtt 200
-        let s = compute_sample(1000, 1200, 1700);
+        let s = compute_sample(1000, 1200, 1700).unwrap();
         assert_eq!((s.offset_ms, s.rtt_ms, s.synced_at_ms), (600, 200, 1200));
     }
 
     #[test]
     fn negative_offset_when_local_clock_is_ahead() {
-        let s = compute_sample(10_000, 10_100, 9_000);
+        let s = compute_sample(10_000, 10_100, 9_000).unwrap();
         assert_eq!((s.offset_ms, s.rtt_ms), (-1050, 100));
     }
 
@@ -193,7 +218,7 @@ mod tests {
     fn synced_status_reports_offset_rtt_and_age_and_exchange_now() {
         let clock = ManualClock::new(1_200);
         let cs = sync_with(&clock);
-        cs.record_success(compute_sample(1000, 1200, 1700));
+        cs.record_success(compute_sample(1000, 1200, 1700).unwrap());
         clock.advance(4_000);
         assert_eq!(cs.status(), ClockStatus::Synced { offset_ms: 600, rtt_ms: 200, age_ms: 4_000 });
         assert_eq!(cs.exchange_now_ms(), Some(5_200 + 600));
@@ -341,5 +366,76 @@ mod tests {
             async {}
         }));
         assert_eq!((ok, resyncs.get()), (Ok(7), 0));
+    }
+
+    // ------------------------------------------------ round 2: sample validation
+
+    #[test]
+    fn i64_min_server_time_does_not_panic_and_is_rejected() {
+        assert!(compute_sample(0, 10, i64::MIN).is_err());
+        assert!(compute_sample(0, 10, i64::MAX).is_err(), "offset far beyond a day");
+    }
+
+    #[test]
+    fn extreme_local_timestamps_do_not_overflow() {
+        assert!(compute_sample(i64::MAX, i64::MAX, 5).is_err());
+        assert!(compute_sample(i64::MIN, i64::MAX, 5).is_err());
+        assert!(compute_sample(i64::MAX - 1, i64::MAX, 5).is_err());
+    }
+
+    #[test]
+    fn negative_rtt_is_rejected() {
+        assert!(compute_sample(2_000, 1_000, 1_500).is_err());
+        assert!(compute_sample(1_000, 1_000, 1_000).is_ok(), "zero RTT is fine");
+    }
+
+    #[test]
+    fn offset_beyond_one_day_is_rejected_exactly_one_day_is_not() {
+        let day = 86_400_000;
+        assert!(compute_sample(1_000_000, 1_000_000, 1_000_000 + day).is_ok());
+        assert!(compute_sample(1_000_000, 1_000_000, 1_000_000 + day + 1).is_err());
+        assert!(compute_sample(1_000_000_000, 1_000_000_000, 1_000_000_000 - day).is_ok());
+        assert!(compute_sample(1_000_000_000, 1_000_000_000, 1_000_000_000 - day - 1).is_err());
+    }
+
+    #[test]
+    fn non_positive_server_time_is_rejected() {
+        assert!(compute_sample(0, 0, 0).is_err());
+        assert!(compute_sample(0, 0, -5).is_err());
+        assert!(compute_sample(0, 0, 1).is_ok());
+    }
+
+    #[test]
+    fn sync_once_with_an_absurd_server_time_keeps_the_previous_state() {
+        let clock = ManualClock::new(1_000_000);
+        let cs = sync_with(&clock);
+        let t = FakeTransport::new().on("/fapi/v1/time", Ok(HttpResponse::ok(r#"{"serverTime":0}"#)));
+        assert!(matches!(block_on(cs.sync_once(&t, Exchange::Binance, "https://h")), Err(AdapterError::Parse(_))));
+        assert_eq!(cs.status(), ClockStatus::Unsynced);
+    }
+
+    #[test]
+    fn a_sample_older_than_one_hour_makes_the_clock_unsynced_again() {
+        let clock = ManualClock::new(10_000);
+        let cs = sync_with(&clock);
+        cs.record_success(ClockSample { offset_ms: 300, rtt_ms: 80, synced_at_ms: 10_000 });
+        clock.advance(3_600_000);
+        assert!(matches!(cs.status(), ClockStatus::Synced { age_ms: 3_600_000, .. }), "exactly one hour is still synced");
+        clock.advance(1);
+        assert_eq!(cs.status(), ClockStatus::Unsynced);
+        assert_eq!(cs.exchange_now_ms(), None, "signing must stop once the offset is that old");
+        assert!(cs.resync_due(RESYNC_INTERVAL_MS));
+    }
+
+    #[test]
+    fn sample_age_ignores_wall_clock_steps() {
+        let clock = ManualClock::new(10_000_000);
+        let cs = sync_with(&clock);
+        cs.record_success(ClockSample { offset_ms: 0, rtt_ms: 0, synced_at_ms: 10_000_000 });
+        clock.jump_wall(-7_200_000); // wall clock steps back two hours
+        clock.advance(60_000);
+        assert!(matches!(cs.status(), ClockStatus::Synced { age_ms: 60_000, .. }));
+        clock.jump_wall(10 * 3_600_000); // and forward ten hours
+        assert!(matches!(cs.status(), ClockStatus::Synced { age_ms: 60_000, .. }));
     }
 }

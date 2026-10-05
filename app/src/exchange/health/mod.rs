@@ -5,4 +5,5 @@
 pub mod cache;
 pub mod clock_sync;
 pub mod feed;
+pub mod gated;
 pub mod ratelimit;
