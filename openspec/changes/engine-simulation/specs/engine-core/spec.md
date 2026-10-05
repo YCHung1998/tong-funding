@@ -99,11 +99,17 @@ UI SHALL 只接收限頻的 `Snapshot`；兩次推送之間的最小間隔 SHALL
 為供 `funding-pnl` 計算損益，引擎 SHALL 在 `ORDER_SUBMIT` 轉移事件（與轉移同一 transaction）中記錄進場快照：兩腿的預期價格（Node 1 計算數量所用的送單前價格）、基準價與掃描價、資金費率，以及以同一份送單前資料計算的 Net Edge（各組成與門檻）、名目與槓桿。
 每筆送單結果事件（`ORDER_SUBMITTED`）與之後查詢發現的成交變化事件（`ORDER_FILL`）SHALL 記錄該委託的交易所、標的、狀態、成交數量、成交均價、手續費與手續費幣別；交易所未回報的欄位 SHALL 記為空值，SHALL NOT 以推測值填入。
 `ports::OrderStatus` SHALL 帶有 `fee` 與 `fee_asset`（皆可為空）；`SimulatedExecutor` SHALL 回報手續費 0、幣別 `USDT`，其事件仍標記為模擬。
+平倉時，引擎 SHALL 在送出 reduce-only 平倉單之前，以 `MarketData::refetch` 對每一腿的標的重新取得一次最新價格（不使用快取），並在該腿平倉單的 `ORDER_SUBMITTED`／`ORDER_FILL` 事件中與成交明細並列記錄平倉參考價（`reference_price`）、其本地觀測時間（`reference_observed_at_ms`）與來源（`reference_source = refetch_before_close`）。重新取得失敗 SHALL NOT 延誤平倉；該腿事件改記 `reference_error`，平倉滑價為「無參考價」。系統 SHALL NOT 以成交價作為參考價。
 
 #### Scenario: 模擬進場留下完整明細
 
 - **WHEN** SIMULATION 的配對通過 Node 0 並完整成交
 - **THEN** `ORDER_SUBMIT` 事件含兩腿預期價格與 Net Edge 快照，兩筆 `ORDER_SUBMITTED` 事件各含成交價、數量、手續費 0 與幣別 `USDT`，且標記為模擬
+
+#### Scenario: 平倉參考價
+
+- **WHEN** 配對開始平倉，送出平倉單前重新取得的價格為 101，平倉成交均價為 100
+- **THEN** 兩腿平倉的 `ORDER_SUBMITTED` 事件各含 `reference_price` 101、早於送單的觀測時間與成交均價 100；若重新取得失敗，平倉照常送出，事件含 `reference_error` 且不含 `reference_price`
 
 #### Scenario: 稍後查詢才得知的成交
 

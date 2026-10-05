@@ -137,11 +137,11 @@ Bybit 流水有 `orderId`、`size`，但 funding 結算並非由訂單產生；B
 規格有歧義處一律取保守解讀；下列每項都可由使用者推翻。
 
 1. **SIMULATION 配對的 FINALIZED（需使用者確認）**：pair-lifecycle 的 MODIFIED 要求「PnL 已計算」，pnl-accounting 又要求 SIMULATION 不產生 PnL，兩者同時成立時模擬配對永遠無法 FINALIZED（並持續佔用 `max_concurrent_pairs`）。實作為 core `PnlGate` 三值：`Missing`（拒絕）、`Recorded`（指向 `PAIR_PNL_COMPUTED`/`RECOMPUTED`）、`NotApplicableSimulated`（只由引擎給模擬配對）。delta spec 已補一句與一個 scenario。
-2. **人工確認已平倉同樣受限**：delta 寫「進入 FINALIZED 的事件 SHALL 同時附帶兩項確認」，因此 `PARTIAL_FAILURE`／`IMBALANCED`／`UNRESOLVED` 直接 `ConfirmClosed` 的路徑也要 PnL。引擎收到使用者確認時先以「最後一次嘗試」記錄 PnL（缺資料即 INCOMPLETE），再轉移；轉移會被拒絕時（未驗證平倉）不寫 PnL 事件。
+2. **人工確認已平倉同樣受限**（與 exchange-demo-execution 合併後：使用者的 `verified_flat` 不再被採信，系統重查兩腿持倉與委託，平倉才以 `pnl_gate::manual_confirm_pnl` 先記錄 PnL、再落地 `ConfirmClosed { verified_flat: true, pnl }`；重查不通過時不寫 PnL）：delta 寫「進入 FINALIZED 的事件 SHALL 同時附帶兩項確認」，因此 `PARTIAL_FAILURE`／`IMBALANCED`／`UNRESOLVED` 直接 `ConfirmClosed` 的路徑也要 PnL。引擎收到使用者確認時先以「最後一次嘗試」記錄 PnL（缺資料即 INCOMPLETE），再轉移；轉移會被拒絕時（未驗證平倉）不寫 PnL 事件。
 3. **core 轉移表**：`ClosedConfirmed`／`ConfirmClosed` 各帶 `verified_flat × PnlGate`（各 6 種），`SystemEvent::ALL` 20→24、`ManualEvent::ALL` 4→8；合法列 30→34（CLOSING→FINALIZED 兩列、鎖定狀態各三列），窮舉拒絕 12×32−34 = 350 列。
 4. **引擎的等待條件**：`CLOSE_CONFIRMED` 後 EXCHANGE_DEMO 配對維持 `CLOSING`，每個 tick 重算；只有「等待可能解決」的原因（缺少結算流水、流水尚未取得、取得失敗）才等待，最長 `PNL_RETRY_WINDOW_MS`（D9 暫定 10 分鐘，自 `CLOSE_CONFIRMED` 起算、注入時鐘）；其他 INCOMPLETE 原因（無參考價、手續費幣別…）不會因等待而改變，立即記錄後 FINALIZED。等待期間寫一次 `PNL_PENDING`，不重做平倉確認。
 5. **等待只在記憶體**：重啟後 `CLOSING` 配對交給重啟對帳；對帳判定已平倉時以現有資料記錄 PnL（最後一次嘗試）再 FINALIZED，之後資料到齊以 `PAIR_PNL_RECOMPUTED` 補算。
-6. **平倉參考價缺口（跨 change，需使用者決定）**：引擎只在進場時保存參考價（`entry_snapshot.*.expected_price`），平倉送單沒有記錄參考價，因此平倉成交的滑價一律「無參考價」，**目前每筆 demo PnL 都會是 INCOMPLETE**。依 spec 不以成交價代替參考價。建議由 `engine-simulation`／`exchange-demo-execution` 在平倉送單時記錄參考價（例如當下行情價）。
+6. **平倉參考價缺口（已解決，2026-10-05 與 exchange-demo-execution 合併時）**：原本引擎只在進場時保存參考價，平倉滑價一律「無參考價」、每筆 demo PnL 都是 INCOMPLETE。現在引擎在送出 reduce-only 平倉單之前，以 `MarketData::refetch` 對每一腿的標的重新取得一次價格（與已記錄成交量的查詢並行、排在持倉讀取之後，盡量貼近送單時點），寫入該腿平倉 `ORDER_SUBMITTED`／`ORDER_FILL` 的 `reference_price`、`reference_observed_at_ms`、`reference_source = refetch_before_close`。選這個而不是「最後一次已知行情價」是保守做法：快取價可能過期，會把行情變動算成滑價；重新取得的價格保證是平倉決定之後、送單之前觀測的。取得失敗不延誤平倉，事件改記 `reference_error`，PnL 維持 INCOMPLETE（「無參考價」並指出是哪一筆）。`funding::pnl_record` 只讀 `reference_price`（同一委託較早事件有、較晚事件沒有時沿用），**從不以成交價代替**。OKX 腿仍視價格為未知（#8）。模擬配對同樣記錄（不產生 PnL，但成交明細一致）。
 7. **成交時間**：引擎事件沒有交易所端成交時間，以該訂單最新一筆 `ORDER_SUBMITTED`／`ORDER_FILL` 的寫入時間（`ts_ms`）作為成交時間；歸屬窗與預期結算都以此為界。
 8. **OKX 腿**：成交數量是張數且事件沒有記錄面值，且 OKX 沒有流水客戶端；其價格分量視為未知、funding 視為未取得（INCOMPLETE），不猜。
 9. **Bybit transaction-log 沒有 symbol 參數**：每窗取回所有 USDT 永續的 `SETTLEMENT`，全部寫入事件表；不屬於任何配對的保留為「未歸屬」。Binance income 以 symbol 查詢。

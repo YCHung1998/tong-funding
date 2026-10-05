@@ -79,7 +79,7 @@
 - [ ] **5.1 demo 帳戶走完一組配對跨過至少一次結算**（需要引擎接上 App，或 exchange-demo-execution 的實測工具）
   1. 在結算前約 1 分鐘進場、結算後平倉（EXCHANGE_DEMO）。
   2. 平倉確認後，確認系統日誌依序出現：`CLOSE_CONFIRMED` →（流水未齊時）`PNL_PENDING` → `FUNDING_LEDGER_FETCHED`（兩所各一筆以上）→ `PAIR_PNL_COMPUTED` → `FINALIZED`；最多等 10 分鐘（`PNL_RETRY_WINDOW_MS`，暫定）。
-  3. 記下：結算到流水出現的實際延遲（校正 `FETCH_DELAY_MS`／`FETCH_RETRY_MS`／`PNL_RETRY_WINDOW_MS`）、`PAIR_PNL_COMPUTED` 的狀態與原因（預期會有「無參考價」：平倉參考價尚未記錄，design 實作紀錄 #6）、各分量數字、對帳 `PNL_RECONCILIATION` 結果、預期對實際的差異。
+  3. 記下：結算到流水出現的實際延遲（校正 `FETCH_DELAY_MS`／`FETCH_RETRY_MS`／`PNL_RETRY_WINDOW_MS`）、`PAIR_PNL_COMPUTED` 的狀態與原因（平倉參考價已在送平倉單前記錄，design 實作紀錄 #6；兩所流水齊全、手續費有回報時應為 COMPLETE；若出現「無參考價」，查平倉 `ORDER_SUBMITTED` 的 `reference_error`）、各分量數字、對帳 `PNL_RECONCILIATION` 結果、預期對實際的差異。
   4. 再跑一次同一窗的取得，確認 `FUNDING_LEDGER_ENTRY` 筆數不變（去重）。
   5. 把實際數字填進 design.md 的「驗證紀錄」最後一行，回報指令與測試檔路徑。
 
