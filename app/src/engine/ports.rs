@@ -191,8 +191,11 @@ pub trait ServerOffsets: Send + Sync {
 /// store holds unfinished order intents, or pairs that were in flight at shutdown
 /// (PRE_TRADE_CHECK, ORDER_SUBMIT, FILL_MONITOR, CLOSING), the actor sets
 /// `reconciliation_pending` before it handles anything and calls [`StartupReconciler::reconcile`]
-/// once from a spawned task. Until that returns `Ok`, every `opens_exposure()` command is refused
-/// and the scheduler leaves the in-flight pairs alone (it has no fills for them in memory).
+/// from a spawned task, again every `actor::RECONCILE_RETRY_MS` while the result is `Err`. Until
+/// it returns `Ok`, every `opens_exposure()` command is refused in EXCHANGE_DEMO (SIMULATION
+/// entries stay allowed, decision 8; the blocker stays visible) and the scheduler leaves the
+/// pairs in `ReconcileContext::scope` alone (it has no fills for them in memory).
+/// Production implementation: `recovery::RecoveryReconciler`.
 ///
 /// Contract: read-only towards exchanges (query by `client_order_id`, positions, open orders; never
 /// submit, cancel or close); every pair change is landed with `transition::land_then_act` on
@@ -211,4 +214,8 @@ pub struct ReconcileContext {
     pub executor: Arc<dyn Executor>,
     pub account: Arc<dyn AccountView>,
     pub execution_mode: ExecutionMode,
+    /// The pairs (internal uuids, and the `pair_uuid` of unfinished intents without a pair row)
+    /// that were in flight at startup. The reconciler touches nothing else: pairs that started
+    /// after startup are live and belong to the actor, even while a retry runs.
+    pub scope: std::collections::BTreeSet<String>,
 }
