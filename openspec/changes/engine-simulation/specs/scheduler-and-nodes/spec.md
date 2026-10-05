@@ -18,13 +18,13 @@
 ### Requirement: 進出場時點以交易所時間校正
 
 配對的結算時間 `T` SHALL 取兩腿 `next_funding_time` 的較早者，並 SHALL 於配對建立時固定保存。
-進場時點 SHALL 為 `T` 之前 15 秒，出場時點 SHALL 為 `T` 之後 15 秒；比較用的「現在」SHALL 為本機時鐘加上該腿交易所的 `serverTime` 偏移。
+進場時點 SHALL 為 `T` 之前 `entry_lead_ms`（設定值，預設 10 秒），出場時點 SHALL 為 `T` 之後 `exit_delay_ms`（設定值，預設 15 秒）；比較用的「現在」SHALL 為本機時鐘加上該腿交易所的 `serverTime` 偏移。
 偏移不可用時，進場 SHALL NOT 觸發（失敗即封閉）；出場 SHALL 仍可由人工觸發。
 
 #### Scenario: 偏移使時點提前
 
 - **WHEN** 本機時鐘比交易所慢 2 秒（偏移為 +2 秒）、`T` 為 12:00:00（交易所時間）
-- **THEN** 本機時鐘在 11:59:43（交易所時間 11:59:45）時觸發進場
+- **THEN** 以預設 `entry_lead_ms` = 10 秒，本機時鐘在 11:59:48（交易所時間 11:59:50）時觸發進場
 
 #### Scenario: 偏移不可用
 
@@ -33,17 +33,17 @@
 
 ### Requirement: 進場只在結算前的視窗內有效
 
-進場 SHALL 只在 `[T − 15 秒, T)`（以校正後時間計）內觸發；`T` 之後 SHALL NOT 進場，因為此時進場已拿不到該次結算的 funding。
-程式停機或延遲導致錯過視窗時，該配對 SHALL 被取消（轉為 `CANCELLED`），SHALL NOT 補進場。
+進場 SHALL 只在 `[T − entry_lead_ms, T)`（以校正後時間計）內觸發；`T` 之後 SHALL NOT 進場，因為此時進場已拿不到該次結算的 funding。
+程式停機或延遲導致錯過視窗時，引擎 SHALL 先寫入一筆警示事件 `ENTRY_WINDOW_MISSED`，再將該配對取消（轉為 `CANCELLED`），SHALL NOT 補進場。處理策略 SHALL 為可設定的列舉值（目前只有「先警示再取消」）。
 
 #### Scenario: 重啟時已過結算
 
 - **WHEN** 程式重啟時，某 `PREPARED` 配對的 `T` 已過去
-- **THEN** 該配對被取消並記錄「錯過進場視窗」事件，不呼叫任何 `Executor`
+- **THEN** 先有 `ENTRY_WINDOW_MISSED` 警示事件、再轉為 `CANCELLED`，不呼叫任何 `Executor`
 
 ### Requirement: 基準價在進場前重新抓取且與送單前價格分開
 
-引擎 SHALL 在進場時點之前一個固定提前量重新抓取基準價並記錄其 `observed_at`；進場時點的送單前檢查 SHALL 再重新抓取一次最新價格。
+引擎 SHALL 在進場時點之前 `base_price_lead_ms`（設定值，預設 5 秒，即 T−15）重新抓取基準價並記錄其 `observed_at`；進場時點的送單前檢查 SHALL 再重新抓取一次最新價格。
 最新價格的 `observed_at` SHALL 嚴格晚於基準價的 `observed_at`；兩者 SHALL NOT 取自同一份未更新的快取。
 基準價抓取失敗時，送單前檢查 SHALL 依 core 規則退回掃描當時價格，並記錄事件。
 
