@@ -321,6 +321,18 @@ fn pnl_status_missing_fill_details_and_unbalanced_quantities_are_incomplete() {
 }
 
 #[test]
+fn pnl_status_a_pair_without_any_recorded_fill_is_incomplete_not_a_complete_zero() {
+    let p = PairInput {
+        legs: vec![leg(Exchange::Binance, Side::Long, vec![], vec![], 0), leg(Exchange::Bybit, Side::Short, vec![], vec![], 0)],
+        ambiguous_attribution: false,
+        reconciliation_mismatch: false,
+    };
+    let b = compute_pnl(&p);
+    assert!(matches!(&b.status, PnlStatus::Incomplete(r) if r.contains(&IncompleteReason::NoFillsRecorded)), "{:?}", b.status);
+    assert!(b.missing.contains(&Component::Net));
+}
+
+#[test]
 fn pnl_status_reasons_have_a_label_and_serialize() {
     let r = IncompleteReason::MissingSettlement { exchange: Exchange::Bybit, expected: 2, received: 1 };
     assert!(r.label().contains("缺少結算流水"), "{}", r.label());

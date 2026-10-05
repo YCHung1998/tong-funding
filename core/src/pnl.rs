@@ -233,6 +233,9 @@ pub enum IncompleteReason {
     OpenCloseQuantityMismatch { exchange: Exchange, opened: Decimal, closed: Decimal },
     AmbiguousAttribution,
     ReconciliationMismatch,
+    /// No leg has any recorded fill: a PnL is only asked for pairs that held exposure, so the fill
+    /// details are missing (never a complete 0).
+    NoFillsRecorded,
 }
 
 impl IncompleteReason {
@@ -254,6 +257,7 @@ impl IncompleteReason {
             }
             IncompleteReason::AmbiguousAttribution => "流水歸屬不明".to_string(),
             IncompleteReason::ReconciliationMismatch => "對帳差異".to_string(),
+            IncompleteReason::NoFillsRecorded => "成交明細缺漏（沒有任何成交紀錄）".to_string(),
         }
     }
 }
@@ -425,6 +429,10 @@ pub fn compute_pnl(input: &PairInput) -> PnlBreakdown {
     for l in &legs {
         total.add(&l.components);
         missing.extend(l.missing.iter().copied());
+    }
+    if !input.legs.iter().any(|l| l.fills.iter().any(|f| !f.quantity.is_zero())) {
+        reasons.push(IncompleteReason::NoFillsRecorded);
+        missing.extend([Component::PriceRef, Component::PriceActual, Component::OpeningFee, Component::ClosingFee, Component::Slippage, Component::Net]);
     }
     if input.ambiguous_attribution {
         reasons.push(IncompleteReason::AmbiguousAttribution);
