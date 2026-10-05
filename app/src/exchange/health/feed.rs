@@ -19,7 +19,7 @@ use tong_funding_core::types::Decimal;
 
 use super::cache::{MarkPriceCache, MarkPriceEntry};
 use crate::exchange::error::AdapterError;
-use crate::ports::{Clock, EventSink};
+use crate::ports::{EventSink, TimeSource};
 
 pub const EVENT_FETCH_ERROR: &str = "FETCH_ERROR";
 pub const EVENT_FEED_RECOVERED: &str = "FEED_RECOVERED";
@@ -50,7 +50,7 @@ pub struct FeedHealth {
     source: String,
     expected_period_ms: i64,
     stale_data_threshold_ms: i64,
-    clock: Arc<dyn Clock>,
+    clock: Arc<dyn TimeSource>,
     sink: Arc<dyn EventSink>,
     inner: Mutex<HealthInner>,
 }
@@ -58,15 +58,19 @@ pub struct FeedHealth {
 #[derive(Default)]
 struct HealthInner {
     connected: bool,
+    /// Monotonic ms of the (re)connection.
     connected_at: i64,
+    /// Wall-clock ms of the last success (for display only).
     last_success_at: Option<i64>,
+    /// Monotonic ms of the last success: every age / silence decision uses this one.
+    last_success_mono: Option<i64>,
     consecutive_failures: u32,
-    /// (error kind, time the failure episode began)
+    /// (error kind, monotonic ms at which the failure episode began)
     failure: Option<(String, i64)>,
 }
 
 impl FeedHealth {
-    pub fn new(source: &str, expected_period_ms: i64, stale_data_threshold_ms: i64, clock: Arc<dyn Clock>, sink: Arc<dyn EventSink>) -> Self {
+    pub fn new(source: &str, expected_period_ms: i64, stale_data_threshold_ms: i64, clock: Arc<dyn TimeSource>, sink: Arc<dyn EventSink>) -> Self {
         Self { source: source.to_string(), expected_period_ms, stale_data_threshold_ms, clock, sink, inner: Mutex::new(HealthInner::default()) }
     }
 
@@ -81,7 +85,7 @@ impl FeedHealth {
 
     /// The transport connected (not yet a recovery: that needs data).
     pub fn on_connected(&self) {
-        let now = self.clock.now_ms();
+        let now = self.clock.mono_ms();
         let mut g = self.lock();
         g.connected = true;
         g.connected_at = now;
@@ -89,11 +93,12 @@ impl FeedHealth {
 
     /// A message / poll succeeded.
     pub fn on_success(&self) {
-        let now = self.clock.now_ms();
+        let (now, wall) = (self.clock.mono_ms(), self.clock.now_ms());
         let recovered = {
             let mut g = self.lock();
             g.connected = true;
-            g.last_success_at = Some(now);
+            g.last_success_at = Some(wall);
+            g.last_success_mono = Some(now);
             g.consecutive_failures = 0;
             g.failure.take()
         };
@@ -116,13 +121,14 @@ impl FeedHealth {
     /// Connected but silent past the threshold: marks the source disconnected and returns true
     /// (the caller must reconnect).
     pub fn check_silence(&self) -> bool {
-        let now = self.clock.now_ms();
+        let now = self.clock.mono_ms();
         let threshold = self.stale_threshold_ms();
         let silent = {
             let g = self.lock();
             // Measured from the later of the last message and the (re)connection.
-            let reference = g.last_success_at.unwrap_or(i64::MIN).max(g.connected_at);
-            g.connected && now - reference > threshold
+            let reference = g.last_success_mono.unwrap_or(i64::MIN).max(g.connected_at);
+            // A negative gap cannot happen on a monotonic clock; if it ever does, treat as silent.
+            g.connected && (now < reference || now - reference > threshold)
         };
         if silent {
             self.fail("Stale", &format!("no message for more than {threshold} ms"));
@@ -131,7 +137,7 @@ impl FeedHealth {
     }
 
     fn fail(&self, kind: &str, message: &str) {
-        let now = self.clock.now_ms();
+        let now = self.clock.mono_ms();
         let emit = {
             let mut g = self.lock();
             g.connected = false;
@@ -159,10 +165,11 @@ impl FeedHealth {
     }
 
     pub fn snapshot(&self) -> HealthSnapshot {
-        let now = self.clock.now_ms();
+        let now = self.clock.mono_ms();
         let threshold = self.stale_threshold_ms();
         let g = self.lock();
-        let stale = !g.connected || g.last_success_at.is_none_or(|t| now - t > threshold);
+        // Unknown or impossible (negative) age is stale, never "fine".
+        let stale = !g.connected || g.last_success_mono.is_none_or(|t| now < t || now - t > threshold);
         HealthSnapshot {
             source: self.source.clone(),
             connected: g.connected,
@@ -279,6 +286,9 @@ pub struct TungsteniteSource {
     stream: Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
 }
 
+/// Largest WebSocket message / frame accepted (8 MiB). The real frames are ~125 KB.
+pub const MAX_WS_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Handshake time limit (proposal, unverified).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -291,7 +301,10 @@ impl TungsteniteSource {
 impl MessageSource for TungsteniteSource {
     async fn connect(&mut self) -> Result<(), AdapterError> {
         self.stream = None;
-        match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(self.url.as_str())).await {
+        let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+            .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_WS_MESSAGE_BYTES));
+        match tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async_with_config(self.url.as_str(), Some(config), false)).await {
             Err(_) => Err(AdapterError::Timeout),
             Ok(Err(e)) => Err(AdapterError::network(e.to_string())),
             Ok(Ok((stream, _response))) => {
@@ -326,7 +339,7 @@ impl MessageSource for TungsteniteSource {
 }
 
 pub struct MarkPriceFeed {
-    clock: Arc<dyn Clock>,
+    clock: Arc<dyn TimeSource>,
     health: Arc<FeedHealth>,
     cache: Arc<MarkPriceCache>,
 }
@@ -334,7 +347,7 @@ pub struct MarkPriceFeed {
 impl MarkPriceFeed {
     pub const SOURCE: &'static str = "binance_ws_mark_price";
 
-    pub fn new(clock: Arc<dyn Clock>, sink: Arc<dyn EventSink>, stale_data_threshold_ms: i64) -> Self {
+    pub fn new(clock: Arc<dyn TimeSource>, sink: Arc<dyn EventSink>, stale_data_threshold_ms: i64) -> Self {
         let health = Arc::new(FeedHealth::new(
             Self::SOURCE,
             crate::exchange::public::feed_endpoints::BINANCE_MARK_PRICE_PERIOD_MS,
@@ -355,16 +368,16 @@ impl MarkPriceFeed {
     }
 
     /// Handles one text frame: parse, merge into the cache, mark the source healthy.
-    /// Returns true if the frame was a valid mark-price message (even an empty one).
+    /// Returns true only if the frame carried at least one valid item. `[]`, frames whose items
+    /// were all skipped, subscription acks and garbage are not data, hence not a sign of life.
     pub fn handle_text(&self, text: &str) -> bool {
         match parse_mark_price_message(text, self.clock.now_ms()) {
-            Ok(entries) => {
+            Ok(entries) if !entries.is_empty() => {
                 self.cache.apply(entries);
                 self.health.on_success();
                 true
             }
-            // Subscription acks, garbage: not data, so not a sign of life either.
-            Err(_) => false,
+            _ => false,
         }
     }
 
@@ -387,11 +400,7 @@ impl MarkPriceFeed {
                             backoff.reset();
                         }
                     }
-                    FeedEvent::Idle => {
-                        if self.health.check_silence() {
-                            break;
-                        }
-                    }
+                    FeedEvent::Idle => {}
                     FeedEvent::Closed(reason) => {
                         self.health.on_disconnect(reason.as_deref().unwrap_or("connection closed"));
                         break;
@@ -401,6 +410,10 @@ impl MarkPriceFeed {
                         break;
                     }
                     FeedEvent::Shutdown => return,
+                }
+                // Every round, not only on Idle: a socket that keeps sending junk is still silent.
+                if self.health.check_silence() {
+                    break;
                 }
             }
             sleeper.sleep(backoff.next_delay()).await;
@@ -416,7 +429,7 @@ mod tests {
     use tong_funding_core::types::Decimal;
 
     use super::*;
-    use crate::ports::{ManualClock, MemoryEventSink};
+    use crate::ports::{Clock, ManualClock, MemoryEventSink};
 
     fn dec(s: &str) -> Decimal {
         Decimal::from_str(s).unwrap()
@@ -757,7 +770,7 @@ mod tests {
         block_on(l.feed.run(&mut src, &l.sleeper));
         let c = l.feed.cache().get("BTCUSDT").expect("cached");
         assert_eq!(c.observed_at, 1_000_000);
-        assert_eq!(c.data.mark_price, dec("86186.20"));
+        assert_eq!(c.data_even_if_stale().mark_price, dec("86186.20"));
         assert!(c.health.connected && !c.health.stale && c.is_fresh());
         assert_eq!(l.feed.cache().len(), 2);
     }
@@ -772,8 +785,8 @@ mod tests {
         );
         block_on(l.feed.run(&mut src, &l.sleeper));
         let cache = l.feed.cache();
-        assert_eq!((cache.get("A").unwrap().observed_at, cache.get("A").unwrap().data.mark_price), (1_001_000, dec("2")));
-        assert_eq!((cache.get("B").unwrap().observed_at, cache.get("B").unwrap().data.mark_price), (1_000_000, dec("1")));
+        assert_eq!((cache.get("A").unwrap().observed_at, cache.get("A").unwrap().data_even_if_stale().mark_price), (1_001_000, dec("2")));
+        assert_eq!((cache.get("B").unwrap().observed_at, cache.get("B").unwrap().data_even_if_stale().mark_price), (1_000_000, dec("1")));
     }
 
     #[test]
@@ -892,7 +905,7 @@ mod tests {
     #[ignore = "network: connects to the public Binance stream for 25 seconds"]
     fn real_binance_stream_25s_update_intervals() {
         use std::collections::HashMap;
-        let clock: Arc<dyn Clock> = Arc::new(crate::ports::SystemClock);
+        let clock: Arc<dyn TimeSource> = Arc::new(crate::ports::SystemClock);
         let sink = Arc::new(MemoryEventSink::default());
         let feed = MarkPriceFeed::new(clock.clone(), sink.clone(), 1_000);
         let mut src = Recording {
@@ -927,5 +940,110 @@ mod tests {
         println!("final health: {snap:?}");
         assert!(!src.frames.is_empty(), "no frame received in 25 s");
         assert!(feed.cache().len() > 100);
+    }
+
+    // ----------------------------------------------- round 2: validity, silence, floods
+
+    #[test]
+    fn empty_or_all_skipped_frames_are_not_a_successful_message() {
+        let l = make_loop();
+        assert!(!l.feed.handle_text("[]"));
+        assert!(!l.feed.handle_text(r#"[{"s":"X"},{"E":1}]"#));
+        assert!(l.feed.health().snapshot().last_success_at.is_none());
+        assert!(l.feed.handle_text(&frame(&[("A", "1")])));
+        assert!(l.feed.health().snapshot().last_success_at.is_some());
+    }
+
+    #[test]
+    fn empty_frames_do_not_reset_the_reconnect_backoff() {
+        let l = make_loop();
+        let refused = || Err(AdapterError::network("refused"));
+        let mut src = Scripted::new(&l.clock, vec![refused(), refused(), Ok(())], vec![Step::Text("[]".into()), Step::Closed]);
+        block_on(l.feed.run(&mut src, &l.sleeper));
+        let secs: Vec<u64> = l.sleeper.slept.lock().unwrap().iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, vec![1, 2, 4], "[] after the third connect must not reset the delay to 1 s");
+    }
+
+    #[test]
+    fn two_hundred_non_data_frames_over_80_seconds_force_a_reconnect() {
+        let l = make_loop();
+        let mut steps = Vec::new();
+        for _ in 0..200 {
+            steps.push(Step::Text("[]".into()));
+            steps.push(Step::Advance(400));
+        }
+        let mut src = Scripted::new(&l.clock, vec![], steps);
+        block_on(l.feed.run(&mut src, &l.sleeper));
+        assert!(src.connect_count >= 2, "a live socket that only sends junk is silent and must be reconnected");
+        assert_eq!(l.sink.events()[0].payload["error_kind"], "Stale");
+    }
+
+    #[test]
+    fn data_frames_arriving_continuously_keep_the_connection_even_without_idle_wakeups() {
+        let l = make_loop();
+        let mut steps = Vec::new();
+        for _ in 0..100 {
+            steps.push(Step::Text(frame(&[("A", "1")])));
+            steps.push(Step::Advance(1_000));
+        }
+        let mut src = Scripted::new(&l.clock, vec![], steps);
+        block_on(l.feed.run(&mut src, &l.sleeper));
+        assert_eq!(src.connect_count, 1);
+        assert!(l.sink.events().is_empty());
+    }
+
+    #[test]
+    fn a_thousand_connect_empty_close_cycles_do_not_flood_the_event_log() {
+        let l = make_loop();
+        let mut steps = Vec::new();
+        for _ in 0..1_000 {
+            steps.push(Step::Text("[]".into()));
+            steps.push(Step::Closed);
+        }
+        let mut src = Scripted::new(&l.clock, vec![], steps);
+        block_on(l.feed.run(&mut src, &l.sleeper));
+        assert!(src.connect_count >= 1_000);
+        let n = l.sink.events().len();
+        assert!(n <= 2, "got {n} events");
+    }
+
+    // ----------------------------------------- websocket message size limit (local server)
+
+    /// Local WebSocket server: sends the given text messages, then idles. Returns its port.
+    async fn ws_server(messages: Vec<String>) -> u16 {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+            for m in messages {
+                if ws.send(Message::Text(m.into())).await.is_err() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        port
+    }
+
+    #[test]
+    fn a_websocket_message_over_8_mib_is_an_error_event_and_one_under_it_is_delivered() {
+        assert_eq!(MAX_WS_MESSAGE_BYTES, 8 * 1024 * 1024);
+        block_on(async {
+            let port = ws_server(vec!["x".repeat(1024 * 1024), "y".repeat(9 * 1024 * 1024)]).await;
+            let mut src = TungsteniteSource::new(format!("ws://127.0.0.1:{port}"));
+            src.connect().await.unwrap();
+            match src.next_event(Duration::from_secs(5)).await {
+                FeedEvent::Text(t) => assert_eq!(t.len(), 1024 * 1024),
+                other => panic!("expected the 1 MiB message, got {other:?}"),
+            }
+            match src.next_event(Duration::from_secs(5)).await {
+                FeedEvent::Error(e) => assert!(e.to_lowercase().contains("size") || e.to_lowercase().contains("too big") || e.to_lowercase().contains("capacity") || e.to_lowercase().contains("space"), "{e}"),
+                FeedEvent::Text(t) => panic!("a {} byte message was accepted", t.len()),
+                other => panic!("expected an error for the 9 MiB message, got {other:?}"),
+            }
+        });
     }
 }

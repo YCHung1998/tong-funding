@@ -21,6 +21,15 @@ pub enum Violation {
     EnvOrConfigRead(String),
     /// POST / PUT / DELETE / PATCH in a read-only client.
     NonGetMethod(String),
+    /// A `cfg` attribute that is not exactly `#[cfg(test)] mod name { .. }` / `mod name;`, or an
+    /// inner `#![cfg(..)]` that is not at the head of the file: it could hide code from the scan.
+    CfgAttribute(String),
+    /// `concat!`, `include_str!`, `env!`, ...: ways to build or load a host the scan cannot see.
+    ForbiddenMacro(String),
+    /// `\x..`, `\u{..}` or a line-continuation backslash inside a string literal.
+    EscapedString(String),
+    /// The signed client names the `public` module (it must not share the public clients' hosts).
+    ImportsPublic,
 }
 
 fn is_ident(b: u8) -> bool {
@@ -60,13 +69,23 @@ fn raw_string_start(b: &[u8], i: usize) -> Option<(usize, usize)> {
     }
 }
 
-/// Returns (code, structure): both have comments blanked; `structure` additionally has string and
-/// char literal contents blanked, so brace matching and keyword search cannot be fooled by them.
-fn mask(src: &str) -> (Vec<u8>, Vec<u8>) {
+/// One string literal's content range and whether it is a raw string.
+#[derive(Debug, Clone, Copy)]
+struct Lit {
+    start: usize,
+    end: usize,
+    raw: bool,
+}
+
+/// Returns (code, structure, literals): both buffers have comments blanked; `structure` additionally
+/// has string and char literal contents blanked, so brace matching and keyword search cannot be
+/// fooled by them. `literals` lists the string literals found (ranges into `code`).
+fn mask(src: &str) -> (Vec<u8>, Vec<u8>, Vec<Lit>) {
     let b = src.as_bytes();
     let n = b.len();
     let mut code = b.to_vec();
     let mut structure = b.to_vec();
+    let mut lits = Vec::new();
     let mut i = 0;
     while i < n {
         let c = b[i];
@@ -96,6 +115,7 @@ fn mask(src: &str) -> (Vec<u8>, Vec<u8>) {
             let mut closer = vec![b'"'];
             closer.extend(std::iter::repeat_n(b'#', hashes));
             let end = find_from(b, &closer, start).unwrap_or(n);
+            lits.push(Lit { start, end: end.min(n), raw: true });
             blank(&mut structure, start, end);
             i = (end + closer.len()).min(n);
         } else if c == b'"' {
@@ -105,6 +125,7 @@ fn mask(src: &str) -> (Vec<u8>, Vec<u8>) {
                 j += if b[j] == b'\\' { 2 } else { 1 };
             }
             let end = j.min(n);
+            lits.push(Lit { start, end, raw: false });
             blank(&mut structure, start, end);
             i = (end + 1).min(n);
         } else if c == b'\'' {
@@ -129,7 +150,7 @@ fn mask(src: &str) -> (Vec<u8>, Vec<u8>) {
             i += 1;
         }
     }
-    (code, structure)
+    (code, structure, lits)
 }
 
 fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -139,68 +160,170 @@ fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     hay[from..].windows(needle.len()).position(|w| w == needle).map(|p| p + from)
 }
 
-/// Index just past the item that starts at `from` (up to a `;` or a balanced `{ ... }`).
-fn item_end(structure: &[u8], from: usize) -> usize {
-    let mut i = from;
+/// Index just past the `}` matching the `{` at `open`.
+fn matching_brace(structure: &[u8], open: usize) -> usize {
+    let mut depth = 0usize;
+    let mut i = open;
     while i < structure.len() {
         match structure[i] {
-            b';' => return i + 1,
-            b'{' => {
-                let mut depth = 0usize;
-                while i < structure.len() {
-                    match structure[i] {
-                        b'{' => depth += 1,
-                        b'}' => {
-                            depth = depth.saturating_sub(1);
-                            if depth == 0 {
-                                return i + 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                    i += 1;
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return i + 1;
                 }
-                return structure.len();
             }
-            _ => i += 1,
+            _ => {}
         }
+        i += 1;
     }
     structure.len()
 }
 
-/// Source with comments blanked out and `#[cfg(test)]` items removed; string literals kept.
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && b[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+fn starts_with_at(b: &[u8], i: usize, pat: &[u8]) -> bool {
+    b.len() >= i + pat.len() && &b[i..i + pat.len()] == pat
+}
+
+/// The part of a file that counts as production code.
+struct Production {
+    /// Comments blanked, test-only modules blanked, string literals kept.
+    code: String,
+    /// Same, with string and char literal contents blanked too.
+    structure: String,
+    /// `cfg` attributes that are not the one allowed shape.
+    violations: Vec<Violation>,
+}
+
+/// After `#[cfg(test)]` at `after_attr`, accepts exactly `[pub[(..)]] mod name { ... }` or
+/// `mod name;` and returns the end of that item.
+fn complete_test_mod(structure: &[u8], after_attr: usize) -> Option<usize> {
+    let mut i = skip_ws(structure, after_attr);
+    if starts_with_at(structure, i, b"pub") && !structure.get(i + 3).is_some_and(|c| is_ident(*c)) {
+        i = skip_ws(structure, i + 3);
+        if structure.get(i) == Some(&b'(') {
+            i = structure[i..].iter().position(|&c| c == b')').map(|p| i + p + 1)?;
+            i = skip_ws(structure, i);
+        }
+    }
+    if !starts_with_at(structure, i, b"mod") || structure.get(i + 3).is_some_and(|c| is_ident(*c)) {
+        return None;
+    }
+    i = skip_ws(structure, i + 3);
+    let name_start = i;
+    while i < structure.len() && is_ident(structure[i]) {
+        i += 1;
+    }
+    if i == name_start {
+        return None;
+    }
+    i = skip_ws(structure, i);
+    match structure.get(i) {
+        Some(b';') => Some(i + 1),
+        Some(b'{') => Some(matching_brace(structure, i)),
+        _ => None,
+    }
+}
+
+fn production(src: &str) -> Production {
+    let (mut code, mut structure, _) = mask(src);
+    let mut violations = Vec::new();
+    let finish = |code: Vec<u8>, structure: Vec<u8>, violations| Production {
+        code: String::from_utf8_lossy(&code).into_owned(),
+        structure: String::from_utf8_lossy(&structure).into_owned(),
+        violations,
+    };
+
+    // Inner attributes: only a `#![cfg(test)]` among the attributes at the very head of the file
+    // makes the whole file test-only; any other inner cfg is a violation.
+    let mut head = skip_ws(&structure, 0);
+    let mut head_inner_end = head;
+    while starts_with_at(&structure, head, b"#![") {
+        let close = structure[head..].iter().position(|&c| c == b']').map_or(structure.len(), |p| head + p + 1);
+        if &structure[head..close] == b"#![cfg(test)]" {
+            let len = code.len();
+            blank(&mut code, 0, len);
+            blank(&mut structure, 0, len);
+            return finish(code, structure, violations);
+        }
+        head = skip_ws(&structure, close);
+        head_inner_end = head;
+    }
+    let _ = head_inner_end;
+
+    let mut from = 0;
+    while let Some(at) = find_from(&structure, b"#", from) {
+        from = at + 1;
+        let inner = starts_with_at(&structure, at + 1, b"!");
+        let bracket = skip_ws(&structure, at + 1 + usize::from(inner));
+        if structure.get(bracket) != Some(&b'[') {
+            continue;
+        }
+        let name = skip_ws(&structure, bracket + 1);
+        if !starts_with_at(&structure, name, b"cfg") {
+            continue;
+        }
+        let attr_end = structure[name..].iter().position(|&c| c == b']').map_or(structure.len(), |p| name + p + 1);
+        let attr = String::from_utf8_lossy(&structure[at..attr_end]).into_owned();
+        if !inner && &structure[at..attr_end] == b"#[cfg(test)]" {
+            if let Some(end) = complete_test_mod(&structure, attr_end) {
+                blank(&mut code, at, end);
+                blank(&mut structure, at, end);
+                from = end;
+                continue;
+            }
+        }
+        violations.push(Violation::CfgAttribute(attr.split_whitespace().collect::<Vec<_>>().join(" ")));
+    }
+    finish(code, structure, violations)
+}
+
+/// Source with comments blanked out and `#[cfg(test)] mod` items removed; string literals kept.
 /// (Blanked ranges become spaces, newlines are kept, so lines are preserved.)
 pub fn production_code(src: &str) -> String {
-    let (mut code, structure) = mask(src);
-    if find_from(&structure, b"#![cfg(test)]", 0).is_some() {
-        let len = code.len();
-        blank(&mut code, 0, len);
-        return String::from_utf8_lossy(&code).into_owned();
-    }
-    let mut from = 0;
-    while let Some(at) = find_from(&structure, b"#[cfg(test)]", from) {
-        let end = item_end(&structure, at + b"#[cfg(test)]".len());
-        blank(&mut code, at, end);
-        from = end;
-    }
-    String::from_utf8_lossy(&code).into_owned()
+    production(src).code
 }
 
 fn norm(ident: &str) -> String {
     ident.to_ascii_lowercase().replace('_', "")
 }
 
-fn is_host_ident(ident: &str) -> bool {
-    matches!(norm(ident).as_str(), "baseurl" | "baseuri" | "host" | "hostname")
+/// A parameter or field name that smells like "where to connect".
+fn is_host_like_name(ident: &str) -> bool {
+    let n = norm(ident);
+    ["baseurl", "baseuri", "host", "endpoint", "url", "root", "uri"].iter().any(|w| n.contains(w))
 }
 
-fn idents(text: &str) -> Vec<&str> {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).collect()
+/// Splits `text` at top-level commas (not inside `<>`, `()`, `[]`, `{}`).
+fn split_top_level(text: &str) -> Vec<&str> {
+    let (mut depth, mut start, mut out) = (0i32, 0usize, Vec::new());
+    let bytes = text.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        match c {
+            b'<' | b'(' | b'[' | b'{' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {} // `->`
+            b'>' | b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                out.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&text[start..]);
+    out
 }
 
-/// Public fns that take a host / base URL parameter, and public fields of that name.
-fn external_base_url(code: &str) -> Vec<Violation> {
-    let b = code.as_bytes();
+/// Public fns with a host-like PARAMETER NAME, and public fields with a host-like name.
+/// Names only: types and the fn's own name are not looked at.
+fn external_base_url(structure: &str) -> Vec<Violation> {
+    let b = structure.as_bytes();
     let mut out = Vec::new();
     let mut from = 0;
     while let Some(at) = find_from(b, b"pub", from) {
@@ -208,35 +331,156 @@ fn external_base_url(code: &str) -> Vec<Violation> {
         if (at > 0 && is_ident(b[at - 1])) || from >= b.len() || is_ident(b[from]) {
             continue; // part of a longer identifier
         }
-        let mut i = from;
-        while i < b.len() && b[i].is_ascii_whitespace() {
-            i += 1;
+        let mut i = skip_ws(b, from);
+        if b.get(i) == Some(&b'(') {
+            i = b[i..].iter().position(|&c| c == b')').map_or(b.len(), |p| i + p + 1);
+            i = skip_ws(b, i);
         }
-        if i < b.len() && b[i] == b'(' {
-            // pub(crate) / pub(super) / pub(in path)
-            while i < b.len() && b[i] != b')' {
+        let rest = &structure[i.min(structure.len())..];
+        let rb = rest.as_bytes();
+        // qualifiers, then `fn`
+        let mut j = 0;
+        let mut word_end = |j: &mut usize| {
+            let s = skip_ws(rb, *j);
+            let mut e = s;
+            while e < rb.len() && is_ident(rb[e]) {
+                e += 1;
+            }
+            *j = e;
+            &rest[s..e]
+        };
+        let mut w = word_end(&mut j);
+        let mut had_qualifier = false;
+        while matches!(w, "async" | "const" | "unsafe" | "extern") {
+            had_qualifier = true;
+            w = word_end(&mut j);
+        }
+        if w == "fn" {
+            let _name = word_end(&mut j);
+            // optional generics, then the parameter list
+            let mut k = skip_ws(rb, j);
+            if rb.get(k) == Some(&b'<') {
+                let mut depth = 0i32;
+                while k < rb.len() {
+                    match rb[k] {
+                        b'<' => depth += 1,
+                        b'>' if k > 0 && rb[k - 1] != b'-' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                k += 1;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                k = skip_ws(rb, k);
+            }
+            if rb.get(k) != Some(&b'(') {
+                continue;
+            }
+            let mut depth = 0i32;
+            let mut close = rb.len();
+            for (m, &c) in rb.iter().enumerate().skip(k) {
+                match c {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = m;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for param in split_top_level(&rest[k + 1..close.min(rest.len())]) {
+                let name_part = param.split(':').next().unwrap_or("");
+                if idents(name_part).iter().any(|t| !matches!(*t, "mut" | "self" | "ref") && is_host_like_name(t)) {
+                    out.push(Violation::ExternalBaseUrl(format!("pub fn parameter `{}`", name_part.trim())));
+                }
+            }
+        } else if !had_qualifier && !w.is_empty() && !matches!(w, "struct" | "enum" | "mod" | "use" | "const" | "static" | "trait" | "type" | "union") {
+            // `pub name: Type` field
+            let after = skip_ws(rb, j);
+            if rb.get(after) == Some(&b':') && rb.get(after + 1) != Some(&b':') && is_host_like_name(w) {
+                out.push(Violation::ExternalBaseUrl(format!("pub field {w}")));
+            }
+        }
+    }
+    out
+}
+
+fn idents(text: &str) -> Vec<&str> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).filter(|t| !t.is_empty()).collect()
+}
+
+const FORBIDDEN_MACROS: [&str; 7] = ["concat", "include_str", "include_bytes", "include", "env", "option_env", "stringify"];
+
+/// Macros that can build or load a host the scan cannot read.
+fn forbidden_macros(structure: &str) -> Vec<Violation> {
+    let b = structure.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if is_ident(b[i]) {
+            let s = i;
+            while i < b.len() && is_ident(b[i]) {
                 i += 1;
             }
+            let word = &structure[s..i];
+            let bang = skip_ws(b, i);
+            if b.get(bang) == Some(&b'!') && b.get(bang + 1) != Some(&b'=') && FORBIDDEN_MACROS.contains(&word) {
+                out.push(Violation::ForbiddenMacro(format!("{word}!")));
+            }
+        } else {
             i += 1;
-            while i < b.len() && b[i].is_ascii_whitespace() {
+        }
+    }
+    out
+}
+
+/// `\x..`, `\u{..}` and line-continuation backslashes inside (non-raw) string literals.
+fn escaped_strings(code: &str, lits: &[Lit]) -> Vec<Violation> {
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    for lit in lits.iter().filter(|l| !l.raw) {
+        let mut i = lit.start;
+        while i < lit.end.min(b.len()) {
+            if b[i] == b'\\' {
+                match b.get(i + 1) {
+                    Some(b'x') => out.push(Violation::EscapedString("\\x".into())),
+                    Some(b'u') => out.push(Violation::EscapedString("\\u".into())),
+                    Some(b'\n') | Some(b'\r') => out.push(Violation::EscapedString("line continuation".into())),
+                    _ => {}
+                }
+                i += 2;
+            } else {
                 i += 1;
             }
         }
-        let rest = &code[i.min(code.len())..];
-        let head_end = rest.find(['(', '{', ';', ':', '<']).unwrap_or(rest.len());
-        let head = idents(&rest[..head_end]);
-        let is_fn = head.contains(&"fn") && head.iter().all(|w| matches!(*w, "async" | "const" | "unsafe" | "extern" | "fn") || head.last() == Some(w));
-        if is_fn {
-            let sig = &rest[..rest.find(['{', ';']).unwrap_or(rest.len())];
-            let toks = idents(sig);
-            let fn_pos = toks.iter().position(|t| *t == "fn").unwrap_or(0);
-            // skip `fn` and the fn's own name
-            if toks.iter().skip(fn_pos + 2).any(|t| is_host_ident(t)) {
-                out.push(Violation::ExternalBaseUrl(sig.split_whitespace().collect::<Vec<_>>().join(" ")));
-            }
-        } else if let Some(field) = head.first() {
-            if is_host_ident(field) && rest[head_end..].starts_with(':') {
-                out.push(Violation::ExternalBaseUrl(format!("pub field {field}")));
+    }
+    out.dedup();
+    out
+}
+
+/// Domain fragments that must not appear in any string literal of the signed client, even split
+/// across literals (`"fapi."` + `"binance.com"`). The allowed demo hosts are removed first.
+fn host_fragments(code: &str, lits: &[Lit]) -> Vec<Violation> {
+    let mut out = Vec::new();
+    for lit in lits {
+        let text = code.get(lit.start..lit.end).unwrap_or("").to_ascii_lowercase();
+        let mut rest = text.clone();
+        for allowed in crate::exchange::signed::endpoints::ALLOWED_SIGNED_HOSTS {
+            rest = rest.replace(allowed, " ");
+        }
+        if !scan_production_hosts_in(&rest).is_empty() {
+            continue; // a whole production host: already reported by the host scan
+        }
+        for frag in ["binance.com", "bybit.com", "okx.com"] {
+            if rest.contains(frag) {
+                out.push(Violation::ProductionHost(frag.to_string()));
             }
         }
     }
@@ -245,32 +489,44 @@ fn external_base_url(code: &str) -> Vec<Violation> {
 
 /// Scans one signed-client source file's text.
 pub fn scan_signed_source(src: &str) -> Vec<Violation> {
-    let code = production_code(src);
-    let mut out = scan_production_hosts_in(&code);
-    out.extend(external_base_url(&code));
-    for pat in ["env::var", "env::vars", "std::env", "dotenv", "read_to_string", "File::open", "env!("] {
-        if code.contains(pat) {
+    let prod = production(src);
+    let (_, _, lits) = mask(&prod.code);
+    let mut out = prod.violations.clone();
+    out.extend(scan_production_hosts_in(&prod.code));
+    out.extend(host_fragments(&prod.code, &lits));
+    out.extend(external_base_url(&prod.structure));
+    out.extend(forbidden_macros(&prod.structure));
+    out.extend(escaped_strings(&prod.code, &lits));
+    if idents(&prod.structure).contains(&"public") {
+        out.push(Violation::ImportsPublic);
+    }
+    for pat in ["env::var", "env::vars", "std::env", "dotenv", "read_to_string", "File::open"] {
+        if prod.structure.contains(pat) {
             out.push(Violation::EnvOrConfigRead(pat.to_string()));
         }
     }
-    for pat in [
-        ".post(", ".put(", ".delete(", ".patch(", "Method::POST", "Method::PUT", "Method::DELETE", "Method::PATCH", "\"POST\"", "\"PUT\"",
-        "\"DELETE\"", "\"PATCH\"",
-    ] {
-        if code.contains(pat) {
+    for pat in [".post(", ".put(", ".delete(", ".patch(", "Method::POST", "Method::PUT", "Method::DELETE", "Method::PATCH"] {
+        if prod.structure.contains(pat) {
             out.push(Violation::NonGetMethod(pat.to_string()));
         }
     }
+    for pat in ["\"POST\"", "\"PUT\"", "\"DELETE\"", "\"PATCH\""] {
+        if prod.code.contains(pat) {
+            out.push(Violation::NonGetMethod(pat.to_string()));
+        }
+    }
+    out.dedup();
     out
 }
 
 fn scan_production_hosts_in(code: &str) -> Vec<Violation> {
-    PRODUCTION_HOSTS.iter().filter(|h| names_host(code, h)).map(|h| Violation::ProductionHost((*h).to_string())).collect()
+    let lower = code.to_ascii_lowercase();
+    PRODUCTION_HOSTS.iter().filter(|h| names_host(&lower, h)).map(|h| Violation::ProductionHost((*h).to_string())).collect()
 }
 
 /// True if `host` occurs as a whole host name. A longer name that merely ends with it, such as the
 /// demo host `demo-fapi.binance.com` (ends with `fapi.binance.com`), does not count; a real
-/// subdomain (`x.fapi.binance.com`, preceded by `.`) does.
+/// subdomain (`x.fapi.binance.com`, preceded by `.`) does. `code` must already be lower-case.
 fn names_host(code: &str, host: &str) -> bool {
     let b = code.as_bytes();
     let mut from = 0;
@@ -546,5 +802,177 @@ const LATE: &str = "api.bybit.com";
             }
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    // ------------------------------------------------ round 2: every known bypass must be caught
+
+    fn has(src: &str, pred: impl Fn(&Violation) -> bool) -> bool {
+        scan_signed_source(src).iter().any(pred)
+    }
+    fn cfg_v(v: &Violation) -> bool {
+        matches!(v, Violation::CfgAttribute(_))
+    }
+    fn macro_v(v: &Violation) -> bool {
+        matches!(v, Violation::ForbiddenMacro(_))
+    }
+    fn esc_v(v: &Violation) -> bool {
+        matches!(v, Violation::EscapedString(_))
+    }
+    fn prod_v(v: &Violation) -> bool {
+        matches!(v, Violation::ProductionHost(_))
+    }
+
+    #[test]
+    fn bypass_cfg_test_on_a_non_mod_item_is_a_violation_and_does_not_hide_its_content() {
+        for src in [
+            "#[cfg(test)]\nconst X: &str = \"https://fapi.binance.com\";",
+            "enum Host { Demo, #[cfg(test)] Prod }",
+            "struct S { #[cfg(test)] pub field: String }",
+            "fn f(x: u8) { match x { #[cfg(test)] 0 => {}, _ => {} } }",
+            "#[cfg(test)]\nfn evil() { client.post(url); }",
+            "#[cfg(test)] impl Foo { fn host(&self) {} }",
+        ] {
+            assert!(has(src, cfg_v), "cfg not flagged: {src}");
+        }
+        // and what the attribute would have hidden is still scanned
+        assert!(has("#[cfg(test)]\nconst X: &str = \"https://fapi.binance.com\";", prod_v));
+        assert!(has("#[cfg(test)]\nfn evil() { client.post(url); }", |v| matches!(v, Violation::NonGetMethod(_))));
+    }
+
+    #[test]
+    fn bypass_other_cfg_forms_are_violations() {
+        for src in [
+            "#[cfg(not(test))]\nfn f() {}",
+            "#[cfg(feature = \"x\")]\nfn f() {}",
+            "#[cfg(unix)] const H: &str = \"x\";",
+            "#[cfg_attr(test, derive(Debug))]\nstruct S;",
+            "#[ cfg(test) ]\nconst X: u8 = 1;",
+            "#[cfg(test)]\n#[allow(dead_code)]\nmod tests { }",
+            "#![cfg(unix)]\nfn f() {}",
+        ] {
+            assert!(has(src, cfg_v), "cfg not flagged: {src}");
+        }
+    }
+
+    #[test]
+    fn the_one_allowed_cfg_shape_is_a_complete_test_mod() {
+        for src in [
+            "fn a() {}\n#[cfg(test)]\nmod tests {\n    const X: &str = \"fapi.binance.com\";\n}\n",
+            "#[cfg(test)]\nmod tests;\nfn a() {}",
+            "mod outer {\n    #[cfg(test)]\n    mod tests { fn t() { client.post(1); } }\n}",
+            "#[cfg(test)] pub(crate) mod helpers { const X: &str = \"www.okx.com\"; }",
+        ] {
+            assert!(scan_signed_source(src).is_empty(), "wrongly flagged: {src}: {:?}", scan_signed_source(src));
+        }
+    }
+
+    #[test]
+    fn bypass_inner_cfg_test_in_the_middle_of_a_file_is_a_violation_and_hides_nothing() {
+        let src = "fn a() {}\n#![cfg(test)]\nconst H: &str = \"https://fapi.binance.com\";";
+        assert!(has(src, cfg_v));
+        assert!(has(src, prod_v), "the text after a mid-file #![cfg(test)] must still be scanned");
+    }
+
+    #[test]
+    fn inner_cfg_test_at_the_head_of_the_file_makes_it_a_test_only_file() {
+        let src = "//! doc\n#![allow(dead_code)]\n#![cfg(test)]\nconst H: &str = \"www.okx.com\";";
+        assert!(scan_signed_source(src).is_empty(), "{:?}", scan_signed_source(src));
+    }
+
+    #[test]
+    fn bypass_forbidden_macros() {
+        for src in [
+            "const H: &str = concat!(\"fapi.\", \"binance.com\");",
+            "const H: &str = include_str!(\"host.txt\");",
+            "const H: &[u8] = include_bytes!(\"host.bin\");",
+            "const H: &str = env!(\"HOST\");",
+            "const H: Option<&str> = option_env!(\"HOST\");",
+            "const H: &str = stringify!(fapi);",
+            "include!(\"gen.rs\");",
+            "let h = concat !(\"a\", \"b\");",
+        ] {
+            assert!(has(src, macro_v), "macro not flagged: {src}");
+        }
+        assert!(!has("let a = 1; if a != 2 { println!(\"x\"); } let v = vec![1]; format!(\"{}\", a);", macro_v), "ordinary macros and != are fine");
+    }
+
+    #[test]
+    fn bypass_escaped_strings_are_violations() {
+        for src in [
+            "const H: &str = \"fapi\\x2ebinance.com\";",
+            "const H: &str = \"fapi\\u{2e}binance\\u{2e}com\";",
+            "const H: &[u8] = b\"\\x66api\";",
+            "const H: &str = \"fapi.\\\n    binance.com\";",
+        ] {
+            assert!(has(src, esc_v), "escape not flagged: {src}");
+        }
+        for ok in ["let s = \"line\\n\";", "let s = \"quote\\\"\";", "let s = \"back\\\\x41\";", "let s = r\"raw \\x41\";", "let s = \"tab\\t\";"] {
+            assert!(!has(ok, esc_v), "wrongly flagged: {ok}");
+        }
+    }
+
+    #[test]
+    fn bypass_host_pieces_in_separate_literals_are_caught() {
+        assert!(has("let a = \"fapi.\"; let b = \"binance.com\"; let h = format!(\"{a}{b}\");", prod_v));
+        assert!(has("let b = \"bybit.com\";", prod_v));
+        assert!(has("let b = \"okx.com\";", prod_v));
+        assert!(!has("let a = \"demo-fapi.binance.com\"; let b = \"api-demo.bybit.com\"; let c = \"testnet.binancefuture.com\";", prod_v));
+    }
+
+    #[test]
+    fn bypass_upper_and_mixed_case_hosts_are_caught() {
+        assert!(has("const H: &str = \"https://FAPI.BINANCE.COM\";", prod_v));
+        assert!(has("const H: &str = \"Api.Bybit.Com\";", prod_v));
+        assert!(has("const H: &str = \"WWW.OKX.COM\";", prod_v));
+        assert!(!has("const H: &str = \"DEMO-FAPI.BINANCE.COM\";", prod_v), "demo host in any case is fine");
+    }
+
+    #[test]
+    fn bypass_importing_the_public_module_is_a_violation() {
+        for src in [
+            "use crate::exchange::public::endpoints::BINANCE_HOST;",
+            "use super::super::public::endpoints;",
+            "fn f() -> String { crate::exchange::public::endpoints::binance_url(\"/x\") }",
+            "use crate::exchange::{public, signed};",
+            "use crate::exchange::{error, public as p};",
+        ] {
+            assert!(has(src, |v| matches!(v, Violation::ImportsPublic)), "not flagged: {src}");
+        }
+        for ok in ["const REASON: &str = \"public market data only\";", "fn is_public() {}", "let publicize = 1;", "// use crate::exchange::public;"] {
+            assert!(!has(ok, |v| matches!(v, Violation::ImportsPublic)), "wrongly flagged: {ok}");
+        }
+    }
+
+    #[test]
+    fn bypass_pub_fn_parameter_names_containing_host_like_words_are_violations() {
+        for src in [
+            "pub fn new(endpoint: &str) -> Self { todo!() }",
+            "pub fn with(url: String) -> Self { todo!() }",
+            "pub fn at(root: &str) -> Self { todo!() }",
+            "pub fn at(uri: Uri) -> Self { todo!() }",
+            "pub fn at(api_host: &str) -> Self { todo!() }",
+            "pub fn at(hostName: &str) -> Self { todo!() }",
+            "pub fn at(my_base_url: &str) -> Self { todo!() }",
+            "pub fn at<T: Clone>(t: T, mut root_url: String) -> Self { todo!() }",
+            "pub async fn at(&self, key: &str, endpoint_override: Option<String>) {}",
+            "pub struct C { pub endpoint: String }",
+            "pub struct C { pub(crate) root_url: String }",
+        ] {
+            assert!(has(src, |v| matches!(v, Violation::ExternalBaseUrl(_))), "not flagged: {src}");
+        }
+    }
+
+    #[test]
+    fn parameter_scan_looks_at_names_not_types_or_return_types() {
+        for ok in [
+            "pub fn new(transport: Arc<T>, demo_env: BinanceHost) -> Self { todo!() }",
+            "pub fn host(self) -> &'static str { \"x\" }",
+            "pub fn base_url(self) -> &'static str { \"x\" }",
+            "pub fn get(&self, key: &str) -> Result<Url, E> { todo!() }",
+            "pub fn at(offset: Arc<dyn Fn(Url) -> Host>) {}",
+            "fn private(base_url: &str) {}",
+        ] {
+            assert!(!has(ok, |v| matches!(v, Violation::ExternalBaseUrl(_))), "wrongly flagged: {ok}");
+        }
     }
 }

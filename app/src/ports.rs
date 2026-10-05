@@ -5,8 +5,8 @@
 #![allow(dead_code)]
 
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tong_funding_core::types::Exchange;
 
@@ -23,25 +23,72 @@ impl Clock for SystemClock {
     }
 }
 
-/// A clock tests can move by hand; clones share the same time.
+/// Monotonic milliseconds: never goes backwards when the wall clock is stepped (NTP, sleep, manual
+/// change). Use it for ages, silence and back-off windows; use [`Clock`] only for timestamps that
+/// are shown or compared with exchange time.
+pub trait MonoClock: Send + Sync {
+    fn mono_ms(&self) -> i64;
+}
+
+/// Both clocks in one object, so a component can hold a single `Arc<dyn TimeSource>`.
+pub trait TimeSource: Clock + MonoClock {}
+impl<T: Clock + MonoClock + ?Sized> TimeSource for T {}
+
+fn process_start() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+/// Monotonic clock based on `Instant` (zero at first use in the process).
+pub struct SystemMono;
+
+impl MonoClock for SystemMono {
+    fn mono_ms(&self) -> i64 {
+        i64::try_from(process_start().elapsed().as_millis()).unwrap_or(i64::MAX)
+    }
+}
+
+impl MonoClock for SystemClock {
+    fn mono_ms(&self) -> i64 {
+        SystemMono.mono_ms()
+    }
+}
+
+/// A clock tests can move by hand; clones share the same time. It has a wall reading and a
+/// separate monotonic reading: `advance` moves both, `set` moves the wall (and the monotonic
+/// reading by the same amount if it moved forward), `jump_wall` moves ONLY the wall (a clock step).
 #[derive(Clone, Default)]
-pub struct ManualClock(Arc<AtomicI64>);
+pub struct ManualClock(Arc<AtomicI64>, Arc<AtomicI64>);
 
 impl ManualClock {
     pub fn new(ms: i64) -> Self {
-        ManualClock(Arc::new(AtomicI64::new(ms)))
+        ManualClock(Arc::new(AtomicI64::new(ms)), Arc::new(AtomicI64::new(ms)))
     }
     pub fn set(&self, ms: i64) {
-        self.0.store(ms, Ordering::SeqCst);
+        let old = self.0.swap(ms, Ordering::SeqCst);
+        if ms > old {
+            self.1.fetch_add(ms - old, Ordering::SeqCst);
+        }
     }
     pub fn advance(&self, ms: i64) {
         self.0.fetch_add(ms, Ordering::SeqCst);
+        self.1.fetch_add(ms, Ordering::SeqCst);
+    }
+    /// Steps the wall clock only (e.g. -3_600_000 = it jumped back one hour); monotonic time is unaffected.
+    pub fn jump_wall(&self, delta_ms: i64) {
+        self.0.fetch_add(delta_ms, Ordering::SeqCst);
     }
 }
 
 impl Clock for ManualClock {
     fn now_ms(&self) -> i64 {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl MonoClock for ManualClock {
+    fn mono_ms(&self) -> i64 {
+        self.1.load(Ordering::SeqCst)
     }
 }
 
@@ -136,6 +183,29 @@ mod tests {
         assert_eq!(d.now_ms(), 1_250);
         d.set(5);
         assert_eq!(c.now_ms(), 5);
+    }
+
+    #[test]
+    fn manual_clock_mono_ignores_wall_steps_and_follows_advance() {
+        let c = ManualClock::new(1_000);
+        c.advance(500);
+        assert_eq!((c.now_ms(), c.mono_ms()), (1_500, 1_500));
+        c.jump_wall(-3_600_000);
+        assert_eq!((c.now_ms(), c.mono_ms()), (1_500 - 3_600_000, 1_500));
+        c.advance(10);
+        assert_eq!(c.mono_ms(), 1_510);
+        let d = c.clone();
+        d.advance(1);
+        assert_eq!(c.mono_ms(), 1_511, "clones share both readings");
+    }
+
+    #[test]
+    fn system_mono_never_decreases() {
+        let a = SystemMono.mono_ms();
+        let b = SystemMono.mono_ms();
+        assert!(b >= a && a >= 0);
+        let _: &dyn TimeSource = &ManualClock::new(0);
+        let _: &dyn TimeSource = &SystemClock;
     }
 
     #[test]
