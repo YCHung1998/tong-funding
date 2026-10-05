@@ -18,6 +18,9 @@
       `cp mvp-python/data/events.jsonl /tmp/events-copy.jsonl && shasum -a 256 /tmp/events-copy.jsonl`
       `cargo run -p tong-funding -- import-legacy-events /tmp/events-copy.jsonl --db /tmp/funding-import-test.db`
       （連跑兩次，第二次應為 `imported: 0`）。把報告與前後 SHA-256 貼進 store-sqlite 的 design.md。
+- [ ] **把 demo 金鑰放進 Keychain**（取代 Python 版的 `.env`；**不要**放進 repo 或 GitHub）：在 Mac 上逐項執行，值從標準輸入讀、不會顯示也不會進 shell 歷史
+      `pbpaste | cargo run -q -p tong-funding -- secrets set binance api-key`（先把值複製到剪貼簿；其餘：`binance api-secret`、`bybit api-key`、`bybit api-secret`、`okx api-key`、`okx api-secret`、`okx passphrase`）
+      `cargo run -q -p tong-funding -- secrets status` 確認每項為 `present`。完成後即可進行下一項。
 - [ ] **demo/testnet 簽名 GET 實測**（exchange-readonly-adapters task 4.2）：需要使用者的 Binance 與 Bybit demo 金鑰；
       須決定 Binance 簽名該用 `testnet.binancefuture.com` 還是 `demo-fapi.binance.com`（design.md Open Questions）。
       沒有金鑰時該 change 不得封存。

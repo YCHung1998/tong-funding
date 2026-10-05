@@ -10,4 +10,5 @@ pub mod legacy_import;
 pub mod scan_buffer;
 pub mod schema;
 pub mod secrets;
+pub mod secrets_cli;
 pub mod state;
