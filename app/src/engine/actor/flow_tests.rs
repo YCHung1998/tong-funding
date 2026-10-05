@@ -6,7 +6,8 @@
 //! second half-way between two ticks, so tick k sees `start + k * 1000` and every event timestamp
 //! is a value the fake clock had.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,6 +25,7 @@ use crate::engine::ports::{
     OrderStatus, QueryOutcome, ReconcileContext, ServerOffsets, StartupReconciler, SubmitOutcome,
 };
 use crate::engine::sim::{CountingFactory, MarginSource, SimBehavior, SimPriceBook, SimulatedExecutor};
+use crate::engine::recovery::{ORDER_INTENT_NOT_SENT, RECONCILE_ALERT, RecoveryReconciler, SIMULATION_INTERRUPTED};
 use crate::ports::ManualClock;
 use crate::store::db::test_support::tempdir;
 use crate::store::state::{FLAG_TRIGGER_MODE, NewIntent};
@@ -215,15 +217,40 @@ impl Executor for NeverFills {
     }
 }
 
+/// Answers from a script (the last answer repeats) and records each call's scope.
 struct FakeReconciler {
     calls: AtomicUsize,
-    result: Result<(), String>,
+    results: Mutex<Vec<Result<(), String>>>,
+    scopes: Mutex<Vec<BTreeSet<String>>>,
+}
+impl FakeReconciler {
+    fn new(results: Vec<Result<(), String>>) -> Arc<FakeReconciler> {
+        Arc::new(FakeReconciler { calls: AtomicUsize::new(0), results: Mutex::new(results), scopes: Mutex::default() })
+    }
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
 }
 impl StartupReconciler for FakeReconciler {
     fn reconcile(&self, ctx: ReconcileContext) -> BoxFut<'static, Result<(), String>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        assert!(ctx.executor.is_simulated(), "SIMULATION hands the simulator to the reconciler");
-        Box::pin(std::future::ready(self.result.clone()))
+        assert_eq!(
+            ctx.executor.is_simulated(),
+            ctx.execution_mode == ExecutionMode::Simulation,
+            "the reconciler gets the executor of the current mode"
+        );
+        self.scopes.lock().unwrap().push(ctx.scope.clone());
+        let mut results = self.results.lock().unwrap();
+        let r = if results.len() > 1 { results.remove(0) } else { results[0].clone() };
+        Box::pin(std::future::ready(r))
+    }
+}
+
+/// A reconciliation that never finishes (pending forever).
+struct NeverReconciles;
+impl StartupReconciler for NeverReconciles {
+    fn reconcile(&self, _ctx: ReconcileContext) -> BoxFut<'static, Result<(), String>> {
+        Box::pin(std::future::pending())
     }
 }
 
@@ -900,12 +927,13 @@ fn leave_unfinished_intent(db: &Db) {
 #[tokio::test(start_paused = true)]
 async fn unfinished_intents_block_exposure_until_the_reconciler_succeeds() {
     for (result, lifted) in [(Ok(()), true), (Err("exchange unreachable".to_string()), false)] {
-        let rec = Arc::new(FakeReconciler { calls: AtomicUsize::new(0), result: result.clone() });
-        let (rig, deps) = rig(Opts { reconciler: Some(rec.clone()), ..Opts::default() });
+        let rec = FakeReconciler::new(vec![result.clone()]);
+        let (rig, deps) = rig(Opts { demo: true, reconciler: Some(rec.clone()), ..Opts::default() });
         leave_unfinished_intent(&rig.db);
         let h = start(deps);
         sleep(Duration::from_millis(300)).await;
-        assert_eq!(rec.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(rec.calls(), 1);
+        assert_eq!(*rec.scopes.lock().unwrap(), vec![BTreeSet::from(["old-pair".to_string()])], "startup scope");
         let blockers = h.snapshots.borrow().blockers.clone();
         let pending = blockers.iter().any(|b| matches!(b, Blocker::ReconciliationPending(_)));
         assert_eq!(pending, !lifted, "{result:?}: {blockers:?}");
@@ -978,10 +1006,391 @@ async fn an_in_flight_pair_at_startup_waits_for_the_reconciler_and_its_result_is
 
 #[tokio::test(start_paused = true)]
 async fn no_unfinished_intents_means_no_reconciliation_block() {
-    let rec = Arc::new(FakeReconciler { calls: AtomicUsize::new(0), result: Err("never".into()) });
+    let rec = FakeReconciler::new(vec![Err("never".into())]);
     let (_rig, deps) = rig(Opts { reconciler: Some(rec.clone()), ..Opts::default() });
     let h = start(deps);
     sleep(Duration::from_millis(300)).await;
-    assert_eq!(rec.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(rec.calls(), 0);
     assert!(h.snapshots.borrow().blockers.is_empty());
+}
+
+// ---- 4.2 wave 3: decision 8, retries, startup scope ----------------------------------------
+
+/// A demo pair left in FILL_MONITOR by the previous run (not simulated).
+fn seed_demo_in_flight(db: &Db, uuid: &str) {
+    let env = PairEnvelope {
+        long_exchange: Exchange::Binance,
+        short_exchange: Exchange::Bybit,
+        settlement_ms: T - 3_600_000,
+        simulated: false,
+        scan: pair_at(uuid, "ETHUSDT", T).entry,
+    };
+    let row = NewPair {
+        internal_uuid: uuid.into(),
+        pair_id: format!("pid-{uuid}"),
+        symbol: "ETHUSDT".into(),
+        status: PairState::FillMonitor,
+        entry: serde_json::to_value(env).unwrap(),
+    };
+    db.add_pair_if_not_pending(&row).unwrap();
+}
+
+// decision 8: unfinished demo reconciliation refuses exposure only in EXCHANGE_DEMO.
+#[tokio::test(start_paused = true)]
+async fn pending_demo_reconciliation_refuses_entries_only_in_exchange_demo() {
+    for demo in [true, false] {
+        let rec = FakeReconciler::new(vec![Err("demo keys unavailable".into())]);
+        let (rig, deps) = rig(Opts { demo, trigger: "MANUAL", reconciler: Some(rec.clone()), ..Opts::default() });
+        seed_demo_in_flight(&rig.db, "demo-stuck");
+        let h = start(deps);
+        assert_eq!(ask(&h, Command::AddPrepared(pair_at(UUID, SYM, T))).await, CommandReply::Accepted);
+        sleep(Duration::from_millis(300)).await;
+        let blockers = h.snapshots.borrow().blockers.clone();
+        assert!(
+            blockers.iter().any(|b| matches!(b, Blocker::ReconciliationPending(r) if r.contains("demo keys unavailable"))),
+            "demo={demo}: the blocker stays visible in the Snapshot: {blockers:?}"
+        );
+        let reply = ask(&h, Command::ManualEnter { pair: UUID.into() }).await;
+        if demo {
+            assert!(matches!(&reply, CommandReply::Rejected(r) if r.contains("reconciliation")), "{reply:?}");
+            assert_eq!(status(&rig.db, UUID), "PREPARED");
+        } else {
+            assert_eq!(reply, CommandReply::Accepted, "SIMULATION entries stay allowed");
+            assert_ne!(status(&rig.db, UUID), "PREPARED");
+        }
+        assert_eq!(status(&rig.db, "demo-stuck"), "FILL_MONITOR", "the unreconciled pair is left alone");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreconciled_demo_pair_still_takes_a_max_concurrent_pairs_slot() {
+    let rec = FakeReconciler::new(vec![Err("demo keys unavailable".into())]);
+    let (rig, deps) = rig(Opts { reconciler: Some(rec), ..Opts::default() });
+    store_risk(&rig.db, &RiskConfig { max_concurrent_pairs: 1, ..risk() });
+    seed_demo_in_flight(&rig.db, "demo-stuck");
+    let h = start(deps);
+    assert_eq!(ask(&h, Command::AddPrepared(pair_at(UUID, SYM, T))).await, CommandReply::Accepted);
+    run_until(&rig.clock, T - 9_000).await;
+    assert_eq!(status(&rig.db, UUID), "BLOCKED", "{:?}", labels(&rig.db));
+    let blocked = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
+    assert!(blocked.to_string().contains("RiskLimits"), "{blocked}");
+    assert!(rig.sim.submitted().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pending_reconciliation_is_retried_every_30_seconds_until_it_succeeds() {
+    let rec = FakeReconciler::new(vec![Err("exchange unreachable".into()), Ok(())]);
+    let start_ms = T - 600_000; // well before the entry window of the pair added below
+    let (rig, deps) = rig(Opts { demo: true, trigger: "MANUAL", start_ms, reconciler: Some(rec.clone()), ..Opts::default() });
+    leave_unfinished_intent(&rig.db);
+    let t0 = rig.clock.now_ms();
+    let h = start(deps);
+    sleep(Duration::from_millis(300)).await;
+    assert_eq!(rec.calls(), 1);
+    let pending = |h: &EngineHandle| h.snapshots.borrow().blockers.iter().any(|b| matches!(b, Blocker::ReconciliationPending(_)));
+    assert!(pending(&h));
+    // A pair added after startup is live: it is never in the reconciler's scope.
+    assert_eq!(ask(&h, Command::AddPrepared(pair_at(UUID, SYM, T))).await, CommandReply::Accepted);
+    run_until(&rig.clock, t0 + RECONCILE_RETRY_MS - 1_000).await;
+    assert_eq!(rec.calls(), 1, "not before 30 s");
+    assert!(pending(&h));
+    run_until(&rig.clock, t0 + RECONCILE_RETRY_MS + 1_000).await;
+    assert_eq!(rec.calls(), 2);
+    assert!(!pending(&h), "{:?}", h.snapshots.borrow().blockers);
+    assert_eq!(rec.scopes.lock().unwrap()[1], BTreeSet::from(["old-pair".to_string()]));
+    run_until(&rig.clock, t0 + 4 * RECONCILE_RETRY_MS).await;
+    assert_eq!(rec.calls(), 2, "no run once it succeeded");
+    assert_eq!(ask(&h, Command::ManualEnter { pair: UUID.into() }).await, CommandReply::Accepted);
+}
+
+fn seed_sim_reconciled(db: &Db) {
+    let env = PairEnvelope {
+        long_exchange: Exchange::Binance,
+        short_exchange: Exchange::Bybit,
+        settlement_ms: T,
+        simulated: true,
+        scan: pair_at(UUID, SYM, T).entry,
+    };
+    let row = NewPair {
+        internal_uuid: UUID.into(),
+        pair_id: "pid".into(),
+        symbol: SYM.into(),
+        status: PairState::Reconciled,
+        entry: serde_json::to_value(env).unwrap(),
+    };
+    db.add_pair_if_not_pending(&row).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_simulated_reconciled_pair_at_startup_is_never_auto_exited_and_goes_to_unresolved() {
+    // While its reconciliation has not finished, the scheduler does not touch it (past T+15).
+    let (bare, deps) = rig(Opts { start_ms: T + 20_000, reconciler: Some(Arc::new(NeverReconciles)), ..Opts::default() });
+    seed_sim_reconciled(&bare.db);
+    let h = start(deps);
+    run_until(&bare.clock, T + 40_000).await;
+    assert_eq!(status(&bare.db, UUID), "RECONCILED", "{:?}", labels(&bare.db));
+    assert!(bare.sim.submitted().is_empty(), "no close order for a position that no longer exists");
+    assert!(h.snapshots.borrow().blockers.iter().any(|b| matches!(b, Blocker::ReconciliationPending(_))));
+
+    // With the real reconciler: UNRESOLVED (decision 7), and the block is lifted.
+    let (rig, mut deps) = rig(Opts { start_ms: T + 20_000, ..Opts::default() });
+    deps.reconciler = Some(Arc::new(RecoveryReconciler::new(rig.market.clone(), Arc::new(rig.clock.clone()))));
+    seed_sim_reconciled(&rig.db);
+    let h = start(deps);
+    run_until(&rig.clock, T + 25_000).await;
+    assert_eq!(status(&rig.db, UUID), "UNRESOLVED");
+    assert_eq!(count(&rig.db, SIMULATION_INTERRUPTED), 1);
+    assert!(h.snapshots.borrow().blockers.is_empty(), "{:?}", h.snapshots.borrow().blockers);
+    assert!(rig.sim.submitted().is_empty());
+}
+
+// ---- 4.2 crash points (crash-recovery spec "崩潰測試涵蓋兩個關鍵時點") ------------------------
+//
+// Each test runs the full actor on a real database file in its own tokio runtime ("process 1"),
+// stops it at a kill point by dropping that runtime (every task dies mid-flight), then starts a
+// fresh actor with `RecoveryReconciler` on the same file ("process 2").
+//
+// Test-only fault injection: the exchange's `submit` never returns. Kill point (a) "intent
+// written, executor not called": the call dies before it reaches the exchange (the exchange never
+// learns the id). Kill point (b) "executor called, result not written back": the exchange fills
+// the order, but the reply never comes back, so the intent stays SUBMITTED.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OnSubmit {
+    /// Kill point (a): dies before the exchange sees the order.
+    DieBefore,
+    /// Kill point (b): the exchange fills it, the reply is lost.
+    DieAfter,
+    /// Fill and reply (process 2; nothing may be submitted there anyway).
+    Fill,
+}
+
+/// An exchange (or, with `simulated`, the simulator) that outlives the program: orders, positions
+/// and call counters survive the restart.
+struct CrashExchange {
+    simulated: bool,
+    on_submit: Mutex<HashMap<Exchange, OnSubmit>>,
+    orders: Mutex<HashMap<String, OrderStatus>>,
+    positions: Mutex<HashMap<(Exchange, String), Decimal>>,
+    submits: AtomicUsize,
+    queries: AtomicUsize,
+}
+
+impl CrashExchange {
+    fn new(simulated: bool, long: OnSubmit, short: OnSubmit) -> Arc<CrashExchange> {
+        Arc::new(CrashExchange {
+            simulated,
+            on_submit: Mutex::new([(Exchange::Binance, long), (Exchange::Bybit, short)].into()),
+            orders: Mutex::default(),
+            positions: Mutex::default(),
+            submits: AtomicUsize::new(0),
+            queries: AtomicUsize::new(0),
+        })
+    }
+    fn submits(&self) -> usize {
+        self.submits.load(Ordering::SeqCst)
+    }
+    fn queries(&self) -> usize {
+        self.queries.load(Ordering::SeqCst)
+    }
+    fn fill(&self, req: &OrderRequest) -> OrderStatus {
+        let signed = match req.side {
+            OrderSide::Buy => req.quantity,
+            OrderSide::Sell => -req.quantity,
+        };
+        *self.positions.lock().unwrap().entry((req.exchange, req.symbol.clone())).or_default() += signed;
+        let status = OrderStatus {
+            client_order_id: req.client_order_id.clone(),
+            exchange_order_id: Some(format!("x-{}", req.client_order_id)),
+            filled_quantity: req.quantity,
+            avg_price: Some(dec("100")),
+            state: OrderState::Filled,
+        };
+        self.orders.lock().unwrap().insert(req.client_order_id.clone(), status.clone());
+        status
+    }
+}
+
+impl Executor for CrashExchange {
+    fn is_simulated(&self) -> bool {
+        self.simulated
+    }
+    fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {
+        self.submits.fetch_add(1, Ordering::SeqCst);
+        let on = self.on_submit.lock().unwrap().get(&req.exchange).copied().unwrap_or(OnSubmit::Fill);
+        match on {
+            OnSubmit::DieBefore => Box::pin(std::future::pending()),
+            OnSubmit::DieAfter => {
+                self.fill(&req);
+                Box::pin(std::future::pending())
+            }
+            OnSubmit::Fill => {
+                let st = self.fill(&req);
+                Box::pin(std::future::ready(SubmitOutcome::Accepted(st)))
+            }
+        }
+    }
+    fn cancel(&self, _: Exchange, _: &str, _: &str) -> BoxFut<'_, QueryOutcome> {
+        panic!("nothing may cancel here");
+    }
+    fn query(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        self.queries.fetch_add(1, Ordering::SeqCst);
+        let o = self.orders.lock().unwrap().get(id).cloned().map_or(QueryOutcome::NotFound, QueryOutcome::Found);
+        Box::pin(std::future::ready(o))
+    }
+}
+
+impl AccountView for CrashExchange {
+    fn positions(&self, exchange: Exchange) -> BoxFut<'_, Result<Listed<AccountPosition>, String>> {
+        let items = (self.positions.lock().unwrap().iter())
+            .filter(|((e, _), q)| *e == exchange && !q.is_zero())
+            .map(|((e, s), q)| AccountPosition { exchange: *e, symbol: s.clone(), quantity: *q })
+            .collect();
+        Box::pin(std::future::ready(Ok(Listed { items, complete: true })))
+    }
+    fn open_orders(&self, _exchange: Exchange) -> BoxFut<'_, Result<Listed<AccountOrder>, String>> {
+        Box::pin(std::future::ready(Ok(Listed { items: vec![], complete: true })))
+    }
+    fn available_margin(&self, _exchange: Exchange) -> BoxFut<'_, Result<Decimal, String>> {
+        Box::pin(std::future::ready(Ok(dec("10000"))))
+    }
+}
+
+/// One "process": its own paused runtime; dropping it kills every task mid-flight.
+fn process<F: Future<Output = ()>>(f: F) {
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    rt.block_on(f);
+    drop(rt);
+}
+
+/// Deps on the database file at `path`; `exchange` is the demo exchange (EXCHANGE_DEMO) or the
+/// simulator (SIMULATION). Returns the db handle and the factory (to count its calls).
+fn crash_deps(path: &std::path::Path, clock: &ManualClock, exchange: &Arc<CrashExchange>, demo: bool) -> (Db, CountingFactory, EngineDeps) {
+    let shared: Arc<dyn Clock> = Arc::new(clock.clone());
+    let db = Db::open_unlocked(path, shared.clone());
+    assert!(!db.is_halted(), "{:?}", db.halt_reason());
+    let factory = CountingFactory::returning(exchange.clone());
+    let simulator: Arc<dyn Executor> = if demo { Arc::new(NeverFills::default()) } else { exchange.clone() };
+    let market = FakeMarket::new(clock.clone());
+    let deps = EngineDeps {
+        db: db.clone(),
+        clock: shared.clone(),
+        timings: EngineTimings::default(),
+        simulator,
+        factory: Arc::new(factory.clone()),
+        market: market.clone(),
+        offsets: FakeOffsets::zero(),
+        account: exchange.clone(),
+        sim_account: exchange.clone(),
+        reconciler: Some(Arc::new(RecoveryReconciler::new(market, shared))),
+    };
+    (db, factory, deps)
+}
+
+/// What the restart found.
+struct AfterRestart {
+    db: Db,
+    submits_after_restart: usize,
+    queries_after_restart: usize,
+    factory_calls: usize,
+    blockers: Vec<Blocker>,
+}
+
+/// Process 1 runs to the kill point (both entry orders landed, submits never return); process 2
+/// restarts on the same file and reconciles.
+fn crash_and_restart(demo: bool, long: OnSubmit, short: OnSubmit) -> (tempfile::TempDir, AfterRestart, Arc<CrashExchange>) {
+    let dir = tempdir();
+    let path = dir.path().join("funding.db");
+    let exchange = CrashExchange::new(!demo, long, short);
+    let clock = ManualClock::new(T - 12_000);
+
+    process(async {
+        let (db, _f, deps) = crash_deps(&path, &clock, &exchange, demo);
+        store_risk(&db, &risk());
+        db.flag_set(FLAG_TRIGGER_MODE, "AUTO").unwrap();
+        if demo {
+            db.flag_set(FLAG_EXECUTION_MODE, "EXCHANGE_DEMO").unwrap();
+        }
+        let h = start(deps);
+        assert_eq!(ask(&h, Command::AddPrepared(pair_at(UUID, SYM, T))).await, CommandReply::Accepted);
+        run_until(&clock, T - 9_000).await;
+        // At the kill point: both intents landed (SUBMITTED), both submits called, no result.
+        assert_eq!(status(&db, UUID), "ORDER_SUBMIT", "{:?}", labels(&db));
+        let intents = db.list_unfinished_intents().unwrap();
+        assert_eq!(intents.len(), 2, "{intents:?}");
+        assert!(intents.iter().all(|i| i.state == "SUBMITTED"), "{intents:?}");
+        assert_eq!(exchange.submits(), 2);
+    }); // killed
+
+    let (submits_before, queries_before) = (exchange.submits(), exchange.queries());
+    exchange.on_submit.lock().unwrap().clear(); // process 2 would fill normally (it must not submit)
+    let mut out = None;
+    process(async {
+        let (db, factory, deps) = crash_deps(&path, &clock, &exchange, demo);
+        let h = start(deps);
+        run_until(&clock, T - 6_000).await;
+        let blockers = h.snapshots.borrow().blockers.clone();
+        out = Some(AfterRestart {
+            db,
+            submits_after_restart: exchange.submits() - submits_before,
+            queries_after_restart: exchange.queries() - queries_before,
+            factory_calls: factory.calls(),
+            blockers,
+        });
+    });
+    (dir, out.unwrap(), exchange)
+}
+
+fn intent_states(db: &Db) -> Vec<String> {
+    let plain = rusqlite::Connection::open(db.path()).unwrap();
+    let mut st = plain.prepare("SELECT state FROM order_intents ORDER BY client_order_id").unwrap();
+    st.query_map([], |r| r.get::<_, String>(0)).unwrap().map(|r| r.unwrap()).collect()
+}
+
+#[test]
+fn demo_kill_point_a_intent_written_but_never_sent_is_cancelled_without_resubmitting() {
+    let (_dir, r, _x) = crash_and_restart(true, OnSubmit::DieBefore, OnSubmit::DieBefore);
+    assert_eq!(r.submits_after_restart, 0, "no order submitted again");
+    assert_eq!(r.queries_after_restart, 2, "both intents queried by client_order_id");
+    assert_eq!(status(&r.db, UUID), "CANCELLED", "{:?}", labels(&r.db));
+    assert_eq!(intent_states(&r.db), vec!["CANCELLED", "CANCELLED"], "marked not sent");
+    assert_eq!(count(&r.db, ORDER_INTENT_NOT_SENT), 2);
+    assert_eq!(count(&r.db, RECONCILE_ALERT), 0, "no alert: nothing was exposed");
+    assert!(r.blockers.is_empty(), "{:?}", r.blockers);
+}
+
+#[test]
+fn demo_kill_point_b_both_orders_filled_but_unrecorded_continue_to_reconciled_without_resubmitting() {
+    let (_dir, r, _x) = crash_and_restart(true, OnSubmit::DieAfter, OnSubmit::DieAfter);
+    assert_eq!(r.submits_after_restart, 0, "no order submitted again");
+    assert_eq!(intent_states(&r.db), vec!["FILLED", "FILLED"]);
+    assert_eq!(status(&r.db, UUID), "RECONCILED", "{:?}", labels(&r.db));
+    let path: Vec<String> = labels(&r.db).into_iter().filter(|l| ["FILL_MONITOR", "RECONCILED"].contains(&l.as_str())).collect();
+    assert_eq!(path, vec!["FILL_MONITOR", "RECONCILED"], "FILL_MONITOR, then the normal fill decision");
+    assert_eq!(count(&r.db, RECONCILE_ALERT), 0);
+    assert!(r.blockers.is_empty(), "{:?}", r.blockers);
+}
+
+#[test]
+fn demo_kill_point_b_on_one_leg_only_is_a_partial_failure_with_an_alert() {
+    let (_dir, r, x) = crash_and_restart(true, OnSubmit::DieAfter, OnSubmit::DieBefore);
+    assert_eq!(r.submits_after_restart, 0, "no order submitted again");
+    assert_eq!(status(&r.db, UUID), "PARTIAL_FAILURE", "{:?}", labels(&r.db));
+    assert_eq!(count(&r.db, RECONCILE_ALERT), 1, "the alert is raised");
+    assert!(intent_states(&r.db).contains(&"FILLED".to_string()), "the long leg's data is kept");
+    assert_eq!(x.positions.lock().unwrap().get(&(Exchange::Binance, SYM.to_string())).copied(), Some(dec("10")), "nothing closed");
+    assert!(r.blockers.is_empty(), "{:?}", r.blockers);
+}
+
+#[test]
+fn simulation_kill_points_a_and_b_end_unresolved_without_any_exchange_request() {
+    for on in [OnSubmit::DieBefore, OnSubmit::DieAfter] {
+        let (_dir, r, _x) = crash_and_restart(false, on, on);
+        assert_eq!(r.submits_after_restart, 0, "{on:?}: no order submitted again");
+        assert_eq!(r.queries_after_restart, 0, "{on:?}: simulated intents are never queried");
+        assert_eq!(r.factory_calls, 0, "{on:?}: no order-capable executor was even built");
+        assert_eq!(status(&r.db, UUID), "UNRESOLVED", "{on:?}: {:?}", labels(&r.db));
+        assert_eq!(count(&r.db, SIMULATION_INTERRUPTED), 1, "{on:?}");
+        assert!(r.blockers.is_empty(), "{on:?}: {:?}", r.blockers);
+    }
 }

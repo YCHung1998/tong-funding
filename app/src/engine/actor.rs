@@ -94,6 +94,10 @@ pub const CONFIG_RISK_OVERRIDES: &str = "risk_overrides";
 /// period before its baseline time; from the baseline on, the baseline data and Node 0 decide.
 pub const PREPARED_RECHECK_MS: i64 = 30_000;
 
+/// While startup reconciliation is pending, it is run again this often (injected clock). It is
+/// idempotent: settled intents are not queried again and landed transitions are not repeated.
+pub const RECONCILE_RETRY_MS: i64 = 30_000;
+
 /// Latest price per (exchange, symbol); feeders update it with `send_modify`.
 pub type MarketPrices = BTreeMap<(Exchange, String), Decimal>;
 
@@ -195,6 +199,12 @@ const fn in_flight(state: PairState) -> bool {
         | PairState::PartialFailure
         | PairState::Unresolved => false,
     }
+}
+
+/// What startup hands to the reconciler: in-flight pairs, and RECONCILED simulated pairs (their
+/// simulated position died with the process; decision 7).
+const fn needs_reconciliation(view: &PairView) -> bool {
+    in_flight(view.state) || (view.simulated && matches!(view.state, PairState::Reconciled))
 }
 
 /// One order of a leg and what is known about it.
@@ -340,8 +350,13 @@ struct Actor {
     /// Disambiguates manual order ids created at the same clock millisecond.
     manual_seq: u64,
     /// Set at startup while unfinished intents / in-flight pairs await reconciliation; refuses
-    /// exposure meanwhile.
+    /// exposure meanwhile (in EXCHANGE_DEMO only, decision 8; always shown in the Snapshot).
     reconciliation_pending: Option<String>,
+    /// Pairs (and manual `pair_uuid`s) found in flight at startup that the reconciler has not
+    /// decided yet. The reconciler touches only these; the scheduler leaves them alone.
+    reconcile_scope: BTreeSet<PairUuid>,
+    reconcile_inflight: bool,
+    last_reconcile_ms: Option<i64>,
     cmd_rx: mpsc::Receiver<CommandMsg>,
     event_tx: mpsc::Sender<Event>,
     event_rx: mpsc::Receiver<Event>,
@@ -380,10 +395,10 @@ impl Actor {
         let mut pairs = BTreeMap::new();
         let mut flows = BTreeMap::new();
         for (view, scan) in load_open_pairs(&db) {
-            flows.insert(view.internal_uuid.clone(), Flow::new(scan, in_flight(view.state)));
+            flows.insert(view.internal_uuid.clone(), Flow::new(scan, needs_reconciliation(&view)));
             pairs.insert(view.internal_uuid.clone(), view);
         }
-        let reconciliation_pending = startup_reconciliation_reason(&db, &pairs);
+        let (reconcile_scope, reconciliation_pending) = startup_reconciliation(&db, &pairs);
 
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
@@ -408,6 +423,9 @@ impl Actor {
             reported: BTreeSet::new(),
             manual_seq: 0,
             reconciliation_pending,
+            reconcile_scope,
+            reconcile_inflight: false,
+            last_reconcile_ms: None,
             cmd_rx,
             event_tx,
             event_rx,
@@ -449,9 +467,13 @@ impl Actor {
 
     // ---- startup reconciliation hook ----
 
-    /// Calls the reconciler once (spawned) when startup left something to reconcile.
+    /// Spawns one reconciliation run when startup left something to reconcile (and none is
+    /// running). Called at start and, while still pending, every `RECONCILE_RETRY_MS`.
     fn start_reconciliation(&mut self) {
         let Some(reason) = self.reconciliation_pending.clone() else { return };
+        if self.reconcile_inflight {
+            return;
+        }
         let Some(reconciler) = self.reconciler.clone() else {
             self.reconciliation_pending = Some(format!("{reason}; no reconciler configured"));
             return;
@@ -462,7 +484,10 @@ impl Actor {
             executor: self.executor.clone(),
             account: self.account_for(simulated),
             execution_mode: self.execution_mode,
+            scope: self.reconcile_scope.clone(),
         };
+        self.reconcile_inflight = true;
+        self.last_reconcile_ms = Some(self.clock.now_ms());
         let tx = self.event_tx.clone();
         tokio::spawn(async move {
             let result = reconciler.reconcile(ctx).await;
@@ -470,34 +495,58 @@ impl Actor {
         });
     }
 
-    fn on_reconciliation_done(&mut self, result: Result<(), String>) {
-        match result {
-            Ok(()) => {
-                self.note(RECONCILIATION_RESULT, None, json!({ "ok": true }));
-                // The reconciler landed its changes in the store: adopt them. Pairs it closed out
-                // (CANCELLED / FINALIZED / ...) are no longer "open": refresh their state too.
-                let known: Vec<PairUuid> = self.pairs.keys().cloned().collect();
-                for id in known {
-                    if let Ok(Some(row)) = self.db.get_pair(&id)
-                        && let (Ok(s), Some(v)) = (row.status.parse::<PairState>(), self.pairs.get_mut(&id))
-                    {
-                        v.state = s;
-                    }
-                }
-                for (view, scan) in load_open_pairs(&self.db) {
-                    let id = view.internal_uuid.clone();
-                    let flow = self.flows.entry(id.clone()).or_default();
-                    flow.scan = scan;
-                    flow.orphan = in_flight(view.state) && flow.open.is_none() && flow.close.is_none();
-                    self.pairs.insert(id, view);
-                }
-                self.reconciliation_pending = None;
-            }
-            Err(reason) => {
-                self.note(RECONCILIATION_RESULT, None, json!({ "ok": false, "reason": reason }));
-                self.reconciliation_pending = Some(format!("reconciliation did not complete: {reason}"));
-            }
+    /// Retry a pending reconciliation (tick).
+    fn maybe_retry_reconciliation(&mut self, now: i64) {
+        if self.reconciliation_pending.is_some()
+            && self.reconciler.is_some()
+            && !self.reconcile_inflight
+            && self.last_reconcile_ms.is_none_or(|t| now - t >= RECONCILE_RETRY_MS)
+        {
+            self.start_reconciliation();
         }
+    }
+
+    /// Adopt what the reconciler landed for the pairs in scope. A pair it decided (its state
+    /// changed, or the whole run succeeded) leaves the scope and is the actor's again; the rest
+    /// stay hands-off for the next run.
+    fn on_reconciliation_done(&mut self, result: Result<(), String>) {
+        self.reconcile_inflight = false;
+        match &result {
+            Ok(()) => self.note(RECONCILIATION_RESULT, None, json!({ "ok": true })),
+            Err(reason) => self.note(RECONCILIATION_RESULT, None, json!({ "ok": false, "reason": reason })),
+        }
+        let scope: Vec<PairUuid> = self.reconcile_scope.iter().cloned().collect();
+        let mut still: Vec<PairUuid> = Vec::new();
+        for id in scope {
+            let before = self.pairs.get(&id).map(|v| v.state);
+            let row = match self.db.get_pair(&id) {
+                Ok(Some(row)) => row,
+                // No pair row (manual orders): done when the run succeeded.
+                Ok(None) => {
+                    if result.is_ok() {
+                        self.reconcile_scope.remove(&id);
+                    }
+                    continue;
+                }
+                Err(_) => continue, // kept; the store error shows elsewhere
+            };
+            let Some((view, scan)) = view_of_row(&self.db, row) else { continue };
+            let decided = (result.is_ok() || before != Some(view.state)) && !needs_reconciliation(&view);
+            let flow = self.flows.entry(id.clone()).or_default();
+            flow.scan = scan;
+            flow.orphan = !decided;
+            if decided {
+                self.reconcile_scope.remove(&id);
+            } else if result.is_ok() {
+                still.push(id.clone());
+            }
+            self.pairs.insert(id, view);
+        }
+        self.reconciliation_pending = match result {
+            Ok(()) if still.is_empty() => None,
+            Ok(()) => Some(format!("reconciler finished but pair(s) still in flight: {}", still.join(", "))),
+            Err(reason) => Some(format!("reconciliation did not complete: {reason}")),
+        };
     }
 
     fn on_command(&mut self, msg: CommandMsg) {
@@ -512,9 +561,10 @@ impl Actor {
         self.dirty = true;
         if cmd.opens_exposure() {
             let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
+            let refusing = gate::refusing(&blockers, self.execution_mode);
             let name = command_name(&cmd);
             let pair = pair_of(&cmd).map(str::to_string);
-            if let Err(why) = gate::admit(&cmd, &blockers) {
+            if let Err(why) = gate::admit(&cmd, &refusing) {
                 let payload = json!({ "command": name, "reason": why });
                 // Best effort: on a halted store this cannot be written (the halt is the record).
                 match pair {
@@ -557,13 +607,14 @@ impl Actor {
 
     fn on_tick(&mut self) -> CommandReply {
         let now = self.clock.now_ms();
+        self.maybe_retry_reconciliation(now);
         let ids: Vec<PairUuid> = self.pairs.keys().cloned().collect();
         for id in ids {
             let Some(view) = self.pairs.get(&id).cloned() else { continue };
             let orphan = self.flows.get(&id).is_some_and(|f| f.orphan);
             match view.state {
                 PairState::Prepared => self.tick_prepared(&view, now),
-                PairState::Reconciled => self.tick_reconciled(&view, now),
+                PairState::Reconciled if !orphan => self.tick_reconciled(&view, now),
                 PairState::OrderSubmit if !orphan => self.check_submitted(&id, now),
                 PairState::FillMonitor if !orphan => {
                     self.poll(&id, OrderAction::Open);
@@ -576,6 +627,7 @@ impl Actor {
                 PairState::OrderSubmit
                 | PairState::FillMonitor
                 | PairState::Closing
+                | PairState::Reconciled
                 | PairState::PreTradeCheck
                 | PairState::Blocked
                 | PairState::Imbalanced
@@ -1313,6 +1365,8 @@ impl Actor {
                 if let Some(v) = self.pairs.get_mut(pair) {
                     v.state = to;
                 }
+                // The actor (a user command) moved it: it is no longer the reconciler's.
+                self.reconcile_scope.remove(pair);
                 self.dirty = true;
                 Ok(to)
             }
@@ -1387,17 +1441,7 @@ impl Actor {
 
     /// Stored global settings and overrides (validated by core). Missing keys = defaults / none.
     fn load_risk(&self) -> Result<(RiskConfig, RiskOverrides), String> {
-        let risk = match self.db.config_get(CONFIG_RISK) {
-            Ok(None) => RiskConfig::default(),
-            Ok(Some(e)) => RiskConfig::from_json(&e.value.to_string()).map_err(|e| format!("{CONFIG_RISK}: {e}"))?,
-            Err(e) => return Err(format!("{CONFIG_RISK}: {e}")),
-        };
-        let overrides = match self.db.config_get(CONFIG_RISK_OVERRIDES) {
-            Ok(None) => RiskOverrides::new(),
-            Ok(Some(e)) => parse_overrides(&e.value).map_err(|e| format!("{CONFIG_RISK_OVERRIDES}: {e}"))?,
-            Err(e) => return Err(format!("{CONFIG_RISK_OVERRIDES}: {e}")),
-        };
-        Ok((risk, overrides))
+        load_risk_config(&self.db)
     }
 
     // ---- order plumbing ----
@@ -1555,16 +1599,35 @@ async fn is_flat(account: &dyn AccountView, legs: &[(Exchange, String); 2]) -> R
     Ok(true)
 }
 
-/// Why startup must reconcile before exposure is allowed, if it must: unfinished intents, or
-/// pairs that were in flight. A failed intent listing counts as "must" (fail closed).
-fn startup_reconciliation_reason(db: &Db, pairs: &BTreeMap<PairUuid, PairView>) -> Option<String> {
-    let intents = match db.list_unfinished_intents() {
-        Ok(v) => v.len(),
-        Err(e) => return Some(format!("cannot list unfinished order intents: {e}")),
+/// Global risk settings and per-exchange overrides from `config` (missing = defaults / none).
+pub(crate) fn load_risk_config(db: &Db) -> Result<(RiskConfig, RiskOverrides), String> {
+    let risk = match db.config_get(CONFIG_RISK) {
+        Ok(None) => RiskConfig::default(),
+        Ok(Some(e)) => RiskConfig::from_json(&e.value.to_string()).map_err(|e| format!("{CONFIG_RISK}: {e}"))?,
+        Err(e) => return Err(format!("{CONFIG_RISK}: {e}")),
     };
-    let flying = pairs.values().filter(|v| in_flight(v.state)).count();
-    (intents > 0 || flying > 0)
-        .then(|| format!("{intents} unfinished order intent(s), {flying} pair(s) in flight at startup"))
+    let overrides = match db.config_get(CONFIG_RISK_OVERRIDES) {
+        Ok(None) => RiskOverrides::new(),
+        Ok(Some(e)) => parse_overrides(&e.value).map_err(|e| format!("{CONFIG_RISK_OVERRIDES}: {e}"))?,
+        Err(e) => return Err(format!("{CONFIG_RISK_OVERRIDES}: {e}")),
+    };
+    Ok((risk, overrides))
+}
+
+/// What startup must reconcile before exposure is allowed: the pairs that need it (in flight,
+/// or RECONCILED simulated) and the `pair_uuid` of every unfinished intent, plus the reason
+/// shown while it is pending. A failed intent listing counts as "must" (fail closed).
+fn startup_reconciliation(db: &Db, pairs: &BTreeMap<PairUuid, PairView>) -> (BTreeSet<PairUuid>, Option<String>) {
+    let mut scope: BTreeSet<PairUuid> = pairs.values().filter(|v| needs_reconciliation(v)).map(|v| v.internal_uuid.clone()).collect();
+    let flying = scope.len();
+    let intents = match db.list_unfinished_intents() {
+        Ok(v) => v,
+        Err(e) => return (scope, Some(format!("cannot list unfinished order intents: {e}"))),
+    };
+    scope.extend(intents.iter().map(|i| i.pair_uuid.clone()));
+    let reason = (!scope.is_empty())
+        .then(|| format!("{} unfinished order intent(s), {flying} pair(s) in flight at startup", intents.len()));
+    (scope, reason)
 }
 
 fn dummy_snapshot() -> Snapshot {
@@ -1582,35 +1645,42 @@ fn dummy_snapshot() -> Snapshot {
 /// after a restart). An open pair row that cannot be read halts the store: an unknown pair may
 /// hold exposure (fail closed).
 fn load_open_pairs(db: &Db) -> Vec<(PairView, Value)> {
-    let mut out = Vec::new();
-    let Ok(rows) = db.list_pairs() else { return out };
-    for row in rows {
-        let state = match row.status.parse::<PairState>() {
-            Ok(s) if !transition::is_open(s) => continue,
-            Ok(s) => s,
-            Err(e) => {
-                db.halt(HaltReason::ConfigReadFailed(format!("pair {}: {e}", row.internal_uuid)));
-                continue;
-            }
-        };
-        match serde_json::from_value::<PairEnvelope>(row.entry) {
-            Ok(env) => out.push((
-                PairView {
-                    internal_uuid: row.internal_uuid,
-                    pair_id: row.pair_id,
-                    symbol: row.symbol,
-                    long_exchange: env.long_exchange,
-                    short_exchange: env.short_exchange,
-                    state,
-                    settlement_ms: env.settlement_ms,
-                    simulated: env.simulated,
-                },
-                env.scan,
-            )),
-            Err(e) => db.halt(HaltReason::ConfigReadFailed(format!("pair {} entry unreadable: {e}", row.internal_uuid))),
+    let Ok(rows) = db.list_pairs() else { return Vec::new() };
+    rows.into_iter()
+        .filter(|row| row.status.parse::<PairState>().map_or(true, transition::is_open))
+        .filter_map(|row| view_of_row(db, row))
+        .collect()
+}
+
+/// A pair row as the actor sees it, with its scan snapshot. An unreadable state or entry halts
+/// the store (an unknown pair may hold exposure; fail closed).
+fn view_of_row(db: &Db, row: crate::store::state::PairRow) -> Option<(PairView, Value)> {
+    let state = match row.status.parse::<PairState>() {
+        Ok(s) => s,
+        Err(e) => {
+            db.halt(HaltReason::ConfigReadFailed(format!("pair {}: {e}", row.internal_uuid)));
+            return None;
+        }
+    };
+    match serde_json::from_value::<PairEnvelope>(row.entry) {
+        Ok(env) => Some((
+            PairView {
+                internal_uuid: row.internal_uuid,
+                pair_id: row.pair_id,
+                symbol: row.symbol,
+                long_exchange: env.long_exchange,
+                short_exchange: env.short_exchange,
+                state,
+                settlement_ms: env.settlement_ms,
+                simulated: env.simulated,
+            },
+            env.scan,
+        )),
+        Err(e) => {
+            db.halt(HaltReason::ConfigReadFailed(format!("pair {} entry unreadable: {e}", row.internal_uuid)));
+            None
         }
     }
-    out
 }
 
 /// Short label for events (no payload data).

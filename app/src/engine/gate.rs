@@ -48,6 +48,21 @@ pub fn current_blockers(db: &Db, reconciliation_pending: Option<&str>) -> Vec<Bl
     out
 }
 
+/// The blockers that refuse exposure in `mode` (decision 8): a pending reconciliation is about
+/// demo orders, so it refuses only in EXCHANGE_DEMO; SIMULATION entries stay allowed (simulated
+/// pairs never need the exchange to reconcile). The kill switch and a halted store refuse in
+/// both modes. The Snapshot keeps showing every blocker.
+pub fn refusing(blockers: &[Blocker], mode: ExecutionMode) -> Vec<Blocker> {
+    blockers
+        .iter()
+        .filter(|b| match b {
+            Blocker::ReconciliationPending(_) => mode == ExecutionMode::ExchangeDemo,
+            Blocker::KillSwitch | Blocker::KillSwitchUnreadable(_) | Blocker::StoreHalted(_) => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// `Err(reason)` when `cmd` must be refused. Only `opens_exposure()` commands are ever refused
 /// here; closing, cancelling and settings always pass (the kill switch never forces a close).
 pub fn admit(cmd: &Command, blockers: &[Blocker]) -> Result<(), String> {
@@ -310,6 +325,26 @@ mod tests {
             current_blockers(&db, Some("2 intents")),
             vec![Blocker::ReconciliationPending("2 intents".into())]
         );
+    }
+
+    // decision 8: unfinished demo reconciliation refuses exposure only in EXCHANGE_DEMO.
+    #[test]
+    fn pending_reconciliation_refuses_only_in_exchange_demo_and_the_rest_refuses_in_both() {
+        let pending = Blocker::ReconciliationPending("demo pair p1".into());
+        let enter = Command::ManualEnter { pair: p() };
+        let demo = refusing(std::slice::from_ref(&pending), ExecutionMode::ExchangeDemo);
+        assert_eq!(demo, vec![pending.clone()]);
+        assert!(admit(&enter, &demo).unwrap_err().contains("reconciliation pending"));
+        let sim = refusing(std::slice::from_ref(&pending), ExecutionMode::Simulation);
+        assert_eq!(sim, vec![]);
+        assert_eq!(admit(&enter, &sim), Ok(()));
+        for other in [Blocker::KillSwitch, Blocker::KillSwitchUnreadable("x".into()), Blocker::StoreHalted("y".into())] {
+            for mode in [ExecutionMode::Simulation, ExecutionMode::ExchangeDemo] {
+                let r = refusing(&[pending.clone(), other.clone()], mode);
+                assert!(r.contains(&other), "{other:?} refuses in {mode:?}");
+                assert!(admit(&enter, &r).is_err());
+            }
+        }
     }
 
     #[test]

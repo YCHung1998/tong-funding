@@ -8,20 +8,28 @@
 //! and alert events.
 //!
 //! Which pairs are looked at: every pair with an unfinished intent, plus every pair in an
-//! in-flight state (ORDER_SUBMIT, FILL_MONITOR, CLOSING) even without one (a crash can land the
-//! state but no intent yet, or settle every intent but not the state), plus RECONCILED pairs of
-//! an interrupted simulation.
+//! in-flight state (PRE_TRADE_CHECK, ORDER_SUBMIT, FILL_MONITOR, CLOSING) even without one (a
+//! crash can land the state but no intent yet, or settle every intent but not the state), plus
+//! RECONCILED pairs of an interrupted simulation, plus unfinished manual orders (`manual-...`
+//! intents without a pair row). With a `scope` (always, from the actor) only the pairs that were
+//! in flight at startup are looked at: pairs started after startup are live and never touched,
+//! however often a pending reconciliation is retried.
+//!
+//! PRE_TRADE_CHECK at restart: no order exists yet (intent-first; intents only follow
+//! CheckPassed), so the pair goes to BLOCKED (`CheckFailed`) with a `PRE_TRADE_CHECK_INTERRUPTED`
+//! event, simulated or not, without any exchange access.
 //!
 //! Simulated pairs (envelope `simulated`, or any `sim`-prefixed intent) are never queried: the
-//! simulated ledger is not persisted, so in-flight ones go to UNRESOLVED with a
+//! simulated ledger is not persisted, so in-flight and RECONCILED ones go to UNRESOLVED with a
 //! `SIMULATION_INTERRUPTED` event (decision 7).
 //!
 //! Demo pairs: unfinished intents are queried by `client_order_id` and recorded; then the legs of
 //! the current phase (open orders in ORDER_SUBMIT / FILL_MONITOR, close orders in CLOSING) are
 //! compared with the positions and open orders of their symbols. Rules (spec table):
 //! - both legs filled, positions match, no open order → normal flow: ORDER_SUBMIT →
-//!   FILL_MONITOR (`BothLegsSubmitted`); FILL_MONITOR stays and the report carries the fills for
-//!   `fill::fill_decision`; CLOSING with both close legs filled and both flat → FINALIZED;
+//!   FILL_MONITOR (`BothLegsSubmitted`), then `fill::fill_decision` on the fills in base coin
+//!   (OKX contract value from `MarketData::order_rules`) and the pair's effective settings →
+//!   RECONCILED / IMBALANCED; CLOSING with both close legs filled and both flat → FINALIZED;
 //! - both legs not filled (rejected / cancelled with zero fill, no intent, or not found while the
 //!   order was at most SUBMITTED) AND no position AND no open order on either leg → CANCELLED
 //!   (`BothSubmitsFailed` from ORDER_SUBMIT, `TimeoutNoFills` from FILL_MONITOR); "not found"
@@ -31,26 +39,34 @@
 //! - anything else (position or open-order mismatch, live order, tampered row) → UNRESOLVED
 //!   (`RestartUndetermined`) + `RECONCILE_ALERT`.
 //!
-//! Missing data is never read as "no exposure": a failed query, an unavailable exchange (no key,
-//! simulated executor) or an incomplete / failed listing leaves the pair untouched and makes the
-//! report `pending`, so the gate keeps refusing exposure-opening commands.
+//! Manual orders: queried and recorded; one the exchange does not know, with no position and no
+//! open order on its symbol, is marked not sent; one it does not know while the symbol carries
+//! exposure raises a `RECONCILE_ALERT` (kept for a human). Simulated manual orders are left as is.
 //!
-//! Core gaps (core is not changed): CLOSING has no way back to RECONCILED, so a CLOSING pair whose
-//! close orders were never sent goes to UNRESOLVED (a human sends `RequestClose` again);
-//! RECONCILED has no restart event, so an interrupted simulated RECONCILED pair keeps its state
-//! and only gets the `SIMULATION_INTERRUPTED` event.
+//! Missing data is never read as "no exposure": a failed query, an unavailable exchange (no key,
+//! SIMULATION mode, simulated executor) or an incomplete / failed listing leaves the pair
+//! untouched and makes the report `pending`. The actor then refuses exposure-opening commands in
+//! EXCHANGE_DEMO (decision 8; SIMULATION entries stay allowed) and retries periodically.
+//!
+//! Core gap (core is not changed): CLOSING has no way back to RECONCILED, so a CLOSING pair whose
+//! close orders were never sent goes to UNRESOLVED (a human sends `RequestClose` again).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 use tong_funding_core::pair::{PairState, SystemEvent};
+use tong_funding_core::risk::{ExecutionMode, effective_for_pair};
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::actor::PairEnvelope;
-use super::fill::LegFill;
+use super::actor::{PairEnvelope, load_risk_config};
+use super::fill::{self, FillDecision, LegFill};
 use super::ids::IdPrefix;
 use super::intent::record_query_outcome;
-use super::ports::{AccountOrder, AccountPosition, AccountView, Executor, Leg, Listed, OrderAction, OrderState, QueryOutcome};
+use super::ports::{
+    AccountOrder, AccountPosition, AccountView, BoxFut, Executor, Leg, Listed, MarketData, OrderAction, OrderState, QueryOutcome,
+    ReconcileContext, StartupReconciler,
+};
 use super::transition::{self, TransitionError};
 use crate::ports::Clock;
 use crate::store::db::Db;
@@ -65,6 +81,10 @@ pub const SIMULATION_INTERRUPTED: &str = "SIMULATION_INTERRUPTED";
 pub const ORDER_INTENT_NOT_SENT: &str = "ORDER_INTENT_NOT_SENT";
 /// Summary of one reconciliation run (written only when there was something to reconcile).
 pub const RECONCILE_FINISHED: &str = "RECONCILE_FINISHED";
+/// A pair was in PRE_TRADE_CHECK when the program stopped: no order was sent; it is BLOCKED.
+pub const PRE_TRADE_CHECK_INTERRUPTED: &str = "PRE_TRADE_CHECK_INTERRUPTED";
+/// `pair_uuid` prefix of manual orders (no pair row; see `Actor::manual_order`).
+pub const MANUAL_PAIR_PREFIX: &str = "manual-";
 
 /// The order-capable executor and account view of EXCHANGE_DEMO. The caller passes
 /// `Err(reason)` when they cannot be built (keys unavailable, ...); a simulated executor is
@@ -86,6 +106,8 @@ pub enum Verdict {
     Unresolved,
     /// A simulated pair was in flight (UNRESOLVED where core allows it).
     SimulationInterrupted,
+    /// The pre-trade check was interrupted; no order was sent (BLOCKED).
+    CheckInterrupted,
     /// No transition applies (locked or settled pair); query results were recorded.
     Kept,
     /// Could not be decided now (see `reason`); nothing was transitioned.
@@ -114,9 +136,36 @@ pub struct ReconcileReport {
     pub finished_at_ms: i64,
 }
 
-/// Reconcile the store with the exchange after a restart. See the module docs for the rules.
+/// Everything one reconciliation run needs.
+pub struct ReconcileInput<'a> {
+    pub db: &'a Db,
+    /// Demo access; `Err(reason)` when there is none (keys unavailable, SIMULATION mode).
+    pub exchange: Result<ExchangeAccess<'a>, String>,
+    /// Order rules (OKX contract value) for the fill decision; `None` = unavailable (an OKX leg
+    /// then keeps its pair pending in FILL_MONITOR).
+    pub market: Option<&'a dyn MarketData>,
+    /// Only these pairs / `pair_uuid`s; `None` = the whole store.
+    pub scope: Option<&'a BTreeSet<String>>,
+    pub clock: &'a dyn Clock,
+}
+
+/// Reconcile the whole store, without order rules (tests and tools).
 pub async fn reconcile_startup(db: &Db, exchange: Result<ExchangeAccess<'_>, String>, clock: &dyn Clock) -> ReconcileReport {
-    let mut run = Run { db, events: EventStore::new(db.clone()), queries: 0, accounts: HashMap::new(), store_failed: false };
+    reconcile(ReconcileInput { db, exchange, market: None, scope: None, clock }).await
+}
+
+/// Reconcile the store with the exchange after a restart. See the module docs for the rules.
+pub async fn reconcile(input: ReconcileInput<'_>) -> ReconcileReport {
+    let ReconcileInput { db, exchange, market, scope, clock } = input;
+    let mut run = Run {
+        db,
+        events: EventStore::new(db.clone()),
+        market,
+        now_ms: clock.now_ms(),
+        queries: 0,
+        accounts: HashMap::new(),
+        store_failed: false,
+    };
     let mut outcomes = Vec::new();
     let mut fatal: Option<String> = None;
     match (db.list_unfinished_intents(), db.list_pairs()) {
@@ -125,7 +174,7 @@ pub async fn reconcile_startup(db: &Db, exchange: Result<ExchangeAccess<'_>, Str
                 Ok(a) if a.executor.is_simulated() => Err("only a simulated executor is available".to_string()),
                 other => other,
             };
-            for cand in candidates(unfinished, pairs) {
+            for cand in candidates(unfinished, pairs).into_iter().filter(|c| scope.is_none_or(|s| s.contains(&c.uuid))) {
                 if run.store_failed {
                     break;
                 }
@@ -159,6 +208,7 @@ fn verdict_str(v: &Verdict) -> &'static str {
         Verdict::PartialFailure => "PARTIAL_FAILURE",
         Verdict::Unresolved => "UNRESOLVED",
         Verdict::SimulationInterrupted => "SIMULATION_INTERRUPTED",
+        Verdict::CheckInterrupted => "CHECK_INTERRUPTED",
         Verdict::Kept => "KEPT",
         Verdict::Pending => "PENDING",
     }
@@ -203,7 +253,11 @@ fn candidates(unfinished: Vec<IntentRow>, pairs: Vec<PairRow>) -> Vec<Candidate>
         let unfinished = by_pair.remove(&row.internal_uuid).unwrap_or_default();
         let wanted = !unfinished.is_empty()
             || match row.status.parse::<PairState>() {
-                Ok(s) => in_flight(s) || (s == PairState::Reconciled && envelope(&row).is_some_and(|e| e.simulated)),
+                Ok(s) => {
+                    in_flight(s)
+                        || s == PairState::PreTradeCheck
+                        || (s == PairState::Reconciled && envelope(&row).is_some_and(|e| e.simulated))
+                }
                 Err(_) => false, // unreadable state without live intents: the actor's loader halts on it
             };
         if wanted {
@@ -299,6 +353,8 @@ type AccountData = Result<(Listed<AccountPosition>, Listed<AccountOrder>), Strin
 struct Run<'a> {
     db: &'a Db,
     events: EventStore,
+    market: Option<&'a dyn MarketData>,
+    now_ms: i64,
     queries: usize,
     accounts: HashMap<Exchange, AccountData>,
     /// A store write failed (the store is halted): stop.
@@ -325,6 +381,9 @@ impl Run<'_> {
             Ok(v) => v,
             Err(e) => return Self::outcome(&cand, Some(state), Some(state), Verdict::Pending, format!("cannot list intents: {e}")),
         };
+        if state == PairState::PreTradeCheck && all.is_empty() {
+            return self.check_interrupted(&cand, state);
+        }
         let simulated = env.simulated || all.iter().any(|i| IdPrefix::of(&i.client_order_id) == Some(IdPrefix::Sim));
         if simulated {
             return self.simulated(&cand, state);
@@ -364,6 +423,9 @@ impl Run<'_> {
 
     /// Intents whose pair row is missing: record what the exchange says, alert, no transition.
     async fn orphan(&mut self, cand: &Candidate, exchange: &Result<ExchangeAccess<'_>, String>) -> PairOutcome {
+        if cand.uuid.starts_with(MANUAL_PAIR_PREFIX) {
+            return self.manual(cand, exchange).await;
+        }
         if cand.unfinished.iter().all(|i| IdPrefix::of(&i.client_order_id) == Some(IdPrefix::Sim)) {
             return Self::outcome(cand, None, None, Verdict::Kept, "simulated intents without a pair row");
         }
@@ -382,6 +444,83 @@ impl Run<'_> {
         }
         self.alert(&cand.uuid, "KEPT", "unfinished order intents without a pair row", json!({}));
         Self::outcome(cand, None, None, Verdict::Kept, "unfinished order intents without a pair row")
+    }
+
+    /// Manual orders (no pair row): query and record; a "not found" one is marked not sent only
+    /// when its symbol carries no exposure; anything that does not add up raises one alert.
+    async fn manual(&mut self, cand: &Candidate, exchange: &Result<ExchangeAccess<'_>, String>) -> PairOutcome {
+        let demo: Vec<IntentRow> =
+            cand.unfinished.iter().filter(|i| IdPrefix::of(&i.client_order_id) != Some(IdPrefix::Sim)).cloned().collect();
+        if demo.is_empty() {
+            return Self::outcome(cand, None, None, Verdict::Kept, "simulated manual orders are not queried");
+        }
+        let access = match exchange {
+            Ok(a) => a,
+            Err(reason) => return Self::outcome(cand, None, None, Verdict::Pending, format!("exchange access unavailable: {reason}")),
+        };
+        let views = match self.query_unfinished(access, &demo).await {
+            Ok(v) => v,
+            Err(()) => return Self::outcome(cand, None, None, Verdict::Pending, "store write failed"),
+        };
+        if let Some(reason) = views.values().find_map(IntentView::failed_query) {
+            return Self::outcome(cand, None, None, Verdict::Pending, format!("order query failed: {reason}"));
+        }
+        let mut problems = Vec::new();
+        for i in &demo {
+            match views.get(&i.client_order_id) {
+                Some(IntentView::NotFound) => {
+                    let Some(ex) = exchange_named(&i.exchange) else {
+                        problems.push(format!("{}: unknown exchange {:?}", i.client_order_id, i.exchange));
+                        continue;
+                    };
+                    let (p, o) = match self.account(access, ex).await {
+                        Ok(x) => x,
+                        Err(e) => return Self::outcome(cand, None, None, Verdict::Pending, e),
+                    };
+                    let exposed = p.items.iter().any(|x| x.exchange == ex && x.symbol == i.symbol && !x.quantity.is_zero())
+                        || o.items.iter().any(|x| x.exchange == ex && x.symbol == i.symbol && x.remaining_quantity > Decimal::ZERO);
+                    if exposed {
+                        problems.push(format!("{} not found on the exchange while {} carries exposure", i.client_order_id, i.symbol));
+                    } else if !self.mark_one_not_sent(&cand.uuid, i) {
+                        return Self::outcome(cand, None, None, Verdict::Pending, "store write failed");
+                    }
+                }
+                Some(IntentView::Mismatch(r)) => problems.push(format!("{}: {r}", i.client_order_id)),
+                Some(
+                    IntentView::Filled(_)
+                    | IntentView::NotFilled
+                    | IntentView::Partial(_)
+                    | IntentView::Working
+                    | IntentView::Unknown(_),
+                )
+                | None => {}
+            }
+        }
+        if problems.is_empty() {
+            return Self::outcome(cand, None, None, Verdict::Kept, "manual orders reconciled");
+        }
+        let reason = problems.join("; ");
+        self.alert(&cand.uuid, "KEPT", "manual order does not add up", json!({ "problems": problems }));
+        Self::outcome(cand, None, None, Verdict::Kept, reason)
+    }
+
+    /// PRE_TRADE_CHECK without any intent: nothing was sent. CheckFailed → BLOCKED; left alone
+    /// (kept) if core does not allow it.
+    fn check_interrupted(&mut self, cand: &Candidate, state: PairState) -> PairOutcome {
+        let reason = "restart during the pre-trade check; no order was sent";
+        let detail = json!({ "block": reason, "source": "restart reconciliation" });
+        match transition::land_then_act(&self.events, &cand.uuid, state, SystemEvent::CheckFailed, detail, |to| to) {
+            Ok((to, _)) => {
+                if self.events.append(PRE_TRADE_CHECK_INTERRUPTED, Some(&cand.uuid), json!({ "reason": reason })).is_err() {
+                    self.store_failed = true;
+                }
+                Self::outcome(cand, Some(state), Some(to), Verdict::CheckInterrupted, reason)
+            }
+            Err(TransitionError::Illegal(e)) => {
+                Self::outcome(cand, Some(state), Some(state), Verdict::Kept, format!("CheckFailed not allowed: {e}"))
+            }
+            Err(e) => self.transition_failed(cand, state, e),
+        }
     }
 
     /// Decision 7: never query; in-flight → UNRESOLVED with a `SIMULATION_INTERRUPTED` event.
@@ -546,8 +685,14 @@ impl Run<'_> {
                 }
                 match (long.kind, short.kind) {
                     (LegKind::Filled, LegKind::Filled) => {
-                        let fill = |l: &LegState| LegFill::Known { requested: l.requested, filled: l.filled };
-                        Decision::Normal { fills: Some((fill(long), fill(short))) }
+                        let (long, short) = (long.clone(), short.clone());
+                        match (self.unit_base(&long).await, self.unit_base(&short).await) {
+                            (Ok(lu), Ok(su)) => {
+                                let fill = |l: &LegState, u: Decimal| LegFill::Known { requested: l.requested * u, filled: l.filled * u };
+                                Decision::Normal { fills: Some((fill(&long, lu), fill(&short, su))) }
+                            }
+                            (Err(e), _) | (_, Err(e)) => Decision::Pending(e),
+                        }
                     }
                     (LegKind::Zero, LegKind::Zero) => Decision::Cancelled,
                     (LegKind::Filled | LegKind::Partial, LegKind::Zero | LegKind::Partial | LegKind::Filled)
@@ -565,6 +710,42 @@ impl Run<'_> {
                     ))
                 }
             },
+        }
+    }
+
+    /// Base coin per order unit (OKX contract value, else 1), as the actor sizes and compares legs.
+    async fn unit_base(&self, leg: &LegState) -> Result<Decimal, String> {
+        match leg.exchange {
+            Exchange::Binance | Exchange::Bybit => Ok(Decimal::ONE),
+            Exchange::Okx => {
+                let market = self.market.ok_or_else(|| "OKX order rules unavailable (no market data)".to_string())?;
+                let rules = market.order_rules(leg.exchange, &leg.symbol).await.map_err(|e| format!("OKX order rules unavailable: {e}"))?;
+                Ok(rules.okx_ct_val.unwrap_or(Decimal::ONE))
+            }
+        }
+    }
+
+    /// FILL_MONITOR with both legs fully filled: the regular fill decision (RECONCILED /
+    /// IMBALANCED) with the pair's effective settings. `Err(reason)` leaves it in FILL_MONITOR.
+    fn settle_fills(&mut self, pair: &str, fills: (LegFill, LegFill)) -> Result<PairState, String> {
+        let row = self.db.get_pair(pair).map_err(|e| format!("cannot read pair: {e}"))?.ok_or("pair row missing")?;
+        let env = envelope(&row).ok_or("pair entry unreadable")?;
+        let (risk, overrides) = load_risk_config(self.db).map_err(|e| format!("settings unreadable: {e}"))?;
+        let eff = effective_for_pair(&risk, &overrides, env.long_exchange, env.short_exchange);
+        match fill::fill_decision(&eff, self.now_ms, self.now_ms, fills.0, fills.1) {
+            FillDecision::Wait => Err("fill decision still waiting".into()),
+            FillDecision::Transition(ev) => {
+                let detail = json!({ "source": "restart reconciliation", "long": format!("{:?}", fills.0), "short": format!("{:?}", fills.1) });
+                match transition::land_then_act(&self.events, pair, PairState::FillMonitor, ev, detail, |to| to) {
+                    Ok((to, _)) => Ok(to),
+                    Err(e) => {
+                        if matches!(e, TransitionError::StoreFailed(_)) {
+                            self.store_failed = true;
+                        }
+                        Err(format!("fill decision not applied: {e}"))
+                    }
+                }
+            }
         }
     }
 
@@ -618,11 +799,24 @@ impl Run<'_> {
                 }
             }
         };
+        // Back on the normal path: FILL_MONITOR continues with the regular fill decision.
+        let after = match &verdict {
+            Verdict::Normal { fills: Some(fills) } if after == PairState::FillMonitor => match self.settle_fills(&cand.uuid, *fills) {
+                Ok(to) => to,
+                Err(why) => return Self::outcome(cand, Some(state), Some(after), Verdict::Pending, why),
+            },
+            _ => after,
+        };
         match verdict {
             Verdict::PartialFailure | Verdict::Unresolved => {
                 self.alert(&cand.uuid, after.as_str(), &reason, json!({ "from": state.as_str() }));
             }
-            Verdict::Normal { .. } | Verdict::Cancelled | Verdict::SimulationInterrupted | Verdict::Kept | Verdict::Pending => {}
+            Verdict::Normal { .. }
+            | Verdict::Cancelled
+            | Verdict::SimulationInterrupted
+            | Verdict::CheckInterrupted
+            | Verdict::Kept
+            | Verdict::Pending => {}
         }
         Self::outcome(cand, Some(state), Some(after), verdict, reason)
     }
@@ -647,21 +841,29 @@ impl Run<'_> {
             if !matches!(st, Some(IntentState::Intended | IntentState::Submitted)) {
                 continue;
             }
-            let ok = self.db.update_intent_state(&i.client_order_id, IntentState::Cancelled, None).is_ok()
-                && self
-                    .events
-                    .append(
-                        ORDER_INTENT_NOT_SENT,
-                        Some(pair),
-                        json!({ "client_order_id": i.client_order_id, "from": i.state, "reason": "not found on the exchange; no position or open order on either leg" }),
-                    )
-                    .is_ok();
-            if !ok {
-                self.store_failed = true;
+            if !self.mark_one_not_sent(pair, i) {
                 return false;
             }
         }
         true
+    }
+
+    /// One "not found, no exposure" intent → CANCELLED + `ORDER_INTENT_NOT_SENT`. `false` = a
+    /// store write failed.
+    fn mark_one_not_sent(&mut self, pair: &str, i: &IntentRow) -> bool {
+        let ok = self.db.update_intent_state(&i.client_order_id, IntentState::Cancelled, None).is_ok()
+            && self
+                .events
+                .append(
+                    ORDER_INTENT_NOT_SENT,
+                    Some(pair),
+                    json!({ "client_order_id": i.client_order_id, "from": i.state, "reason": "not found on the exchange; no position or open order" }),
+                )
+                .is_ok();
+        if !ok {
+            self.store_failed = true;
+        }
+        ok
     }
 }
 
@@ -772,6 +974,35 @@ fn leg_state(
     Ok(st)
 }
 
+/// The production [`StartupReconciler`]: [`reconcile`] over the actor's startup scope, with
+/// demo access only in EXCHANGE_DEMO (the simulator is never demo access) and `Ok` only when
+/// nothing is left pending.
+pub struct RecoveryReconciler {
+    market: Arc<dyn MarketData>,
+    clock: Arc<dyn Clock>,
+}
+
+impl RecoveryReconciler {
+    pub fn new(market: Arc<dyn MarketData>, clock: Arc<dyn Clock>) -> RecoveryReconciler {
+        RecoveryReconciler { market, clock }
+    }
+}
+
+impl StartupReconciler for RecoveryReconciler {
+    fn reconcile(&self, ctx: ReconcileContext) -> BoxFut<'static, Result<(), String>> {
+        let (market, clock) = (self.market.clone(), self.clock.clone());
+        Box::pin(async move {
+            let exchange = match ctx.execution_mode {
+                ExecutionMode::ExchangeDemo => Ok(ExchangeAccess { executor: ctx.executor.as_ref(), account: ctx.account.as_ref() }),
+                ExecutionMode::Simulation => Err("SIMULATION mode: no order-capable executor to query demo orders".to_string()),
+            };
+            let input =
+                ReconcileInput { db: &ctx.db, exchange, market: Some(market.as_ref()), scope: Some(&ctx.scope), clock: clock.as_ref() };
+            reconcile(input).await.pending.map_or(Ok(()), Err)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +1012,7 @@ mod tests {
         AccountOrder, AccountPosition, BoxFut, Leg, Listed, OrderAction, OrderRequest, OrderState, OrderStatus, QueryOutcome,
         SubmitOutcome,
     };
+    use std::sync::Arc;
     use crate::ports::ManualClock;
     use crate::store::db::test_support::{clock, open_tmp, tempdir};
     use crate::store::events::EventStore;
@@ -1014,11 +1246,11 @@ mod tests {
         assert_eq!(r.pending, None, "{r:?}");
         assert_eq!((intent_state(&db, &l), intent_state(&db, &s)), ("FILLED".into(), "FILLED".into()));
         assert_eq!(db.get_intent(&l).unwrap().unwrap().exchange_order_id, Some(format!("EX-{l}")));
-        assert_eq!(pair_state(&db), "FILL_MONITOR", "back on the normal path");
+        assert_eq!(pair_state(&db), "RECONCILED", "back on the normal path: FILL_MONITOR, then the fill decision");
         let o = only_outcome(&r);
         let known = LegFill::Known { requested: d("0.01"), filled: d("0.01") };
         assert_eq!(o.verdict, Verdict::Normal { fills: Some((known, known)) });
-        assert_eq!(o.after, Some(PairState::FillMonitor));
+        assert_eq!(o.after, Some(PairState::Reconciled));
         assert!(events(&db, RECONCILE_ALERT).is_empty());
         fx.assert_read_only();
     }
@@ -1314,10 +1546,10 @@ mod tests {
         fx.position(SHORT_EX, "-0.01");
         assert_eq!(run(&db, &fx).pending, None);
         let before = transitions(&db);
-        assert_eq!(before, 1);
+        assert_eq!(before, 2, "FILL_MONITOR, then RECONCILED");
         let r = run(&db, &fx);
         assert_eq!(r.pending, None, "{r:?}");
-        assert_eq!(pair_state(&db), "FILL_MONITOR");
+        assert_eq!(pair_state(&db), "RECONCILED");
         assert_eq!(transitions(&db), before, "no second transition");
         assert_eq!(fx.queries().len(), 2, "terminal intents are not queried again");
     }
@@ -1384,5 +1616,250 @@ mod tests {
         let c = ManualClock::new(1);
         let fut = reconcile_startup(&db, Ok(ExchangeAccess { executor: &fx, account: &fx }), &c);
         assert_send(&fut);
+    }
+
+    // ---- wave 3: PRE_TRADE_CHECK, manual orders, fill decision, scope, the StartupReconciler ----
+
+    /// Order rules: OKX contract value 0.01, or unavailable.
+    struct Rules(Option<Decimal>);
+    impl MarketData for Rules {
+        fn refetch(&self, _: Exchange, _: &str) -> BoxFut<'_, Result<crate::engine::ports::FreshQuote, String>> {
+            Box::pin(std::future::ready(Err("not used".into())))
+        }
+        fn order_rules(&self, _: Exchange, _: &str) -> BoxFut<'_, Result<crate::engine::ports::OrderRules, String>> {
+            let r = self.0.map(|ct| crate::engine::ports::OrderRules {
+                lot: tong_funding_core::quantity::LotSize { step_size: d("1"), min_qty: d("1") },
+                okx_ct_val: Some(ct),
+            });
+            Box::pin(std::future::ready(r.ok_or_else(|| "rules down".to_string())))
+        }
+    }
+
+    fn run_with(db: &Db, fx: &FakeExchange, market: Option<&dyn MarketData>, scope: Option<&BTreeSet<String>>) -> ReconcileReport {
+        let c = ManualClock::new(5_000_000);
+        let input = ReconcileInput { db, exchange: Ok(ExchangeAccess { executor: fx, account: fx }), market, scope, clock: &c };
+        reconcile(input).now_or_never().expect("fakes resolve at once")
+    }
+
+    #[test]
+    fn a_pair_stopped_in_pre_trade_check_is_blocked_without_any_exchange_call() {
+        for simulated in [false, true] {
+            let (_d, db, _) = open_tmp();
+            seed_pair(&db, PAIR, PairState::PreTradeCheck, simulated);
+            let c = ManualClock::new(5_000_000);
+            // No exchange access at all: nothing was sent, so none is needed.
+            let r = reconcile_startup(&db, Err("no keys".into()), &c).now_or_never().unwrap();
+            assert_eq!(r.pending, None, "simulated={simulated}: {r:?}");
+            assert_eq!(pair_state(&db), "BLOCKED", "simulated={simulated}");
+            let o = only_outcome(&r);
+            assert_eq!((o.before, o.after, &o.verdict), (Some(PairState::PreTradeCheck), Some(PairState::Blocked), &Verdict::CheckInterrupted));
+            let ev = events(&db, PRE_TRADE_CHECK_INTERRUPTED);
+            assert_eq!(ev.len(), 1);
+            assert!(ev[0]["reason"].as_str().unwrap().contains("no order was sent"));
+            assert_eq!(r.queries, 0);
+            assert!(events(&db, RECONCILE_ALERT).is_empty());
+        }
+    }
+
+    const MANUAL: &str = "manual-1700000000000-1";
+
+    fn seed_manual(db: &Db, prefix: IdPrefix, exchange: Exchange, upto: IntentState) -> String {
+        let cid = client_order_id(prefix, MANUAL, Leg::Long, OrderAction::Open, 0);
+        db.create_intent(&NewIntent {
+            client_order_id: cid.clone(),
+            pair_uuid: MANUAL.into(),
+            leg: "long".into(),
+            exchange: exchange.name().into(),
+            symbol: SYM.into(),
+            side: "BUY".into(),
+            quantity: "0.01".into(),
+        })
+        .unwrap();
+        if upto == IntentState::Submitted {
+            db.update_intent_state(&cid, IntentState::Submitted, None).unwrap();
+        }
+        cid
+    }
+
+    #[test]
+    fn a_filled_manual_order_is_recorded_without_an_alert() {
+        let (_d, db, _) = open_tmp();
+        let m = seed_manual(&db, IdPrefix::Demo, LONG_EX, IntentState::Submitted);
+        let fx = FakeExchange::default();
+        fx.filled(&m, "0.01");
+        fx.position(LONG_EX, "0.01");
+        let r = run(&db, &fx);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!(fx.queries(), vec![m.clone()]);
+        assert_eq!(intent_state(&db, &m), "FILLED");
+        assert_eq!(only_outcome(&r).verdict, Verdict::Kept);
+        assert!(events(&db, RECONCILE_ALERT).is_empty(), "a manual order that resolves cleanly is not an orphan alert");
+        assert!(db.list_unfinished_intents().unwrap().is_empty());
+        fx.assert_read_only();
+    }
+
+    #[test]
+    fn an_unknown_manual_order_without_exposure_is_marked_not_sent() {
+        let (_d, db, _) = open_tmp();
+        let m = seed_manual(&db, IdPrefix::Demo, LONG_EX, IntentState::Submitted);
+        let fx = FakeExchange::default();
+        let r = run(&db, &fx);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!(intent_state(&db, &m), "CANCELLED");
+        assert_eq!(events(&db, ORDER_INTENT_NOT_SENT).len(), 1);
+        assert!(events(&db, RECONCILE_ALERT).is_empty());
+        fx.assert_read_only();
+    }
+
+    #[test]
+    fn an_unknown_manual_order_while_its_symbol_has_exposure_is_kept_with_an_alert() {
+        let (_d, db, _) = open_tmp();
+        let m = seed_manual(&db, IdPrefix::Demo, LONG_EX, IntentState::Submitted);
+        let fx = FakeExchange::default();
+        fx.position(LONG_EX, "0.01");
+        let r = run(&db, &fx);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!(intent_state(&db, &m), "SUBMITTED", "not proven unsent");
+        assert_eq!(events(&db, RECONCILE_ALERT).len(), 1);
+        assert!(events(&db, ORDER_INTENT_NOT_SENT).is_empty());
+    }
+
+    #[test]
+    fn manual_orders_need_exchange_access_and_simulated_ones_are_never_queried() {
+        let (_d, db, _) = open_tmp();
+        seed_manual(&db, IdPrefix::Demo, LONG_EX, IntentState::Submitted);
+        let c = ManualClock::new(5_000_000);
+        let r = reconcile_startup(&db, Err("no keys".into()), &c).now_or_never().unwrap();
+        assert!(r.pending.as_deref().is_some_and(|p| p.contains("no keys")), "{r:?}");
+
+        let (_d2, db2, _) = open_tmp();
+        let s = seed_manual(&db2, IdPrefix::Sim, LONG_EX, IntentState::Submitted);
+        let fx = FakeExchange::default();
+        let r = run(&db2, &fx);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert!(fx.queries().is_empty());
+        assert_eq!(intent_state(&db2, &s), "SUBMITTED");
+    }
+
+    /// FILL_MONITOR pair with long on OKX (1 contract of 0.01 BTC) and short on Bybit (0.01).
+    fn okx_pair(db: &Db) -> (String, String) {
+        let env = PairEnvelope { long_exchange: Exchange::Okx, short_exchange: SHORT_EX, settlement_ms: 2_000_000, simulated: false, scan: json!({}) };
+        let p = NewPair {
+            internal_uuid: PAIR.into(),
+            pair_id: "pid".into(),
+            symbol: SYM.into(),
+            status: PairState::FillMonitor,
+            entry: serde_json::to_value(env).unwrap(),
+        };
+        db.add_pair_if_not_pending(&p).unwrap();
+        let mut ids = Vec::new();
+        for (leg, ex, side, qty) in [(Leg::Long, Exchange::Okx, "BUY", "1"), (Leg::Short, SHORT_EX, "SELL", "0.01")] {
+            let cid = client_order_id(IdPrefix::Demo, PAIR, leg, OrderAction::Open, 0);
+            db.create_intent(&NewIntent {
+                client_order_id: cid.clone(),
+                pair_uuid: PAIR.into(),
+                leg: leg.as_str().into(),
+                exchange: ex.name().into(),
+                symbol: SYM.into(),
+                side: side.into(),
+                quantity: qty.into(),
+            })
+            .unwrap();
+            db.update_intent_state(&cid, IntentState::Submitted, None).unwrap();
+            ids.push(cid);
+        }
+        (ids[0].clone(), ids[1].clone())
+    }
+
+    #[test]
+    fn the_fill_decision_compares_legs_in_base_coin_with_the_okx_contract_value() {
+        let (_d, db, _) = open_tmp();
+        let (l, s) = okx_pair(&db);
+        let fx = FakeExchange::default();
+        fx.filled(&l, "1");
+        fx.filled(&s, "0.01");
+        fx.position(Exchange::Okx, "1");
+        fx.position(SHORT_EX, "-0.01");
+        // Rules unavailable: the base quantities are unknown, so the pair waits in FILL_MONITOR.
+        let r = run_with(&db, &fx, Some(&Rules(None)), None);
+        assert!(r.pending.as_deref().is_some_and(|p| p.contains("OKX order rules")), "{r:?}");
+        assert_eq!(pair_state(&db), "FILL_MONITOR");
+        // 1 contract x 0.01 = 0.01 BTC on both legs: within tolerance.
+        let r = run_with(&db, &fx, Some(&Rules(Some(d("0.01")))), None);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!(pair_state(&db), "RECONCILED");
+        let known = LegFill::Known { requested: d("0.01"), filled: d("0.01") };
+        assert_eq!(only_outcome(&r).verdict, Verdict::Normal { fills: Some((known, known)) });
+        fx.assert_read_only();
+    }
+
+    #[test]
+    fn both_legs_filled_but_far_apart_is_imbalanced() {
+        let (_d, db, _) = open_tmp();
+        seed_pair(&db, PAIR, PairState::FillMonitor, false);
+        let l = seed_intent(&db, IdPrefix::Demo, Leg::Long, OrderAction::Open, "0.01", IntentState::Submitted);
+        let s = seed_intent(&db, IdPrefix::Demo, Leg::Short, OrderAction::Open, "0.02", IntentState::Submitted);
+        let fx = FakeExchange::default();
+        fx.filled(&l, "0.01");
+        fx.filled(&s, "0.02");
+        fx.position(LONG_EX, "0.01");
+        fx.position(SHORT_EX, "-0.02");
+        let r = run(&db, &fx);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!(pair_state(&db), "IMBALANCED");
+    }
+
+    #[test]
+    fn pairs_outside_the_scope_are_never_touched() {
+        let (_d, db, _) = open_tmp();
+        seed_pair(&db, PAIR, PairState::OrderSubmit, false); // started after startup: live
+        let other = "7f1c2d3e-4b5a-4c6d-8e7f-0123456789ab";
+        seed_pair(&db, other, PairState::FillMonitor, true); // in flight at startup
+        seed_intent(&db, IdPrefix::Demo, Leg::Long, OrderAction::Open, "0.01", IntentState::Submitted);
+        let fx = FakeExchange::default();
+        let scope: BTreeSet<String> = [other.to_string()].into();
+        let r = run_with(&db, &fx, None, Some(&scope));
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!(only_outcome(&r).pair, other);
+        assert_eq!(db.get_pair(other).unwrap().unwrap().status, "UNRESOLVED");
+        assert_eq!(pair_state(&db), "ORDER_SUBMIT");
+        assert!(fx.queries().is_empty(), "the live pair's intent is not queried");
+    }
+
+    fn ctx(db: &Db, fx: &Arc<FakeExchange>, mode: ExecutionMode, scope: &[&str]) -> ReconcileContext {
+        ReconcileContext {
+            db: db.clone(),
+            executor: fx.clone(),
+            account: fx.clone(),
+            execution_mode: mode,
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_startup_reconciler_has_demo_access_only_in_exchange_demo() {
+        let sim_pair = "7f1c2d3e-4b5a-4c6d-8e7f-0123456789ab";
+        let (_d, db, _) = open_tmp();
+        seed_pair(&db, PAIR, PairState::OrderSubmit, false);
+        seed_pair(&db, sim_pair, PairState::FillMonitor, true);
+        let l = seed_intent(&db, IdPrefix::Demo, Leg::Long, OrderAction::Open, "0.01", IntentState::Submitted);
+        let fx = Arc::new(FakeExchange::default());
+        let rec = RecoveryReconciler::new(Arc::new(Rules(None)), Arc::new(ManualClock::new(5_000_000)));
+
+        // SIMULATION: the executor handed over is not demo access; the sim pair still resolves.
+        let r = rec.reconcile(ctx(&db, &fx, ExecutionMode::Simulation, &[PAIR, sim_pair])).now_or_never().unwrap();
+        let why = r.expect_err("demo pair cannot be reconciled in SIMULATION");
+        assert!(why.contains("SIMULATION"), "{why}");
+        assert!(fx.queries().is_empty());
+        assert_eq!(db.get_pair(sim_pair).unwrap().unwrap().status, "UNRESOLVED");
+        assert_eq!(pair_state(&db), "ORDER_SUBMIT");
+
+        // EXCHANGE_DEMO: queried and resolved.
+        fx.filled(&l, "0.01");
+        fx.position(LONG_EX, "0.01");
+        let r = rec.reconcile(ctx(&db, &fx, ExecutionMode::ExchangeDemo, &[PAIR, sim_pair])).now_or_never().unwrap();
+        assert_eq!(r, Ok(()));
+        assert_eq!(pair_state(&db), "PARTIAL_FAILURE", "long filled, short never sent");
+        fx.assert_read_only();
     }
 }
