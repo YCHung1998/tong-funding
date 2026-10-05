@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use serde_json::Value;
-use tong_funding_core::redact::{PLACEHOLDER, redact_secrets};
+use tong_funding_core::redact::{PLACEHOLDER, is_sensitive_name, redact_secrets};
 use tong_funding_core::types::Exchange;
 
 use crate::ports::{SecretError, SecretName, SecretProvider};
@@ -26,7 +26,14 @@ pub fn account_name(exchange: Exchange, name: SecretName) -> String {
 }
 
 fn unavailable(e: keyring::Error) -> SecretError {
-    SecretError::Unavailable(e.to_string())
+    SecretError::Unavailable(redact_secrets(&e.to_string()))
+}
+
+/// Error messages never carry secret material, whatever the store put in them.
+fn scrub(e: SecretError) -> SecretError {
+    match e {
+        SecretError::Unavailable(m) => SecretError::Unavailable(redact_secrets(&m)),
+    }
 }
 
 /// Minimal key/value seam over the OS secret store, keyed by account name.
@@ -103,51 +110,51 @@ impl<S: KeyStore> KeychainSecrets<S> {
         if value.is_empty() {
             return Err(SecretError::Unavailable("refusing to store an empty secret".into()));
         }
-        self.store.set(&account_name(exchange, name), value)
+        self.store.set(&account_name(exchange, name), value).map_err(|e| match scrub(e) {
+            // a store may echo the value it failed to write; drop it verbatim too
+            SecretError::Unavailable(m) => SecretError::Unavailable(m.replace(value, PLACEHOLDER)),
+        })
     }
 
     /// Removes a secret; removing a missing one is not an error.
     pub fn delete_secret(&self, exchange: Exchange, name: SecretName) -> Result<(), SecretError> {
-        self.store.delete(&account_name(exchange, name))
+        self.store.delete(&account_name(exchange, name)).map_err(scrub)
     }
 }
 
 impl<S: KeyStore> SecretProvider for KeychainSecrets<S> {
     fn get(&self, exchange: Exchange, name: SecretName) -> Result<Option<String>, SecretError> {
         // An empty stored value is never usable: report it as missing, not as a credential.
-        Ok(self.store.get(&account_name(exchange, name))?.filter(|v| !v.is_empty()))
+        Ok(self.store.get(&account_name(exchange, name)).map_err(scrub)?.filter(|v| !v.is_empty()))
     }
 }
 
-/// Field names whose string value is a secret (the spec's query params and headers).
-const SENSITIVE_KEYS: [&str; 9] = [
-    "signature",
-    "api_key",
-    "apikey",
-    "x-mbx-apikey",
-    "x-bapi-api-key",
-    "x-bapi-sign",
-    "ok-access-key",
-    "ok-access-sign",
-    "ok-access-passphrase",
-];
-
-fn is_sensitive_key(key: &str) -> bool {
-    SENSITIVE_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
-}
-
-/// Returns `value` with every string leaf passed through `redact_secrets`; structure, keys and
-/// non-string values are untouched. Use before anything goes into `events.payload`.
+/// Returns `value` made safe to store in `events.payload`, recursively:
+/// - an object entry whose KEY is a sensitive name (case/whitespace-insensitive) has its whole
+///   value (string, number, array or object) replaced by [`PLACEHOLDER`];
+/// - object keys and every string leaf go through `redact_secrets` (a key may be a URL);
+/// - a `[name, value]` pair array with a sensitive name has its value replaced.
+///
+/// Structure and non-sensitive non-string values are kept. Idempotent. If two keys collapse to the
+/// same text after redaction the later one wins (never reached for ordinary payloads).
 pub fn safe_event_payload(value: Value) -> Value {
     match value {
         Value::String(s) => Value::String(redact_secrets(&s)),
-        Value::Array(a) => Value::Array(a.into_iter().map(safe_event_payload).collect()),
+        Value::Array(a) => {
+            let is_pair = a.len() == 2 && matches!(&a[0], Value::String(n) if is_sensitive_name(n));
+            let mut it = a.into_iter();
+            if is_pair {
+                let name = it.next().map(safe_event_payload).unwrap_or(Value::Null);
+                Value::Array(vec![name, Value::String(PLACEHOLDER.to_string())])
+            } else {
+                Value::Array(it.map(safe_event_payload).collect())
+            }
+        }
         Value::Object(o) => Value::Object(
             o.into_iter()
-                .map(|(k, v)| match v {
-                    // `redact_secrets` only sees leaf text, so `{"apiKey": "secret"}` needs the key name.
-                    Value::String(_) if is_sensitive_key(&k) => (k, Value::String(PLACEHOLDER.to_string())),
-                    v => (k, safe_event_payload(v)),
+                .map(|(k, v)| {
+                    let masked = if is_sensitive_name(&k) { Value::String(PLACEHOLDER.to_string()) } else { safe_event_payload(v) };
+                    (redact_secrets(&k), masked)
                 })
                 .collect(),
         ),
@@ -315,6 +322,119 @@ mod tests {
         let v = json!({"e": "a?signature=abc&symbol=X"});
         let once = safe_event_payload(v);
         assert_eq!(safe_event_payload(once.clone()), once);
+    }
+
+    // ---- redteam cases for safe_event_payload ----
+
+    fn assert_no_leak(v: Value, secret: &str) -> Value {
+        let out = safe_event_payload(v);
+        let s = out.to_string();
+        assert!(!s.contains(secret), "{secret} leaked: {s}");
+        assert_eq!(safe_event_payload(out.clone()), out, "not idempotent");
+        out
+    }
+
+    #[test]
+    fn sensitive_key_masks_the_whole_subtree_whatever_its_shape() {
+        assert_no_leak(json!({"apiKey": ["S3CR3T"]}), "S3CR3T");
+        assert_no_leak(json!({"X-MBX-APIKEY": {"v": "S3CR3T"}}), "S3CR3T");
+        assert_no_leak(json!({"api_key": 123456789}), "123456789");
+        assert_no_leak(json!({"signature": {"a": [{"b": "S3CR3T"}]}}), "S3CR3T");
+        let out = safe_event_payload(json!({"apiKey": ["S3CR3T"], "symbol": "BTCUSDT", "n": 1}));
+        assert_eq!(out["apiKey"], PLACEHOLDER);
+        assert_eq!(out["symbol"], "BTCUSDT");
+        assert_eq!(out["n"], 1);
+    }
+
+    #[test]
+    fn every_listed_sensitive_name_is_masked_in_any_case_with_padding() {
+        for name in [
+            "apiKey", "api_key", "api_secret", "secretKey", "secret", "passphrase", "signature",
+            "X-MBX-APIKEY", "X-BAPI-API-KEY", "X-BAPI-SIGN", "OK-ACCESS-KEY", "OK-ACCESS-SIGN", "OK-ACCESS-PASSPHRASE",
+        ] {
+            for k in [name.to_string(), name.to_uppercase(), format!("  {name}\t"), format!("{name} ")] {
+                let out = safe_event_payload(json!({ k.clone(): "S3CR3T" }));
+                assert!(!out.to_string().contains("S3CR3T"), "key {k:?}: {out}");
+            }
+        }
+    }
+
+    #[test]
+    fn name_value_pair_arrays_mask_the_value() {
+        let out = assert_no_leak(json!([["X-MBX-APIKEY", "S3CR3T"], ["symbol", "BTCUSDT"]]), "S3CR3T");
+        assert_eq!(out[1][1], "BTCUSDT");
+        assert_no_leak(json!({"headers": [["OK-ACCESS-SIGN", {"x": "S3CR3T"}]]}), "S3CR3T");
+        assert_no_leak(json!([["  Signature ", 987654321]]), "987654321");
+    }
+
+    #[test]
+    fn keys_are_redacted_too() {
+        assert_no_leak(json!({"https://x/api?symbol=B&signature=S3CR3T": 1}), "S3CR3T");
+        assert_no_leak(json!({"https://x/api?symbol=B&signature%3DS3CR3T": 1}), "S3CR3T");
+        assert_no_leak(json!({"outer": {"GET /x?api_key=S3CR3T": ["a"]}}), "S3CR3T");
+    }
+
+    #[test]
+    fn leaf_formats_tab_newline_single_quote_escaped_json_and_okx_passphrase() {
+        assert_no_leak(json!("signature=\tS3CR3T"), "S3CR3T");
+        assert_no_leak(json!("signature:\nS3CR3T"), "S3CR3T");
+        assert_no_leak(json!("{'api_secret': 'S3CR3T'}"), "S3CR3T");
+        assert_no_leak(json!("x signature%3DS3CR3T&y=1"), "S3CR3T");
+        assert_no_leak(json!({"body": "{\"secretKey\": \"S3CR3T\"}"}), "S3CR3T");
+        let two = json!({"inner": json!({"msg": "{\"apiKey\":\"S3CR3T\"}"}).to_string()});
+        assert_no_leak(two, "S3CR3T");
+        assert_no_leak(json!("OK-ACCESS-PASSPHRASE: my pass S3CR3T phrase"), "S3CR3T");
+        assert_no_leak(json!({"e": "passphrase=my pass S3CR3T"}), "S3CR3T");
+    }
+
+    #[test]
+    fn structure_and_non_sensitive_values_survive() {
+        let v = json!({"a": [1, 2.5, true, null, {"b": "x"}], "pair": ["k", "v"], "s": "plain"});
+        assert_eq!(safe_event_payload(v.clone()), v);
+    }
+
+    // ---- 4.1 contract: Ok(None) / Ok(None) / Err(Unavailable) with redacted message ----
+
+    #[test]
+    fn get_contract_empty_missing_and_error() {
+        let s = KeychainSecrets::new(MemStore::default());
+        s.store.set("Binance:api_key", "").unwrap();
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey), Ok(None), "stored empty");
+        assert_eq!(s.get(Exchange::Okx, SecretName::ApiKey), Ok(None), "missing");
+        let f = KeychainSecrets::new(MemStore::failing());
+        assert!(matches!(f.get(Exchange::Binance, SecretName::ApiKey), Err(SecretError::Unavailable(_))), "error");
+    }
+
+    struct LeakyStore;
+    impl KeyStore for LeakyStore {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretError> {
+            Err(SecretError::Unavailable("denied: api_key=S3CR3T signature=SIG123".into()))
+        }
+        fn set(&self, a: &str, v: &str) -> Result<(), SecretError> {
+            self.get(a).map(|_| ()).map_err(|_| SecretError::Unavailable(format!("cannot set {v}: api_key=S3CR3T")))
+        }
+        fn delete(&self, a: &str) -> Result<(), SecretError> {
+            self.get(a).map(|_| ())
+        }
+    }
+
+    #[test]
+    fn error_messages_from_any_store_are_redacted() {
+        let s = KeychainSecrets::new(LeakyStore);
+        let Err(SecretError::Unavailable(m)) = s.get(Exchange::Binance, SecretName::ApiKey) else { panic!() };
+        assert!(!m.contains("S3CR3T") && !m.contains("SIG123"), "{m}");
+        let Err(SecretError::Unavailable(m)) = s.set_secret(Exchange::Binance, SecretName::ApiKey, "VALUE-XYZ") else { panic!() };
+        assert!(!m.contains("S3CR3T") && !m.contains("VALUE-XYZ"), "{m}");
+        let Err(SecretError::Unavailable(m)) = s.delete_secret(Exchange::Binance, SecretName::ApiKey) else { panic!() };
+        assert!(!m.contains("S3CR3T"), "{m}");
+    }
+
+    #[test]
+    fn keyring_errors_are_redacted_by_the_real_store_adapter() {
+        let e = keyring::Error::PlatformFailure(Box::new(std::io::Error::other("boom api_key=S3CR3T")));
+        let SecretError::Unavailable(m) = unavailable(e);
+        assert!(!m.contains("S3CR3T"), "{m}");
+        assert!(m.contains("boom"), "{m}");
     }
 
     fn mem_db() -> Connection {
