@@ -15,7 +15,8 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::adapter::{
     BATCH_TIMEOUT, ExchangeAdapter, InstrumentRules, ListingStatus, META_TTL_MS, RawObservation, RulesLookup,
-    SINGLE_TIMEOUT, TtlCell, assemble, dec, http_get, int, parse_json, str_field,
+    SINGLE_TIMEOUT, TtlCell, assemble, dec_field, http_get, int, parse_json, percent_encode_value, str_field,
+    validate_symbol,
 };
 use super::endpoints::{
     BINANCE_EXCHANGE_INFO, BINANCE_FUNDING_INFO, BINANCE_PREMIUM_INDEX, BINANCE_TICKER_24H, binance_url,
@@ -55,27 +56,36 @@ fn parse_binance_body(body: &str) -> Result<Value, AdapterError> {
     Ok(v)
 }
 
-fn parse_rules(symbol: &str, filters: &[Value]) -> Result<InstrumentRules, String> {
+/// Outer error: a field is a JSON number instead of a string (`Parse`). Inner error: a required
+/// field is missing, so the rules are unavailable.
+fn parse_rules(symbol: &str, filters: &[Value]) -> Result<Result<InstrumentRules, String>, AdapterError> {
     let filter = |name: &str| filters.iter().find(|f| str_field(f, "filterType") == Some(name));
-    let lot = filter("LOT_SIZE").ok_or("LOT_SIZE filter missing")?;
-    let step_size =
-        lot.get("stepSize").and_then(dec).filter(|s| *s > Decimal::ZERO).ok_or("LOT_SIZE.stepSize missing")?;
-    let min_qty = lot.get("minQty").and_then(dec).ok_or("LOT_SIZE.minQty missing")?;
+    let Some(lot) = filter("LOT_SIZE") else { return Ok(Err("LOT_SIZE filter missing".into())) };
+    let step_size = dec_field(lot, "stepSize")?.filter(|s| *s > Decimal::ZERO);
+    let min_qty = dec_field(lot, "minQty")?;
+    let (Some(step_size), Some(min_qty)) = (step_size, min_qty) else {
+        return Ok(Err("LOT_SIZE.stepSize or minQty missing".into()));
+    };
     let market = filter("MARKET_LOT_SIZE");
-    let market_field = |key: &str| market.and_then(|m| m.get(key)).and_then(dec);
-    Ok(InstrumentRules {
+    let market_field = |key: &str| -> Result<Option<Decimal>, AdapterError> {
+        match market {
+            Some(m) => dec_field(m, key),
+            None => Ok(None),
+        }
+    };
+    Ok(Ok(InstrumentRules {
         exchange: Exchange::Binance,
         symbol: symbol.to_string(),
         step_size,
         min_qty,
-        max_qty: lot.get("maxQty").and_then(dec),
-        market_step_size: market_field("stepSize"),
-        market_min_qty: market_field("minQty"),
-        market_max_qty: market_field("maxQty"),
+        max_qty: dec_field(lot, "maxQty")?,
+        market_step_size: market_field("stepSize")?,
+        market_min_qty: market_field("minQty")?,
+        market_max_qty: market_field("maxQty")?,
         min_notional: None,
         ct_val: None,
         ct_mult: None,
-    })
+    }))
 }
 
 fn parse_catalog(body: &str) -> Result<Catalog, AdapterError> {
@@ -89,7 +99,7 @@ fn parse_catalog(body: &str) -> Result<Catalog, AdapterError> {
             && str_field(s, "contractType") == Some("PERPETUAL")
             && str_field(s, "quoteAsset") == Some("USDT");
         let filters = s.get("filters").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[]);
-        map.insert(symbol.to_string(), Instrument { tradable_usdt_perpetual: tradable, rules: parse_rules(symbol, filters) });
+        map.insert(symbol.to_string(), Instrument { tradable_usdt_perpetual: tradable, rules: parse_rules(symbol, filters)? });
     }
     Ok(Catalog(map))
 }
@@ -107,18 +117,19 @@ fn parse_intervals(body: &str) -> Result<Intervals, AdapterError> {
     Ok(Intervals(map))
 }
 
-/// One premiumIndex row as raw fields (`None` where the exchange gave nothing usable).
-fn raw_from_premium(row: &Value, volume: Option<Decimal>) -> Option<RawObservation> {
-    let symbol = str_field(row, "symbol")?.to_string();
-    Some(RawObservation {
+/// One premiumIndex row as raw fields (`None` where the exchange gave nothing usable); a JSON number
+/// in a decimal field is a `Parse` error.
+fn raw_from_premium(row: &Value, volume: Option<Decimal>) -> Result<Option<RawObservation>, AdapterError> {
+    let Some(symbol) = str_field(row, "symbol") else { return Ok(None) };
+    Ok(Some(RawObservation {
         exchange: Exchange::Binance,
-        symbol,
-        funding_rate: row.get("lastFundingRate").and_then(dec),
-        mark_price: row.get("markPrice").and_then(dec),
+        symbol: symbol.to_string(),
+        funding_rate: dec_field(row, "lastFundingRate")?,
+        mark_price: dec_field(row, "markPrice")?,
         next_funding_time: row.get("nextFundingTime").and_then(int),
         exchange_timestamp: row.get("time").and_then(int),
         volume_24h_quote: volume,
-    })
+    }))
 }
 
 impl<T: HttpTransport> BinanceAdapter<T> {
@@ -196,25 +207,27 @@ impl<T: HttpTransport> ExchangeAdapter for BinanceAdapter<T> {
         let ticker = parse_binance_body(&ticker?)?;
         let observed_at = earliest_observed_at(&[premium_at, ticker_at]).unwrap_or(premium_at);
 
-        let volumes: HashMap<&str, Decimal> = ticker
-            .as_array()
-            .ok_or_else(|| AdapterError::parse("ticker/24hr is not an array"))?
-            .iter()
-            .filter_map(|r| Some((str_field(r, "symbol")?, r.get("quoteVolume").and_then(dec)?)))
-            .collect();
+        let mut volumes: HashMap<&str, Decimal> = HashMap::new();
+        for r in ticker.as_array().ok_or_else(|| AdapterError::parse("ticker/24hr is not an array"))? {
+            if let (Some(symbol), Some(volume)) = (str_field(r, "symbol"), dec_field(r, "quoteVolume")?) {
+                volumes.insert(symbol, volume);
+            }
+        }
         let rows = premium.as_array().ok_or_else(|| AdapterError::parse("premiumIndex is not an array"))?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let Some(symbol) = str_field(row, "symbol") else { continue };
-            let Some(raw) = raw_from_premium(row, volumes.get(symbol).copied()) else { continue };
+            let Some(raw) = raw_from_premium(row, volumes.get(symbol).copied())? else { continue };
             out.push(self.finish(raw, &catalog, &intervals, observed_at));
         }
         Ok(out)
     }
 
     async fn refetch_symbol(&self, symbol: &str) -> Result<FundingObservation, AdapterError> {
-        let premium_q = format!("{BINANCE_PREMIUM_INDEX}?symbol={symbol}");
-        let ticker_q = format!("{BINANCE_TICKER_24H}?symbol={symbol}");
+        validate_symbol(symbol)?;
+        let encoded = percent_encode_value(symbol);
+        let premium_q = format!("{BINANCE_PREMIUM_INDEX}?symbol={encoded}");
+        let ticker_q = format!("{BINANCE_TICKER_24H}?symbol={encoded}");
         let (premium, ticker, catalog, intervals) = tokio::join!(
             self.timed_get(&premium_q, SINGLE_TIMEOUT),
             self.timed_get(&ticker_q, SINGLE_TIMEOUT),
@@ -226,9 +239,15 @@ impl<T: HttpTransport> ExchangeAdapter for BinanceAdapter<T> {
         let premium = parse_binance_body(&premium?)?;
         let ticker = parse_binance_body(&ticker?)?;
         let observed_at = earliest_observed_at(&[premium_at, ticker_at]).unwrap_or(premium_at);
-        let volume = ticker.get("quoteVolume").and_then(dec);
-        let raw =
-            raw_from_premium(&premium, volume).ok_or_else(|| AdapterError::parse("premiumIndex row has no symbol"))?;
+        if str_field(&premium, "symbol") != Some(symbol) {
+            return Err(AdapterError::parse("premiumIndex answered for a different symbol than requested"));
+        }
+        if str_field(&ticker, "symbol").is_some_and(|t| t != symbol) {
+            return Err(AdapterError::parse("ticker/24hr answered for a different symbol than requested"));
+        }
+        let volume = dec_field(&ticker, "quoteVolume")?;
+        let raw = raw_from_premium(&premium, volume)?
+            .ok_or_else(|| AdapterError::parse("premiumIndex row has no symbol"))?;
         Ok(self.finish(raw, &catalog, &intervals, observed_at))
     }
 
@@ -669,6 +688,89 @@ mod tests {
         let (_, adapter, _) = setup(fake, 0);
         let o = block_on(adapter.refetch_symbol("OMGUSDT")).unwrap();
         assert_eq!(o.data_status, DataStatus::NotListed);
+    }
+
+    // ----- round 2 -----
+
+    #[test]
+    fn status_418_is_rate_limited_with_its_retry_after() {
+        let mut banned = HttpResponse::with_status(418, "{}");
+        banned.headers.push(("Retry-After".into(), "60".into()));
+        let fake = FakeTransport::new()
+            .on("/fapi/v1/premiumIndex", Ok(banned))
+            .on("/fapi/v1/ticker/24hr", ok("binance/ticker24hr.json"))
+            .on("/fapi/v1/exchangeInfo", ok("binance/exchangeInfo.json"))
+            .on("/fapi/v1/fundingInfo", ok("binance/fundingInfo.json"));
+        assert_eq!(snapshot(fake), Err(AdapterError::RateLimited { retry_after_ms: Some(60_000) }));
+    }
+
+    #[test]
+    fn symbol_with_url_metacharacters_is_rejected_before_any_request() {
+        let (t, adapter, _) = setup(refetch_fake(), 0);
+        for bad in ["BTCUSDT&x=1", "BTCUSDT#@evil.com", "", "a b"] {
+            assert!(matches!(block_on(adapter.refetch_symbol(bad)), Err(AdapterError::Parse(_))), "{bad:?}");
+        }
+        assert!(t.requests().is_empty(), "no request may be sent for an invalid symbol");
+    }
+
+    #[test]
+    fn refetch_response_for_another_symbol_is_a_parse_error() {
+        let fake = FakeTransport::new()
+            .on("premiumIndex?symbol=ETHUSDT", ok("binance/premiumIndex_single_btcusdt.json"))
+            .on("ticker/24hr?symbol=ETHUSDT", ok("binance/ticker24hr_single_btcusdt.json"))
+            .on("/fapi/v1/exchangeInfo", ok("binance/exchangeInfo.json"))
+            .on("/fapi/v1/fundingInfo", ok("binance/fundingInfo.json"));
+        let (_, adapter, _) = setup(fake, 0);
+        assert!(matches!(block_on(adapter.refetch_symbol("ETHUSDT")), Err(AdapterError::Parse(_))));
+    }
+
+    #[test]
+    fn json_number_where_a_decimal_string_is_expected_is_a_parse_error() {
+        let prem = mutated("binance/premiumIndex.json", |v| {
+            v.as_array_mut().unwrap()[0]["markPrice"] = serde_json::json!(86007.5);
+        });
+        let fake = FakeTransport::new()
+            .on("/fapi/v1/premiumIndex", ok_json(&prem))
+            .on("/fapi/v1/ticker/24hr", ok("binance/ticker24hr.json"))
+            .on("/fapi/v1/exchangeInfo", ok("binance/exchangeInfo.json"))
+            .on("/fapi/v1/fundingInfo", ok("binance/fundingInfo.json"));
+        assert!(matches!(snapshot(fake), Err(AdapterError::Parse(_))));
+        let tk = mutated("binance/ticker24hr.json", |v| v.as_array_mut().unwrap()[0]["quoteVolume"] = serde_json::json!(1e-4));
+        let fake = FakeTransport::new()
+            .on("/fapi/v1/premiumIndex", ok("binance/premiumIndex.json"))
+            .on("/fapi/v1/ticker/24hr", ok_json(&tk))
+            .on("/fapi/v1/exchangeInfo", ok("binance/exchangeInfo.json"))
+            .on("/fapi/v1/fundingInfo", ok("binance/fundingInfo.json"));
+        assert!(matches!(snapshot(fake), Err(AdapterError::Parse(_))));
+    }
+
+    #[test]
+    fn zero_or_past_next_funding_time_on_a_trading_symbol_is_data_error() {
+        for next in [0_i64, 1_791_201_208_000 - 3_600_000] {
+            let prem = mutated("binance/premiumIndex.json", |v| {
+                for r in v.as_array_mut().unwrap() {
+                    if r["symbol"] == "BTCUSDT" {
+                        r["nextFundingTime"] = Value::from(next);
+                    }
+                }
+            });
+            let fake = FakeTransport::new()
+                .on("/fapi/v1/premiumIndex", ok_json(&prem))
+                .on("/fapi/v1/ticker/24hr", ok("binance/ticker24hr.json"))
+                .on("/fapi/v1/exchangeInfo", ok("binance/exchangeInfo.json"))
+                .on("/fapi/v1/fundingInfo", ok("binance/fundingInfo.json"));
+            let all = snapshot(fake).unwrap();
+            assert_eq!(find(&all, "BTCUSDT").data_status, DataStatus::DataError, "next = {next}");
+            assert_eq!(find(&all, "ETHUSDT").data_status, DataStatus::Listed);
+        }
+    }
+
+    #[test]
+    fn real_recorded_responses_are_not_rejected_by_the_string_only_rule() {
+        assert!(snapshot(happy_fake()).is_ok());
+        let (_, adapter, _) = setup(refetch_fake(), 0);
+        assert!(block_on(adapter.refetch_symbol("BTCUSDT")).is_ok());
+        assert!(matches!(block_on(adapter.instrument_rules("BTCUSDT")), Ok(RulesLookup::Available(_))));
     }
 
     #[test]

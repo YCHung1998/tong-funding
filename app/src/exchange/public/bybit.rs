@@ -17,7 +17,8 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::adapter::{
     BATCH_TIMEOUT, ExchangeAdapter, InstrumentRules, ListingStatus, MAX_PAGES, META_TTL_MS, RawObservation,
-    RulesLookup, SINGLE_TIMEOUT, TtlCell, assemble, dec, http_get, int, parse_json, str_field,
+    RulesLookup, SINGLE_TIMEOUT, TtlCell, assemble, classify_exchange_body, dec_field, http_get, int, parse_json,
+    percent_encode_value, str_field, validate_symbol,
 };
 use super::endpoints::{BYBIT_INSTRUMENTS_INFO, BYBIT_TICKERS, bybit_url};
 use super::refetch::earliest_observed_at;
@@ -51,6 +52,9 @@ pub struct BybitAdapter<T: HttpTransport> {
 
 /// HTTP 200 with `retCode != 0` is a failure.
 fn parse_bybit_body(body: &str) -> Result<Value, AdapterError> {
+    if let Some(limited) = classify_exchange_body(Exchange::Bybit, body) {
+        return Err(limited);
+    }
     let v = parse_json(body)?;
     let code = v.get("retCode").and_then(int).ok_or_else(|| AdapterError::parse("response has no retCode"))?;
     if code != 0 {
@@ -60,35 +64,40 @@ fn parse_bybit_body(body: &str) -> Result<Value, AdapterError> {
     Ok(v)
 }
 
-fn parse_rules(symbol: &str, row: &Value) -> Result<InstrumentRules, String> {
-    let lot = row.get("lotSizeFilter").ok_or("lotSizeFilter missing")?;
-    let step_size = lot.get("qtyStep").and_then(dec).filter(|s| *s > Decimal::ZERO).ok_or("lotSizeFilter.qtyStep missing")?;
-    let min_qty = lot.get("minOrderQty").and_then(dec).ok_or("lotSizeFilter.minOrderQty missing")?;
-    Ok(InstrumentRules {
+/// Outer error: a field is a JSON number instead of a string (`Parse`). Inner error: a required
+/// field is missing, so the rules are unavailable.
+fn parse_rules(symbol: &str, row: &Value) -> Result<Result<InstrumentRules, String>, AdapterError> {
+    let Some(lot) = row.get("lotSizeFilter") else { return Ok(Err("lotSizeFilter missing".into())) };
+    let step_size = dec_field(lot, "qtyStep")?.filter(|s| *s > Decimal::ZERO);
+    let min_qty = dec_field(lot, "minOrderQty")?;
+    let (Some(step_size), Some(min_qty)) = (step_size, min_qty) else {
+        return Ok(Err("lotSizeFilter.qtyStep or minOrderQty missing".into()));
+    };
+    Ok(Ok(InstrumentRules {
         exchange: Exchange::Bybit,
         symbol: symbol.to_string(),
         step_size,
         min_qty,
-        max_qty: lot.get("maxOrderQty").and_then(dec),
+        max_qty: dec_field(lot, "maxOrderQty")?,
         market_step_size: None,
         market_min_qty: None,
-        market_max_qty: lot.get("maxMktOrderQty").and_then(dec),
-        min_notional: lot.get("minNotionalValue").and_then(dec),
+        market_max_qty: dec_field(lot, "maxMktOrderQty")?,
+        min_notional: dec_field(lot, "minNotionalValue")?,
         ct_val: None,
         ct_mult: None,
-    })
+    }))
 }
 
-fn parse_instrument(symbol: &str, row: &Value) -> Instrument {
+fn parse_instrument(symbol: &str, row: &Value) -> Result<Instrument, AdapterError> {
     let contract_type = str_field(row, "contractType");
-    Instrument {
+    Ok(Instrument {
         tradable_usdt_perpetual: str_field(row, "status") == Some("Trading")
             && contract_type == Some("LinearPerpetual")
             && str_field(row, "quoteCoin") == Some("USDT"),
         linear_futures: contract_type == Some("LinearFutures"),
         interval_secs: bybit_interval_secs(row.get("fundingInterval").and_then(int)),
-        rules: parse_rules(symbol, row),
-    }
+        rules: parse_rules(symbol, row)?,
+    })
 }
 
 /// One page: its instruments and the next cursor (`None` when empty or absent).
@@ -96,13 +105,12 @@ fn parse_instruments_page(body: &str) -> Result<(Vec<(String, Instrument)>, Opti
     let v = parse_bybit_body(body)?;
     let result = v.get("result").ok_or_else(|| AdapterError::parse("instruments-info has no result"))?;
     let list = result.get("list").and_then(Value::as_array).ok_or_else(|| AdapterError::parse("instruments-info has no list"))?;
-    let rows = list
-        .iter()
-        .filter_map(|r| {
-            let symbol = str_field(r, "symbol")?;
-            Some((symbol.to_string(), parse_instrument(symbol, r)))
-        })
-        .collect();
+    let mut rows = Vec::with_capacity(list.len());
+    for r in list {
+        if let Some(symbol) = str_field(r, "symbol") {
+            rows.push((symbol.to_string(), parse_instrument(symbol, r)?));
+        }
+    }
     let cursor = result.get("nextPageCursor").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string);
     Ok((rows, cursor))
 }
@@ -123,7 +131,7 @@ impl<T: HttpTransport> BybitAdapter<T> {
             let mut url = format!("{BYBIT_INSTRUMENTS_INFO}?category=linear&limit={INSTRUMENTS_LIMIT}");
             if let Some(c) = &cursor {
                 url.push_str("&cursor=");
-                url.push_str(c);
+                url.push_str(&percent_encode_value(c));
             }
             let fetched = match http_get(&*self.transport, bybit_url(&url), BATCH_TIMEOUT).await {
                 Ok(body) => parse_instruments_page(&body),
@@ -183,8 +191,8 @@ impl<T: HttpTransport> BybitAdapter<T> {
         catalog: &Result<Arc<PagedCatalog>, AdapterError>,
         observed_at: i64,
         explicit_request: bool,
-    ) -> Option<FundingObservation> {
-        let symbol = str_field(row, "symbol")?.to_string();
+    ) -> Result<Option<FundingObservation>, AdapterError> {
+        let Some(symbol) = str_field(row, "symbol").map(str::to_string) else { return Ok(None) };
         let (mut base, interval) = match catalog {
             Err(_) => (DataStatus::DataError, None),
             Ok(c) => match c.entries.get(&symbol) {
@@ -206,17 +214,17 @@ impl<T: HttpTransport> BybitAdapter<T> {
         let raw = RawObservation {
             exchange: Exchange::Bybit,
             symbol,
-            funding_rate: row.get("fundingRate").and_then(dec),
-            mark_price: row.get("markPrice").and_then(dec),
+            funding_rate: dec_field(row, "fundingRate")?,
+            mark_price: dec_field(row, "markPrice")?,
             next_funding_time: row.get("nextFundingTime").and_then(int).filter(|t| *t > 0),
             exchange_timestamp: response_time,
-            volume_24h_quote: row.get("turnover24h").and_then(dec),
+            volume_24h_quote: dec_field(row, "turnover24h")?,
         };
         let (obs, outdated) = assemble(raw, base, interval, observed_at);
         if outdated {
             self.catalog.invalidate();
         }
-        Some(obs)
+        Ok(Some(obs))
     }
 }
 
@@ -236,11 +244,18 @@ impl<T: HttpTransport> ExchangeAdapter for BybitAdapter<T> {
             .and_then(|r| r.get("list"))
             .and_then(Value::as_array)
             .ok_or_else(|| AdapterError::parse("tickers has no result.list"))?;
-        Ok(rows.iter().filter_map(|row| self.observation(row, time, &catalog, observed_at, false)).collect())
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            if let Some(obs) = self.observation(row, time, &catalog, observed_at, false)? {
+                out.push(obs);
+            }
+        }
+        Ok(out)
     }
 
     async fn refetch_symbol(&self, symbol: &str) -> Result<FundingObservation, AdapterError> {
-        let q = format!("{BYBIT_TICKERS}?category=linear&symbol={symbol}");
+        validate_symbol(symbol)?;
+        let q = format!("{BYBIT_TICKERS}?category=linear&symbol={}", percent_encode_value(symbol));
         let ((tickers, tickers_at), catalog) = tokio::join!(self.timed_get(&q, SINGLE_TIMEOUT), self.catalog());
         let body = parse_bybit_body(&tickers?)?;
         let time = body.get("time").and_then(int);
@@ -250,7 +265,7 @@ impl<T: HttpTransport> ExchangeAdapter for BybitAdapter<T> {
             .and_then(Value::as_array)
             .and_then(|l| l.iter().find(|r| str_field(r, "symbol") == Some(symbol)))
             .ok_or_else(|| AdapterError::parse(format!("tickers returned no row for {symbol}")))?;
-        self.observation(row, time, &catalog, tickers_at, true)
+        self.observation(row, time, &catalog, tickers_at, true)?
             .ok_or_else(|| AdapterError::parse("ticker row has no symbol"))
     }
 
@@ -490,7 +505,7 @@ mod tests {
         let pages: Vec<_> = t.requests().into_iter().filter(|r| r.url.contains(INSTRUMENTS)).collect();
         assert_eq!(pages.len(), 2);
         assert!(pages[0].url.contains("limit=1000") && !pages[0].url.contains("cursor="), "explicit max limit: {}", pages[0].url);
-        assert!(pages[1].url.contains(&format!("cursor={REAL_CURSOR}")) && pages[1].url.contains("limit=1000"), "{}", pages[1].url);
+        assert!(pages[1].url.contains("cursor=first%253D0GUSDT%2526last%253DMOCAUSDT") && pages[1].url.contains("limit=1000"), "{}", pages[1].url);
     }
 
     #[test]
@@ -735,6 +750,81 @@ mod tests {
         let fake = FakeTransport::new().on("symbol=GONEUSDT", ok_json(&empty)).on(INSTRUMENTS, ok("bybit/instruments_complete.json"));
         let (_, adapter, _) = setup(fake, 0);
         assert!(matches!(block_on(adapter.refetch_symbol("GONEUSDT")), Err(AdapterError::Parse(_))));
+    }
+
+    // ----- round 2 -----
+
+    #[test]
+    fn rate_limit_ret_codes_with_http_200_are_rate_limited() {
+        for code in [10006, 10018] {
+            let body = format!(r#"{{"retCode":{code},"retMsg":"Too many visits"}}"#);
+            let fake = FakeTransport::new().on(TICKERS, Ok(HttpResponse::ok(body))).on(INSTRUMENTS, ok("bybit/instruments_complete.json"));
+            assert_eq!(snapshot(fake), Err(AdapterError::RateLimited { retry_after_ms: None }), "{code}");
+        }
+        let mut banned = HttpResponse::with_status(418, "");
+        banned.headers.push(("Retry-After".into(), "9".into()));
+        let fake = FakeTransport::new().on(TICKERS, Ok(banned)).on(INSTRUMENTS, ok("bybit/instruments_complete.json"));
+        assert_eq!(snapshot(fake), Err(AdapterError::RateLimited { retry_after_ms: Some(9_000) }));
+    }
+
+    #[test]
+    fn rate_limit_code_on_a_catalog_page_is_returned_as_rate_limited() {
+        let fake = FakeTransport::new().on(INSTRUMENTS, Ok(HttpResponse::ok(r#"{"retCode":10006,"retMsg":"x"}"#)));
+        let (_, adapter, _) = setup(fake, 0);
+        assert!(matches!(block_on(adapter.fetch_catalog()), Err(AdapterError::RateLimited { retry_after_ms: None })));
+    }
+
+    #[test]
+    fn symbol_with_url_metacharacters_is_rejected_before_any_request() {
+        let (t, adapter, _) = setup(refetch_fake(), 0);
+        for bad in ["BTCUSDT&category=inverse#@evil.com", "", "a b"] {
+            assert!(matches!(block_on(adapter.refetch_symbol(bad)), Err(AdapterError::Parse(_))), "{bad:?}");
+        }
+        assert!(t.requests().is_empty());
+    }
+
+    #[test]
+    fn cursor_is_percent_encoded_exactly_like_the_signed_client() {
+        // a cursor containing %, = and & must survive one round trip through the query string
+        let fake = FakeTransport::new()
+            .on(INSTRUMENTS, ok_json(&page_with_cursor("AAAUSDT", "a%3Db&c=d%")))
+            .on(INSTRUMENTS, ok_json(&page_with_cursor("BBBUSDT", "")));
+        let (t, adapter, _) = setup(fake, 0);
+        let paged = block_on(adapter.fetch_catalog()).unwrap();
+        assert!(paged.incomplete.is_none());
+        let second = t.requests().into_iter().filter(|r| r.url.contains(INSTRUMENTS)).nth(1).unwrap();
+        assert!(second.url.ends_with("&cursor=a%253Db%26c%3Dd%25"), "{}", second.url);
+    }
+
+    #[test]
+    fn json_number_where_a_decimal_string_is_expected_is_a_parse_error() {
+        let t = tickers_with("BTCUSDT", |r| r["turnover24h"] = serde_json::json!(4.1e9));
+        let fake = FakeTransport::new().on(TICKERS, ok_json(&t)).on(INSTRUMENTS, ok("bybit/instruments_complete.json"));
+        assert!(matches!(snapshot(fake), Err(AdapterError::Parse(_))));
+        let inst = mutated("bybit/instruments_complete.json", |v| {
+            edit_row(v, "BTCUSDT", |r| r["lotSizeFilter"]["qtyStep"] = serde_json::json!(0.001));
+        });
+        let fake = FakeTransport::new().on(INSTRUMENTS, ok_json(&inst));
+        let (_, adapter, _) = setup(fake, 0);
+        assert!(matches!(block_on(adapter.fetch_catalog()), Err(AdapterError::Parse(_))));
+    }
+
+    #[test]
+    fn zero_or_past_next_funding_time_on_a_trading_symbol_is_data_error() {
+        for next in ["0", "1791197600000"] {
+            let t = tickers_with("BTCUSDT", |r| r["nextFundingTime"] = Value::from(next));
+            let fake = FakeTransport::new().on(TICKERS, ok_json(&t)).on(INSTRUMENTS, ok("bybit/instruments_complete.json"));
+            let all = snapshot(fake).unwrap();
+            assert_eq!(find(&all, "BTCUSDT").data_status, DataStatus::DataError, "next = {next}");
+            assert_eq!(find(&all, "ETHUSDT").data_status, DataStatus::Listed);
+        }
+    }
+
+    #[test]
+    fn real_recorded_responses_are_not_rejected_by_the_string_only_rule() {
+        assert!(snapshot(happy_fake()).is_ok());
+        let (_, adapter, _) = setup(refetch_fake(), 0);
+        assert!(block_on(adapter.refetch_symbol("BTCUSDT")).is_ok());
     }
 
     #[test]
