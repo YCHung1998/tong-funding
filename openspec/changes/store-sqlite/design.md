@@ -82,6 +82,10 @@ schema_version(version INTEGER)
 - **`SCAN_RUN` 重啟即失。** 這是刻意取捨；若使用者想事後分析掃描歷史，需要改設計。
 - **匯入器假設舊檔的 `ts` 是 Unix 秒。** 已對 7,129 行確認皆為 1.79e9 量級，符合；但仍以驗證階段檢查數值範圍。
 
+- **遮蔽的已知漏網形式（已接受）**：標頭名稱與值之間只有 tab、沒有 `:` / `=`（例如 `OK-ACCESS-SIGN\t<值>`）不會被遮蔽。
+  實際送出的請求在 `HttpRequest` 的 Debug 會整個遮掉標頭值，且從 Keychain 讀出的金鑰另有 exact-value registry 兜底，因此不另外處理。
+  tuple 形式 `("X-MBX-APIKEY", "<值>")` 已於 2026-10-05 補上。
+
 ## Open Questions
 
 - 是否需要週期性備份資料庫（例如 WAL checkpoint 後複製）與 hash chain？目前列為 Non-Goal，red-team 建議過。
