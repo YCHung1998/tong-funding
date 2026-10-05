@@ -1,0 +1,3475 @@
+{
+ "case_count": 85,
+ "cases": [
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      0,
+      1
+     ]
+    ],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      0,
+      1
+     ]
+    ],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      1,
+      5
+     ]
+    ],
+    "ungrouped": [
+     0,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      3,
+      3,
+      0
+     ]
+    ],
+    "ungrouped": [
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      2,
+      1
+     ]
+    ],
+    "ungrouped": [
+     0,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      1,
+      2
+     ]
+    ],
+    "ungrouped": [
+     0,
+     3
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      1,
+      2,
+      0
+     ]
+    ],
+    "ungrouped": [
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      1,
+      2,
+      3
+     ]
+    ],
+    "ungrouped": [
+     0,
+     1,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      5,
+      3
+     ],
+     [
+      3,
+      2,
+      1
+     ]
+    ],
+    "ungrouped": [
+     0,
+     4,
+     6
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      3,
+      0
+     ]
+    ],
+    "ungrouped": [
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      1,
+      0
+     ]
+    ],
+    "ungrouped": [
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      3,
+      0,
+      1
+     ]
+    ],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      2,
+      4,
+      2
+     ]
+    ],
+    "ungrouped": [
+     0,
+     1,
+     3
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      1,
+      4
+     ]
+    ],
+    "ungrouped": [
+     0,
+     2,
+     3
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      4,
+      5
+     ]
+    ],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     6
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      1,
+      0
+     ]
+    ],
+    "ungrouped": [
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5,
+     6
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      2,
+      5,
+      2
+     ]
+    ],
+    "ungrouped": [
+     0,
+     1,
+     3,
+     4,
+     6
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": []
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4,
+     5
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      2,
+      3
+     ]
+    ],
+    "ungrouped": [
+     0,
+     1
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      0,
+      1,
+      0
+     ]
+    ],
+    "ungrouped": [
+     2,
+     3,
+     4
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "BTCUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [
+     [
+      1,
+      3,
+      1
+     ]
+    ],
+    "ungrouped": [
+     0,
+     2,
+     4,
+     5,
+     6
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "BTCUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Bybit",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "SOLUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": [
+     0,
+     1,
+     2
+    ]
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "Binance",
+      "short_exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     }
+    ],
+    "rows": [
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     },
+     {
+      "exchange": "Bybit",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "exchange": "OKX",
+      "symbol": "ETHUSDT"
+     }
+    ]
+   }
+  },
+  {
+   "expected": {
+    "grouped": [],
+    "ungrouped": []
+   },
+   "input": {
+    "entries": [
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "SOLUSDT"
+     },
+     {
+      "long_exchange": "OKX",
+      "short_exchange": "Binance",
+      "symbol": "ETHUSDT"
+     }
+    ],
+    "rows": []
+   }
+  }
+ ],
+ "header": {
+  "exported_at": "2026-10-05T10:30:05Z",
+  "source": {
+   "files_sha256": {
+    "position_grouping.py": "5b32e45267f15783bf4dba1d88b17957f6165635e276ccd81c2180f98dd03744"
+   },
+   "functions": [
+    "group_positions_by_pair"
+   ],
+   "git_commit": "c1a14c37253ebd023a1d2a7840e1855f1ef59469",
+   "repo": "/Users/eason.hung/orca/workspaces/funding-analysis/mvp-python",
+   "working_tree_dirty": true
+  }
+ }
+}

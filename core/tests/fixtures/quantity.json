@@ -1,0 +1,1970 @@
+{
+ "case_count": 163,
+ "cases": [
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2.1",
+    "qty": "2.1"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2.14589213",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2.3",
+    "qty": "2.3"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2.3",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": true
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "0.0004",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "0.019",
+    "qty": "0.019"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "0.019933554",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1",
+    "qty": "1.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "1.0",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": true
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "0.999999",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "5.0",
+    "qty": "5.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "5",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "0.0005",
+    "qty": "0.0005"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "0.0005",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "123.45",
+    "qty": "123.45"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "123.456789",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "0.07",
+    "qty": "0.07"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "0.07",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "0.3",
+    "qty": "0.3"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "0.3",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1230",
+    "qty": "1230.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "1234.5678",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": true
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "9.99",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2728.4",
+    "qty": "2728.4"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2728.40870603",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "772",
+    "qty": "772.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "772.46998863",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2600",
+    "qty": "2600.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "2609.486405",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "558.721",
+    "qty": "558.721"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "558.72187395",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2679.0",
+    "qty": "2679.0"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2679.07803992",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4418.0",
+    "qty": "4418.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "4418.04355959",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2066.0",
+    "qty": "2066.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "2066.33765853",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4281.5",
+    "qty": "4281.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "4281.52176609",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4423.68",
+    "qty": "4423.68"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "4423.68732091",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1834.34",
+    "qty": "1834.34"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "1834.34646969",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1467.3",
+    "qty": "1467.3"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "1467.36134856",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1480.8",
+    "qty": "1480.8"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "1480.8866024",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3851.854",
+    "qty": "3851.854"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "3851.85431073",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "782.2363",
+    "qty": "782.2363"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "782.23631656",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1553.9",
+    "qty": "1553.9"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "1553.9187505",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3560",
+    "qty": "3560.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "3569.39392306",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3550",
+    "qty": "3550.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "3558.90108455",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1154",
+    "qty": "1154.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "1154.33603818",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3718.1156",
+    "qty": "3718.1156"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "3718.11568216",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2360",
+    "qty": "2360.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "2364.64388816",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2117.43",
+    "qty": "2117.43"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "2117.43646616",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1610",
+    "qty": "1610.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "1610.21967162",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1292.05",
+    "qty": "1292.05"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "1292.05297884",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "100",
+    "qty": "100.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "106.32739453",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2157.703",
+    "qty": "2157.703"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2157.70347394",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4116.406",
+    "qty": "4116.406"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "4116.40663114",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4665",
+    "qty": "4665.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "4665.24456632",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "917.5",
+    "qty": "917.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "917.77752266",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2487.0751",
+    "qty": "2487.0751"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "2487.07514672",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4830",
+    "qty": "4830.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "4831.04896396",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3656.48",
+    "qty": "3656.48"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "3656.4898388",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3942.0711",
+    "qty": "3942.0711"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "3942.0711062",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1520",
+    "qty": "1520.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "1522.60151449",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4610",
+    "qty": "4610.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "4612.89160527",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1333.7",
+    "qty": "1333.7"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "1333.72808665",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "835.1",
+    "qty": "835.1"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "835.15294846",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3796.580",
+    "qty": "3796.58"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "3796.58043097",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1800",
+    "qty": "1800.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "1801.81666207",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "884.2",
+    "qty": "884.2"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "884.27614924",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "202.4",
+    "qty": "202.4"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "202.45853162",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2256.0",
+    "qty": "2256.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "2256.09934758",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1252.40",
+    "qty": "1252.4"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "1252.40003166",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3291.4",
+    "qty": "3291.4"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "3291.47635315",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3000.6814",
+    "qty": "3000.6814"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "3000.68142727",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3532.2",
+    "qty": "3532.2"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "3532.25583522",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2850",
+    "qty": "2850.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "2859.55525268",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "210",
+    "qty": "210.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "212.20535728",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4534.809",
+    "qty": "4534.809"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "4534.80907274",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4149.5",
+    "qty": "4149.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "4149.73403814",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4250.91",
+    "qty": "4250.91"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "4250.91228235",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1570.9",
+    "qty": "1570.9"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "1570.9439083",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "749.56",
+    "qty": "749.56"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "749.56602722",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4000",
+    "qty": "4000.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "4003.75366788",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3147",
+    "qty": "3147.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "3147.81295048",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2700.5",
+    "qty": "2700.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "2700.97837533",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "14.6916",
+    "qty": "14.6916"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "14.69162728",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4297",
+    "qty": "4297.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "4297.40769308",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4329.2",
+    "qty": "4329.2"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "4329.22398671",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "393.6530",
+    "qty": "393.653"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "393.65307331",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1250",
+    "qty": "1250.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "1250.05652228",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1936",
+    "qty": "1936.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "1936.68995098",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1354",
+    "qty": "1354.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "1354.47778855",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1192.356",
+    "qty": "1192.356"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "1192.35689022",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3700.8",
+    "qty": "3700.8"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "3700.85827358",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "265.6794",
+    "qty": "265.6794"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "265.67942812",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "971.5732",
+    "qty": "971.5732"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "971.57329661",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1707.5365",
+    "qty": "1707.5365"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "1707.53652523",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4713",
+    "qty": "4713.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "4713.44066641",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1991.681",
+    "qty": "1991.681"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "1991.68114338",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3644",
+    "qty": "3644.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "3644.19312825",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2771.5",
+    "qty": "2771.5"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2771.52998955",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2645.679",
+    "qty": "2645.679"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2645.67935057",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2503.961",
+    "qty": "2503.961"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2503.96176268",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2790.843",
+    "qty": "2790.843"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2790.84302727",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2459.1",
+    "qty": "2459.1"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2459.157568",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3535.8600",
+    "qty": "3535.86"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "3535.86002424",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "314",
+    "qty": "314.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "314.55559004",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4770.577",
+    "qty": "4770.577"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "4770.57797795",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1878",
+    "qty": "1878.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "1878.71701851",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3780.5",
+    "qty": "3780.5"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "3780.5868446",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2360.360",
+    "qty": "2360.36"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2360.36040131",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1219.0013",
+    "qty": "1219.0013"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "1219.00132654",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1910",
+    "qty": "1910.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "1914.87584729",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2670",
+    "qty": "2670.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "2670.77631278",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "730",
+    "qty": "730.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "732.49514759",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3181.5",
+    "qty": "3181.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "3181.84120348",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3620",
+    "qty": "3620.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "3620.66080161",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4861.1",
+    "qty": "4861.1"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "4861.18167237",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "411.078",
+    "qty": "411.078"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "411.07880559",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2905.139",
+    "qty": "2905.139"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2905.13984701",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3705.0",
+    "qty": "3705.0"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "3705.03018651",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2992.95",
+    "qty": "2992.95"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "2992.95323233",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1927.8",
+    "qty": "1927.8"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "1927.85622852",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3798.4335",
+    "qty": "3798.4335"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "3798.4335648",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4398.5",
+    "qty": "4398.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "4398.52550597",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4713",
+    "qty": "4713.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "4713.41051791",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1443.9",
+    "qty": "1443.9"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "1443.98205948",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "960",
+    "qty": "960.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "961.47933408",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3993.8",
+    "qty": "3993.8"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "3993.86917029",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "624.49",
+    "qty": "624.49"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "624.49201635",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1999",
+    "qty": "1999.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "1999.77841933",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "12.8331",
+    "qty": "12.8331"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "12.83319009",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2440",
+    "qty": "2440.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "2446.13973861",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1330",
+    "qty": "1330.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "1331.44882357",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2484.56",
+    "qty": "2484.56"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "2484.5681304",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3437.0",
+    "qty": "3437.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "3437.30065227",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "54",
+    "qty": "54.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "54.57856347",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1534.5",
+    "qty": "1534.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "1534.898723",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3549.44",
+    "qty": "3549.44"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "3549.44636382",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "193",
+    "qty": "193.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "193.36984989",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1145.5",
+    "qty": "1145.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "1145.59654488",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4305.104",
+    "qty": "4305.104"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "4305.10468306",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2206.206",
+    "qty": "2206.206"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2206.20623057",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4342.33",
+    "qty": "4342.33"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "4342.33690111",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2490",
+    "qty": "2490.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "2490.8883956",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2117.3556",
+    "qty": "2117.3556"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "2117.35560559",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3628",
+    "qty": "3628.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "3628.15944573",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3204.07",
+    "qty": "3204.07"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "3204.07266558",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2642.406",
+    "qty": "2642.406"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "2642.40666655",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "538.0",
+    "qty": "538.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "538.48585217",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4451.3794",
+    "qty": "4451.3794"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "4451.37948278",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "906.7",
+    "qty": "906.7"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "906.7159547",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4945.756",
+    "qty": "4945.756"
+   },
+   "input": {
+    "min_qty": "0.001",
+    "qty": "4945.75650823",
+    "step_size": "0.001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2574.6",
+    "qty": "2574.6"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2574.68390454",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "257",
+    "qty": "257.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "257.55262411",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "570",
+    "qty": "570.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "576.47605712",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3587.0",
+    "qty": "3587.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "3587.01933096",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "500",
+    "qty": "500.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "505.11955226",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2161.5",
+    "qty": "2161.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "2161.98259212",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1320.6055",
+    "qty": "1320.6055"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "1320.60557815",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "529",
+    "qty": "529.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "529.23318866",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4444.7",
+    "qty": "4444.7"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "4444.76375817",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3824.2229",
+    "qty": "3824.2229"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "3824.22294122",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4854",
+    "qty": "4854.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "4854.51068109",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4430.0678",
+    "qty": "4430.0678"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "4430.06782055",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1444.6440",
+    "qty": "1444.644"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "1444.64400697",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3895.0",
+    "qty": "3895.0"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "3895.08592761",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "681.0",
+    "qty": "681.0"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "681.38876024",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1133.88",
+    "qty": "1133.88"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "1133.88468018",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "940",
+    "qty": "940.0"
+   },
+   "input": {
+    "min_qty": "10",
+    "qty": "945.63538012",
+    "step_size": "10"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "1877.5",
+    "qty": "1877.5"
+   },
+   "input": {
+    "min_qty": "0.5",
+    "qty": "1877.88376907",
+    "step_size": "0.5"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2666",
+    "qty": "2666.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "2666.05143013",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2316.3",
+    "qty": "2316.3"
+   },
+   "input": {
+    "min_qty": "0.1",
+    "qty": "2316.33975815",
+    "step_size": "0.1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "3188",
+    "qty": "3188.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "3188.12964307",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4301.6344",
+    "qty": "4301.6344"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "4301.63440129",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2866.4354",
+    "qty": "2866.4354"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "2866.43542527",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "860",
+    "qty": "860.0"
+   },
+   "input": {
+    "min_qty": "1",
+    "qty": "860.13241422",
+    "step_size": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4477.9275",
+    "qty": "4477.9275"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "4477.92757354",
+    "step_size": "0.0001"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "2294.40",
+    "qty": "2294.4"
+   },
+   "input": {
+    "min_qty": "0.01",
+    "qty": "2294.4073417",
+    "step_size": "0.01"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "formatted": "4359.5798",
+    "qty": "4359.5798"
+   },
+   "input": {
+    "min_qty": "0.0001",
+    "qty": "4359.57980929",
+    "step_size": "0.0001"
+   }
+  }
+ ],
+ "header": {
+  "exported_at": "2026-10-05T10:30:05Z",
+  "source": {
+   "files_sha256": {
+    "quantity_precision.py": "ff78b5c9297f2239056db85dcdba2b5dcfa0e18cef017b3b6ede4ad0944a1648"
+   },
+   "functions": [
+    "apply_lot_size",
+    "format_quantity"
+   ],
+   "git_commit": "c1a14c37253ebd023a1d2a7840e1855f1ef59469",
+   "repo": "/Users/eason.hung/orca/workspaces/funding-analysis/mvp-python",
+   "working_tree_dirty": true
+  }
+ }
+}

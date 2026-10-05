@@ -1,0 +1,3136 @@
+{
+ "case_count": 150,
+ "cases": [
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "77620.64",
+    "long_latest": "77480.99",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "37412.73",
+    "short_latest": "37417.38"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "68683.19",
+    "long_latest": "68593.57",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "42878.94",
+    "short_latest": "42766.23"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "30281.61",
+    "long_latest": "30307.58",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "28707.46",
+    "short_latest": "28685.33"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "50378.63",
+    "long_latest": "50334.77",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "24116.51",
+    "short_latest": "23795.32"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "82743.86",
+    "long_latest": "82721.63",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "79476.59",
+    "short_latest": "79304.17"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "77988.69",
+    "long_latest": "77915.53",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "19934.35",
+    "short_latest": "19999.71"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "66948.57",
+    "long_latest": "67105.63",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "66362.63",
+    "short_latest": "66231.23"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "21984.93",
+    "long_latest": "21989.29",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "72242.6",
+    "short_latest": "71892.87"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "59266.8",
+    "long_latest": "59461.65",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "9888.54",
+    "short_latest": "9916.74"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "29033.84",
+    "long_latest": "29148.37",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "72781.71",
+    "short_latest": "73028.75"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "87084.13",
+    "long_latest": "86831.95",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "8615.21",
+    "short_latest": "8585.7"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "39440.11",
+    "long_latest": "39336.18",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "16724.93",
+    "short_latest": "16769.61"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "9068.29",
+    "long_latest": "9061.05",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "10014.0",
+    "short_latest": "10036.61"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "68450.69",
+    "long_latest": "68610.03",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "1610.73",
+    "short_latest": "1589.13"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "19807.64",
+    "long_latest": "19880.68",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "19880.68",
+    "short_latest": "19959.71"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "5074.11",
+    "long_latest": "5117.87",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "15916.13",
+    "short_latest": "15644.97"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "12637.53",
+    "long_latest": "12635.31",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "78910.49",
+    "short_latest": "78620.87"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "60856.92",
+    "long_latest": "60711.0",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "41688.12",
+    "short_latest": "41840.95"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "45225.02",
+    "long_latest": "45287.89",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "21501.94",
+    "short_latest": "21557.28"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "24263.72",
+    "long_latest": "24263.31",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "33209.99",
+    "short_latest": "33306.26"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "40441.3",
+    "long_latest": "40521.2",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "76271.85",
+    "short_latest": "76197.18"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "14466.66",
+    "long_latest": "14409.38",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "77884.02",
+    "short_latest": "78079.19"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "48300.35",
+    "long_latest": "48459.48",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "21215.34",
+    "short_latest": "21178.16"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "82034.38",
+    "long_latest": "81945.97",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "22119.32",
+    "short_latest": "22201.68"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "43325.48",
+    "long_latest": "43157.08",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "15473.72",
+    "short_latest": "15422.44"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "49537.1",
+    "long_latest": "50174.31",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "72950.22",
+    "short_latest": "74053.98"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "55389.09",
+    "long_latest": "55550.84",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "80582.94",
+    "short_latest": "80463.1"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "25739.69",
+    "long_latest": "26176.95",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "81553.23",
+    "short_latest": "82130.9"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "45617.7",
+    "long_latest": "45484.96",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "88046.69",
+    "short_latest": "88245.91"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "10572.8",
+    "long_latest": "10612.97",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "65561.51",
+    "short_latest": "65804.6"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "399",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "73867.68",
+    "long_latest": "72686.38",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "67462.59",
+    "short_latest": "68193.44"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "3457.07",
+    "long_latest": "3446.45",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "63319.36",
+    "short_latest": "64564.15"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "23541.26",
+    "long_latest": "23525.57",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "47427.82",
+    "short_latest": "47613.68"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "24028.62",
+    "long_latest": "24112.47",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "76974.9",
+    "short_latest": "76766.23"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "72119.45",
+    "long_latest": "72259.27",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "61564.66",
+    "short_latest": "61763.55"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "69698.51",
+    "long_latest": "70770.55",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "3838.86",
+    "short_latest": "3823.87"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "30879.34",
+    "long_latest": "30877.41",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "11059.8",
+    "short_latest": "11050.24"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "73935.28",
+    "long_latest": "73799.78",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "94.13",
+    "short_latest": "93.94"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "21201.3",
+    "long_latest": "21471.05",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "65806.09",
+    "short_latest": "65507.74"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "78178.75",
+    "long_latest": "78245.85",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "20198.37",
+    "short_latest": "20226.52"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "65705.78",
+    "long_latest": "65676.51",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "9362.07",
+    "short_latest": "9346.46"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "12347.01",
+    "long_latest": "12373.85",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "57417.79",
+    "short_latest": "57345.72"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "74585.92",
+    "long_latest": "74746.2",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "26801.02",
+    "short_latest": "26871.56"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "82836.13",
+    "long_latest": "82577.06",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "69154.84",
+    "short_latest": "68968.39"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "30309.19",
+    "long_latest": "30296.35",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "83448.88",
+    "short_latest": "83727.15"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "83684.8",
+    "long_latest": "83820.46",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "26405.3",
+    "short_latest": "26364.49"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "399",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "53928.8",
+    "long_latest": "53990.82",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "82532.78",
+    "short_latest": "82573.7"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "32229.37",
+    "long_latest": "32191.63",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "35806.16",
+    "short_latest": "35838.99"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "52671.63",
+    "long_latest": "52676.78",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "20697.43",
+    "short_latest": "20737.74"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "2204.29",
+    "long_latest": "2195.66",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "13341.88",
+    "short_latest": "13329.35"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "73881.51",
+    "long_latest": "73876.03",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "42581.96",
+    "short_latest": "42662.98"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "33307.21",
+    "long_latest": "33364.72",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "36749.22",
+    "short_latest": "36887.82"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "401",
+    "baseline_source": "scan",
+    "leverage": "1",
+    "long_baseline": "18694.15",
+    "long_latest": "18740.93",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "48938.99",
+    "short_latest": "48555.47"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage",
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "17330.86",
+    "long_latest": "17576.43",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "16214.4",
+    "short_latest": "15948.25"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "16600.74",
+    "long_latest": "16840.66",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "36680.16",
+    "short_latest": "36848.87"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "46576.97",
+    "long_latest": "47492.94",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "55915.92",
+    "short_latest": "55681.33"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "73075.6",
+    "long_latest": "72442.36",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "86192.23",
+    "short_latest": "85980.83"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "19209.45",
+    "long_latest": "19268.27",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "59867.46",
+    "short_latest": "59847.41"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "64797.55",
+    "long_latest": "64002.05",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "55090.95",
+    "short_latest": "55609.01"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "1259.26",
+    "long_latest": "1259.01",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "72209.32",
+    "short_latest": "72235.74"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "37074.25",
+    "long_latest": "36993.45",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "83818.68",
+    "short_latest": "83550.32"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "20699.98",
+    "long_latest": "20672.82",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "65859.47",
+    "short_latest": "65972.33"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "81801.88",
+    "long_latest": "80973.84",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "24680.66",
+    "short_latest": "24703.76"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "29562.64",
+    "long_latest": "29589.29",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "40109.49",
+    "short_latest": "40071.93"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "52847.63",
+    "long_latest": "53065.02",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "50001.03",
+    "short_latest": "50034.87"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "12117.25",
+    "long_latest": "12005.38",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "13361.9",
+    "short_latest": "13474.1"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "58448.86",
+    "long_latest": "58476.03",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "29201.2",
+    "short_latest": "29312.53"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "48151.88",
+    "long_latest": "47976.05",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "68688.42",
+    "short_latest": "68746.01"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "43595.36",
+    "long_latest": "43693.69",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "9033.9",
+    "short_latest": "9017.59"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "60347.92",
+    "long_latest": "60353.01",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "1864.59",
+    "short_latest": "1865.14"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "3668.82",
+    "long_latest": "3671.33",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "38042.57",
+    "short_latest": "38107.48"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage",
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "12257.61",
+    "long_latest": "12282.9",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "34456.14",
+    "short_latest": "34356.15"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage",
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "38806.63",
+    "long_latest": "38689.86",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "35167.18",
+    "short_latest": "35197.03"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "399",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "14000.89",
+    "long_latest": "14122.4",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "48091.42",
+    "short_latest": "47918.97"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "68635.1",
+    "long_latest": "69986.62",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "78881.15",
+    "short_latest": "77868.3"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "7914.55",
+    "long_latest": "7891.5",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "13922.32",
+    "short_latest": "13872.9"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "85830.12",
+    "long_latest": "86069.4",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "70209.76",
+    "short_latest": "70424.21"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "9795.58",
+    "long_latest": "9780.49",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "73824.94",
+    "short_latest": "73684.08"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "75834.16",
+    "long_latest": "74635.08",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "16370.05",
+    "short_latest": "16640.84"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "60750.31",
+    "long_latest": "60593.98",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "85555.22",
+    "short_latest": "85358.97"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "399",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "32521.14",
+    "long_latest": "33157.39",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "50121.39",
+    "short_latest": "49390.23"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "82703.26",
+    "long_latest": "83401.18",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "41280.25",
+    "short_latest": "41715.31"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "14986.46",
+    "long_latest": "14937.39",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "65226.69",
+    "short_latest": "65147.63"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "40204.16",
+    "long_latest": "40866.3",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "46064.38",
+    "short_latest": "46660.15"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "73750.45",
+    "long_latest": "74889.79",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "15067.34",
+    "short_latest": "14838.32"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "77340.44",
+    "long_latest": "77583.23",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "3246.67",
+    "short_latest": "3253.78"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage",
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "79958.87",
+    "long_latest": "80044.42",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "13964.26",
+    "short_latest": "13932.49"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "40247.09",
+    "long_latest": "40290.08",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "73405.73",
+    "short_latest": "73300.94"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "36824.98",
+    "long_latest": "36750.75",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "17996.56",
+    "short_latest": "18068.09"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "46709.7",
+    "long_latest": "46798.25",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "31640.99",
+    "short_latest": "31691.57"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "88220.1",
+    "long_latest": "87881.06",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "67273.86",
+    "short_latest": "67356.8"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "41334.34",
+    "long_latest": "41343.84",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "27313.23",
+    "short_latest": "27113.64"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "77411.04",
+    "long_latest": "77143.81",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "78261.15",
+    "short_latest": "78179.62"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage",
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "400",
+    "baseline_source": "scan",
+    "leverage": "6",
+    "long_baseline": "26645.37",
+    "long_latest": "26696.76",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "61212.95",
+    "short_latest": "61332.96"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "60812.49",
+    "long_latest": "60796.48",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "79589.81",
+    "short_latest": "79668.51"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "46778.85",
+    "long_latest": "46293.39",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "71019.29",
+    "short_latest": "71952.78"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "401",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "16953.34",
+    "long_latest": "16620.57",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "78875.31",
+    "short_latest": "79458.05"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "83525.5",
+    "long_latest": "85165.0",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "66949.77",
+    "short_latest": "67180.57"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "34075.98",
+    "long_latest": "33955.35",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "7481.43",
+    "short_latest": "7483.0"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "79342.32",
+    "long_latest": "78034.92",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "75783.71",
+    "short_latest": "76166.71"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "61752.36",
+    "long_latest": "60659.57",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "84216.19",
+    "short_latest": "84311.08"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "42765.04",
+    "long_latest": "42718.49",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "54893.45",
+    "short_latest": "54832.48"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "57992.67",
+    "long_latest": "57874.9",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "43926.57",
+    "short_latest": "43876.12"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "88510.83",
+    "long_latest": "89970.46",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "71151.16",
+    "short_latest": "70668.01"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "86515.65",
+    "long_latest": "86606.84",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "84239.11",
+    "short_latest": "84039.86"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "29425.27",
+    "long_latest": "29440.62",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "86088.9",
+    "short_latest": "86005.2"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "11283.11",
+    "long_latest": "11320.64",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "84488.51",
+    "short_latest": "84252.75"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "28832.65",
+    "long_latest": "28683.93",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "25037.63",
+    "short_latest": "24991.75"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "400",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "67250.26",
+    "long_latest": "67469.22",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "88713.15",
+    "short_latest": "89043.21"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "56982.93",
+    "long_latest": "56175.41",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "73165.05",
+    "short_latest": "74197.2"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "399",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "21721.61",
+    "long_latest": "21705.99",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "44795.76",
+    "short_latest": "44776.11"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "1",
+    "long_baseline": "6740.36",
+    "long_latest": "6750.12",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "16169.46",
+    "short_latest": "16127.74"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "56614.97",
+    "long_latest": "56770.98",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "25516.0",
+    "short_latest": "25449.21"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "72037.05",
+    "long_latest": "71802.75",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "1631.53",
+    "short_latest": "1637.9"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "29693.38",
+    "long_latest": "29723.64",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "49883.09",
+    "short_latest": "49991.87"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "11131.43",
+    "long_latest": "11134.29",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "83590.28",
+    "short_latest": "83670.28"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "12304.61",
+    "long_latest": "12282.05",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "10970.71",
+    "short_latest": "10992.2"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "401",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "58944.62",
+    "long_latest": "58803.77",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "10267.94",
+    "short_latest": "10287.19"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "43683.77",
+    "long_latest": "43696.1",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "44014.06",
+    "short_latest": "43936.28"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "56577.79",
+    "long_latest": "56528.99",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "236.21",
+    "short_latest": "236.1"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "23849.69",
+    "long_latest": "23902.93",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "16836.95",
+    "short_latest": "16816.57"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "9107.8",
+    "long_latest": "9111.74",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "19963.57",
+    "short_latest": "19965.79"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "28522.78",
+    "long_latest": "28627.32",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "47119.92",
+    "short_latest": "47136.81"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "21019.06",
+    "long_latest": "20979.16",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "84350.55",
+    "short_latest": "84306.13"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "1",
+    "long_baseline": "40797.42",
+    "long_latest": "40667.99",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "70627.33",
+    "short_latest": "70480.83"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "45132.71",
+    "long_latest": "45278.86",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "64946.87",
+    "short_latest": "64711.03"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "1",
+    "long_baseline": "51712.41",
+    "long_latest": "51060.22",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "36945.25",
+    "short_latest": "36278.28"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "45852.61",
+    "long_latest": "45788.69",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "31909.3",
+    "short_latest": "31806.9"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "1",
+    "long_baseline": "22361.07",
+    "long_latest": "22281.01",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "3147.9",
+    "short_latest": "3150.48"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "75477.83",
+    "long_latest": "75568.01",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "50652.39",
+    "short_latest": "50910.15"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "34706.54",
+    "long_latest": "34668.09",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "6139.4",
+    "short_latest": "6118.5"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "86444.81",
+    "long_latest": "85178.87",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "17290.24",
+    "short_latest": "17255.14"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "38118.84",
+    "long_latest": "38254.32",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "37904.51",
+    "short_latest": "37758.36"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "400",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "51944.16",
+    "long_latest": "52399.64",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "13787.7",
+    "short_latest": "13676.74"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "3",
+    "long_baseline": "5311.14",
+    "long_latest": "5256.63",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "17906.85",
+    "short_latest": "17680.88"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "22817.26",
+    "long_latest": "22413.89",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "2032.29",
+    "short_latest": "2039.05"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "49131.29",
+    "long_latest": "49335.51",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "1737.22",
+    "short_latest": "1730.94"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "1",
+    "long_baseline": "145.06",
+    "long_latest": "144.95",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "42193.26",
+    "short_latest": "42276.33"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "82334.39",
+    "long_latest": "82063.58",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "14906.34",
+    "short_latest": "14956.55"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "22280.26",
+    "long_latest": "22271.77",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "73161.69",
+    "short_latest": "73220.03"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Leverage",
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "399",
+    "available_margin_short": "50",
+    "baseline_source": "pretrade",
+    "leverage": "6",
+    "long_baseline": "72000.83",
+    "long_latest": "72811.77",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "23210.7",
+    "short_latest": "22901.53"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "67269.11",
+    "long_latest": "67085.15",
+    "margin_needed": "100",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "53095.34",
+    "short_latest": "53211.98"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "20538.31",
+    "long_latest": "20197.0",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "1",
+    "short_baseline": "16168.07",
+    "short_latest": "16009.31"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "63215.42",
+    "long_latest": "62586.73",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.5",
+    "short_baseline": "87415.26",
+    "short_latest": "88891.63"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "60122.84",
+    "long_latest": "60264.38",
+    "margin_needed": "100",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "16772.13",
+    "short_latest": "16762.16"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "5",
+    "long_baseline": "37318.35",
+    "long_latest": "37766.87",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "10241.43",
+    "short_latest": "10364.22"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "5000",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "73765.87",
+    "long_latest": "72678.44",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "19441.12",
+    "short_latest": "19112.12"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "5000",
+    "available_margin_short": "5000",
+    "baseline_source": "scan",
+    "leverage": "3",
+    "long_baseline": "57706.94",
+    "long_latest": "57831.16",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "0.05",
+    "short_baseline": "60569.76",
+    "short_latest": "60745.85"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [],
+    "pass": true
+   },
+   "input": {
+    "available_margin_long": "401",
+    "available_margin_short": "400",
+    "baseline_source": "pretrade",
+    "leverage": "5",
+    "long_baseline": "41661.53",
+    "long_latest": "41572.9",
+    "margin_needed": "400",
+    "max_leverage": "10",
+    "max_price_drift_pct": "1",
+    "short_baseline": "77322.06",
+    "short_latest": "77600.71"
+   }
+  },
+  {
+   "expected": {
+    "failed_checks": [
+     "Margin",
+     "PriceDrift"
+    ],
+    "pass": false
+   },
+   "input": {
+    "available_margin_long": "50",
+    "available_margin_short": "50",
+    "baseline_source": "scan",
+    "leverage": "1",
+    "long_baseline": "30308.66",
+    "long_latest": "30382.89",
+    "margin_needed": "400",
+    "max_leverage": "5",
+    "max_price_drift_pct": "0.1",
+    "short_baseline": "68362.6",
+    "short_latest": "68498.26"
+   }
+  }
+ ],
+ "header": {
+  "exported_at": "2026-10-05T10:30:05Z",
+  "source": {
+   "files_sha256": {
+    "pretrade_check.py": "a7b0df71bb095a77ac0f8495b8eac3f83c28034a1410b3ee143a99a9866bb7b2"
+   },
+   "functions": [
+    "evaluate_pretrade"
+   ],
+   "git_commit": "c1a14c37253ebd023a1d2a7840e1855f1ef59469",
+   "repo": "/Users/eason.hung/orca/workspaces/funding-analysis/mvp-python",
+   "working_tree_dirty": true
+  }
+ }
+}
