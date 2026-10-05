@@ -13,11 +13,12 @@
 | `order_timeout_seconds`（預設 15） | 秒 |
 | `max_leg_imbalance_pct` | % |
 | `min_24h_volume_usdt` | USDT |
+| `min_expected_net_pnl_pct`（標籤「Min Expected Net PnL %」，預設 0.03，只存在於全域） | % |
 | `allowed_exchanges`、`allowed_coins` | — |
 
 所有 `_pct` 欄位 SHALL 為百分比數值（0.01 代表 0.01%），單位標示 SHALL 為 `%`，輸入與顯示 SHALL NOT 在小數與百分比之間偷偷換算。
 頁面 SHALL NOT 出現下列欄位：Funding Threshold（`funding_threshold_pct`）、Max Concurrent Trades（以 legs 計）、Hedge Threshold（`hedge_threshold_pct`）。
-Figma 上的「Min Expected Net PnL %」SHALL 由 `net_edge_threshold_pct` 取代，且 SHALL NOT 同時存在兩個語意重複的門檻欄位。
+Figma 上的「Min Expected Net PnL %」SHALL 保留為 `min_expected_net_pnl_pct`，與 `net_edge_threshold_pct` 並存（使用者 2026-10-05 晚拍板）；頁面 SHALL 以文字區分兩者：Net Edge 門檻扣除安全邊際，Min Expected Net PnL 是扣除手續費與估計滑價、未扣安全邊際的預期淨收益，兩者皆須達到才算 `NetEdgeQualified`。
 `max_concurrent_pairs` 旁 SHALL 顯示目前開啟中的配對數（例如「目前 2 / 3 組」）。
 
 #### Scenario: 已移除欄位不存在
@@ -34,6 +35,11 @@ Figma 上的「Min Expected Net PnL %」SHALL 由 `net_edge_threshold_pct` 取�
 
 - **WHEN** 使用全新設定開啟頁面
 - **THEN** Stale Data Threshold 顯示 1000，單位標示為 ms，而不是 Figma 示範的 5 秒
+
+#### Scenario: 兩個門檻並存
+
+- **WHEN** 檢視 Global Limits 與 Net Edge 區塊
+- **THEN** 同時存在 `net_edge_threshold_pct` 與 `min_expected_net_pnl_pct`（預設 0.03），後者不出現在各交易所覆寫區塊
 
 #### Scenario: 價格漂移與滑價為兩個欄位
 
@@ -115,7 +121,7 @@ Figma 上的「Min Expected Net PnL %」SHALL 由 `net_edge_threshold_pct` 取�
 ### Requirement: 執行模式單選只有 SIMULATION 與 EXCHANGE_DEMO
 
 頁面 SHALL 以單選提供 `SIMULATION` 與 `EXCHANGE_DEMO`，SHALL NOT 出現 `LIVE` 字樣或選項。
-頁面 SHALL 說明：`SIMULATION` 只跑送單前檢查、不送出訂單；`EXCHANGE_DEMO` 對 demo / testnet 帳戶真實下單、會真的改變帳戶內的倉位；兩者皆不涉及真錢。
+頁面 SHALL 說明：`SIMULATION` 跑完整流程與送單前檢查，訂單由模擬器成交、不送到任何交易所；`EXCHANGE_DEMO` 對 demo / testnet 帳戶真實下單、會真的改變帳戶內的倉位；兩者皆不涉及真錢。
 由 `SIMULATION` 切到 `EXCHANGE_DEMO` SHALL 先顯示確認視窗；設定不完整或 demo 金鑰不可用時，`EXCHANGE_DEMO` 選項 SHALL 被禁用並說明原因。
 切換 SHALL 寫入事件（含前後值）並即時更新狀態列的模式徽章；切換 SHALL NOT 改變既有倉位，也 SHALL NOT 改變 `trigger_mode`。
 

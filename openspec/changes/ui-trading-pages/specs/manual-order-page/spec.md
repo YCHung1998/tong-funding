@@ -3,7 +3,7 @@
 ### Requirement: 手動下單頁標示為除錯工具並與標準流程隔開
 
 手動下單頁 SHALL 在側邊欄以分隔線與標準七頁隔開，頁面頂部 SHALL 以警示樣式標示「除錯工具，非標準流程」，並說明單腿下單會造成未避險曝險、標準流程為「掃幣 → 交易單」。
-頁面上關於環境的說明 SHALL 依目前 `execution_mode` 如實顯示：`SIMULATION` 時說明不會送出任何訂單；`EXCHANGE_DEMO` 時說明將對 demo / testnet 帳戶真實下單。
+頁面上關於環境的說明 SHALL 依目前 `execution_mode` 如實顯示：`SIMULATION` 時說明訂單由模擬器成交、不會送到任何交易所；`EXCHANGE_DEMO` 時說明將對 demo / testnet 帳戶真實下單。
 頁面 SHALL NOT 在 `EXCHANGE_DEMO` 下顯示「無外部請求」或「無真實帳戶」之類不實的說明。
 頁面 SHALL 只提供 Binance 與 Bybit 兩個交易所的面板；OKX 不提供下單。
 `allowed_exchanges` 不包含某交易所時，該所面板 SHALL 被禁用並說明原因。
@@ -23,17 +23,17 @@
 - **WHEN** 開啟手動下單頁
 - **THEN** 只出現 Binance 與 Bybit 兩個面板
 
-### Requirement: 手動下單受 execution_mode 約束且只走 engine 的單一路徑
+### Requirement: 手動下單依 execution_mode 決定執行器且只走 engine 的單一路徑
 
-手動下單頁的送出與撤單 SHALL 受 `execution_mode` 約束：`SIMULATION` 下 SHALL 禁用「Submit Order」與「Cancel」並顯示原因，且 SHALL NOT 向 engine 或任何交易所送出任何請求；`EXCHANGE_DEMO` 下才可送出。
-頁面 SHALL 僅以 engine 的 Command 下單與撤單，SHALL NOT 持有或呼叫任何交易所 client；系統 SHALL 只有一條下單路徑。
-kill switch 已啟動或系統處於停機狀態時，送出 SHALL 被禁用並說明原因。
-模式於頁面開啟期間改變時，按鈕的啟用狀態 SHALL 即時更新。
+手動下單頁的送出與撤單 SHALL 一律以 engine 的 Command 執行，由 engine 依目前的 `execution_mode` 選擇執行器（與已合併的 `engine-simulation` spec「SIMULATION 下的手動下單 → SimulatedExecutor」一致）：`SIMULATION` 下 SHALL 送往 `SimulatedExecutor`（不送到任何交易所），結果與事件 SHALL 標示為模擬；`EXCHANGE_DEMO` 下 SHALL 送往 demo 執行器。
+頁面 SHALL NOT 持有或呼叫任何交易所 client；系統 SHALL 只有一條下單路徑。
+頁面 SHALL 提供 `reduce_only` 選項；kill switch 已啟動或系統處於停機狀態時，非 reduce-only 的送出 SHALL 被禁用並說明原因，reduce-only 的送出 SHALL 仍可進行（`engine-simulation` D5：reduce-only 只會減少曝險）。
+模式於頁面開啟期間改變時，環境說明與確認視窗的目標環境 SHALL 即時更新。
 
-#### Scenario: SIMULATION 下不可送出
+#### Scenario: SIMULATION 下送往模擬器
 
-- **WHEN** `execution_mode` 為 `SIMULATION`
-- **THEN** 「Submit Order」與「Cancel」皆禁用並顯示「SIMULATION 下不可送出」，engine 收到 0 個命令
+- **WHEN** `execution_mode` 為 `SIMULATION`，使用者完成確認並送出
+- **THEN** engine 恰好收到一個單腿下單命令，由 `SimulatedExecutor` 成交，結果標示為模擬，沒有任何交易所請求
 
 #### Scenario: EXCHANGE_DEMO 下送出經由 engine
 
@@ -42,13 +42,13 @@ kill switch 已啟動或系統處於停機狀態時，送出 SHALL 被禁用並�
 
 #### Scenario: kill switch 啟動
 
-- **WHEN** kill switch 為啟動狀態
-- **THEN** 「Submit Order」被禁用並顯示「緊急停止中」
+- **WHEN** kill switch 為啟動狀態，且未勾選 `reduce_only`
+- **THEN** 「Submit Order」被禁用並顯示「緊急停止中」；勾選 `reduce_only` 後可送出
 
 #### Scenario: 開啟期間切換模式
 
 - **WHEN** 頁面開啟時 `execution_mode` 由 `EXCHANGE_DEMO` 改為 `SIMULATION`
-- **THEN** 按鈕立即變為禁用狀態
+- **THEN** 環境說明立即改為「SIMULATION：由模擬器成交，不會送到交易所」
 
 ### Requirement: 單腿下單須取整、確認並如實顯示結果
 
@@ -80,7 +80,7 @@ kill switch 已啟動或系統處於停機狀態時，送出 SHALL 被禁用並�
 
 ### Requirement: 撤單以 order id 為準
 
-撤單 SHALL 以交易所、Symbol 與 Order ID 為輸入，並僅在 `EXCHANGE_DEMO` 下可送出（見受 `execution_mode` 約束的需求）；撤單 SHALL 透過 engine 的 Command 執行。
+撤單 SHALL 以交易所、Symbol 與 Order ID（本系統送單時的 `client_order_id`）為輸入，SHALL 透過 engine 的 Command 執行，由目前 `execution_mode` 的執行器處理（`SIMULATION` 下為模擬器）。
 Order ID 為空時 SHALL 禁用撤單；交易所回報找不到該訂單或已成交時，SHALL 如實顯示交易所的回應，SHALL NOT 顯示成功。
 撤單結果 SHALL 寫入不可變事件。
 

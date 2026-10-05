@@ -47,6 +47,14 @@
 只有使用者在確認視窗按下確認後，頁面 SHALL 才向 engine 送出一個執行命令；取消或關閉視窗 SHALL NOT 送出任何命令。
 頁面 SHALL 僅以 engine 的 Command 送單，SHALL NOT 直接呼叫任何交易所。
 
+一鍵送出 SHALL 在 `trigger_mode` 為 AUTO 與 MANUAL 時皆可用（使用者 2026-10-05 晚拍板），兩者皆須二次確認。
+AUTO 下排程器可能在使用者確認前後觸發同一配對：防止重複進場 SHALL 由 engine 的原子狀態轉移負責（`PREPARED → PRE_TRADE_CHECK` 先落庫再行動，只能轉出一次），第二次嘗試 SHALL 被拒絕且不送出任何訂單；頁面 SHALL 如實顯示被拒絕的配對與原因。
+
+#### Scenario: AUTO 下與排程器搶同一配對
+
+- **WHEN** `trigger_mode` 為 AUTO，排程器已把某配對轉出 `PREPARED`，使用者隨後確認送出同一配對
+- **THEN** engine 拒絕該配對（「not PREPARED」），該配對沒有任何額外訂單，頁面顯示被拒絕的原因
+
 #### Scenario: 確認視窗列出每一腿
 
 - **WHEN** 已選 2 筆配對後按「一鍵送出」
