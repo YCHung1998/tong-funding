@@ -50,6 +50,57 @@ pub struct Shell {
     log_filter: LogFilter,
     log_vm: Option<SystemLogVm>,
     log_error: Option<LoadView>,
+    frames: Option<FrameRecorder>,
+}
+
+/// `TONG_FUNDING_FRAME_STATS=<seconds>`: measures frame intervals on the scanner page with the
+/// real data feeds (ui-readonly-pages task 4.2) and prints one line per window, like the
+/// `--bench-table` spike. Off unless the variable is set.
+pub const FRAME_STATS_ENV: &str = "TONG_FUNDING_FRAME_STATS";
+
+struct FrameRecorder {
+    window: Duration,
+    started: std::time::Instant,
+    last: Option<std::time::Instant>,
+    intervals_ms: Vec<f64>,
+}
+
+impl FrameRecorder {
+    fn from_env() -> Option<Self> {
+        let secs: u64 = std::env::var(FRAME_STATS_ENV).ok()?.parse().ok().filter(|s| *s > 0)?;
+        Some(FrameRecorder { window: Duration::from_secs(secs), started: std::time::Instant::now(), last: None, intervals_ms: Vec::new() })
+    }
+
+    fn frame(&mut self, rows: usize) {
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last {
+            self.intervals_ms.push(now.duration_since(prev).as_secs_f64() * 1000.0);
+        }
+        self.last = Some(now);
+        if now.duration_since(self.started) < self.window {
+            return;
+        }
+        let samples = &self.intervals_ms[self.intervals_ms.len().min(30)..];
+        let running = super::frame_stats::split_paused(samples);
+        match super::frame_stats::summarize(&running) {
+            Some(s) => {
+                let d = super::frame_stats::drops(samples, s.p50_ms);
+                println!(
+                    "FRAMES page=scanner rows={rows} window_s={} frames={} p50_ms={:.2} p95_ms={:.2} max_ms={:.2} dropped={} paused={}",
+                    self.window.as_secs(),
+                    s.frames,
+                    s.p50_ms,
+                    s.p95_ms,
+                    s.max_ms,
+                    d.dropped,
+                    d.paused
+                );
+            }
+            None => println!("FRAMES no frames recorded (stay on the scanner page with the window visible)"),
+        }
+        self.started = now;
+        self.intervals_ms.clear();
+    }
 }
 
 fn wall_ms() -> i64 {
@@ -81,6 +132,7 @@ impl Shell {
             log_filter: LogFilter::default(),
             log_vm: None,
             log_error: None,
+            frames: FrameRecorder::from_env(),
         };
         shell.recompute(cx);
         cx.spawn(async move |this, cx| {
@@ -503,7 +555,16 @@ impl Shell {
 }
 
 impl Render for Shell {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(rec) = &mut self.frames {
+            if self.page == Page::Scanner {
+                rec.frame(self.scanner.rows.len());
+                // Worst case on purpose (like `--bench-table`): redraw every frame while measuring.
+                window.request_animation_frame();
+            } else {
+                rec.last = None;
+            }
+        }
         let mut root = div()
             .size_full()
             .flex()
