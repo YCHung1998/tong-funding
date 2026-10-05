@@ -995,7 +995,14 @@ impl Actor {
             has_foreign_exposure: short_foreign,
         };
         match node0::run(&ctx, &long, &short) {
-            Node0Verdict::Block(block) => fail(self, json!({ "block": format!("{block:?}"), "notes": notes })),
+            Node0Verdict::Block(block) => {
+                // Every failed check by name, for the staged orders page (never only the first).
+                let failed_checks: Vec<String> = match &block {
+                    node0::Node0Block::Checks { failed, .. } => failed.iter().map(|c| format!("{c:?}")).collect(),
+                    node0::Node0Block::ConfigIncomplete { .. } | node0::Node0Block::InvalidEntry { .. } | node0::Node0Block::DataMismatch { .. } => Vec::new(),
+                };
+                fail(self, json!({ "block": format!("{block:?}"), "notes": notes, "failed_checks": failed_checks }))
+            }
             Node0Verdict::Pass => {
                 // Lands in the same transaction as ORDER_SUBMIT (funding-pnl's entry record).
                 let snapshot = entry_snapshot_json(&view, &entry, &eff, [&pre_l, &pre_s], [base_l, base_s], &scan);

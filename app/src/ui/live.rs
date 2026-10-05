@@ -21,7 +21,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::banner::read_system_flags;
 use super::bridge::{
-    AccountData, AccountState, AssetInput, ClockState, PairInfo, ReadOnlyDataSource, RefreshRequest, Settings, SourceHealth, SourceId, SourceUpdate,
+    AccountData, AccountState, AssetInput, ClockState, ContractTemplate, PairInfo, ReadOnlyDataSource, RefreshRequest, Settings, SourceHealth, SourceId, SourceUpdate,
 };
 use super::scanner_refresh::{RefreshGate, RefreshGuard, RefreshOutcome, refresh_sources};
 use crate::exchange::error::AdapterError;
@@ -133,9 +133,17 @@ pub fn load_settings(db: &Db) -> Settings {
         Ok(Some(e)) => parse_overrides(&e.value).map_err(|e| format!("risk_overrides: {e}")),
         Err(e) => Err(format!("risk_overrides: {e}")),
     };
+    let (contract, contract_error) = match db.config_get(crate::engine::actor::CONFIG_CONTRACT_TEMPLATE) {
+        Ok(None) => (ContractTemplate::default(), None),
+        Ok(Some(e)) => match ContractTemplate::from_json(&e.value) {
+            Ok(t) => (t, None),
+            Err(why) => (ContractTemplate::default(), Some(why)),
+        },
+        Err(e) => (ContractTemplate::default(), Some(format!("contract_template: {e}"))),
+    };
     match (risk, overrides) {
-        (Ok(risk), Ok(overrides)) => Settings { risk, overrides, error: None },
-        (r, o) => Settings { risk: r.clone().unwrap_or_default(), overrides: o.clone().unwrap_or_default(), error: r.err().or(o.err()) },
+        (Ok(risk), Ok(overrides)) => Settings { risk, overrides, error: None, contract, contract_error },
+        (r, o) => Settings { risk: r.clone().unwrap_or_default(), overrides: o.clone().unwrap_or_default(), error: r.err().or(o.err()), contract, contract_error },
     }
 }
 

@@ -125,3 +125,16 @@ async fn the_contract_template_is_validated_and_saved_with_its_event() {
     // The open pair is untouched by a template change.
     assert_eq!(status(&rig.db, UUID), "PREPARED");
 }
+
+/// The staged orders page lists every failed check by name from the BLOCKED transition.
+#[tokio::test(start_paused = true)]
+async fn a_blocked_entry_records_every_failed_check_by_name() {
+    let (rig, _h) = started(Opts { margin: Ok(dec("1")), ..Opts::default() }).await;
+    let mut ov = RiskOverrides::new();
+    ov.insert(Exchange::Bybit, RiskOverride { max_leverage: Some(dec("4")), ..Default::default() });
+    store_overrides(&rig.db, &ov);
+    run_until(&rig.clock, T - 9_000).await;
+    assert_eq!(status(&rig.db, UUID), "BLOCKED");
+    let blocked = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
+    assert_eq!(blocked["detail"]["failed_checks"], json!(["Margin", "Leverage"]), "{blocked}");
+}

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tong_funding_core::funding::{DataStatus, FundingObservation, equivalent_8h_rate, is_consistent_listed};
-use tong_funding_core::net_edge::{NetEdgeParams, best_opportunity_with};
+use tong_funding_core::net_edge::{NetEdgeParams, best_opportunity_with, meets_min_expected_net_pnl};
 use tong_funding_core::risk::{EffectiveConfig, RiskConfig, RiskOverrides, effective_for_pair};
 use tong_funding_core::types::{Decimal, Exchange};
 
@@ -374,7 +374,15 @@ fn pairing<'a>(candidates: &[&'a FundingObservation], settings: &Settings, enabl
             Pairing {
                 legs: pick(opp.edge.long).zip(pick(opp.edge.short)),
                 net: NetEdgeCell::Value(opp.edge.net_edge_pct),
-                qualified: if opp.qualifies { Qualified::Yes } else { Qualified::No },
+                // ui-trading-pages: "達標" also needs expected net PnL ≥ min_expected_net_pnl_pct
+                // (same rule as Node 0's NetEdgeQualified).
+                qualified: if opp.qualifies
+                    && meets_min_expected_net_pnl(&opp.edge, Decimal::from(SCAN_NOTIONAL_USDT), settings.risk.min_expected_net_pnl_pct)
+                {
+                    Qualified::Yes
+                } else {
+                    Qualified::No
+                },
             }
         }
         Ok(None) => Pairing { legs: None, net: NetEdgeCell::NotApplicable, qualified: Qualified::NotApplicable },

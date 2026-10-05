@@ -29,6 +29,9 @@ pub fn complete_settings(threshold: &str) -> Settings {
     risk.est_slippage_pct = Some(d("0"));
     risk.safety_margin_pct = d("0");
     risk.min_24h_volume_usdt = d("0");
+    // ui-trading-pages added min_expected_net_pnl_pct (default 0.03); these fixtures test the
+    // Net Edge threshold alone, so the second threshold is off here (tests that need it set it).
+    risk.min_expected_net_pnl_pct = d("0");
     for e in Exchange::ALL {
         risk.taker_fee_pct.insert(e, d("0.02"));
     }
