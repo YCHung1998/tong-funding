@@ -10,6 +10,7 @@ use tong_funding_core::pair::PairState;
 
 use super::db::{Db, HaltReason, StoreError};
 use super::events::insert_event_on;
+use super::secrets::safe_event_payload;
 use tong_funding_core::redact::redact_secrets;
 
 pub const FLAG_KILL_SWITCH: &str = "kill_switch";
@@ -17,6 +18,14 @@ pub const FLAG_TRIGGER_MODE: &str = "trigger_mode";
 pub const FLAG_EXECUTION_MODE: &str = "execution_mode";
 const KILL_ON: &str = "ON";
 const KILL_OFF: &str = "OFF";
+
+/// Reject (never silently rewrite) a JSON value that redaction would change.
+fn reject_secret_json(field: &str, v: &Value) -> Result<(), StoreError> {
+    if safe_event_payload(v.clone()) != *v {
+        return Err(StoreError::SecretInValue { field: field.to_string() });
+    }
+    Ok(())
+}
 
 /// Asset history is kept for the last 7 days.
 pub const PORTFOLIO_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -175,6 +184,9 @@ impl Db {
 
     /// All-or-nothing: if any change conflicts, none is applied. Returns the new versions in order.
     pub fn config_set_many(&self, changes: &[ConfigChange]) -> Result<Vec<i64>, StoreError> {
+        for ch in changes {
+            reject_secret_json(&ch.key, &ch.value)?;
+        }
         self.with_conn(|c| {
             let now = self.now_ms();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -213,6 +225,9 @@ impl Db {
         if key.eq_ignore_ascii_case(FLAG_KILL_SWITCH) {
             return Err(StoreError::ReservedFlag(key.to_string()));
         }
+        if redact_secrets(value) != value {
+            return Err(StoreError::SecretInValue { field: format!("system_flags.{key}") });
+        }
         self.with_conn(|c| {
             upsert_flag(c, key, value, self.now_ms())?;
             Ok(())
@@ -247,8 +262,32 @@ impl Db {
             let now = self.now_ms();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             upsert_flag(&tx, FLAG_KILL_SWITCH, if on { KILL_ON } else { KILL_OFF }, now)?;
-            insert_event_on(&tx, now, "KILL_SWITCH_CHANGED", None, &serde_json::json!({ "on": on }))?;
+            insert_event_on(&tx, now, "KILL_SWITCH_CHANGED", None, &serde_json::json!({ "on": on }))
+                .map_err(|e| self.event_write_failed("KILL_SWITCH_CHANGED", &e))?;
             tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Explicit recovery for the one halt that has a way out: the `kill_switch` row is missing (or
+    /// unreadable). Writes the row as `on`, records `KILL_SWITCH_ROW_RESTORED` in the same
+    /// transaction and lifts the halt. Refused for every other halt reason and when not halted.
+    /// This is a deliberate user action; never call it automatically.
+    pub fn restore_kill_switch_row(&self, on: bool) -> Result<(), StoreError> {
+        // Hold the connection lock for the whole check-and-restore so no writer interleaves.
+        self.with_conn_even_if_halted(|c| {
+            match self.halt_reason() {
+                Some(HaltReason::KillSwitchReadFailed(_)) => {}
+                Some(other) => return Err(StoreError::RestoreNotApplicable(format!("store is halted for another reason: {other}"))),
+                None => return Err(StoreError::RestoreNotApplicable("store is not halted".into())),
+            }
+            let now = self.now_ms();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            upsert_flag(&tx, FLAG_KILL_SWITCH, if on { KILL_ON } else { KILL_OFF }, now)?;
+            insert_event_on(&tx, now, "KILL_SWITCH_ROW_RESTORED", None, &serde_json::json!({ "on": on }))
+                .map_err(|e| self.event_write_failed("KILL_SWITCH_ROW_RESTORED", &e))?;
+            tx.commit()?;
+            self.clear_halt();
             Ok(())
         })
     }
@@ -257,6 +296,7 @@ impl Db {
 
     /// Atomic: relies only on the `uniq_prepared_symbol` index (no check-then-insert).
     pub fn add_pair_if_not_pending(&self, pair: &NewPair) -> Result<AddPairOutcome, StoreError> {
+        reject_secret_json("pairs.entry_json", &pair.entry)?;
         self.with_conn(|c| {
             let now = self.now_ms();
             let n = c.execute(
@@ -342,27 +382,31 @@ impl Db {
         self.with_conn(|c| {
             let now = self.now_ms();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let prev: Option<(String, String)> = tx
+            let prev: Option<(String, String, Option<String>)> = tx
                 .query_row(
-                    "SELECT state, pair_uuid FROM order_intents WHERE client_order_id = ?1",
+                    "SELECT state, pair_uuid, exchange_order_id FROM order_intents WHERE client_order_id = ?1",
                     [client_order_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
-            let Some((from, pair_uuid)) = prev else {
+            let Some((from, pair_uuid, current_order_id)) = prev else {
                 return Err(StoreError::IntentNotFound(client_order_id.to_string()));
             };
-            let from_state = IntentState::parse(&from);
-            if from_state == Some(state) {
-                return Ok(()); // idempotent: same state again writes nothing and records no event
-            }
-            if !from_state.is_some_and(|f| f.can_transition_to(state)) {
-                return Err(StoreError::IllegalIntentTransition { from, to: state.as_str().to_string() });
-            }
             // An exchange order id is an opaque id, but it comes from the network: keep it out of
             // both the row and the event if it ever carries something secret-looking.
             let exchange_order_id = exchange_order_id.map(redact_secrets);
             let exchange_order_id = exchange_order_id.as_deref();
+            let from_state = IntentState::parse(&from);
+            let backfill = from_state == Some(state);
+            if backfill {
+                // Same state again is idempotent, except that a missing exchange order id may be
+                // filled in (once); that is recorded as an event.
+                if !(current_order_id.is_none() && exchange_order_id.is_some()) {
+                    return Ok(());
+                }
+            } else if !from_state.is_some_and(|f| f.can_transition_to(state)) {
+                return Err(StoreError::IllegalIntentTransition { from, to: state.as_str().to_string() });
+            }
             tx.execute(
                 "UPDATE order_intents SET state = ?2, exchange_order_id = COALESCE(?3, exchange_order_id), updated_ms = ?4
                  WHERE client_order_id = ?1",
@@ -373,8 +417,10 @@ impl Db {
                 "from": from,
                 "to": state.as_str(),
                 "exchange_order_id": exchange_order_id,
+                "backfill": backfill,
             });
-            insert_event_on(&tx, now, "ORDER_INTENT_STATE", Some(&pair_uuid), &payload)?;
+            insert_event_on(&tx, now, "ORDER_INTENT_STATE", Some(&pair_uuid), &payload)
+                .map_err(|e| self.event_write_failed("ORDER_INTENT_STATE", &e))?;
             tx.commit()?;
             Ok(())
         })
@@ -390,10 +436,12 @@ impl Db {
     pub fn list_unfinished_intents(&self) -> Result<Vec<IntentRow>, StoreError> {
         self.with_conn(|c| {
             let sql = format!(
-                "{INTENT_SELECT} WHERE state IN ('{}', '{}', '{}') ORDER BY created_ms, rowid",
-                IntentState::Intended.as_str(),
-                IntentState::Submitted.as_str(),
-                IntentState::Acknowledged.as_str()
+                // Anything that is not a known terminal state counts as unfinished, including values
+                // that were tampered with: failing open here would hide a live order.
+                "{INTENT_SELECT} WHERE state NOT IN ('{}', '{}', '{}') ORDER BY created_ms, rowid",
+                IntentState::Filled.as_str(),
+                IntentState::Cancelled.as_str(),
+                IntentState::Failed.as_str()
             );
             let mut st = c.prepare(&sql)?;
             let rows = st.query_map([], intent_row)?;
@@ -485,10 +533,15 @@ mod tests {
 
     /// Make every INSERT into `events` fail, like a full disk or a constraint failure would.
     fn break_event_inserts(db: &Db) {
-        db.with_conn(|c| {
+        db.with_raw_conn_for_tests(|c| {
             Ok(c.execute_batch("CREATE TRIGGER inject_fail BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'injected failure'); END")?)
         })
         .unwrap();
+    }
+
+    fn plain_flag(db: &Db, key: &str) -> String {
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        plain.query_row("SELECT value FROM system_flags WHERE key = ?1", [key], |r| r.get(0)).unwrap()
     }
 
     fn event_count(db: &Db) -> i64 {
@@ -635,7 +688,8 @@ mod tests {
         // If the event cannot be written, the flag must not change either.
         break_event_inserts(&db);
         assert!(db.set_kill_switch(false).is_err());
-        assert!(db.kill_switch_halted(), "flag unchanged after the failed transaction");
+        let v: String = plain_flag(&db, "kill_switch");
+        assert_eq!(v, "ON", "flag unchanged after the failed transaction");
     }
 
     #[test]
@@ -789,7 +843,9 @@ mod tests {
         db.create_intent(&intent("c1")).unwrap();
         break_event_inserts(&db);
         assert!(db.update_intent_state("c1", IntentState::Submitted, None).is_err());
-        assert_eq!(db.get_intent("c1").unwrap().unwrap().state, "INTENDED");
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        let st: String = plain.query_row("SELECT state FROM order_intents WHERE client_order_id='c1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(st, "INTENDED");
     }
 
     #[test]
@@ -1025,5 +1081,154 @@ mod tests {
         let dump = crate::store::db::test_support::dump_db(&db);
         assert!(!dump.contains("RAWSIG"), "{dump}");
         assert!(!crate::store::db::test_support::files_contain(db.path(), "RAWSIG"));
+    }
+
+    // ---- hardening round 2 ----
+
+    #[test]
+    fn a_failed_event_write_in_update_intent_state_halts_and_rolls_back() {
+        let (_d, db, _) = open_tmp();
+        db.create_intent(&intent("c1")).unwrap();
+        break_event_inserts(&db);
+        assert!(db.update_intent_state("c1", IntentState::Submitted, None).is_err());
+        assert!(matches!(db.halt_reason(), Some(HaltReason::EventWriteFailed(_))), "{:?}", db.halt_reason());
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        let st: String = plain.query_row("SELECT state FROM order_intents", [], |r| r.get(0)).unwrap();
+        assert_eq!(st, "INTENDED", "transaction rolled back");
+    }
+
+    #[test]
+    fn a_failed_event_write_in_set_kill_switch_halts() {
+        let (_d, db, _) = open_tmp();
+        break_event_inserts(&db);
+        assert!(db.set_kill_switch(true).is_err());
+        assert!(matches!(db.halt_reason(), Some(HaltReason::EventWriteFailed(_))), "{:?}", db.halt_reason());
+        assert_eq!(plain_flag(&db, "kill_switch"), "OFF", "rolled back");
+    }
+
+    fn delete_kill_switch_row(db: &Db) {
+        db.with_conn(|c| Ok(c.execute("DELETE FROM system_flags WHERE key = 'kill_switch'", [])?)).unwrap();
+    }
+
+    #[test]
+    fn restore_kill_switch_row_recovers_from_a_missing_row_and_records_an_event() {
+        for on in [false, true] {
+            let (_d, db, _) = open_tmp();
+            delete_kill_switch_row(&db);
+            assert!(db.kill_switch_halted());
+            assert!(db.is_halted());
+            db.restore_kill_switch_row(on).unwrap();
+            assert!(!db.is_halted(), "{:?}", db.halt_reason());
+            assert_eq!(db.kill_switch_halted(), on);
+            assert_eq!(events_of(&db, "KILL_SWITCH_ROW_RESTORED").len(), 1);
+            assert_eq!(events_of(&db, "KILL_SWITCH_ROW_RESTORED")[0].1["on"], json!(on));
+        }
+    }
+
+    #[test]
+    fn restore_kill_switch_row_is_refused_for_every_other_halt_reason_and_when_not_halted() {
+        // not halted
+        let (_d, db, _) = open_tmp();
+        assert!(matches!(db.restore_kill_switch_row(false), Err(StoreError::RestoreNotApplicable(_))));
+        assert_eq!(events_of(&db, "KILL_SWITCH_ROW_RESTORED").len(), 0);
+        // halted for another reason
+        let (_d2, db2, _) = open_tmp();
+        db2.halt(HaltReason::EventWriteFailed("x".into()));
+        assert!(matches!(db2.restore_kill_switch_row(false), Err(StoreError::RestoreNotApplicable(_))));
+        assert!(matches!(db2.halt_reason(), Some(HaltReason::EventWriteFailed(_))), "still halted");
+        // a database that never opened
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        std::fs::write(&p, b"garbage garbage garbage".repeat(200)).unwrap();
+        let (c, _) = clock(1);
+        let db3 = Db::open(&p, c);
+        assert!(db3.restore_kill_switch_row(false).is_err());
+        assert!(db3.is_halted());
+    }
+
+    #[test]
+    fn restore_failing_to_write_leaves_the_store_halted() {
+        let (_d, db, _) = open_tmp();
+        delete_kill_switch_row(&db);
+        assert!(db.kill_switch_halted());
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        plain.execute_batch("CREATE TRIGGER inject BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'no'); END").unwrap();
+        drop(plain);
+        assert!(db.restore_kill_switch_row(false).is_err());
+        assert!(db.is_halted());
+    }
+
+    #[test]
+    fn an_unknown_stored_state_is_listed_as_unfinished() {
+        let (_d, db, _) = open_tmp();
+        intent_in_state(&db, "done", IntentState::Filled);
+        db.create_intent(&intent("odd")).unwrap();
+        db.with_conn(|c| Ok(c.execute("UPDATE order_intents SET state = 'filled' WHERE client_order_id = 'odd'", [])?)).unwrap();
+        db.create_intent(&intent("odd2")).unwrap();
+        db.with_conn(|c| Ok(c.execute("UPDATE order_intents SET state = '' WHERE client_order_id = 'odd2'", [])?)).unwrap();
+        let ids: Vec<String> = db.list_unfinished_intents().unwrap().into_iter().map(|r| r.client_order_id).collect();
+        assert_eq!(ids, vec!["odd", "odd2"], "tampered states must not disappear from reconciliation");
+    }
+
+    #[test]
+    fn a_same_state_update_backfills_a_missing_exchange_order_id_with_an_event() {
+        let (_d, db, clock) = open_tmp();
+        intent_in_state(&db, "c1", IntentState::Submitted);
+        assert_eq!(db.get_intent("c1").unwrap().unwrap().exchange_order_id, None);
+        let before = event_count(&db);
+        clock.set(7_777_777);
+        db.update_intent_state("c1", IntentState::Submitted, Some("EX-9")).unwrap();
+        let row = db.get_intent("c1").unwrap().unwrap();
+        assert_eq!((row.state.as_str(), row.exchange_order_id.as_deref(), row.updated_ms), ("SUBMITTED", Some("EX-9"), 7_777_777));
+        assert_eq!(event_count(&db), before + 1, "the backfill is recorded");
+        // Once set, it is not overwritten by a later same-state call, and no event is written.
+        db.update_intent_state("c1", IntentState::Submitted, Some("EX-OTHER")).unwrap();
+        assert_eq!(db.get_intent("c1").unwrap().unwrap().exchange_order_id.as_deref(), Some("EX-9"));
+        assert_eq!(event_count(&db), before + 1);
+    }
+
+    #[test]
+    fn secrets_in_config_values_are_rejected_not_silently_rewritten() {
+        let (_d, db, _) = open_tmp();
+        for (key, v) in [
+            ("a", json!({"api_key": "abc123"})),
+            ("b", json!({"note": "call with signature=RAWSIG"})),
+            ("c", json!(["x", {"nested": {"apiSecret": "zzz"}}])),
+        ] {
+            let r = db.config_set(key, &v, None);
+            assert!(matches!(&r, Err(StoreError::SecretInValue { field }) if field == key), "{key}: {r:?}");
+            assert_eq!(db.config_get(key).unwrap(), None, "nothing written");
+        }
+        // all-or-nothing in a batch
+        let r = db.config_set_many(&[
+            ConfigChange { key: "ok".into(), value: json!(1), expected_version: None },
+            ConfigChange { key: "bad".into(), value: json!({"api_key": "x"}), expected_version: None },
+        ]);
+        assert!(matches!(r, Err(StoreError::SecretInValue { .. })));
+        assert_eq!(db.config_get("ok").unwrap(), None);
+    }
+
+    #[test]
+    fn the_full_default_risk_config_is_not_mistaken_for_a_secret() {
+        let (_d, db, _) = open_tmp();
+        let v = serde_json::to_value(tong_funding_core::risk::RiskConfig::default()).unwrap();
+        db.config_set("risk", &v, None).unwrap();
+        assert_eq!(db.config_get("risk").unwrap().unwrap().value, v);
+    }
+
+    #[test]
+    fn secret_looking_flag_values_and_pair_entries_are_rejected() {
+        let (_d, db, _) = open_tmp();
+        let r = db.flag_set("note", "api_key=abc123");
+        assert!(matches!(&r, Err(StoreError::SecretInValue { field }) if field.contains("note")), "{r:?}");
+        assert_eq!(db.flag_get("note").unwrap(), None);
+        db.flag_set("trigger_mode", "auto").unwrap();
+        let mut p = pair("u1", "BTCUSDT", PairState::Prepared);
+        p.entry = json!({"edge": "0.001", "api_key": "abc"});
+        let r = db.add_pair_if_not_pending(&p);
+        assert!(matches!(&r, Err(StoreError::SecretInValue { field }) if field.contains("entry")), "{r:?}");
+        assert!(db.get_pair("u1").unwrap().is_none());
+        p.entry = json!({"edge": "0.001"});
+        assert_eq!(db.add_pair_if_not_pending(&p).unwrap(), AddPairOutcome::Added);
     }
 }

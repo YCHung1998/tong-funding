@@ -9,7 +9,7 @@ use rusqlite::{Connection, params};
 use serde_json::Value;
 use tong_funding_core::redact::redact_secrets;
 
-use super::db::{Db, HaltReason, StoreError};
+use super::db::{Db, StoreError};
 use super::scan_buffer::{DEFAULT_CAPACITY, ScanBuffer, ScanRecord};
 use super::secrets::safe_event_payload;
 use crate::ports::EventSink;
@@ -36,6 +36,8 @@ pub(super) fn insert_event_on(
 ) -> rusqlite::Result<i64> {
     // Every event passes through redaction on its way into the database, whoever the caller is.
     let payload = safe_event_payload(payload.clone());
+    let event_type = redact_secrets(event_type);
+    let pair_id = pair_id.map(redact_secrets);
     conn.execute(
         "INSERT INTO events (ts_ms, event_type, pair_id, payload) VALUES (?1, ?2, ?3, ?4)",
         params![ts_ms, event_type, pair_id, payload.to_string()],
@@ -77,16 +79,12 @@ impl EventStore {
             self.scan.push(ScanRecord { ts_ms, pair_id: pair_id.map(str::to_string), payload: safe_event_payload(payload) });
             return Ok(None);
         }
-        match self.db.with_conn(|c| Ok(insert_event_on(c, ts_ms, event_type, pair_id, &payload)?)) {
-            Ok(id) => Ok(Some(id)),
-            Err(StoreError::Halted(r)) => Err(StoreError::Halted(r)),
-            Err(e) => {
-                let reason = HaltReason::EventWriteFailed(redact_secrets(&format!("{event_type}: {e}")));
-                self.db.halt(reason.clone());
-                // Hand back the (redacted) halt reason, not the raw SQLite error text.
-                Err(StoreError::Halted(self.db.halt_reason().unwrap_or(reason)))
-            }
-        }
+        // A failed insert halts the store and hands back the (redacted) halt reason, not the raw
+        // SQLite error text.
+        let id = self
+            .db
+            .with_conn(|c| insert_event_on(c, ts_ms, event_type, pair_id, &payload).map_err(|e| self.db.event_write_failed(event_type, &e)))?;
+        Ok(Some(id))
     }
 
     pub fn count(&self) -> Result<i64, StoreError> {
@@ -299,7 +297,7 @@ mod tests {
     fn a_failed_event_write_halts_the_store_with_a_redacted_reason() {
         let (_d, es, _) = store();
         es.db()
-            .with_conn(|c| {
+            .with_raw_conn_for_tests(|c| {
                 Ok(c.execute_batch(
                     "CREATE TRIGGER inject BEFORE INSERT ON events WHEN NEW.event_type = 'BOOM'
                      BEGIN SELECT RAISE(ABORT, 'disk full signature=RAWSIG'); END",
@@ -327,5 +325,16 @@ mod tests {
         let es = EventStore::new(Db::open(&p, c));
         es.emit("A", None, json!({}));
         assert!(matches!(es.db().halt_reason(), Some(HaltReason::Corrupt(_))));
+    }
+
+    // ---- hardening round 2 ----
+
+    #[test]
+    fn event_type_and_pair_id_are_redacted_too() {
+        let (_d, es, _) = store();
+        es.append("ERR signature=RAWSIG", Some("pair api_key=RAWKEY"), json!({})).unwrap();
+        let dump = dump_db(es.db());
+        assert!(!dump.contains("RAWSIG") && !dump.contains("RAWKEY"), "{dump}");
+        assert!(!files_contain(es.db().path(), "RAWSIG") && !files_contain(es.db().path(), "RAWKEY"));
     }
 }

@@ -42,7 +42,7 @@ mod tests {
         let c = db();
         c.execute("INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (1,'A','{}','h1')", []).unwrap();
         let r = c.execute("INSERT OR REPLACE INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (2,'B','{}','h1')", []);
-        assert!(r.is_err(), "REPLACE must be blocked by the delete trigger (recursive_triggers = ON)");
+        assert_eq!(r.unwrap(), 0, "REPLACE is ignored by the dedupe trigger");
         let ty: String = c.query_row("SELECT event_type FROM events", [], |r| r.get(0)).unwrap();
         assert_eq!(ty, "A");
     }
@@ -69,6 +69,29 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_legacy_hash_is_ignored_on_a_plain_connection_whatever_the_conflict_clause() {
+        // No recursive_triggers: REPLACE would otherwise delete the old row without any trigger.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA_V1).unwrap();
+        c.execute("INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (1,'ORIGINAL','{\"k\":1}','h1')", []).unwrap();
+        for sql in [
+            "REPLACE INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (2,'FORGED','{}','h1')",
+            "INSERT OR REPLACE INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (2,'FORGED','{}','h1')",
+            "INSERT OR IGNORE INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (2,'FORGED','{}','h1')",
+            "INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (2,'FORGED','{}','h1') ON CONFLICT(legacy_hash) DO NOTHING",
+            "INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (2,'FORGED','{}','h1')",
+        ] {
+            assert_eq!(c.execute(sql, []).unwrap(), 0, "{sql}");
+        }
+        let (n, ty, p): (i64, String, String) =
+            c.query_row("SELECT COUNT(*), MIN(event_type), MIN(payload) FROM events", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!((n, ty.as_str(), p.as_str()), (1, "ORIGINAL", "{\"k\":1}"));
+        // A different hash and a NULL hash still insert.
+        assert_eq!(c.execute("INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (3,'B','{}','h2')", []).unwrap(), 1);
+        assert_eq!(c.execute("INSERT INTO events (ts_ms, event_type, payload) VALUES (3,'C','{}')", []).unwrap(), 1);
+    }
+
+    #[test]
     fn event_payload_must_be_valid_json() {
         assert!(insert_event(&db(), "X", "not json").is_err());
     }
@@ -79,7 +102,10 @@ mod tests {
         c.execute("INSERT INTO events (ts_ms, event_type, payload) VALUES (1,'A','{}')", []).unwrap();
         c.execute("INSERT INTO events (ts_ms, event_type, payload) VALUES (2,'A','{}')", []).unwrap();
         c.execute("INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (3,'A','{}','h')", []).unwrap();
-        assert!(c.execute("INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (4,'A','{}','h')", []).is_err());
+        // A duplicate legacy_hash is silently ignored (see the dedupe trigger test below).
+        assert_eq!(c.execute("INSERT INTO events (ts_ms, event_type, payload, legacy_hash) VALUES (4,'A','{}','h')", []).unwrap(), 0);
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3);
     }
 
     fn add_pair(c: &Connection, uuid: &str, symbol: &str, status: &str) -> rusqlite::Result<usize> {
