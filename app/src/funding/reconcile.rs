@@ -107,3 +107,7 @@ fn merge(mut a: Value, b: Value) -> Value {
     }
     a
 }
+
+#[cfg(test)]
+#[path = "reconcile_tests.rs"]
+mod tests;

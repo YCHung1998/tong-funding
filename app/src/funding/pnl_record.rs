@@ -427,4 +427,4 @@ pub fn recompute_if_changed(db: &Db, pair: &str, now_ms: i64) -> Result<Option<i
 
 #[cfg(test)]
 #[path = "pnl_record_tests.rs"]
-mod tests;
+pub(crate) mod tests;

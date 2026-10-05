@@ -13,17 +13,17 @@ use crate::store::events::EventStore;
 use crate::store::state::NewPair;
 
 /// An 8-hour settlement boundary.
-const T: i64 = 1_791_216_000_000;
+pub(crate) const T: i64 = 1_791_216_000_000;
 const H8: i64 = 28_800;
 
-fn d(s: &str) -> Decimal {
+pub(crate) fn d(s: &str) -> Decimal {
     s.parse().unwrap()
 }
 
-struct Fx {
+pub(crate) struct Fx {
     _dir: tempfile::TempDir,
-    db: Db,
-    clock: ManualClock,
+    pub(crate) db: Db,
+    pub(crate) clock: ManualClock,
     events: EventStore,
 }
 
@@ -63,7 +63,7 @@ fn snapshot() -> Value {
 }
 
 /// Entry at T−10 s, close at T+15 s, the spec's −0.82 numbers (funding −0.12 + 0.36).
-fn scenario(with_snapshot: bool) -> Fx {
+pub(crate) fn scenario(with_snapshot: bool) -> Fx {
     let (dir, db, clock) = open_tmp();
     let fx = Fx { events: EventStore::new(db.clone()), _dir: dir, db, clock };
     add_pair(&fx.db, "p1", "BTCUSDT", false);
@@ -78,7 +78,7 @@ fn scenario(with_snapshot: bool) -> Fx {
     fx
 }
 
-fn ledger(exchange: Exchange, symbol: &str, id: &str, amount: &str, ts: i64) -> FundingLedgerEntry {
+pub(crate) fn ledger(exchange: Exchange, symbol: &str, id: &str, amount: &str, ts: i64) -> FundingLedgerEntry {
     let kind = if exchange == Exchange::Binance { "FUNDING_FEE" } else { "SETTLEMENT" };
     FundingLedgerEntry::new(exchange, symbol, d(amount), "USDT", ts, id, kind, json!({}))
 }
@@ -89,7 +89,7 @@ fn fetched(fx: &Fx, exchange: Exchange, symbol: Option<&str>, start: i64, end: i
     });
 }
 
-fn both_fetched(fx: &Fx) {
+pub(crate) fn both_fetched(fx: &Fx) {
     fetched(fx, Exchange::Binance, Some("BTCUSDT"), T - 10_000, T + 15_000);
     fetched(fx, Exchange::Bybit, None, T - 10_000, T + 15_000);
 }
