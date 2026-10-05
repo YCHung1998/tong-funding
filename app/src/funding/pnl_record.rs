@@ -8,8 +8,9 @@
 //! Conservative readings (design.md 實作紀錄):
 //! - A fill's time is the store time of the newest `ORDER_SUBMITTED` / `ORDER_FILL` of that order
 //!   (the engine records no exchange fill time).
-//! - Close orders carry no reference price (the engine records one only at entry): their slippage
-//!   is "無參考價" and the PnL INCOMPLETE until a close reference price is recorded.
+//! - A close order's reference price is the `reference_price` the engine wrote on its close events
+//!   (a fresh single-symbol refetch right before the reduce-only close was sent). Without it the
+//!   close slippage is "無參考價" and the PnL INCOMPLETE; the fill price is never used instead.
 //! - OKX legs: quantities are contracts and no contract value is recorded with the fill, and OKX
 //!   has no ledger client; their prices are treated as unknown and their funding as not fetched.
 
@@ -150,12 +151,17 @@ fn order_fills(events: &[EventRow], entry_prices: [Option<Decimal>; 2]) -> Vec<O
             Side::Short => 1,
         };
         let okx = exchange == Some(Exchange::Okx);
+        // Close reference: the price the engine fetched right before sending this reduce-only
+        // close (`reference_price` on its close events). Kept from an earlier event of the same
+        // order when a later one (e.g. ORDER_FILL) lacks it; never the fill price itself.
+        let close_reference = dec(&p["reference_price"]).or_else(|| by_id.get(id).and_then(|f| f.record.expected_price));
         let record = FillRecord {
             id: id.to_string(),
             action,
             quantity,
             expected_price: match action {
                 FillAction::Open if !okx => entry_prices[idx],
+                FillAction::Close if !okx => close_reference,
                 FillAction::Open | FillAction::Close => None,
             },
             actual_price: if okx { None } else { dec(&p["avg_price"]) },

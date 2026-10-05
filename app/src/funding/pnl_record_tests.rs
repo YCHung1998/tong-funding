@@ -108,7 +108,7 @@ fn pnl_record_assembles_fills_ledger_and_settlements_from_the_store() {
     assert_eq!(a.input.legs[0].funding.len(), 1);
     assert_eq!(a.input.legs[0].fills.len(), 2);
     assert_eq!(a.input.legs[0].fills[0].expected_price, Some(d("60000")), "entry reference price from entry_snapshot");
-    assert_eq!(a.input.legs[0].fills[1].expected_price, None, "the engine records no close reference price");
+    assert_eq!(a.input.legs[0].fills[1].expected_price, None, "no close reference recorded in this fixture");
     assert_eq!(a.expected.as_ref().unwrap().funding_income, d("0.40"));
     let b = tong_funding_core::pnl::compute_pnl(&a.input);
     assert_eq!(b.total.funding, d("0.24"));
@@ -212,4 +212,78 @@ fn pnl_record_a_reconciliation_mismatch_makes_the_result_incomplete() {
     });
     let a = assemble(&fx.db, "p1", T + 90_000).unwrap();
     assert!(a.input.reconciliation_mismatch);
+}
+
+// ---- gap 2: close reference price recorded by the engine when the close orders are sent ------
+
+/// The engine's close events: the fill details plus the per-leg reference price it fetched right
+/// before sending the reduce-only close (`reference_price`), or why it has none.
+fn close_with_reference(fx: &Fx, ts: i64, leg: &str, exchange: Exchange, avg: &str, reference: Result<&str, &str>) {
+    at(fx, ts, |es| {
+        let mut p = json!({
+            "outcome": "accepted", "state": "Filled", "filled_quantity": "0.02", "avg_price": avg, "fee": "0.24", "fee_asset": "USDT",
+            "client_order_id": format!("demo-p1-{leg}-close"), "leg": leg, "action": "close", "simulated": false,
+            "exchange": exchange.name(), "symbol": "BTCUSDT",
+        });
+        match reference {
+            Ok(r) => {
+                p["reference_price"] = json!(r);
+                p["reference_observed_at_ms"] = json!(ts - 50);
+                p["reference_source"] = json!("refetch_before_close");
+            }
+            Err(e) => p["reference_error"] = json!(e),
+        }
+        es.append("ORDER_SUBMITTED", Some("p1"), p).unwrap();
+    });
+}
+
+/// `scenario` without its close orders (they are added with or without a reference).
+fn opened_round() -> Fx {
+    let (dir, db, clock) = open_tmp();
+    let fx = Fx { events: EventStore::new(db.clone()), _dir: dir, db, clock };
+    add_pair(&fx.db, "p1", "BTCUSDT", false);
+    at(&fx, T - 10_000, |es| {
+        es.append("PAIR_TRANSITION", Some("p1"), json!({ "from": "PRE_TRADE_CHECK", "to": "ORDER_SUBMIT", "detail": { "checks": "pass", "entry_snapshot": snapshot() } })).unwrap();
+    });
+    order(&fx, T - 10_000, "p1", "long", "open", Exchange::Binance, "60002.5", "0.24");
+    order(&fx, T - 10_000, "p1", "short", "open", Exchange::Bybit, "60000", "0.24");
+    fx
+}
+
+#[test]
+fn pnl_record_a_demo_round_with_close_references_and_funding_is_complete() {
+    let fx = opened_round();
+    close_with_reference(&fx, T + 15_000, "long", Exchange::Binance, "59997.5", Ok("60000"));
+    close_with_reference(&fx, T + 15_000, "short", Exchange::Bybit, "60000", Ok("60001"));
+    fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_fetched(&fx);
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    assert_eq!(a.input.legs[0].fills[1].expected_price, Some(d("60000")), "close reference from the close event");
+    assert_eq!(a.input.legs[1].fills[1].expected_price, Some(d("60001")));
+    fx.clock.set(T + 80_000);
+    let r = settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "COMPLETE"), "{r:?}");
+    let latest = latest_pnl(&fx.db, "p1").unwrap().unwrap();
+    assert_eq!(latest.payload["status"], json!("COMPLETE"), "{}", latest.payload);
+    // long: open buy 0.02 x (60002.5 − 60000) = 0.05, close sell 0.02 x (60000 − 59997.5) = 0.05;
+    // short: close buy 0.02 x (60000 − 60001) = −0.02 (better than the reference).
+    assert_eq!(latest.payload["breakdown"]["legs"][0]["components"]["slippage"], json!("0.1"), "{}", latest.payload["breakdown"]);
+    assert_eq!(latest.payload["breakdown"]["total"]["slippage"], json!("0.08"));
+}
+
+#[test]
+fn pnl_record_a_missing_close_reference_keeps_the_result_incomplete_with_the_reason() {
+    let fx = opened_round();
+    close_with_reference(&fx, T + 15_000, "long", Exchange::Binance, "59997.5", Ok("60000"));
+    close_with_reference(&fx, T + 15_000, "short", Exchange::Bybit, "60000", Err("refetch failed: timeout"));
+    fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_fetched(&fx);
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    assert_eq!(a.input.legs[1].fills[1].expected_price, None, "never the fill price as the reference");
+    fx.clock.set(T + 80_000);
+    let r = settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "INCOMPLETE"), "{r:?}");
+    let latest = latest_pnl(&fx.db, "p1").unwrap().unwrap();
+    let reasons: Vec<String> = serde_json::from_value(latest.payload["reasons"].clone()).unwrap();
+    assert_eq!(reasons, vec!["無參考價（Bybit demo-p1-short-close）".to_string()], "only the short close lacks a reference");
 }
