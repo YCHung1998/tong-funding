@@ -98,6 +98,11 @@ pub struct RiskConfig {
     pub est_slippage_pct: Option<Pct>,
     /// Required, no default; a missing exchange entry means "not set".
     pub taker_fee_pct: BTreeMap<Exchange, Pct>,
+    /// Minimum expected net PnL (funding income − fees − estimated slippage, before the safety
+    /// margin) as a percentage of the per-leg notional; part of `NetEdgeQualified` next to
+    /// `net_edge_threshold_pct` (ui-trading-pages, user decision 2026-10-05 evening). Global only,
+    /// documented default 0.03 (Python `risk_config.py`), so it never makes the config incomplete.
+    pub min_expected_net_pnl_pct: Pct,
 }
 
 impl Default for RiskConfig {
@@ -118,6 +123,7 @@ impl Default for RiskConfig {
             net_edge_threshold_pct: None,
             est_slippage_pct: None,
             taker_fee_pct: BTreeMap::new(),
+            min_expected_net_pnl_pct: Decimal::new(3, 2),
         }
     }
 }
@@ -159,6 +165,7 @@ impl RiskConfig {
         for v in self.taker_fee_pct.values() {
             non_negative("taker_fee_pct", *v)?;
         }
+        non_negative("min_expected_net_pnl_pct", self.min_expected_net_pnl_pct)?;
         Ok(())
     }
 
@@ -306,6 +313,8 @@ pub struct EffectiveConfig {
     pub est_slippage_pct: Option<Pct>,
     pub long_taker_fee_pct: Option<Pct>,
     pub short_taker_fee_pct: Option<Pct>,
+    /// Global only (not overridable): the global value, unchanged.
+    pub min_expected_net_pnl_pct: Pct,
 }
 
 impl EffectiveConfig {
@@ -357,6 +366,7 @@ pub fn effective_for_pair(
         est_slippage_pct: leg_opt(|o| o.est_slippage_pct, global.est_slippage_pct),
         long_taker_fee_pct: global.taker_fee_pct.get(&long_exchange).copied(),
         short_taker_fee_pct: global.taker_fee_pct.get(&short_exchange).copied(),
+        min_expected_net_pnl_pct: global.min_expected_net_pnl_pct,
     }
 }
 

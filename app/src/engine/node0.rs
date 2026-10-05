@@ -1,5 +1,7 @@
 //! Node 0 (task 2.2): assembles core's pre-trade input from freshly fetched data and the pair's
-//! effective (per-pair merged) risk settings, then runs core's ten checks. Pure: the fetched
+//! effective (per-pair merged) risk settings, then runs core's ten checks. `NetEdgeQualified` needs
+//! both Net Edge ≥ `net_edge_threshold_pct` and expected net PnL ≥ `min_expected_net_pnl_pct`
+//! (ui-trading-pages, MODIFIED pretrade-validation). Pure: the fetched
 //! quotes, margins and `now_ms` are parameters.
 //!
 //! Fail-closed inputs are fed to core as values core itself rejects, so core stays the single
@@ -10,7 +12,7 @@
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tong_funding_core::funding::{is_consistent_listed, FundingObservation};
-use tong_funding_core::net_edge::{compute_net_edge, NetEdge, NetEdgeParams};
+use tong_funding_core::net_edge::{compute_net_edge, expected_net_pnl_pct, meets_min_expected_net_pnl, NetEdge, NetEdgeParams};
 use tong_funding_core::pair::PairState;
 use tong_funding_core::pretrade::{evaluate_pretrade, Check, LegInput, PretradeInput, PretradeLimits, PretradeVerdict};
 use tong_funding_core::risk::EffectiveConfig;
@@ -194,7 +196,19 @@ pub fn build_input(
     let mut notes = Vec::new();
     let net_edge_qualified =
         match net_edge_with_threshold(&long.pretrade.funding, &short.pretrade.funding, entry.notional_usdt, eff) {
-            Ok((edge, threshold)) => edge.net_edge_pct >= threshold,
+            // NetEdgeQualified = Net Edge ≥ threshold AND expected net PnL ≥ min (both effective).
+            Ok((edge, threshold)) => {
+                let min = eff.min_expected_net_pnl_pct;
+                let pnl_ok = meets_min_expected_net_pnl(&edge, entry.notional_usdt, min);
+                if !pnl_ok {
+                    notes.push(format!(
+                        "expected net PnL {}% is below min_expected_net_pnl_pct {}%",
+                        expected_net_pnl_pct(&edge, entry.notional_usdt).normalize(),
+                        min.normalize()
+                    ));
+                }
+                edge.net_edge_pct >= threshold && pnl_ok
+            }
             Err(why) => {
                 notes.push(format!("net edge not computable: {}", why.join(", ")));
                 false
@@ -542,6 +556,18 @@ mod tests {
         let mut fx = Fx::new();
         fx.pre_s = quote(Exchange::Bybit, "0.0002", "100.01", 6_000);
         assert_eq!(fx.failed(), vec![Check::NetEdgeQualified]);
+    }
+
+    /// ui-trading-pages (MODIFIED pretrade-validation): Net Edge 0.07 % clears the 0.05 threshold;
+    /// expected net PnL (before the 0.01 safety margin) is 0.08 %: income 2.0 − fees 0.8 −
+    /// slippage 0.4 = 0.8 USDT on 1,000.
+    #[test]
+    fn expected_net_pnl_below_min_fails_net_edge_qualified_and_equal_passes() {
+        let mut fx = Fx::new();
+        fx.cfg.min_expected_net_pnl_pct = dec("0.0801");
+        assert_eq!(fx.failed(), vec![Check::NetEdgeQualified]);
+        fx.cfg.min_expected_net_pnl_pct = dec("0.08");
+        assert_eq!(fx.verdict(), Node0Verdict::Pass);
     }
 
     #[test]

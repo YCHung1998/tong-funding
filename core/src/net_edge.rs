@@ -106,6 +106,22 @@ pub fn compute_net_edge(
     })
 }
 
+/// Expected net PnL of a computed pair as a percentage of the per-leg `notional`: funding income
+/// minus fees minus estimated slippage, i.e. Net Edge BEFORE the safety margin (pretrade-validation
+/// MODIFIED by ui-trading-pages). A non-positive notional gives 0 (and never qualifies, see below).
+pub fn expected_net_pnl_pct(edge: &NetEdge, notional: Notional) -> Pct {
+    if notional <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    (edge.funding_income_usdt - edge.fee_usdt - edge.slippage_usdt) * Decimal::ONE_HUNDRED / notional
+}
+
+/// `min_expected_net_pnl_pct` rule: expected net PnL % ≥ `min` (equal passes); a non-positive
+/// notional fails (fail closed).
+pub fn meets_min_expected_net_pnl(edge: &NetEdge, notional: Notional, min: Pct) -> bool {
+    notional > Decimal::ZERO && expected_net_pnl_pct(edge, notional) >= min
+}
+
 /// Evaluates one fixed orientation (`long` / `short`) and applies the qualification rules.
 fn evaluate_oriented(
     long: &FundingObservation,
