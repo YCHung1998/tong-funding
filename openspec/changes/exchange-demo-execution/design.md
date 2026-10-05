@@ -135,3 +135,11 @@ Python 版用配對記錄的數量與方向，若成交量有偏差、被強平�
 10. **只支援市價單**（沿用 Python 版）。市價單在流動性差的 testnet 可能滑價大或部分成交；是否需要限價選項未決。
 11. **macOS 系統通知的實作機制**未驗證（D8）。
 12. **完全人工的負擔門檻**由使用者在 4.3 後判斷；系統不預設任何自動停機規則。
+
+## 決定紀錄（2026-10-05 晚，使用者）
+
+- **只支援市價單**（Open Question 10）。
+- **平倉數量 = min(配對記錄量, 實際持倉)**，差異超過 `max_leg_imbalance_pct` 轉人工（Open Question 4），與 `engine-simulation` 一致。
+- **成交明細（價格、數量、手續費、手續費幣別）寫入不可變事件**（`funding-pnl` Open Question 2）。
+- 已在 `engine-simulation` 處理：core 的 `CLOSING → PARTIAL_FAILURE`、`FILL_MONITOR → IMBALANCED` 轉移已存在（Open Question 7）；不平衡量為幣本位相對差（對較大者，Open Question 6）。
+- 金鑰只放 macOS Keychain；雲端開發環境連不到交易所，真實 demo 驗證（4.2）一律在使用者的 Mac 上執行。

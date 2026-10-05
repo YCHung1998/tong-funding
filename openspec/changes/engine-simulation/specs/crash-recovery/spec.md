@@ -9,7 +9,7 @@
 #### Scenario: 意圖先於呼叫
 
 - **WHEN** 引擎準備送出某腿訂單，並在 `Executor` 的送單函式入口記錄當時 store 內容
-- **THEN** 此時 `order_intents` 已有該 `client_order_id` 且狀態為已意圖
+- **THEN** 此時 `order_intents` 已有該 `client_order_id`（先寫已意圖、再標已送出，兩者都在呼叫之前完成）
 
 #### Scenario: 意圖寫入失敗
 
@@ -63,7 +63,7 @@
 
 ### Requirement: 對帳完成前不接受增加曝險的動作
 
-啟動後，在所有未結束意圖完成對帳之前，引擎 SHALL 拒絕所有 `opens_exposure()` 為真的 Command，排程器 SHALL NOT 觸發進場。
+啟動後，在所有未結束的 demo 意圖完成對帳之前，引擎 SHALL 在 `EXCHANGE_DEMO` 模式下拒絕所有 `opens_exposure()` 為真的 Command，排程器 SHALL NOT 觸發進場；`SIMULATION` 模式的進場不受 demo 對帳狀態影響（使用者 2026-10-05 決定），但未對帳的 demo 配對仍計入已開啟配對。
 對帳因交易所不可連線、金鑰不可用或查詢失敗而無法完成時，引擎 SHALL 維持此狀態並顯示原因，SHALL NOT 因無法對帳而放行。
 沒有任何未結束意圖時，此限制 SHALL 立即解除。
 

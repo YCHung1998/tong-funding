@@ -32,6 +32,8 @@ fn table() -> Vec<(S, Event, S)> {
         (S::Reconciled, man(M::RequestClose), S::Closing),
         (S::Closing, sys(E::ClosedConfirmed { verified_flat: true }), S::Finalized),
         (S::Closing, sys(E::CloseFailed), S::PartialFailure),
+        // engine-simulation: a simulated pair's ledger is gone after a restart.
+        (S::Reconciled, sys(E::RestartUndetermined), S::Unresolved),
     ];
     for s in in_flight {
         t.push((s, sys(E::RestartFoundPartial), S::PartialFailure));
@@ -59,8 +61,8 @@ fn run(state: S, e: Event) -> Result<S, IllegalTransition> {
 
 #[test]
 fn table_has_expected_row_count() {
-    // 17 single rows + 3 in-flight * 2 + 3 locked * 2 = 29
-    assert_eq!(table().len(), 29);
+    // 18 single rows (incl. RECONCILED restart, engine-simulation) + 3 in-flight * 2 + 3 locked * 2 = 30
+    assert_eq!(table().len(), 30);
 }
 
 #[test]
@@ -90,7 +92,7 @@ fn everything_outside_the_table_is_rejected_exhaustively() {
             }
         }
     }
-    assert_eq!(rejected, 12 * 24 - 29);
+    assert_eq!(rejected, 12 * 24 - 30);
 }
 
 #[test]
@@ -201,6 +203,8 @@ fn scenario_close_failure_goes_partial() {
 fn scenario_restart_single_leg() {
     assert_eq!(next(S::FillMonitor, E::RestartFoundPartial), Ok(S::PartialFailure));
     assert_eq!(next(S::OrderSubmit, E::RestartUndetermined), Ok(S::Unresolved));
+    assert_eq!(next(S::Reconciled, E::RestartUndetermined), Ok(S::Unresolved));
+    assert!(next(S::Reconciled, E::RestartFoundPartial).is_err(), "only 'undetermined' leaves RECONCILED on restart");
 }
 
 #[test]

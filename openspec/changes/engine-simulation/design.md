@@ -52,7 +52,7 @@ Python 版的競態都來自「多個執行緒各拿一把鎖操作同一份狀�
 | Command | opens_exposure | 理由 |
 |---|---|---|
 | 排程器內部進場觸發、手動執行進場 | 真 | 開新倉 |
-| 手動下單 | `!reduce_only` | 無 reduce-only 的訂單可能開倉或加倉（我的決定，需使用者確認，見 Open Questions） |
+| 手動下單 | `!reduce_only` | 無 reduce-only 的訂單可能開倉或加倉；停機時仍可手動減倉（使用者確認：優先清倉拿回現金） |
 | 新增 PREPARED 配對 | 假 | 尚未下任何單；進場觸發時才檢查 kill switch |
 | 自動出場、手動出場、人工平倉、人工確認已平倉 | 假 | 只減少曝險 |
 | 取消 PREPARED、修改 `trigger_mode`、修改 `execution_mode`、修改設定、切換 kill switch | 假 | 不產生曝險 |
@@ -71,8 +71,15 @@ Python 版在進場後就 `FINALIZED`（`ENTRY_SIMULATED`），所以從未在�
 **D8　`Executor` 與 `AccountView` 分離。**
 `Executor` 只管訂單生命週期（送單、撤單、依 `client_order_id` 查單）；`AccountView` 管持倉、未成交委託、餘額（來自 `exchange-readonly-adapters` 的唯讀實作）。SIMULATION 下 `AccountView` 的持倉與委託來自模擬帳，餘額來源見 Open Questions。這樣唯讀能力不被誤算成「能下單」。
 
-**D9　進場視窗 `[T−15s, T)`，錯過即取消。**
-Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後進場，拿不到該次 funding 卻付了四筆手續費。新版加上上限。這是**我新增的規則，未經使用者確認**，列入 Open Questions。出場沒有上限（晚平倉比不平倉好）。
+**D9　進場視窗 `[T − entry_lead, T)`，錯過先警示再取消；時點全部是設定值。**
+Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後進場，拿不到該次 funding 卻付了四筆手續費。新版加上上限（使用者 2026-10-05 確認）。
+時點集中在 `EngineTimings`（不寫死在流程裡，使用者要求之後好調整）：
+- `entry_lead_ms`：預設 **10,000（T−10）**。使用者希望 T−5，但送單延遲尚未實測（重抓單一標的實測 0.16–0.26 秒，每所僅 3 次；送單延遲需 demo 金鑰）。
+  **改為 T−5 的條件**：`exchange-demo-execution` 實測「進場觸發 → 兩腿皆被交易所接受」p99 < 2,500 ms（5 秒的一半）。
+- `base_price_lead_ms`：基準價在進場時點之前多久抓取，預設 5,000（即 T−15，與使用者最初描述一致）。
+- `exit_delay_ms`：預設 15,000（T+15）。
+- `missed_window_policy`：目前只有 `WarnThenCancel`——錯過視窗時先寫一筆警示事件 `ENTRY_WINDOW_MISSED`，再轉 `CANCELLED`。以 enum 表示，日後新增策略只需加變體。
+出場沒有上限（晚平倉比不平倉好）。
 
 **D10　結算時間 `T` 在配對建立時固定。**
 `T` 由兩腿 `next_funding_time` 取較早者（core 規則），建立時保存。Node 0 重新抓取後若發現 funding 時間或週期已變，目前由 `NetEdgeQualified` 以最新資料重算來間接反映；是否要另設「結算時間改變即 BLOCK」未決（Open Questions）。
@@ -92,10 +99,10 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 |---|---|---|---|
 | SIMULATION 後續 | 進場後直接 `FINALIZED` | 走完整輪 | D7 |
 | 進場時點上限 | 無 | `T` 之前 | D9 |
-| 基準價提前量 | 進場觸發前 15 秒（約 T−30 秒） | 固定提前量，預設沿用 Python（見 Open Questions） | 與使用者「T−15 秒」描述有出入，待確認 |
+| 進場時點 / 基準價 | 進場 T−15；基準價再提前 15 秒（約 T−30） | 進場 T−10、基準價 T−15，皆為設定值 | 使用者決定（D9） |
 | 每腿覆寫 | 只存不讀 | `effective_for_pair` 接進 Node 0 與逾時 | 使用者決定 |
 | `order_timeout_seconds` | 只在設定頁 | 執行路徑讀取 | 使用者決定 |
-| 停機時自動出場 | 被擋 | 不被擋（`opens_exposure` 為假） | 使用者決定的分類規則；與 Python 不同，見 Open Questions |
+| 停機時自動出場 | 被擋 | 不被擋（`opens_exposure` 為假） | 使用者 2026-10-05 確認 |
 | 送單意圖 | 無 | 先落地、帶 `client_order_id` | 抗辯 |
 | 手動下單頁 | 不受 `execution_mode` 約束 | 受約束，同一條路徑 | 使用者決定 |
 | `requests` 類例外 | 往上拋、配對卡住 | 明確的「結果未知」狀態 | 見 `exchange-demo-execution` |
@@ -108,14 +115,67 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 - **對帳假設交易所能以 `client_order_id` 查單。** 若某所對舊訂單查不到，會有更多配對落入 `UNRESOLVED`，增加人工負擔；實際保留期限**未驗證**。
 - **SIMULATION 的模擬成交過於樂觀**（完整成交、無滑價），不能用來估計單腿失敗頻率；該統計只能在 `exchange-demo-execution` 取得。
 
+## 已決定（2026-10-05，使用者）
+
+1. **core 轉移已涵蓋。** 已對照 `core/src/pair.rs` 的 `next()`：`PREPARED → CANCELLED`、`ORDER_SUBMIT`/`FILL_MONITOR`/`CLOSING` 的 `RestartFoundPartial → PARTIAL_FAILURE` 與 `RestartUndetermined → UNRESOLVED`、`CLOSING` 的 `CloseFailed → PARTIAL_FAILURE` 皆存在，不需修改 core。
+2. **停機時自動出場照常執行。**
+3. **進場 T−10、基準價 T−15**，皆為設定值；改 T−5 的條件見 D9。
+4. **進場視窗上限採用**；錯過時先寫警示事件再取消；策略做成可調整（D9）。
+5. **手動下單以 `reduce_only` 分類**（D5）。
+6. **SIMULATION 的保證金**：讀交易所 demo 帳戶的真實餘額（唯讀簽名 GET，經 `AccountView`）。金鑰在使用者 Mac 的 Keychain；讀不到餘額時 `Margin` 檢查失敗（BLOCK，失敗即封閉），不使用預設值或虛擬餘額。測試一律用假的 `AccountView`。
+7. **SIMULATION 中斷後的配對一律 `UNRESOLVED`。** 包含 `RECONCILED` 的模擬配對：使用者同意在 core 補上 `RECONCILED` + 重啟無法判定 → `UNRESOLVED`（本 change 以 MODIFIED 修改 `pair-lifecycle`，封存時同步主 spec）。
+8. **對帳未完成只擋 EXCHANGE_DEMO 的開倉。** demo 配對因金鑰不可用等原因對帳未完成時，`SIMULATION` 的進場照常允許（模擬不碰交易所）；該 demo 配對仍佔 `max_concurrent_pairs`，橫幅持續警示直到人工處理。
+
+## 實作時的決定（wave 1，2026-10-05）
+
+- **一腿數量不足（低於 `min_qty`）時兩腿都不送**（`BothSubmitsFailed` → `CANCELLED`），避免刻意開出裸倉。
+- **出場時偏移不可用改用本機時間**（`ExitClock::LocalFallback`），出場不因校時失敗卡住；進場仍失敗即封閉。
+- **進場需兩腿交易所皆有偏移**；進場起點以「時鐘最落後的一腿」到達 `T − entry_lead_ms`，視窗在「最超前的一腿」到達 `T` 時關閉。
+- **PREPARED 重新評估時設定不完整即取消**（尚無曝險，失敗即封閉）。
+- **不平衡量**：兩腿以幣本位成交量的相對差（對較大者的百分比），等於門檻視為通過。
+- **`entry_json` 格式**：`PairEnvelope { long_exchange, short_exchange, settlement_ms, simulated, scan }`，`scan` 內 `long_scan_price`、`short_scan_price`、`notional_usdt`、`leverage` 一律為字串（拒絕浮點數）。
+- **模式旗標遺失或讀取失敗時預設 `MANUAL` + `SIMULATION`**（安全組合）；儲存的 `EXCHANGE_DEMO` 在啟動時若建不出執行器，退回 `SIMULATION` 並寫 `EXECUTION_MODE_FALLBACK`。
+- **PREPARED 也算已開啟配對**（依 spec 定義），所以有 PREPARED 配對時不能切換 `execution_mode`。
+- **意圖在呼叫前先寫 INTENDED、再標 SUBMITTED**，兩次寫入都成功才呼叫 `Executor`；因此崩潰後資料庫一定是 SUBMITTED（不會出現「已呼叫但仍是 INTENDED」）。重啟對帳時「SUBMITTED + 查無 + 兩腿持倉與委託皆無曝險」判為未送達（D12）。
+- **`client_order_id`**：`<sim|demo><l|s><o|c><seq base36 4 碼><uuid 的 FNV-1a 13 碼><uuid 前 0–8 個英數字>`，只用小寫英數、≤ 31 字元（比 spec 的 36 更保守，也落在 OKX `clOrdId` 32 字元以內，**OKX 規則未查證**）。
+- **系統時鐘掃描**只放行 `tokio::time::Instant::now`（可在測試中暫停的計時器，只用於 Snapshot 推送間隔，不蓋事件時間戳）。
+
+## 實作時的決定（wave 2，2026-10-05）
+
+- **自動出場不受 `trigger_mode` 影響**：MANUAL 模式下 RECONCILED 配對到 `T + exit_delay_ms` 仍自動出場（晚平倉比不平倉好），也不受 kill switch 影響。
+- **進場視窗在進場處理內再檢查一次**：`EntryTrigger` 與 `ManualEnter` 在偏移不可用、或時鐘最超前的一腿已到 `T` 時一律拒絕；人工進場可以早於 `T − entry_lead_ms`。
+- **PREPARED 自動撤銷只在 AUTO 執行**：使用基準價資料，外加每 30 秒一次的重新抓取（只在距基準價時點 30 秒以上時進行），讓進場視窗內恰好只有兩次抓取（基準價與送單前）。
+- **送單永遠不回應**：在 `ORDER_SUBMIT` 超過生效的 `order_timeout_seconds` 即視為「結果未知」，進 `FILL_MONITOR` 後以同一 id 查詢，查不到則 `UNRESOLVED`。
+- **平倉數量取自帳戶持倉**（`AccountView`，SIMULATION 時為模擬帳），不取記憶體中的成交量，因此重啟後的人工平倉也正確。沒有持倉的腿略過；方向不符或帳戶不可讀 → `CloseFailed` → `PARTIAL_FAILURE`；平倉後仍有持倉或委託 → `PARTIAL_FAILURE`。
+- **殘留委託不自動撤單**（逾時與平倉前都不撤）：符合「單腿與不平衡完全人工處理」；部分成交後仍掛著的委託會使已平倉確認失敗而轉 `PARTIAL_FAILURE`。
+- **帳戶列表不可讀或不完整視為有外部曝險**（Node 0 的 `ExistingExposure` 失敗）。
+- **kill switch 讀取失敗時不寫 `COMMAND_REFUSED`**：讀取失敗會讓 store 停機，事件無法寫入；停機原因本身即是紀錄。
+- **手動下單的意圖**以 `manual-<now_ms>-<n>` 作為 `pair_uuid`（`pairs` 表沒有對應列）；Buy 視為 long、Sell 視為 short，reduce-only 為 Close，否則 Open。
+- **單位**：`OrderRequest.quantity`、`OrderStatus.filled_quantity`、`AccountPosition.quantity` 一律為交易所下單單位（OKX 為張數）；成交比較一律換成幣本位（張數 × `ct_val`）。
+- **風控設定來源**：store 的 config key `risk`（`RiskConfig`）與 `risk_overrides`；缺少時用預設值，而預設值不完整，所以 Node 0 會 BLOCK（不會用 0 計算）。
+
+**尚待正式接線（不在本 change 的測試範圍）**：`SimPriceBook` 需由行情 `watch` 持續餵價，否則模擬執行器因無價格而拒單；`MarketData::order_rules` 需要真實的 adapter 實作。
+
+## 實作時的決定（wave 3，2026-10-05）
+
+- **對帳範圍（scope）固定在啟動當下**：啟動時進行中的配對與所有未結束意圖所屬的配對；之後新增的配對不會被重試的對帳誤判為崩潰殘留。scope 內的配對排程器不處理（包含模擬的 RECONCILED 配對，不會被自動出場）。配對在對帳改變其狀態、對帳成功或使用者指令落地時離開 scope。
+- **對帳失敗每 30 秒重試**（注入時鐘），同時最多一個，成功後不再執行。
+- **重啟時 PRE_TRADE_CHECK 的配對 → BLOCKED**（`CheckFailed`，寫 `PRE_TRADE_CHECK_INTERRUPTED`）：尚未送單，模擬與 demo 皆不需交易所存取。
+- **重啟時兩腿皆完整成交的 demo 配對**由對帳直接以 `fill_decision`（幣本位）判定 RECONCILED / IMBALANCED，否則它會永遠停在 FILL_MONITOR。
+- **手動下單的意圖（`manual-*`）**：查詢並記錄；查無且該標的無曝險 → 標為未送達；查無但有曝險 → 警示交給人工。
+- **配對只能用建立時的模式下單**：demo 配對在 SIMULATION 下（例如啟動時 EXCHANGE_DEMO 退回 SIMULATION）的進場、出場、人工平倉一律拒絕並說明原因，不會送到模擬執行器；反之亦然。否則 demo 倉位會「看似平倉」但交易所上仍在。
+- **崩潰測試的終止點 (a)** 以「送單永遠沒有到達交易所」模擬（`intent` 的寫入與呼叫之間沒有另設測試掛鉤）。
+
 ## Open Questions
 
-1. **core 的轉移是否涵蓋本 change 的需求（需要人類決定由誰補）。** `core-domain-and-fixtures` 的 pair-lifecycle spec 只明列：正常路徑、檢查失敗 `BLOCKED`、`ORDER_SUBMIT` 的單腿失敗 `PARTIAL_FAILURE`、`FILL_MONITOR` 逾時分流、人工事件離開、`CLOSING` 完成。本 change 另需要：`PREPARED → CANCELLED`（自動撤銷、錯過視窗、人工取消）；`ORDER_SUBMIT` / `FILL_MONITOR` / `CLOSING` 因重啟對帳轉 `UNRESOLVED` 或 `PARTIAL_FAILURE`；`CLOSING` 內單腿平倉失敗轉 `PARTIAL_FAILURE`。我只能讀 spec，沒有檢查 `core` 實際程式碼；本 change 的限制是不得修改其他 change。
-2. **kill switch 停機時，已排定的自動出場是否仍應執行？** 使用者決策是「只攔 `opens_exposure` 為真者」，出場不增加曝險，所以我照此設計（停機時自動出場照常執行）。但 Python 版停機會擋自動出場（`kill_switch.py` 註解：「已成交的配對就停在那裡，等人決定」），這是行為變更，需要使用者確認。
-3. **基準價提前量。** 使用者描述為「T−15 秒的基準價」，core spec 寫「結算前約 15 秒重新抓取」，但 Python 實際是進場觸發（T−15 秒）之前再提前 15 秒（約 T−30 秒）。本 change 的 spec 只要求「固定提前量、且與送單前價格分開」，數值待確認。
-4. **進場視窗上限（D9）是新增規則**，需要使用者確認；以及錯過視窗時是否改為只警示而不取消。
-5. **手動下單的 `opens_exposure` 分類（D5）。** 我選以 `reduce_only` 決定；替代做法是手動下單一律視為增加曝險、停機時整頁封鎖，但那會使停機時無法手動減倉。
-6. **SIMULATION 的保證金來源。** Python 版模擬時仍呼叫真實 demo 帳戶的餘額（唯讀簽名請求）。若沒有金鑰，選項是：Margin 檢查標為不可用而 BLOCK，或新增使用者填寫的虛擬餘額設定（無預設值）。未決。
-7. **SIMULATION 中斷後的配對一律 `UNRESOLVED`** 對純模擬使用者可能過於繁瑣；替代是持久化模擬持倉帳。未決，先取保守做法。
-8. **Snapshot 最小間隔 250 毫秒、`client_order_id` 長度 36 與字元集、交易所查單保留期限、SQLite 寫入延遲、actor panic 行為**皆為**未驗證**，分別在 task 1.2、4.1、`exchange-demo-execution` 的驗證中確認。
-9. **Node 0 發現結算時間或週期改變時是否另行 BLOCK**（D10），目前不另設檢查。
+- **demo 配對在 SIMULATION 下可能一直卡住（需使用者決定）**：啟動時 EXCHANGE_DEMO 因金鑰不可用退回 SIMULATION 並持久化後，未對帳的 demo 配對每次重啟都維持未對帳；而有已開啟配對時不允許切換模式，修好金鑰重啟也仍在 SIMULATION。可選：(1) 只剩未對帳的 demo 配對時允許切換到 EXCHANGE_DEMO；(2) 啟動時若儲存的模式是 EXCHANGE_DEMO 而建不出執行器，不持久化退回值（下次啟動再試）。
+
+- Snapshot 最小間隔 250 毫秒、`client_order_id` 長度 36 與字元集、交易所查單保留期限、SQLite 寫入延遲、actor panic 行為皆**未驗證**，分別在 task 1.2、4.1、`exchange-demo-execution` 的驗證中確認。
+- Node 0 發現結算時間或週期改變時是否另行 BLOCK（D10），目前不另設檢查。
+
+## 決定紀錄（2026-10-05 晚，使用者）
+
+- **金鑰與模式**：啟動時儲存的模式是 `EXCHANGE_DEMO` 但讀不到金鑰 → 跳提醒並退回 `SIMULATION`（現行行為加上提醒）；`SIMULATION` 切到 `EXCHANGE_DEMO` 前先檢查金鑰（建立執行器），失敗即不切換。
+- **模式切換的條件改為「所有已開啟配對都屬於目標模式」**：取代原本的「完全沒有已開啟配對」。如此，因金鑰問題退回 SIMULATION 而留下的 demo 配對，在金鑰修好後可以切回 EXCHANGE_DEMO 對帳與處理；模擬配對與 demo 配對永遠不會用到對方的執行器。
+- **平倉數量 = min(配對記錄的成交量, 實際持倉)**；實際持倉與記錄量差異超過 `max_leg_imbalance_pct` 時不自動平倉，轉人工（`CloseFailed` → `PARTIAL_FAILURE`，附差異的警示事件），不動到不屬於本配對的部位。取代 wave 2「平倉數量取自帳戶持倉」。
+- **成交明細寫入不可變事件**（供 `funding-pnl`）：下單當下的預期價格與 Net Edge 快照、每筆成交的價格、數量、手續費與手續費幣別。

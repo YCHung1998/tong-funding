@@ -1,3 +1,4 @@
+mod engine;
 mod exchange;
 mod ports;
 mod store;
@@ -10,6 +11,10 @@ fn main() {
     // Headless subcommands run before any window is created.
     if args.get(1).map(String::as_str) == Some(store::import_cli::SUBCOMMAND) {
         std::process::exit(store::import_cli::run(&args[2..], &mut std::io::stdout(), &mut std::io::stderr()));
+    }
+    if args.get(1).map(String::as_str) == Some(store::secrets_cli::SUBCOMMAND) {
+        let code = store::secrets_cli::run(&args[2..], &mut std::io::stdin().lock(), &mut std::io::stdout(), &mut std::io::stderr());
+        std::process::exit(code);
     }
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
