@@ -139,3 +139,24 @@ Figma 有一個可編輯的「達標門檻 %」輸入框（舊的 gross spread �
 - **OKX 不提示**：維持只比價（Open Question 3）。
 - **掃幣頁的 Net Edge 門檻唯讀**，到風控頁修改（Open Question 4）。
 - 不平衡率：`engine-simulation` 已定為幣本位 `|Δ| ÷ max`（Open Question 5）。
+
+## 實作紀錄（2026-10-05，agent；tasks 1.1、2.1–2.5、3.1、3.2）
+
+結構：view-model 在 `app/src/ui/vm/<頁面>.rs`（測試 `<頁面>_tests.rs`），模組路徑維持 `ui::<頁面>`；繪製在 `app/src/ui/pages.rs` 與 `shell.rs`；正式資料來源 `app/src/ui/live.rs`；開發用設定子命令 `app/src/store/config_cli.rs`（`tong-funding config show|set`，寫入引擎讀取的 `risk` / `risk_overrides`）。
+
+以下是實作時做的解讀，**未經使用者確認**，task 4.1 時一併檢查：
+
+1. **`allowed_coins` 的單位**：risk-config 寫的是幣種（`BTC`），但 `core` 的達標判定拿它跟標的（`BTCUSDT`）比對。掃幣頁把每個項目轉成 `<幣種>USDT`（已以 USDT 結尾者不變），列集合與傳給 `core` 的參數用同一組，兩者一致。引擎（`node0.rs`）目前傳空集合。建議 `core` 定案其中一種單位。
+2. **合約權益列（D9）**：交易所欄位對應未驗證，`LiveSource` 暫不產生「合約」列，各所 Value 只含錢包各幣種（Bybit 有 `usdValue` 時用它，否則用同所 `<幣種>USDT` 的 mark price，都沒有則「無法估值」）。Binance 期貨錢包的 USDT 餘額可能已含已用保證金，若再加合約權益會重複計入；4.1 對照交易所畫面後再決定。
+3. **鎖定狀態的配對卡片**：`position-grouping` 只配 `RECONCILED`，所以 `PARTIAL_FAILURE` / `IMBALANCED` / `UNRESOLVED` 的配對另外以警示卡呈現（找得到的腿照列），其持倉列仍標「未配對」、計入未避險單腿。
+4. **失敗來源的舊值**：部分來源刷新失敗時，舊觀測仍參與 Net Edge 計算，但儲存格標「過期」並在表頭列出錯誤；若要改成「失敗來源不參與計算」，只需在 `scanner::build` 過濾。
+5. **門檻顯示**：頁首顯示全域 `net_edge_threshold_pct`；有每所覆寫時，各列實際用的是 `core` 合併後的值。
+6. **倒數未校時**：沒有校時偏移的交易所以本機時間計算並標「（未校時）」，不隱藏倒數。
+7. **可關閉的警示**：斷線、過期、限流 / 時鐘警示可以暫時關閉，條件消失後再出現會重新顯示；需人工處理與停機不可關閉。
+8. **Binance WebSocket 狀態詞**：頁首用 ONLINE / RECONNECTING / OFFLINE，對應來源判定的 Online / Stale（含限流）/ Offline（含未知）。
+9. **WebSocket 與輪詢的合併**：Binance 每 10 秒的 REST 快照提供週期、成交量與上架狀態，WebSocket 每秒更新 rate、mark price、下次結算時間（只覆蓋較新的事件時間）。
+10. **SCAN_RUN 內容**：每次輪詢或立即刷新寫一筆（`trigger`、`duration_ms`、各所筆數或錯誤），只進記憶體緩衝。
+11. **Binance 簽名主機**：預設 `testnet.binancefuture.com`，環境變數 `TONG_FUNDING_BINANCE_HOST=demo` 改用 `demo-fapi.binance.com`；只能在兩個編譯期常數間切換，不接受網址（exchange-readonly-adapters Open Question 2 未定案）。
+12. **資料庫單一實例**：`config set` 須在 App 關閉時執行（App 持有資料庫鎖）。
+13. **詳情 JSON**：以排版後的 JSON 顯示（serde_json 依鍵名排序），不刪改任何欄位；格式錯誤時顯示原文並標「格式錯誤」。
+14. **「載入中」的帳戶**也不計入總資產，並列在「不含未連線的交易所」註記中。
