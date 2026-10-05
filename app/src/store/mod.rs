@@ -3,7 +3,9 @@
 //! durable state; `secrets`, `legacy_import` = Keychain and importer. `schema` is shared and fixed.
 #![allow(dead_code)]
 
+pub mod config_cli;
 pub mod db;
+pub mod event_query;
 pub mod events;
 pub mod import_cli;
 pub mod legacy_import;

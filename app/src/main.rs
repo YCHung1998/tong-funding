@@ -16,6 +16,9 @@ fn main() {
         let code = store::secrets_cli::run(&args[2..], &mut std::io::stdin().lock(), &mut std::io::stdout(), &mut std::io::stderr());
         std::process::exit(code);
     }
+    if args.get(1).map(String::as_str) == Some(store::config_cli::SUBCOMMAND) {
+        std::process::exit(store::config_cli::run(&args[2..], &mut std::io::stdout(), &mut std::io::stderr()));
+    }
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         ui::component_theme::apply(cx);
