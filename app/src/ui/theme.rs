@@ -38,6 +38,7 @@ pub const FONT_SIZES_LARGE: &[f32] = &[21.0, 25.0, 28.0];
 pub enum Tone {
     Positive,
     Negative,
+    Warning,
     Muted,
 }
 
@@ -46,6 +47,7 @@ impl Tone {
         match self {
             Tone::Positive => POSITIVE,
             Tone::Negative => NEGATIVE,
+            Tone::Warning => WARNING,
             Tone::Muted => TEXT_MUTED,
         }
     }
