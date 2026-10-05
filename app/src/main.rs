@@ -24,7 +24,7 @@ fn main() {
         ui::component_theme::apply(cx);
         ui::fonts::register(cx);
         let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.0), px(800.0)), cx))),
+            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1600.0), px(1000.0)), cx))),
             titlebar: Some(TitlebarOptions { title: Some("Funding Monitor".into()), ..Default::default() }),
             ..Default::default()
         };
@@ -40,7 +40,8 @@ fn main() {
                 gpui_kit::open_window(options, cx, |_, cx| cx.new(|_| ui::bench::DonutBench)).expect("failed to open window");
             }
             _ => {
-                gpui_kit::open_window(options, cx, |_, cx| cx.new(ui::shell::Shell::new)).expect("failed to open window");
+                let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = ui::live::LiveSource::start();
+                gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| ui::shell::Shell::new(source, window, cx))).expect("failed to open window");
             }
         }
         cx.activate(true);

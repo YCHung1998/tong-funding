@@ -3,11 +3,13 @@
 
 pub mod bench;
 pub mod clock;
+pub mod live;
 pub mod component_theme;
 pub mod font_check;
 pub mod frame_stats;
 pub mod fonts;
 pub mod nav;
+pub mod pages;
 pub mod shell;
 pub mod status;
 pub mod theme;
