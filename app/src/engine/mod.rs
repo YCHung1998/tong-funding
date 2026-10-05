@@ -11,14 +11,18 @@
 //! - `schedule`, `node0`, `fill`: pure scheduling, Node 0 input assembly and fill / timeout
 //!   decisions (tasks 2.1–2.3 logic).
 //! - `recovery`: read-only restart reconciliation and its report for the startup gate (task 4.2).
+//! - `alert`, `latency` (change exchange-demo-execution): alert reasons / notifier / once-per-entry
+//!   bookkeeping, and `ORDER_LATENCY` events with their p50/p95/p99 aggregation.
 #![allow(dead_code)]
 
 pub mod actor;
+pub mod alert;
 pub mod command;
 pub mod fill;
 pub mod gate;
 pub mod ids;
 pub mod intent;
+pub mod latency;
 pub mod node0;
 pub mod ports;
 pub mod recovery;

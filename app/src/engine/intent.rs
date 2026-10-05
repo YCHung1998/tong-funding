@@ -15,6 +15,7 @@
 use serde_json::json;
 
 use super::ports::{Executor, Leg, OrderRequest, OrderSide, OrderState, OrderStatus, QueryOutcome, SubmitOutcome};
+use crate::ports::Clock;
 use crate::store::db::{Db, StoreError};
 use crate::store::events::EventStore;
 use crate::store::state::{IntentState, NewIntent};
@@ -43,6 +44,22 @@ pub struct SubmitReport {
     pub query: Option<QueryOutcome>,
     /// Intent state in the store afterwards.
     pub state: IntentState,
+    /// When the submit call started / returned on the injected clock (`None` without a clock).
+    pub timing: Option<SubmitTiming>,
+}
+
+/// Latency of one submit call (exchange-demo-execution task 1.3): `request_sent_at_ms` is read
+/// right before `Executor::submit` (after the intent landed), `ack_at_ms` when it returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitTiming {
+    pub request_sent_at_ms: i64,
+    pub ack_at_ms: i64,
+}
+
+impl SubmitTiming {
+    pub fn latency_ms(&self) -> i64 {
+        self.ack_at_ms - self.request_sent_at_ms
+    }
 }
 
 pub fn side_str(side: OrderSide) -> &'static str {
@@ -151,17 +168,31 @@ pub async fn submit_with_intent(
     leg: Leg,
     req: OrderRequest,
 ) -> Result<SubmitReport, IntentError> {
+    submit_with_intent_clocked(db, executor, None, pair_uuid, leg, req).await
+}
+
+/// Same, also timing the submit call on `clock` (`SubmitReport::timing`).
+pub async fn submit_with_intent_clocked(
+    db: &Db,
+    executor: &dyn Executor,
+    clock: Option<&dyn Clock>,
+    pair_uuid: &str,
+    leg: Leg,
+    req: OrderRequest,
+) -> Result<SubmitReport, IntentError> {
     land_intent(db, pair_uuid, leg, &req)?;
     let simulated = executor.is_simulated();
+    let request_sent_at_ms = clock.map(|c| c.now_ms());
     let outcome = executor.submit(req.clone()).await;
+    let timing = request_sent_at_ms.zip(clock).map(|(sent, c)| SubmitTiming { request_sent_at_ms: sent, ack_at_ms: c.now_ms() });
     let state = record_submit_outcome(db, &req, &outcome, simulated)?;
     if !matches!(outcome, SubmitOutcome::Unknown { .. }) {
-        return Ok(SubmitReport { outcome, query: None, state });
+        return Ok(SubmitReport { outcome, query: None, state, timing });
     }
     // Result unknown: look it up under the SAME id; never resubmit (crash-recovery spec).
     let query = executor.query(req.exchange, &req.symbol, &req.client_order_id).await;
     let state = record_query_outcome(db, &req.client_order_id, &query, simulated)?;
-    Ok(SubmitReport { outcome, query: Some(query), state })
+    Ok(SubmitReport { outcome, query: Some(query), state, timing })
 }
 
 #[cfg(test)]

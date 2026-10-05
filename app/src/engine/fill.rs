@@ -376,6 +376,24 @@ mod tests {
         );
     }
 
+    /// fill-confirmation spec numbers (exchange-demo-execution task 2.1).
+    #[test]
+    fn spec_imbalance_examples_half_a_percent_passes_five_percent_does_not_and_a_partial_leg_waits() {
+        let eff = eff_with(RiskOverrides::new());
+        assert_eq!(
+            fill_decision(&eff, 0, 10, known("0.0200", "0.0200"), known("0.0199", "0.0199")),
+            FillDecision::Transition(SystemEvent::FillsWithinTolerance),
+            "0.5 % <= 1 %"
+        );
+        assert_eq!(
+            fill_decision(&eff, 0, 10, known("0.0200", "0.0200"), known("0.0190", "0.0190")),
+            FillDecision::Transition(SystemEvent::FillsExceedTolerance),
+            "5 % > 1 %"
+        );
+        // 0.014 of 0.020 filled, still open: wait (and poll) until the timeout.
+        assert_eq!(fill_decision(&eff, 0, 10, known("0.0200", "0.0200"), known("0.020", "0.014")), FillDecision::Wait);
+    }
+
     #[test]
     fn unknown_leg_waits_then_goes_undetermined() {
         let eff = eff_with(RiskOverrides::new());

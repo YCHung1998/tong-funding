@@ -121,6 +121,38 @@ pub enum Event {
     FlatChecked { pair: PairUuid, flat: Result<bool, String> },
     /// The startup reconciler finished (`ports::StartupReconciler`).
     ReconciliationDone { result: Result<(), String> },
+    /// Fill timeout: an own, not completely filled order was cancelled (`cancel` = what the cancel
+    /// call said) and then looked up again (`after`): the final fill decides (fill-confirmation spec).
+    CancelChecked { pair: PairUuid, client_order_id: String, cancel: QueryOutcome, after: QueryOutcome },
+    /// "Confirm closed" re-query of both legs (partial-failure-alerting spec): positions and
+    /// open orders on the pair's symbol, read again from the account (never the user's word).
+    ConfirmChecked { pair: PairUuid, result: Result<FlatReport, String> },
+}
+
+/// Both legs' signed positions and open-order counts on the pair's symbol (complete lists only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlatReport {
+    pub positions: [Decimal; 2],
+    pub open_orders: [usize; 2],
+}
+
+impl FlatReport {
+    pub fn is_flat(&self) -> bool {
+        self.positions.iter().all(|p| p.is_zero()) && self.open_orders.iter().all(|n| *n == 0)
+    }
+}
+
+/// Banner data for a pair in PARTIAL_FAILURE / IMBALANCED / UNRESOLVED, derived from its state
+/// (partial-failure-alerting spec). Present until a manual command moves the pair on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alert {
+    pub pair: PairUuid,
+    pub pair_id: String,
+    pub symbol: String,
+    pub state: PairState,
+    pub simulated: bool,
+    /// `AlertReason::as_str` of the current entry, once its `PAIR_ALERT` was written.
+    pub reason: Option<String>,
 }
 
 /// Read-only view of one pair for the UI.
@@ -168,6 +200,8 @@ pub struct Snapshot {
     pub prices: Vec<(Exchange, String, Decimal)>,
     /// User notices (additive), e.g. the startup fallback from EXCHANGE_DEMO to SIMULATION.
     pub notices: Vec<Notice>,
+    /// One per pair in an alert state (derived from the pairs; survives restarts).
+    pub alerts: Vec<Alert>,
 }
 
 /// Reply to a command (sent on the command's oneshot, if any).

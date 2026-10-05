@@ -19,10 +19,16 @@
 //!   →(CheckPassed) ORDER_SUBMIT → Node 1 sizing → one intent-first submit per leg on the executor
 //!   of the current mode → FILL_MONITOR / PARTIAL_FAILURE / CANCELLED → fills polled by
 //!   `Executor::query` each tick → `fill::fill_decision` with the EFFECTIVE `order_timeout_seconds`
-//!   → RECONCILED / IMBALANCED / CANCELLED / PARTIAL_FAILURE / UNRESOLVED. Never an extra order.
+//!   → RECONCILED / IMBALANCED / CANCELLED / PARTIAL_FAILURE / UNRESOLVED. At the timeout the
+//!   pair's own unfinished orders are cancelled and looked up again first (the final fill
+//!   decides). Never an extra order. Every submit writes `ORDER_LATENCY` (both legs in parallel).
 //! - exit: RECONCILED (or a locked state, by hand) → CLOSING → positions read → one reduce-only
-//!   close per non-flat leg (intent first) → flat check (positions 0, no open orders) →
-//!   `CLOSE_CONFIRMED` event → FINALIZED; a rejected close or a non-flat result → PARTIAL_FAILURE.
+//!   close per non-flat leg (intent first) → flat check (positions 0, no open orders; retried
+//!   until the close timeout) → `CLOSE_CONFIRMED` event → FINALIZED; a rejected close or a
+//!   non-flat result at the timeout → PARTIAL_FAILURE.
+//! - alerts: entering PARTIAL_FAILURE / IMBALANCED / UNRESOLVED writes one `PAIR_ALERT` and
+//!   notifies once (`alert`); the banner (`Snapshot::alerts`) is derived from the pair states.
+//!   "Confirm closed" is accepted only after a re-query shows both legs flat.
 //!
 //! A panic inside the actor ends the task: every later `send` gets `Rejected("engine stopped")`
 //! and the snapshot stops updating. There is no automatic restart (design Risks; unverified).
@@ -40,9 +46,11 @@ use tong_funding_core::risk::{
 };
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
+use super::alert::{self, AlertNotice, AlertReason, Notifier, PAIR_ALERT};
 use super::command::{
-    Blocker, Command, CommandReply, Event, ManualOrder, NewPreparedPair, Notice, PairUuid, PairView, Snapshot,
+    Alert, Blocker, Command, CommandReply, Event, FlatReport, ManualOrder, NewPreparedPair, Notice, PairUuid, PairView, Snapshot,
 };
+use super::latency::{self, ORDER_LATENCY};
 use super::fill::{self, AutoCancel, FillDecision, LegFill, LegSizing, PreparedRecheck, SubmitPlan};
 use super::gate::{self, ModeSwitch};
 use super::ids::{self, IdPrefix, client_order_id};
@@ -92,6 +100,10 @@ pub const MANUAL_ORDER_RESULT: &str = "MANUAL_ORDER_RESULT";
 pub const CONFIG_UPDATED: &str = "CONFIG_UPDATED";
 /// Startup reconciliation finished (or failed).
 pub const RECONCILIATION_RESULT: &str = "RECONCILIATION_RESULT";
+/// Fill timeout: what cancelling an own unfilled order and looking it up again said.
+pub const ORDER_CANCEL_RESULT: &str = "ORDER_CANCEL_RESULT";
+/// Result of "confirm closed" (accepted after the system re-query, or refused with positions).
+pub const MANUAL_CONFIRM_RESULT: &str = "MANUAL_CONFIRM_RESULT";
 
 /// `config` key of the global `RiskConfig` JSON. Missing = defaults (incomplete: Node 0 blocks).
 pub const CONFIG_RISK: &str = "risk";
@@ -137,6 +149,8 @@ pub struct EngineDeps {
     /// Startup reconciliation (`engine::recovery`); `None` = unfinished intents keep exposure
     /// blocked (fail closed).
     pub reconciler: Option<Arc<dyn StartupReconciler>>,
+    /// System notification channel for alerts (`alert::LogNotifier` until the macOS one exists).
+    pub notifier: Arc<dyn Notifier>,
 }
 
 /// The public surface: send commands, read snapshots, feed prices. Nothing here exposes mutable
@@ -227,15 +241,30 @@ struct LegOrder {
     /// Latest status (from an accepted submit or a query by `client_order_id`).
     status: Option<OrderStatus>,
     query_inflight: bool,
+    /// Fill-timeout cancel of this (own, not completely filled) order.
+    cancel: CancelStep,
+    /// After the timeout cancel, the final state could not be confirmed (lookup failed, or the
+    /// order was still open): the leg counts as unknown (-> UNRESOLVED), never guessed.
+    final_unknown: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelStep {
+    NotNeeded,
+    InFlight,
+    Done,
 }
 
 impl LegOrder {
     fn new(req: OrderRequest, unit_base: Decimal) -> LegOrder {
-        LegOrder { req, unit_base, outcome: None, status: None, query_inflight: false }
+        LegOrder { req, unit_base, outcome: None, status: None, query_inflight: false, cancel: CancelStep::NotNeeded, final_unknown: false }
     }
 
     fn fill(&self) -> LegFill {
         let requested = self.req.quantity * self.unit_base;
+        if self.final_unknown {
+            return LegFill::Unknown;
+        }
         match (&self.status, &self.outcome) {
             (Some(s), _) => {
                 let filled = s.filled_quantity * self.unit_base;
@@ -268,7 +297,7 @@ impl LegOrder {
 
     /// Worth a lookup by `client_order_id` (open, or result unknown / still pending).
     fn needs_query(&self) -> bool {
-        !self.query_inflight && !self.is_over()
+        !self.query_inflight && !self.is_over() && self.cancel == CancelStep::NotNeeded
     }
 }
 
@@ -279,6 +308,8 @@ struct OrderSet {
     /// The pair's effective settings at sending (timeout, imbalance tolerance).
     eff: EffectiveConfig,
     legs: [Option<LegOrder>; 2],
+    /// The fill-timeout cancels were started (at most once per set).
+    cancel_started: bool,
 }
 
 impl OrderSet {
@@ -323,6 +354,10 @@ struct Flow {
     /// symbol that is not the pair's (left untouched). The flat check compares against it.
     close_residual: [Decimal; 2],
     flat_inflight: bool,
+    /// When the entry / the close was triggered (injected clock): the start of the latency the
+    /// T-5 decision depends on (`ORDER_LATENCY.triggered_at`).
+    open_triggered_ms: Option<i64>,
+    close_triggered_ms: Option<i64>,
 }
 
 impl Flow {
@@ -371,6 +406,13 @@ struct Actor {
     notices: Vec<Notice>,
     reconcile_inflight: bool,
     last_reconcile_ms: Option<i64>,
+    notifier: Arc<dyn Notifier>,
+    /// Reason of the current alert entry per pair (shown with the banner).
+    alert_reasons: BTreeMap<PairUuid, String>,
+    /// `(pair, transition event id)` whose notification is in flight or done in this run.
+    notify_started: BTreeSet<(PairUuid, i64)>,
+    /// "Confirm closed" re-queries in flight, with the replies waiting for them.
+    pending_confirms: BTreeMap<PairUuid, Vec<oneshot::Sender<CommandReply>>>,
     cmd_rx: mpsc::Receiver<CommandMsg>,
     event_tx: mpsc::Sender<Event>,
     event_rx: mpsc::Receiver<Event>,
@@ -384,7 +426,7 @@ struct Actor {
 
 impl Actor {
     fn new(deps: EngineDeps) -> (Actor, EngineHandle) {
-        let EngineDeps { db, clock, timings, simulator, factory, market, offsets, account, sim_account, reconciler } = deps;
+        let EngineDeps { db, clock, timings, simulator, factory, market, offsets, account, sim_account, reconciler, notifier } = deps;
         let events = EventStore::new(db.clone());
         let (trigger_mode, mut execution_mode, warnings) = gate::load_modes(&db);
         for w in warnings {
@@ -450,6 +492,10 @@ impl Actor {
             notices,
             reconcile_inflight: false,
             last_reconcile_ms: None,
+            notifier,
+            alert_reasons: BTreeMap::new(),
+            notify_started: BTreeSet::new(),
+            pending_confirms: BTreeMap::new(),
             cmd_rx,
             event_tx,
             event_rx,
@@ -459,6 +505,9 @@ impl Actor {
             dirty: false,
             last_push: None,
         };
+        // Pairs already in an alert state at startup: banner from their state; PAIR_ALERT /
+        // notification only for an entry that has none yet (never again after a restart).
+        actor.sync_alerts();
         let (snapshot_tx, snapshots) = watch::channel(actor.snapshot());
         actor.snapshot_tx = snapshot_tx;
         (actor, EngineHandle { commands: cmd_tx, snapshots, market: market_tx })
@@ -566,6 +615,7 @@ impl Actor {
             }
             self.pairs.insert(id, view);
         }
+        self.sync_alerts();
         self.reconciliation_pending = match result {
             Ok(()) if still.is_empty() => None,
             Ok(()) => Some(format!("reconciler finished but pair(s) still in flight: {}", still.join(", "))),
@@ -574,6 +624,24 @@ impl Actor {
     }
 
     fn on_command(&mut self, msg: CommandMsg) {
+        if let Command::ConfirmClosed { pair, .. } = &msg.command {
+            // Answered when the re-query of both legs is back (never on the user's word).
+            self.dirty = true;
+            let pair = pair.clone();
+            match self.start_confirm(&pair) {
+                Ok(()) => {
+                    if let Some(tx) = msg.reply {
+                        self.pending_confirms.entry(pair).or_default().push(tx);
+                    }
+                }
+                Err(reply) => {
+                    if let Some(tx) = msg.reply {
+                        let _ = tx.send(reply);
+                    }
+                }
+            }
+            return;
+        }
         let reply = self.dispatch(msg.command);
         if let Some(tx) = msg.reply {
             let _ = tx.send(reply);
@@ -614,9 +682,11 @@ impl Actor {
             Command::CancelPrepared { pair, reason } => {
                 self.transition(&pair, ManualEvent::Cancel, json!({ "reason": reason }))
             }
-            Command::ConfirmClosed { pair, verified_flat } => {
-                self.transition(&pair, ManualEvent::ConfirmClosed { verified_flat }, json!({ "source": "user" }))
-            }
+            // The user's `verified_flat` is not trusted: the system re-queries both legs.
+            Command::ConfirmClosed { pair, .. } => match self.start_confirm(&pair) {
+                Ok(()) => CommandReply::Accepted,
+                Err(reply) => reply,
+            },
             Command::SetTriggerMode(m) => self.set_trigger_mode(m),
             Command::SetExecutionMode(m) => self.set_execution_mode(m),
             Command::UpdateConfig { key, value } => self.update_config(&key, value),
@@ -808,7 +878,9 @@ impl Actor {
         if let Err(e) = self.land(pair, SystemEvent::StartCheck, json!({ "source": source })) {
             return CommandReply::Rejected(e);
         }
+        let now = self.clock.now_ms();
         let flow = self.flows.entry(pair.to_string()).or_default();
+        flow.open_triggered_ms = Some(now);
         flow.pretrade = None;
         flow.margins = None;
         flow.context = None;
@@ -990,7 +1062,7 @@ impl Actor {
             };
             legs[idx(leg)] = Some(LegOrder::new(req, unit(exchange, &r)));
         }
-        let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs };
+        let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs, cancel_started: false };
         self.send_set(pair, OrderAction::Open, set);
     }
 
@@ -999,12 +1071,17 @@ impl Actor {
         let reqs: Vec<(Leg, OrderRequest)> =
             Leg::BOTH.into_iter().filter_map(|leg| set.legs[idx(leg)].as_ref().map(|o| (leg, o.req.clone()))).collect();
         let flow = self.flows.entry(pair.to_string()).or_default();
+        let triggered = match action {
+            OrderAction::Open => flow.open_triggered_ms,
+            OrderAction::Close => flow.close_triggered_ms,
+        };
         match action {
             OrderAction::Open => flow.open = Some(set),
             OrderAction::Close => flow.close = Some(set),
         }
+        // Both legs are spawned before either can answer: they run in parallel (D5).
         for (leg, req) in reqs {
-            self.spawn_submit(pair.to_string(), leg, action, req);
+            self.spawn_submit(pair.to_string(), leg, action, req, triggered);
         }
     }
 
@@ -1041,20 +1118,105 @@ impl Actor {
         }
     }
 
-    /// FILL_MONITOR: `fill::fill_decision` with the effective settings; never sends anything.
+    /// FILL_MONITOR: `fill::fill_decision` with the effective settings. Never sends an order. At
+    /// the effective timeout, the pair's own orders that are not over (open, or result unknown)
+    /// are cancelled and looked up again first (fill-confirmation spec); the decision is then
+    /// taken on those FINAL fills. A cancel or final lookup that cannot be confirmed leaves the
+    /// leg unknown -> UNRESOLVED.
     fn check_fills(&mut self, pair: &str, now: i64) {
         if self.pairs.get(pair).map(|v| v.state) != Some(PairState::FillMonitor) {
             return;
         }
         let Some(set) = self.flows.get(pair).and_then(|f| f.open.clone()) else { return };
+        if set.legs.iter().flatten().any(|o| o.cancel == CancelStep::InFlight) {
+            return; // waiting for the final lookups after the timeout cancel
+        }
         let (long, short) = (set.leg_fill(Leg::Long), set.leg_fill(Leg::Short));
         match fill::fill_decision(&set.eff, set.sent_at_ms, now, long, short) {
             FillDecision::Wait => {}
             FillDecision::Transition(event) => {
-                let detail = json!({ "long": format!("{long:?}"), "short": format!("{short:?}"), "sent_at_ms": set.sent_at_ms });
+                let at_timeout =
+                    matches!(event, SystemEvent::TimeoutNoFills | SystemEvent::TimeoutPartialFill | SystemEvent::TimeoutUndetermined);
+                if at_timeout && !set.cancel_started && self.start_timeout_cancels(pair) {
+                    return;
+                }
+                let mut detail = json!({ "long": format!("{long:?}"), "short": format!("{short:?}"), "sent_at_ms": set.sent_at_ms });
+                if event == SystemEvent::TimeoutUndetermined {
+                    // A leg whose submit never gave a usable answer: "result unknown"; otherwise the
+                    // fill confirmation itself could not be completed.
+                    let submit_unknown = set.legs.iter().flatten().any(|o| {
+                        o.status.is_none() && matches!(o.outcome, None | Some(SubmitOutcome::Unknown { .. }))
+                    });
+                    let reason = if submit_unknown { AlertReason::SubmitUnknown } else { AlertReason::FillUnconfirmed };
+                    detail["alert_reason"] = json!(reason.as_str());
+                }
                 let _ = self.land(pair, event, detail);
             }
         }
+    }
+
+    /// Cancel (own ids only, never a position) every opening order of the pair that is not over,
+    /// then look each up again. Returns false when there is nothing to cancel.
+    fn start_timeout_cancels(&mut self, pair: &str) -> bool {
+        let Some(set) = self.flows.get_mut(pair).and_then(|f| f.open.as_mut()) else { return false };
+        set.cancel_started = true;
+        let mut todo = Vec::new();
+        for o in set.legs.iter_mut().flatten() {
+            if !o.is_over() {
+                o.cancel = CancelStep::InFlight;
+                todo.push(o.req.clone());
+            }
+        }
+        for req in &todo {
+            let (executor, db, tx, pair) = (self.executor.clone(), self.db.clone(), self.event_tx.clone(), pair.to_string());
+            let req = req.clone();
+            tokio::spawn(async move {
+                let cancel = executor.cancel(req.exchange, &req.symbol, &req.client_order_id).await;
+                let after = executor.query(req.exchange, &req.symbol, &req.client_order_id).await;
+                if let QueryOutcome::Found(status) = &after
+                    && let Ok(Some(row)) = db.get_intent(&req.client_order_id)
+                    && IntentState::parse(&row.state) != Some(intent_state_of(status))
+                {
+                    let _ = intent::record_query_outcome(&db, &req.client_order_id, &after, executor.is_simulated());
+                }
+                let _ = tx.send(Event::CancelChecked { pair, client_order_id: req.client_order_id, cancel, after }).await;
+            });
+        }
+        !todo.is_empty()
+    }
+
+    fn on_cancel_checked(&mut self, pair: &str, client_order_id: &str, cancel: QueryOutcome, after: QueryOutcome) {
+        let simulated = self.pairs.get(pair).is_some_and(|v| v.simulated);
+        let Some(o) = self.flows.get_mut(pair).and_then(|f| f.open.as_mut()).and_then(|s| s.find_mut(client_order_id)) else { return };
+        o.cancel = CancelStep::Done;
+        o.query_inflight = false;
+        let verdict = match &after {
+            QueryOutcome::Found(s) if s.state != OrderState::Open => {
+                o.status = Some(s.clone());
+                "final"
+            }
+            QueryOutcome::Found(s) => {
+                o.status = Some(s.clone());
+                o.final_unknown = true;
+                "still open after cancel: unknown"
+            }
+            QueryOutcome::NotFound | QueryOutcome::Failed { .. } => {
+                o.final_unknown = true;
+                "final state not confirmed: unknown"
+            }
+        };
+        let payload = json!({
+            "client_order_id": client_order_id,
+            "exchange": o.req.exchange.name(),
+            "symbol": o.req.symbol,
+            "cancel": query_json(&cancel),
+            "after": query_json(&after),
+            "verdict": verdict,
+            "simulated": simulated,
+        });
+        self.note(ORDER_CANCEL_RESULT, Some(pair), payload);
+        let now = self.clock.now_ms();
+        self.check_fills(pair, now);
     }
 
     /// Spawn a lookup by `client_order_id` for every leg of `action`'s set that needs one.
@@ -1069,19 +1231,24 @@ impl Actor {
             }
         }
         for req in todo {
-            let (executor, db, tx, pair) = (self.executor.clone(), self.db.clone(), self.event_tx.clone(), pair.to_string());
-            tokio::spawn(async move {
-                let outcome = executor.query(req.exchange, &req.symbol, &req.client_order_id).await;
-                // Keep the intent in step with what the exchange reports (state changes only).
-                if let QueryOutcome::Found(status) = &outcome
-                    && let Ok(Some(row)) = db.get_intent(&req.client_order_id)
-                    && IntentState::parse(&row.state) != Some(intent_state_of(status))
-                {
-                    let _ = intent::record_query_outcome(&db, &req.client_order_id, &outcome, executor.is_simulated());
-                }
-                let _ = tx.send(Event::Queried { pair: Some(pair), client_order_id: req.client_order_id, outcome }).await;
-            });
+            self.spawn_lookup(pair, req);
         }
+    }
+
+    /// One lookup by `client_order_id`; the result comes back as `Event::Queried`.
+    fn spawn_lookup(&self, pair: &str, req: OrderRequest) {
+        let (executor, db, tx, pair) = (self.executor.clone(), self.db.clone(), self.event_tx.clone(), pair.to_string());
+        tokio::spawn(async move {
+            let outcome = executor.query(req.exchange, &req.symbol, &req.client_order_id).await;
+            // Keep the intent in step with what the exchange reports (state changes only).
+            if let QueryOutcome::Found(status) = &outcome
+                && let Ok(Some(row)) = db.get_intent(&req.client_order_id)
+                && IntentState::parse(&row.state) != Some(intent_state_of(status))
+            {
+                let _ = intent::record_query_outcome(&db, &req.client_order_id, &outcome, executor.is_simulated());
+            }
+            let _ = tx.send(Event::Queried { pair: Some(pair), client_order_id: req.client_order_id, outcome }).await;
+        });
     }
 
     // ---- exit: -> CLOSING -> close orders -> flat check -> FINALIZED ----
@@ -1094,7 +1261,9 @@ impl Actor {
             return CommandReply::Rejected(e);
         }
         let Some(view) = self.pairs.get(pair).cloned() else { return CommandReply::Accepted };
+        let now = self.clock.now_ms();
         let flow = self.flows.entry(pair.to_string()).or_default();
+        flow.close_triggered_ms = Some(now);
         flow.orphan = false;
         flow.close = None;
         flow.close_residual = [Decimal::ZERO; 2];
@@ -1237,7 +1406,7 @@ impl Actor {
             legs[idx(leg)] = Some(LegOrder::new(req, Decimal::ONE));
         }
         self.flows.entry(pair.to_string()).or_default().close_residual = [plan[0].1, plan[1].1];
-        let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs };
+        let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs, cancel_started: false };
         self.send_set(pair, OrderAction::Close, set);
         self.check_close(pair, self.clock.now_ms());
     }
@@ -1294,9 +1463,11 @@ impl Actor {
                     let _ = self.land(pair, SystemEvent::ClosedConfirmed { verified_flat: true }, json!({ "source": "flat check" }));
                 }
             }
-            Ok(false) => {
+            // Position updates may lag: re-checked on the next tick until the close timeout.
+            Ok(false) if timed_out => {
                 let _ = self.land(pair, SystemEvent::CloseFailed, json!({ "reason": "not flat after closing (position or open order left)" }));
             }
+            Ok(false) => {}
             Err(e) if timed_out => {
                 let _ = self.land(pair, SystemEvent::CloseFailed, json!({ "reason": format!("flat check failed: {e}") }));
             }
@@ -1397,6 +1568,9 @@ impl Actor {
                 for (a, set) in [(OrderAction::Open, flow.open.as_mut()), (OrderAction::Close, flow.close.as_mut())] {
                     if let Some(o) = set.and_then(|s| s.find_mut(&client_order_id)) {
                         o.query_inflight = false;
+                        if o.cancel != CancelStep::NotNeeded {
+                            break; // the timeout cancel's own lookup decides this leg
+                        }
                         if let QueryOutcome::Found(status) = &outcome {
                             if fill_changed(o.status.as_ref(), status) {
                                 let mut p = status_json(status);
@@ -1441,6 +1615,8 @@ impl Actor {
             }
             Event::FlatChecked { pair, flat } => self.on_flat_checked(&pair, flat),
             Event::ReconciliationDone { result } => self.on_reconciliation_done(result),
+            Event::CancelChecked { pair, client_order_id, cancel, after } => self.on_cancel_checked(&pair, &client_order_id, cancel, after),
+            Event::ConfirmChecked { pair, result } => self.on_confirm_checked(&pair, result),
         }
     }
 
@@ -1466,10 +1642,20 @@ impl Actor {
         let Some(o) = self.flows.get_mut(pair).and_then(|f| f.set_mut(action)).and_then(|s| s.find_mut(client_order_id)) else {
             return; // not an order this pair is waiting for
         };
+        let mut fee_lookup = None;
         if let SubmitOutcome::Accepted(status) = &outcome {
             o.status = Some(status.clone());
+            // Filled in the ACK but without its fee (Binance reports fees per trade): one lookup
+            // fetches it for the fill details (`ORDER_FILL`), whatever the pair does next.
+            if status.state == OrderState::Filled && status.fee.is_none() && status.filled_quantity > Decimal::ZERO {
+                o.query_inflight = true;
+                fee_lookup = Some(o.req.clone());
+            }
         }
         o.outcome = Some(outcome);
+        if let Some(req) = fee_lookup {
+            self.spawn_lookup(pair, req);
+        }
         let now = self.clock.now_ms();
         match (self.pairs.get(pair).map(|v| v.state), action) {
             (Some(PairState::OrderSubmit), OrderAction::Open) => self.check_submitted(pair, now),
@@ -1542,6 +1728,7 @@ impl Actor {
                 // The actor (a user command) moved it: it is no longer the reconciler's.
                 self.reconcile_scope.remove(pair);
                 self.dirty = true;
+                self.sync_alert_for(pair);
                 Ok(to)
             }
             Err(e @ TransitionError::Stale { .. }) => {
@@ -1663,11 +1850,42 @@ impl Actor {
     /// current executor in a spawned task; the result comes back as `Event::Submitted` (and, for
     /// an unknown result, the follow-up query under the same id as `Event::Queried`). Callers
     /// must have landed the pair transition first (land then act).
-    fn spawn_submit(&self, pair: PairUuid, leg: Leg, action: OrderAction, req: OrderRequest) {
-        let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
+    ///
+    /// Every submit writes one `ORDER_LATENCY` event (request sent / ACK on the injected clock,
+    /// `triggered_at` of the entry or close) from the spawned task.
+    fn spawn_submit(&self, pair: PairUuid, leg: Leg, action: OrderAction, req: OrderRequest, triggered_at: Option<i64>) {
+        let (db, executor, tx, clock, events) = (self.db.clone(), self.executor.clone(), self.event_tx.clone(), self.clock.clone(), self.events.clone());
         tokio::spawn(async move {
             let client_order_id = req.client_order_id.clone();
-            let (outcome, query) = match intent::submit_with_intent(&db, executor.as_ref(), &pair, leg, req).await {
+            let exchange = req.exchange;
+            let result = intent::submit_with_intent_clocked(&db, executor.as_ref(), Some(clock.as_ref()), &pair, leg, req).await;
+            if let Ok(report) = &result
+                && let Some(t) = report.timing
+            {
+                let class = match &report.outcome {
+                    SubmitOutcome::Accepted(_) => "accepted",
+                    SubmitOutcome::Rejected { .. } => "rejected",
+                    SubmitOutcome::Unknown { .. } => "unknown",
+                };
+                let action_str = match action {
+                    OrderAction::Open => "open",
+                    OrderAction::Close => "close",
+                };
+                let payload = latency::latency_payload(
+                    &pair,
+                    leg.as_str(),
+                    action_str,
+                    exchange.name(),
+                    &client_order_id,
+                    t.request_sent_at_ms,
+                    t.ack_at_ms,
+                    class,
+                    triggered_at,
+                    executor.is_simulated(),
+                );
+                let _ = events.append(ORDER_LATENCY, Some(&pair), payload);
+            }
+            let (outcome, query) = match result {
                 Ok(report) => (report.outcome, report.query),
                 // The executor was not called: nothing exists on the exchange.
                 Err(IntentError::NotLanded(e)) => (SubmitOutcome::Rejected { reason: format!("not sent: {e}") }, None),
@@ -1723,6 +1941,193 @@ impl Actor {
             blockers: gate::current_blockers(&self.db, self.reconciliation_pending.as_deref()),
             prices: self.market_rx.borrow().iter().map(|((e, s), p)| (*e, s.clone(), *p)).collect(),
             notices: self.notices.clone(),
+            alerts: self
+                .pairs
+                .values()
+                .filter(|v| alert::is_alert_state(v.state))
+                .map(|v| Alert {
+                    pair: v.internal_uuid.clone(),
+                    pair_id: v.pair_id.clone(),
+                    symbol: v.symbol.clone(),
+                    state: v.state,
+                    simulated: v.simulated,
+                    reason: self.alert_reasons.get(&v.internal_uuid).cloned(),
+                })
+                .collect(),
+        }
+    }
+
+    // ---- alerts (partial-failure-alerting) ----
+
+    fn sync_alerts(&mut self) {
+        let ids: Vec<PairUuid> = self.pairs.keys().cloned().collect();
+        for id in ids {
+            self.sync_alert_for(&id);
+        }
+    }
+
+    /// For a pair in an alert state: write the entry's `PAIR_ALERT` once and start its one
+    /// notification once (both keyed by the transition event that entered the state, so a restart
+    /// does neither again). Any other state: forget the reason (the banner is derived anyway).
+    fn sync_alert_for(&mut self, pair: &str) {
+        let Some(view) = self.pairs.get(pair).cloned() else { return };
+        if !alert::is_alert_state(view.state) {
+            self.alert_reasons.remove(pair);
+            return;
+        }
+        let entry = match alert::entry_of(&self.db, pair, view.state) {
+            Ok(Some(e)) => e,
+            Ok(None) | Err(_) => return, // no entry event (e.g. seeded state): banner only
+        };
+        let reason = match entry.alerted {
+            Some(r) => r,
+            None => {
+                let r = AlertReason::of_transition(&entry.transition);
+                let payload = json!({
+                    "reason": r.as_str(),
+                    "state": view.state.as_str(),
+                    "from": entry.transition.get("from").cloned().unwrap_or(Value::Null),
+                    "transition_id": entry.transition_id,
+                    "pair_id": view.pair_id,
+                    "symbol": view.symbol,
+                    "long_exchange": view.long_exchange.name(),
+                    "short_exchange": view.short_exchange.name(),
+                    "detail": entry.transition.get("detail").cloned().unwrap_or(Value::Null),
+                    "legs": self.legs_json(pair),
+                    "simulated": view.simulated,
+                });
+                if self.events.append(PAIR_ALERT, Some(pair), payload).is_err() {
+                    return; // halted store: the halt is the record; the banner still shows
+                }
+                r
+            }
+        };
+        self.alert_reasons.insert(pair.to_string(), reason.as_str().to_string());
+        if entry.notified || !self.notify_started.insert((pair.to_string(), entry.transition_id)) {
+            return;
+        }
+        let notice = AlertNotice {
+            pair: pair.to_string(),
+            pair_id: view.pair_id.clone(),
+            symbol: view.symbol.clone(),
+            state: view.state,
+            reason,
+            simulated: view.simulated,
+        };
+        let (notifier, events, transition_id) = (self.notifier.clone(), self.events.clone(), entry.transition_id);
+        // Off the actor: a notifier may block; its failure changes nothing but one event.
+        tokio::task::spawn_blocking(move || {
+            let payload = |extra: Value| {
+                let mut p = json!({ "state": notice.state.as_str(), "reason": notice.reason.as_str(), "transition_id": transition_id });
+                if let (Value::Object(m), Value::Object(x)) = (&mut p, extra) {
+                    m.extend(x);
+                }
+                p
+            };
+            match notifier.notify(&notice) {
+                Ok(()) => {
+                    let _ = events.append(alert::ALERT_NOTIFIED, Some(&notice.pair), payload(json!({})));
+                }
+                Err(e) => {
+                    let _ = events.append(alert::ALERT_NOTIFY_FAILED, Some(&notice.pair), payload(json!({ "error": e })));
+                }
+            }
+        });
+    }
+
+    /// Both legs' orders and fills as known in memory (kept in the alert event: the filled leg's
+    /// data is never dropped).
+    fn legs_json(&self, pair: &str) -> Value {
+        let Some(flow) = self.flows.get(pair) else { return Value::Null };
+        let set_json = |set: &Option<OrderSet>| -> Value {
+            let Some(set) = set else { return Value::Null };
+            let legs: Vec<Value> = Leg::BOTH
+                .into_iter()
+                .filter_map(|leg| {
+                    set.legs[idx(leg)].as_ref().map(|o| {
+                        let mut v = match &o.status {
+                            Some(s) => status_json(s),
+                            None => json!({}),
+                        };
+                        v["leg"] = json!(leg.as_str());
+                        v["client_order_id"] = json!(o.req.client_order_id);
+                        v["exchange"] = json!(o.req.exchange.name());
+                        v["requested_quantity"] = json!(dstr(o.req.quantity));
+                        v["submit"] = match &o.outcome {
+                            Some(out) => outcome_json(out),
+                            None => json!({ "result": "no reply" }),
+                        };
+                        v["final_unknown"] = json!(o.final_unknown);
+                        v
+                    })
+                })
+                .collect();
+            json!(legs)
+        };
+        json!({ "open": set_json(&flow.open), "close": set_json(&flow.close) })
+    }
+
+    // ---- confirm closed (manual exit 2 of 2) ----
+
+    /// Starts the re-query of both legs for "confirm closed". Only for pairs in an alert state.
+    fn start_confirm(&mut self, pair: &str) -> Result<(), CommandReply> {
+        let Some(view) = self.pairs.get(pair).cloned() else {
+            return Err(CommandReply::Rejected(format!("unknown pair {pair}")));
+        };
+        if !alert::is_alert_state(view.state) {
+            return Err(CommandReply::Rejected(format!(
+                "pair is {}: confirm closed applies to PARTIAL_FAILURE / IMBALANCED / UNRESOLVED",
+                view.state
+            )));
+        }
+        if self.pending_confirms.contains_key(pair) {
+            return Ok(()); // one re-query answers every waiting confirm
+        }
+        self.pending_confirms.insert(pair.to_string(), Vec::new());
+        let (account, tx) = (self.account_for(view.simulated), self.event_tx.clone());
+        let legs = [(view.long_exchange, view.symbol.clone()), (view.short_exchange, view.symbol.clone())];
+        let pair = pair.to_string();
+        tokio::spawn(async move {
+            let result = flat_report(account.as_ref(), &legs).await;
+            let _ = tx.send(Event::ConfirmChecked { pair, result }).await;
+        });
+        Ok(())
+    }
+
+    fn on_confirm_checked(&mut self, pair: &str, result: Result<FlatReport, String>) {
+        let waiting = self.pending_confirms.remove(pair).unwrap_or_default();
+        let simulated = self.pairs.get(pair).is_some_and(|v| v.simulated);
+        let reply = match result {
+            Ok(r) if r.is_flat() => {
+                let detail = json!({ "source": "user", "verified_by": "system re-query of positions and open orders" });
+                match self.land(pair, ManualEvent::ConfirmClosed { verified_flat: true }, detail) {
+                    Ok(_) => {
+                        self.note(MANUAL_CONFIRM_RESULT, Some(pair), json!({ "accepted": true, "simulated": simulated }));
+                        CommandReply::Accepted
+                    }
+                    Err(e) => CommandReply::Rejected(e),
+                }
+            }
+            Ok(r) => {
+                let payload = json!({
+                    "accepted": false,
+                    "positions": { "long": dstr(r.positions[0]), "short": dstr(r.positions[1]) },
+                    "open_orders": { "long": r.open_orders[0], "short": r.open_orders[1] },
+                    "simulated": simulated,
+                });
+                self.note(MANUAL_CONFIRM_RESULT, Some(pair), payload);
+                CommandReply::Rejected(format!(
+                    "not flat: long position {}, short position {}, open orders long {} / short {}",
+                    r.positions[0], r.positions[1], r.open_orders[0], r.open_orders[1]
+                ))
+            }
+            Err(e) => {
+                self.note(MANUAL_CONFIRM_RESULT, Some(pair), json!({ "accepted": false, "error": e, "simulated": simulated }));
+                CommandReply::Rejected(format!("cannot verify that the pair is flat: {e}"))
+            }
+        };
+        for tx in waiting {
+            let _ = tx.send(reply.clone());
         }
     }
 }
@@ -1928,7 +2333,35 @@ fn dummy_snapshot() -> Snapshot {
         blockers: Vec::<Blocker>::new(),
         prices: Vec::new(),
         notices: Vec::new(),
+        alerts: Vec::new(),
     }
+}
+
+fn query_json(o: &QueryOutcome) -> Value {
+    match o {
+        QueryOutcome::Found(s) => {
+            let mut v = status_json(s);
+            v["result"] = json!("found");
+            v
+        }
+        QueryOutcome::NotFound => json!({ "result": "not found" }),
+        QueryOutcome::Failed { reason } => json!({ "result": "failed", "reason": reason }),
+    }
+}
+
+/// Positions and open-order counts of both legs' symbol (complete lists only).
+async fn flat_report(account: &dyn AccountView, legs: &[(Exchange, String); 2]) -> Result<FlatReport, String> {
+    let mut positions = [Decimal::ZERO; 2];
+    let mut open_orders = [0usize; 2];
+    for (i, (exchange, symbol)) in legs.iter().enumerate() {
+        positions[i] = signed_position(account, *exchange, symbol).await?;
+        let orders = account.open_orders(*exchange).await?;
+        if !orders.complete {
+            return Err(format!("{} open orders list incomplete", exchange.name()));
+        }
+        open_orders[i] = orders.items.iter().filter(|o| &o.symbol == symbol).count();
+    }
+    Ok(FlatReport { positions, open_orders })
 }
 
 /// Open pairs from the store with their scan snapshot (they count for mode switching and limits
@@ -2096,6 +2529,7 @@ mod tests {
             account: Arc::new(NoPorts),
             sim_account: Arc::new(NoPorts),
             reconciler: None,
+            notifier: Arc::new(crate::engine::alert::RecordingNotifier::default()),
         };
         (Rig { _dir: dir, db, sim, factory }, deps)
     }
@@ -2174,7 +2608,7 @@ mod tests {
             quantity: Decimal::new(1, 3),
             reduce_only: false,
         };
-        actor.spawn_submit("u-hang".into(), Leg::Long, OrderAction::Open, req);
+        actor.spawn_submit("u-hang".into(), Leg::Long, OrderAction::Open, req, None);
         tokio::spawn(actor.run());
         sleep(Duration::from_millis(10)).await;
         assert_eq!(rig.sim.submits.load(Ordering::SeqCst), 1, "the hanging submit is in flight");
@@ -2192,6 +2626,97 @@ mod tests {
         assert!(*seen_now.last().unwrap() >= T0 + 29_000, "{seen_now:?}");
         sleep(Duration::from_millis(300)).await;
         assert_eq!(snaps.borrow().pairs.len(), 30);
+    }
+
+    /// Answers each submit after a per-exchange delay on tokio's (paused) clock and logs when each
+    /// call entered and returned.
+    struct DelayedExchange {
+        delay_ms: std::collections::HashMap<Exchange, u64>,
+        log: std::sync::Mutex<Vec<(String, Instant)>>,
+    }
+    impl Executor for DelayedExchange {
+        fn is_simulated(&self) -> bool {
+            false
+        }
+        fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {
+            self.log.lock().unwrap().push((format!("enter {}", req.exchange.name()), tokio::time::Instant::now()));
+            let delay = self.delay_ms[&req.exchange];
+            Box::pin(async move {
+                sleep(Duration::from_millis(delay)).await;
+                self.log.lock().unwrap().push((format!("return {}", req.exchange.name()), tokio::time::Instant::now()));
+                let status = OrderStatus {
+                    client_order_id: req.client_order_id.clone(),
+                    exchange_order_id: Some("x".into()),
+                    filled_quantity: Decimal::ZERO,
+                    avg_price: None,
+                    fee: None,
+                    fee_asset: None,
+                    state: OrderState::Open,
+                };
+                SubmitOutcome::Accepted(status)
+            })
+        }
+        fn cancel(&self, _: Exchange, _: &str, _: &str) -> BoxFut<'_, QueryOutcome> {
+            Box::pin(std::future::ready(QueryOutcome::NotFound))
+        }
+        fn query(&self, _: Exchange, _: &str, _: &str) -> BoxFut<'_, QueryOutcome> {
+            Box::pin(std::future::ready(QueryOutcome::NotFound))
+        }
+    }
+
+    // ---- exchange-demo-execution 1.3: parallel legs and latency events ------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn both_legs_are_sent_before_either_answers_and_latency_events_carry_sent_ack_and_latency() {
+        let (rig, mut deps) = rig();
+        let x = Arc::new(DelayedExchange {
+            delay_ms: [(Exchange::Binance, 180), (Exchange::Bybit, 200)].into_iter().collect(),
+            log: std::sync::Mutex::default(),
+        });
+        deps.simulator = x.clone();
+        let (actor, _h) = Actor::new(deps);
+        let id = |leg| client_order_id(IdPrefix::Demo, "pair-lat", leg, OrderAction::Open, 0);
+        let req = |leg, exchange, side| OrderRequest {
+            client_order_id: id(leg),
+            exchange,
+            symbol: "BTCUSDT".into(),
+            side,
+            quantity: Decimal::new(19, 3),
+            reduce_only: false,
+        };
+        let triggered = T0 - 40;
+        let start = tokio::time::Instant::now();
+        actor.spawn_submit("pair-lat".into(), Leg::Long, OrderAction::Open, req(Leg::Long, Exchange::Binance, OrderSide::Buy), Some(triggered));
+        actor.spawn_submit("pair-lat".into(), Leg::Short, OrderAction::Open, req(Leg::Short, Exchange::Bybit, OrderSide::Sell), Some(triggered));
+        tokio::spawn(actor.run());
+        sleep(Duration::from_millis(400)).await;
+
+        let log = x.log.lock().unwrap().clone();
+        let names: Vec<&str> = log.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(&names[..2], ["enter Binance", "enter Bybit"], "both requests out before any answer: {names:?}");
+        let last_return = log.iter().filter(|(n, _)| n.starts_with("return")).map(|(_, t)| *t).max().unwrap();
+        assert_eq!((last_return - start).as_millis(), 200, "parallel: about 200 ms in total, not 380");
+
+        let plain = rusqlite::Connection::open(rig.db.path()).unwrap();
+        let mut st = plain.prepare("SELECT payload FROM events WHERE event_type = ?1 ORDER BY id").unwrap();
+        let events: Vec<Value> = st
+            .query_map([latency::ORDER_LATENCY], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|p| serde_json::from_str(&p.unwrap()).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "{events:?}");
+        let by_leg = |leg: &str| events.iter().find(|e| e["leg"] == json!(leg)).unwrap().clone();
+        let (long, short) = (by_leg("long"), by_leg("short"));
+        assert_eq!(long["latency_ms"], json!(180));
+        assert_eq!(short["latency_ms"], json!(200));
+        assert_eq!(long["client_order_id"], json!(id(Leg::Long)));
+        assert_eq!(long["request_sent_at"], json!(T0));
+        assert_eq!(long["ack_at"], json!(T0 + 180));
+        assert_eq!((long["result"].clone(), long["triggered_at"].clone()), (json!("accepted"), json!(triggered)));
+        // Aggregation for the T-5 decision: trigger -> both accepted = 200 + 40.
+        let report = latency::LatencyReport::from_events(&events, false);
+        assert_eq!(report.entry_to_both_accepted.unwrap().p99, 240);
+        assert_eq!(report.t5_criterion_met(), Some(true));
     }
 
     #[tokio::test(start_paused = true)]
