@@ -13,7 +13,7 @@
 use serde_json::json;
 use tong_funding_core::pair::{ManualEvent, PairState, PnlGate, SystemEvent, next};
 
-use super::{Actor, CommandReply};
+use super::Actor;
 use crate::funding::PNL_RETRY_WINDOW_MS;
 use crate::funding::pnl_record::{PnlAttempt, settle_pnl};
 
@@ -65,21 +65,24 @@ impl Actor {
         }
     }
 
-    /// The user's "confirmed closed" on a locked pair: the PnL is recorded first (final attempt:
-    /// whatever data exists), then the transition. A refused transition writes no PnL event.
-    pub(super) fn confirm_closed(&mut self, pair: &str, verified_flat: bool) -> CommandReply {
-        let Some(view) = self.pairs.get(pair).cloned() else { return CommandReply::Rejected(format!("unknown pair {pair}")) };
-        let pnl = if view.simulated {
-            PnlGate::NotApplicableSimulated
-        } else if verified_flat && next(view.state, ManualEvent::ConfirmClosed { verified_flat, pnl: PnlGate::Recorded }).is_ok() {
-            match settle_pnl(&self.db, pair, self.clock.now_ms(), true) {
-                Ok(PnlAttempt::Recorded { .. }) => PnlGate::Recorded,
-                Ok(PnlAttempt::Waiting { .. }) => PnlGate::Missing,
-                Err(e) => return CommandReply::Rejected(format!("PnL not recorded, not finalized: {e}")),
-            }
-        } else {
-            PnlGate::Missing
-        };
-        self.transition(pair, ManualEvent::ConfirmClosed { verified_flat, pnl }, json!({ "source": "user" }))
+    /// The verified "confirmed closed" on a locked pair (exchange-demo-execution re-queried both
+    /// legs and found them flat): the PnL is recorded first (final attempt: whatever data exists,
+    /// INCOMPLETE when something is missing), and the returned gate goes into
+    /// `ManualEvent::ConfirmClosed { verified_flat: true, pnl }`. A transition that would be
+    /// refused anyway writes no PnL event (`Missing` is returned and the core refuses). A store
+    /// error is returned as `Err`: never finalized without the PnL event.
+    pub(super) fn manual_confirm_pnl(&mut self, pair: &str) -> Result<(PnlGate, Option<i64>), String> {
+        let Some(view) = self.pairs.get(pair).cloned() else { return Err(format!("unknown pair {pair}")) };
+        if view.simulated {
+            return Ok((PnlGate::NotApplicableSimulated, None));
+        }
+        if next(view.state, ManualEvent::ConfirmClosed { verified_flat: true, pnl: PnlGate::Recorded }).is_err() {
+            return Ok((PnlGate::Missing, None));
+        }
+        match settle_pnl(&self.db, pair, self.clock.now_ms(), true)? {
+            PnlAttempt::Recorded { event_id, .. } => Ok((PnlGate::Recorded, Some(event_id))),
+            // Not reachable with a final attempt; kept explicit so a change there fails closed.
+            PnlAttempt::Waiting { .. } => Ok((PnlGate::Missing, None)),
+        }
     }
 }

@@ -138,7 +138,7 @@ fn to_decimal(field: &str, s: &str) -> Result<Decimal, AdapterError> {
 }
 
 /// Required decimal: absent, null or empty is a parse error.
-pub(super) fn dec_req(obj: &Value, field: &str) -> Result<Decimal, AdapterError> {
+pub(in crate::exchange) fn dec_req(obj: &Value, field: &str) -> Result<Decimal, AdapterError> {
     match text_of(field, obj.get(field).unwrap_or(&Value::Null))? {
         Some(s) => to_decimal(field, &s),
         None => Err(AdapterError::parse(format!("missing field {field}"))),
@@ -146,23 +146,23 @@ pub(super) fn dec_req(obj: &Value, field: &str) -> Result<Decimal, AdapterError>
 }
 
 /// Optional decimal: absent, null or empty is `None`; malformed is a parse error.
-pub(super) fn dec_opt(obj: &Value, field: &str) -> Result<Option<Decimal>, AdapterError> {
+pub(in crate::exchange) fn dec_opt(obj: &Value, field: &str) -> Result<Option<Decimal>, AdapterError> {
     match text_of(field, obj.get(field).unwrap_or(&Value::Null))? {
         Some(s) => to_decimal(field, &s).map(Some),
         None => Ok(None),
     }
 }
 
-pub(super) fn str_req(obj: &Value, field: &str) -> Result<String, AdapterError> {
+pub(in crate::exchange) fn str_req(obj: &Value, field: &str) -> Result<String, AdapterError> {
     text_of(field, obj.get(field).unwrap_or(&Value::Null))?
         .ok_or_else(|| AdapterError::parse(format!("missing field {field}")))
 }
 
-pub(super) fn str_opt(obj: &Value, field: &str) -> Result<Option<String>, AdapterError> {
+pub(in crate::exchange) fn str_opt(obj: &Value, field: &str) -> Result<Option<String>, AdapterError> {
     text_of(field, obj.get(field).unwrap_or(&Value::Null))
 }
 
-pub(super) fn bool_opt(obj: &Value, field: &str) -> bool {
+pub(in crate::exchange) fn bool_opt(obj: &Value, field: &str) -> bool {
     obj.get(field).and_then(Value::as_bool).unwrap_or(false)
 }
 

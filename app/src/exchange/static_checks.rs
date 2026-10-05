@@ -340,7 +340,7 @@ fn external_base_url(structure: &str) -> Vec<Violation> {
         let rb = rest.as_bytes();
         // qualifiers, then `fn`
         let mut j = 0;
-        let mut word_end = |j: &mut usize| {
+        let word_end = |j: &mut usize| {
             let s = skip_ws(rb, *j);
             let mut e = s;
             while e < rb.len() && is_ident(rb[e]) {
@@ -784,13 +784,17 @@ const LATE: &str = "api.bybit.com";
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
     }
 
+    /// Order-mutating fns (place / cancel / ...) may exist only in `execution/` (change
+    /// exchange-demo-execution evolves the earlier "GET only" rule deliberately: orders in ONE
+    /// module, demo/testnet hosts only; see `execution_sources_pass_every_signed_rule_except_get_only`).
     #[test]
-    fn no_order_mutating_fns_outside_public_and_health() {
+    fn no_order_mutating_fns_outside_public_health_and_execution() {
         let files: Vec<_> = rust_files(&exchange_dir())
             .into_iter()
             .filter(|p| {
                 !p.starts_with(exchange_dir().join("public"))
                     && !p.starts_with(exchange_dir().join("health"))
+                    && !p.starts_with(exchange_dir().join("execution"))
                     && p.file_name().is_some_and(|n| n != "static_checks.rs")
             })
             .collect();
@@ -799,6 +803,92 @@ const LATE: &str = "api.bybit.com";
         for f in &files {
             for name in scan_order_keywords(&std::fs::read_to_string(f).unwrap()) {
                 violations.push(format!("{}: fn {name}", f.display()));
+            }
+        }
+        assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    fn execution_dir() -> PathBuf {
+        exchange_dir().join("execution")
+    }
+
+    /// The order module obeys every rule of the signed clients (no production host, no host
+    /// parameter or public host field, no env / config read, no host-building macro or escape,
+    /// no `public` import, only the allowed `cfg(test)` shape) except "GET only".
+    #[test]
+    fn execution_sources_pass_every_signed_rule_except_get_only() {
+        let files = rust_files(&execution_dir());
+        assert!(files.len() >= 8, "execution/ must exist and be scanned: {files:?}");
+        let mut violations = Vec::new();
+        let mut methods_seen = false;
+        for f in &files {
+            for v in scan_signed_source(&std::fs::read_to_string(f).unwrap()) {
+                match v {
+                    Violation::NonGetMethod(_) => methods_seen = true,
+                    other => violations.push(format!("{}: {other:?}", f.display())),
+                }
+            }
+        }
+        assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+        assert!(methods_seen, "the scan must actually see the order methods in execution/ (or it scans nothing)");
+    }
+
+    /// POST / PUT / DELETE / PATCH requests exist only under `exchange/execution/`: every other
+    /// exchange file is scanned with the full signed-client method list, the rest of the crate
+    /// with the HTTP-method patterns (a plain `.delete(` there is e.g. a Keychain call).
+    #[test]
+    fn non_get_methods_only_in_execution() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        for f in rust_files(&src) {
+            if f.starts_with(execution_dir()) || f.file_name().is_some_and(|n| n == "static_checks.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).unwrap();
+            if f.starts_with(exchange_dir()) {
+                for v in scan_signed_source(&text) {
+                    if let Violation::NonGetMethod(m) = v {
+                        violations.push(format!("{}: {m}", f.display()));
+                    }
+                }
+            } else {
+                let prod = production(&text);
+                for pat in ["Method::POST", "Method::PUT", "Method::DELETE", "Method::PATCH", "reqwest::Method"] {
+                    if prod.structure.contains(pat) {
+                        violations.push(format!("{}: {pat}", f.display()));
+                    }
+                }
+                for pat in ["\"POST\"", "\"PUT\"", "\"DELETE\"", "\"PATCH\""] {
+                    if prod.code.contains(pat) {
+                        violations.push(format!("{}: {pat}", f.display()));
+                    }
+                }
+            }
+        }
+        assert!(violations.is_empty(), "non-GET outside exchange/execution:\n{}", violations.join("\n"));
+    }
+
+    /// The order module names no host at all (hosts come only from `signed::endpoints` through
+    /// the `DemoEnv` enum) and has no OKX request: no `okx` identifier other than the
+    /// `Exchange::Okx` variant, no OKX path or domain in any literal.
+    #[test]
+    fn execution_names_no_host_literal_and_has_no_okx_request() {
+        let mut violations = Vec::new();
+        for f in rust_files(&execution_dir()) {
+            let prod = production(&std::fs::read_to_string(&f).unwrap());
+            let (_, _, lits) = mask(&prod.code);
+            for lit in &lits {
+                let text = prod.code.get(lit.start..lit.end).unwrap_or("").to_ascii_lowercase();
+                for bad in ["http://", "https://", "okx.com", "/api/v5/", ".com"] {
+                    if text.contains(bad) {
+                        violations.push(format!("{}: literal {text:?} contains {bad}", f.display()));
+                    }
+                }
+            }
+            for ident in idents(&prod.structure) {
+                if ident.to_ascii_lowercase().contains("okx") && ident != "Okx" && ident != "OKX_UNSUPPORTED" && ident != "OKX_ACCOUNT_UNSUPPORTED" {
+                    violations.push(format!("{}: identifier {ident}", f.display()));
+                }
             }
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
