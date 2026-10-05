@@ -35,6 +35,20 @@
 - **WHEN** 嘗試把 `max_leverage` 設為 0 或 `execution_mode` 設為 `LIVE`
 - **THEN** 驗證失敗並回傳具體欄位名稱，設定不被改動
 
+### Requirement: 載入設定時必須驗證
+
+從儲存的資料載入風控設定 SHALL 經過驗證：僅以通用的反序列化會接受的非法值（例如 `max_leverage = 0`、`max_concurrent_pairs = 0`、空的 `allowed_exchanges`）SHALL 在載入時被拒絕並指出欄位名稱，不得得到一個看似有效的設定物件。
+
+#### Scenario: 載入非法設定
+
+- **WHEN** 載入內容為 `max_leverage = 0`、`max_concurrent_pairs = 0`、`allowed_exchanges = []` 的設定
+- **THEN** 載入失敗並指出具體欄位名稱
+
+#### Scenario: 載入合法設定
+
+- **WHEN** 載入一份由預設值序列化而來的設定
+- **THEN** 得到與預設值相同的設定
+
 ### Requirement: 每腿風控覆寫與保守值合併
 
 系統 SHALL 允許針對個別交易所覆寫下列欄位：`max_leverage`、`max_price_drift_pct`、`stale_data_threshold_ms`、`order_timeout_seconds`、`max_leg_imbalance_pct`、`min_24h_volume_usdt`、`net_edge_threshold_pct`、`est_slippage_pct`、`safety_margin_pct`。

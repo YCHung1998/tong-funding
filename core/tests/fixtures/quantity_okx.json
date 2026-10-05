@@ -1,0 +1,822 @@
+{
+ "case_count": 67,
+ "cases": [
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "2.0"
+   },
+   "input": {
+    "base_qty": "0.021",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "1.0"
+   },
+   "input": {
+    "base_qty": "0.0199",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": true
+   },
+   "input": {
+    "base_qty": "0.004",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "7.0"
+   },
+   "input": {
+    "base_qty": "0.07",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "12.0"
+   },
+   "input": {
+    "base_qty": "12.5",
+    "ct_val": "1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "3.0"
+   },
+   "input": {
+    "base_qty": "0.3",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "162.0"
+   },
+   "input": {
+    "base_qty": "162.953746",
+    "ct_val": "1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "965.0"
+   },
+   "input": {
+    "base_qty": "96.565896",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "14616.0"
+   },
+   "input": {
+    "base_qty": "146.163208",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "499849.0"
+   },
+   "input": {
+    "base_qty": "499.849318",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "727.0"
+   },
+   "input": {
+    "base_qty": "72.736587",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "1214.0"
+   },
+   "input": {
+    "base_qty": "1.214074",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "14.0"
+   },
+   "input": {
+    "base_qty": "14.176595",
+    "ct_val": "1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "8.0"
+   },
+   "input": {
+    "base_qty": "86.340751",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "2536.0"
+   },
+   "input": {
+    "base_qty": "253.657942",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "9.0"
+   },
+   "input": {
+    "base_qty": "91.43783",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "58.0"
+   },
+   "input": {
+    "base_qty": "58.655024",
+    "ct_val": "1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "389359.0"
+   },
+   "input": {
+    "base_qty": "389.359808",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "234832.0"
+   },
+   "input": {
+    "base_qty": "234.832647",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "958.0"
+   },
+   "input": {
+    "base_qty": "95.844776",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "42269.0"
+   },
+   "input": {
+    "base_qty": "422.696839",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "450575.0"
+   },
+   "input": {
+    "base_qty": "450.57594",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "352130.0"
+   },
+   "input": {
+    "base_qty": "352.130778",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "4992.0"
+   },
+   "input": {
+    "base_qty": "49.92318",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "3715.0"
+   },
+   "input": {
+    "base_qty": "371.567057",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "4746.0"
+   },
+   "input": {
+    "base_qty": "47.462968",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "41.0"
+   },
+   "input": {
+    "base_qty": "413.68105",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "486622.0"
+   },
+   "input": {
+    "base_qty": "486.622919",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "222.0"
+   },
+   "input": {
+    "base_qty": "222.379694",
+    "ct_val": "1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "487591.0"
+   },
+   "input": {
+    "base_qty": "487.591914",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "468.0"
+   },
+   "input": {
+    "base_qty": "468.426475",
+    "ct_val": "1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "41409.0"
+   },
+   "input": {
+    "base_qty": "414.093893",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "37.0"
+   },
+   "input": {
+    "base_qty": "375.529343",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "265484.0"
+   },
+   "input": {
+    "base_qty": "265.484684",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "2863.0"
+   },
+   "input": {
+    "base_qty": "286.332109",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "36.0"
+   },
+   "input": {
+    "base_qty": "369.075002",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": true
+   },
+   "input": {
+    "base_qty": "6.397221",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "2611.0"
+   },
+   "input": {
+    "base_qty": "26.117216",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "37291.0"
+   },
+   "input": {
+    "base_qty": "372.918649",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "5.0"
+   },
+   "input": {
+    "base_qty": "58.949728",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "452559.0"
+   },
+   "input": {
+    "base_qty": "452.5593",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "2.0"
+   },
+   "input": {
+    "base_qty": "27.978994",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "41.0"
+   },
+   "input": {
+    "base_qty": "411.298407",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "7370.0"
+   },
+   "input": {
+    "base_qty": "73.705745",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "45913.0"
+   },
+   "input": {
+    "base_qty": "45.91339",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "45.0"
+   },
+   "input": {
+    "base_qty": "457.629953",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "28.0"
+   },
+   "input": {
+    "base_qty": "287.792112",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "39705.0"
+   },
+   "input": {
+    "base_qty": "397.057834",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "3803.0"
+   },
+   "input": {
+    "base_qty": "380.314518",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "35050.0"
+   },
+   "input": {
+    "base_qty": "350.500164",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "440.0"
+   },
+   "input": {
+    "base_qty": "44.08423",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "5.0"
+   },
+   "input": {
+    "base_qty": "56.728698",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "48.0"
+   },
+   "input": {
+    "base_qty": "487.229728",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "44187.0"
+   },
+   "input": {
+    "base_qty": "441.879153",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "1196.0"
+   },
+   "input": {
+    "base_qty": "119.689593",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "3859.0"
+   },
+   "input": {
+    "base_qty": "385.964412",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "8076.0"
+   },
+   "input": {
+    "base_qty": "80.762793",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "125.0"
+   },
+   "input": {
+    "base_qty": "12.548215",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "3352.0"
+   },
+   "input": {
+    "base_qty": "335.209556",
+    "ct_val": "0.1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "48.0"
+   },
+   "input": {
+    "base_qty": "483.463961",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "356026.0"
+   },
+   "input": {
+    "base_qty": "356.026072",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "208659.0"
+   },
+   "input": {
+    "base_qty": "208.659008",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "133903.0"
+   },
+   "input": {
+    "base_qty": "133.903504",
+    "ct_val": "0.001",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "23572.0"
+   },
+   "input": {
+    "base_qty": "235.729778",
+    "ct_val": "0.01",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "14.0"
+   },
+   "input": {
+    "base_qty": "147.522091",
+    "ct_val": "10",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": false,
+    "contracts": "143.0"
+   },
+   "input": {
+    "base_qty": "143.817736",
+    "ct_val": "1",
+    "lot_sz": "1",
+    "min_sz": "1"
+   }
+  },
+  {
+   "expected": {
+    "below_min": true
+   },
+   "input": {
+    "base_qty": "0.02",
+    "ct_val": "0",
+    "lot_sz": "1",
+    "min_sz": "1"
+   },
+   "known_difference": "ct_val_zero"
+  }
+ ],
+ "header": {
+  "exported_at": "2026-10-05T11:33:45Z",
+  "source": {
+   "files_sha256": {
+    "quantity_precision.py": "ff78b5c9297f2239056db85dcdba2b5dcfa0e18cef017b3b6ede4ad0944a1648"
+   },
+   "functions": [
+    "okx_base_qty_to_contracts",
+    "apply_lot_size"
+   ],
+   "git_commit": "c1a14c37253ebd023a1d2a7840e1855f1ef59469",
+   "repo": "/Users/eason.hung/orca/workspaces/funding-analysis/mvp-python",
+   "working_tree_dirty": true
+  }
+ }
+}
