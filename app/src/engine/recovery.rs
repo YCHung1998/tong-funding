@@ -393,7 +393,8 @@ impl Run<'_> {
             }
         };
         match state {
-            PairState::OrderSubmit | PairState::FillMonitor | PairState::Closing => {
+            // RECONCILED too: its simulated position died with the process (decision 7).
+            PairState::OrderSubmit | PairState::FillMonitor | PairState::Closing | PairState::Reconciled => {
                 let detail = json!({ "reason": "simulation interrupted", "simulated": true });
                 match transition::land_then_act(&self.events, &cand.uuid, state, SystemEvent::RestartUndetermined, detail, |to| to) {
                     Ok((to, _)) => {
@@ -402,11 +403,6 @@ impl Run<'_> {
                     }
                     Err(e) => self.transition_failed(cand, state, e),
                 }
-            }
-            PairState::Reconciled => {
-                // Core gap: RECONCILED has no restart event; keep it, but say so.
-                note(self, false);
-                Self::outcome(cand, Some(state), Some(state), Verdict::SimulationInterrupted, "simulation interrupted; no core transition from RECONCILED")
             }
             PairState::Prepared
             | PairState::PreTradeCheck
@@ -1144,6 +1140,21 @@ mod tests {
         let r = reconcile_startup(&db2, Err("no keys".into()), &c).now_or_never().unwrap();
         assert_eq!(r.pending, None, "{r:?}");
         assert_eq!(db2.get_pair(PAIR).unwrap().unwrap().status, "UNRESOLVED", "in-flight sim pair without intents too");
+    }
+
+    #[test]
+    fn a_reconciled_simulated_pair_becomes_unresolved_once() {
+        let (_d, db, _) = open_tmp();
+        seed_pair(&db, PAIR, PairState::Reconciled, true);
+        let c = ManualClock::new(5_000_000);
+        let r = reconcile_startup(&db, Err("no keys".into()), &c).now_or_never().unwrap();
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!(pair_state(&db), "UNRESOLVED", "its simulated ledger is gone (decision 7)");
+        assert_eq!(only_outcome(&r).verdict, Verdict::SimulationInterrupted);
+        assert_eq!(events(&db, SIMULATION_INTERRUPTED).len(), 1);
+        // A second restart finds nothing in flight and writes nothing more.
+        reconcile_startup(&db, Err("no keys".into()), &c).now_or_never().unwrap();
+        assert_eq!(events(&db, SIMULATION_INTERRUPTED).len(), 1);
     }
 
     #[test]

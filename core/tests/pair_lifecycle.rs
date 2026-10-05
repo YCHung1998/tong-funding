@@ -32,6 +32,8 @@ fn table() -> Vec<(S, Event, S)> {
         (S::Reconciled, man(M::RequestClose), S::Closing),
         (S::Closing, sys(E::ClosedConfirmed { verified_flat: true }), S::Finalized),
         (S::Closing, sys(E::CloseFailed), S::PartialFailure),
+        // engine-simulation: a simulated pair's ledger is gone after a restart.
+        (S::Reconciled, sys(E::RestartUndetermined), S::Unresolved),
     ];
     for s in in_flight {
         t.push((s, sys(E::RestartFoundPartial), S::PartialFailure));
@@ -201,6 +203,8 @@ fn scenario_close_failure_goes_partial() {
 fn scenario_restart_single_leg() {
     assert_eq!(next(S::FillMonitor, E::RestartFoundPartial), Ok(S::PartialFailure));
     assert_eq!(next(S::OrderSubmit, E::RestartUndetermined), Ok(S::Unresolved));
+    assert_eq!(next(S::Reconciled, E::RestartUndetermined), Ok(S::Unresolved));
+    assert!(next(S::Reconciled, E::RestartFoundPartial).is_err(), "only 'undetermined' leaves RECONCILED on restart");
 }
 
 #[test]

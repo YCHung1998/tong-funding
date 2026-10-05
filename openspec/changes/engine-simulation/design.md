@@ -123,7 +123,8 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 4. **進場視窗上限採用**；錯過時先寫警示事件再取消；策略做成可調整（D9）。
 5. **手動下單以 `reduce_only` 分類**（D5）。
 6. **SIMULATION 的保證金**：讀交易所 demo 帳戶的真實餘額（唯讀簽名 GET，經 `AccountView`）。金鑰在使用者 Mac 的 Keychain；讀不到餘額時 `Margin` 檢查失敗（BLOCK，失敗即封閉），不使用預設值或虛擬餘額。測試一律用假的 `AccountView`。
-7. **SIMULATION 中斷後的配對一律 `UNRESOLVED`。**
+7. **SIMULATION 中斷後的配對一律 `UNRESOLVED`。** 包含 `RECONCILED` 的模擬配對：使用者同意在 core 補上 `RECONCILED` + 重啟無法判定 → `UNRESOLVED`（本 change 以 MODIFIED 修改 `pair-lifecycle`，封存時同步主 spec）。
+8. **對帳未完成只擋 EXCHANGE_DEMO 的開倉。** demo 配對因金鑰不可用等原因對帳未完成時，`SIMULATION` 的進場照常允許（模擬不碰交易所）；該 demo 配對仍佔 `max_concurrent_pairs`，橫幅持續警示直到人工處理。
 
 ## 實作時的決定（wave 1，2026-10-05）
 

@@ -295,6 +295,8 @@ pub fn next(state: PairState, event: impl Into<Event>) -> Result<PairState, Ille
         (S::OrderSubmit | S::FillMonitor | S::Closing, System(SystemEvent::RestartUndetermined)) => {
             Some(S::Unresolved)
         }
+        // A simulated pair loses its in-memory ledger on restart (engine-simulation decision 7).
+        (S::Reconciled, System(SystemEvent::RestartUndetermined)) => Some(S::Unresolved),
         (S::PartialFailure | S::Imbalanced | S::Unresolved, Manual(ManualEvent::RequestClose)) => {
             Some(S::Closing)
         }

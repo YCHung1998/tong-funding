@@ -63,7 +63,7 @@
 
 ### Requirement: 對帳完成前不接受增加曝險的動作
 
-啟動後，在所有未結束意圖完成對帳之前，引擎 SHALL 拒絕所有 `opens_exposure()` 為真的 Command，排程器 SHALL NOT 觸發進場。
+啟動後，在所有未結束的 demo 意圖完成對帳之前，引擎 SHALL 在 `EXCHANGE_DEMO` 模式下拒絕所有 `opens_exposure()` 為真的 Command，排程器 SHALL NOT 觸發進場；`SIMULATION` 模式的進場不受 demo 對帳狀態影響（使用者 2026-10-05 決定），但未對帳的 demo 配對仍計入已開啟配對。
 對帳因交易所不可連線、金鑰不可用或查詢失敗而無法完成時，引擎 SHALL 維持此狀態並顯示原因，SHALL NOT 因無法對帳而放行。
 沒有任何未結束意圖時，此限制 SHALL 立即解除。
 
