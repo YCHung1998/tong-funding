@@ -340,7 +340,7 @@ fn external_base_url(structure: &str) -> Vec<Violation> {
         let rb = rest.as_bytes();
         // qualifiers, then `fn`
         let mut j = 0;
-        let mut word_end = |j: &mut usize| {
+        let word_end = |j: &mut usize| {
             let s = skip_ws(rb, *j);
             let mut e = s;
             while e < rb.len() && is_ident(rb[e]) {

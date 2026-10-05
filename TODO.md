@@ -100,3 +100,30 @@
   3. 單腿失敗：在 Bybit demo 先把可用保證金降到不足（或把該標的槓桿設到交易所會拒絕的值），再送一輪 → 配對應為 `PARTIAL_FAILURE`，交易單頁「需人工處理」區塊顯示兩腿持倉；「人工確認已平倉」在仍有持倉時禁用並寫「Binance 仍有持倉」；按「人工要求平倉」→ 確認 → 平掉剩下一腿 → 約 15 秒後（帳戶讀取週期）「人工確認已平倉」可按 → 配對 `FINALIZED`。截圖 `partial-failure-*.png`，並回報入口是否夠用（design.md Risks：Python 版 47 筆單腿失敗）。
 - [ ] **5.1-e 手動下單頁**：SIMULATION 下送 Binance BTCUSDT BUY 0.0014 → 確認面板顯示 0.001，結果列「[模擬] 下單成功」；切 EXCHANGE_DEMO 送同一筆 → 交易所 order id；用結果中的 client_order_id 撤單（已成交時應顯示「訂單已是 Filled，未撤銷」而不是成功）；開 kill switch 後非 reduce-only 的 Submit 禁用並顯示「緊急停止中」，勾 reduce_only 可送。
 - [ ] **5.1-f rate limit**：運行 30 分鐘後到系統日誌確認沒有 `RATE_LIMITED`（交易頁每 15 秒讀一次兩所持倉 / 委託 / 保證金，另有 30 秒的帳戶輪詢）；若有，回報次數。
+
+## funding-pnl：需要在 Mac 上做的驗證（task 1.1、4.1 截圖、5.1；agent 連不到交易所、沒有金鑰）
+在分支 `feat/funding-pnl` 上操作。前置：上面「把 demo 金鑰放進 Keychain」已完成（`cargo run -q -p tong-funding -- secrets import-env /path/to/mvp-python/.env`，再 `secrets status` 全部 `present`）。
+目前的流水解析器與 fixtures 只依公開文件撰寫（fixtures 標頭寫著 `UNVERIFIED, FROM DOCS`），這三項做完前不得封存本 change。
+
+- [ ] **1.1 先驗證再信任解析器**（唯讀簽名 GET，各打一次；不下單）
+  1. 先確認 demo 帳戶過去 7 天內有持倉跨過 funding 結算（沒有的話先完成 5.1 的一組配對再回來做）。
+  2. 用 `curl` 或一次性的 `cargo test -- --ignored` 都可以；最簡單是 Python（金鑰從 Keychain 讀，不要貼進終端歷史）：
+     - Binance：`GET https://testnet.binancefuture.com/fapi/v1/income?symbol=<SYMBOL>&incomeType=FUNDING_FEE&startTime=<7 天前 ms>&endTime=<現在 ms>&limit=1000&timestamp=…&recvWindow=5000&signature=…`（header `X-MBX-APIKEY`）；若 testnet 拒絕，改 `demo-fapi.binance.com`，記下哪個主機成功。
+     - Bybit：`GET https://api-demo.bybit.com/v5/account/transaction-log?accountType=UNIFIED&category=linear&currency=USDT&type=SETTLEMENT&startTime=…&endTime=…&limit=50`（header `X-BAPI-API-KEY`、`X-BAPI-SIGN`、`X-BAPI-TIMESTAMP`、`X-BAPI-RECV-WINDOW`）。
+  3. 把回應去敏（刪掉帳戶 id、`orderId`、`tradeId` 等可識別欄位；保留欄位名稱、型別、正負號、時間）存成
+     `app/tests/fixtures/funding/binance_income_funding_fee.json` 與 `bybit_transaction_log_settlement.json`（保留 `{"_fixture_note", "request", "response"}` 結構，`_fixture_note` 改成「RECORDED <日期> from demo, de-identified」）。
+     注意：測試目前檢查 `_fixture_note` 以 `UNVERIFIED, FROM DOCS` 開頭，換成真實回應時一併改 `app/src/exchange/signed/ledger.rs` 測試裡的那行斷言與期望值。
+  4. 逐項填 `openspec/changes/funding-pnl/design.md` 的「驗證紀錄」表：欄位名稱、`income`／`funding` 正負號（收到是正嗎？對照交易所網頁的資金費紀錄）、`time`／`transactionTime` 單位與是否等於結算時刻（差幾秒？影響時間軸 ±60 秒容差）、`tranId`／`id` 是否唯一、單頁上限、`nextPageCursor` 行為、funding rate 為 0 的結算是否仍有流水、成交手續費幣別。
+  5. 跑 `cargo test -p tong-funding funding_parse`；與文件不符處修正解析器、spec 與 design。
+
+- [ ] **4.1 持倉頁截圖對照 Figma**（view-model 與畫面已完成，只差截圖）
+  1. App 目前沒有啟動引擎（見 design 實作紀錄 #17），持倉頁的 Funding 欄在沒有配對時都顯示「—（尚未取得）」或「—」（未配對）是預期。
+  2. 啟動 `cargo run --release -p tong-funding`，持倉頁截 `openspec/changes/funding-pnl/screenshots/positions-funding.png`；與 Figma 持倉頁並排，把差異（Funding 收到欄、「價差，未含 funding 與手續費」註記、配對卡的已付開倉手續費／進行中合計／結算時間軸／預期對實際面板）列進 design.md。
+  3. 若要看到有資料的畫面，等引擎接上 App 後在 demo 跑一組配對（5.1）再截一次。
+
+- [ ] **5.1 demo 帳戶走完一組配對跨過至少一次結算**（需要引擎接上 App，或 exchange-demo-execution 的實測工具）
+  1. 在結算前約 1 分鐘進場、結算後平倉（EXCHANGE_DEMO）。
+  2. 平倉確認後，確認系統日誌依序出現：`CLOSE_CONFIRMED` →（流水未齊時）`PNL_PENDING` → `FUNDING_LEDGER_FETCHED`（兩所各一筆以上）→ `PAIR_PNL_COMPUTED` → `FINALIZED`；最多等 10 分鐘（`PNL_RETRY_WINDOW_MS`，暫定）。
+  3. 記下：結算到流水出現的實際延遲（校正 `FETCH_DELAY_MS`／`FETCH_RETRY_MS`／`PNL_RETRY_WINDOW_MS`）、`PAIR_PNL_COMPUTED` 的狀態與原因（平倉參考價已在送平倉單前記錄，design 實作紀錄 #6；兩所流水齊全、手續費有回報時應為 COMPLETE；若出現「無參考價」，查平倉 `ORDER_SUBMITTED` 的 `reference_error`）、各分量數字、對帳 `PNL_RECONCILIATION` 結果、預期對實際的差異。
+  4. 再跑一次同一窗的取得，確認 `FUNDING_LEDGER_ENTRY` 筆數不變（去重）。
+  5. 把實際數字填進 design.md 的「驗證紀錄」最後一行，回報指令與測試檔路徑。

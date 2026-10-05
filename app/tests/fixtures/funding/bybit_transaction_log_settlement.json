@@ -1,0 +1,18 @@
+{
+  "_fixture_note": "UNVERIFIED, FROM DOCS. Not a recorded demo response: constructed from the documented example of GET /v5/account/transaction-log (bybit-exchange/docs v5/account/transaction-log.mdx; funding -0.003676 is that page's example row). Field meanings (funding positive = received) are documented but NOT verified against a demo account (funding-pnl task 1.1). Replace with a recorded, de-identified demo response when task 1.1 is done.",
+  "request": "GET /v5/account/transaction-log?accountType=UNIFIED&category=linear&currency=USDT&type=SETTLEMENT&startTime=...&endTime=...&limit=50",
+  "response": {
+    "retCode": 0,
+    "retMsg": "OK",
+    "result": {
+      "nextPageCursor": "",
+      "list": [
+        {"id": "592324_XRPUSDT_161440249321", "symbol": "XRPUSDT", "category": "linear", "side": "Buy", "transactionTime": "1672128000000", "type": "SETTLEMENT", "qty": "100", "size": "100", "currency": "USDT", "tradePrice": "0.3676", "funding": "-0.003676", "fee": "0", "cashFlow": "0", "change": "-0.003676", "cashBalance": "5086.55825002", "feeRate": "0.0001", "bonusChange": "", "tradeId": "534c0003-4bf7-486f-aa02-78cee36825e4", "orderId": "", "orderLinkId": ""},
+        {"id": "592324_BTCUSDT_161440249322", "symbol": "BTCUSDT", "category": "linear", "side": "Sell", "transactionTime": "1672156800000", "type": "SETTLEMENT", "qty": "0.02", "size": "-0.02", "currency": "USDT", "tradePrice": "60000", "funding": "0.5", "fee": "0", "cashFlow": "0", "change": "0.5", "cashBalance": "5087.05825002", "feeRate": "0.0001", "bonusChange": "", "tradeId": "", "orderId": "", "orderLinkId": ""},
+        {"id": "592324_BTCUSDT_161440249323", "symbol": "BTCUSDT", "category": "linear", "side": "Sell", "transactionTime": "1672156900000", "type": "TRADE", "qty": "0.02", "size": "-0.02", "currency": "USDT", "tradePrice": "60000", "funding": "", "fee": "0.66", "cashFlow": "0", "change": "-0.66", "cashBalance": "5086.39825002", "feeRate": "0.00055", "bonusChange": "", "tradeId": "abc", "orderId": "o1", "orderLinkId": ""}
+      ]
+    },
+    "retExtInfo": {},
+    "time": 1672156901000
+  }
+}

@@ -131,12 +131,17 @@ pub enum Event {
     /// Read before closing: signed positions (exchange order unit) of both legs' symbol, and the
     /// pair's recorded fill per leg (sum of its open orders' filled quantity, looked up by
     /// `client_order_id`; `Err` = not known). Close quantity = min(recorded, |position|).
+    /// `*_reference`: a fresh single-symbol refetch per leg made right before the reduce-only
+    /// closes are sent: the close reference price (funding-pnl gap 2). `Err` never holds the close
+    /// back; the close then has no reference (its slippage stays "無參考價").
     ClosePositionsFetched {
         pair: PairUuid,
         long: Result<Decimal, String>,
         short: Result<Decimal, String>,
         long_recorded: Result<Decimal, String>,
         short_recorded: Result<Decimal, String>,
+        long_reference: Result<FreshQuote, String>,
+        short_reference: Result<FreshQuote, String>,
     },
     /// Closed-confirmation read: `Ok(true)` = both legs' positions are 0 and no open order is
     /// left on the symbol (complete lists only).

@@ -1,0 +1,9 @@
+{
+  "_fixture_note": "UNVERIFIED, FROM DOCS. Not a recorded demo response: constructed from the documented shape of GET /fapi/v1/income (binance-connector-js derivatives-trading-usds-futures get-income-history-response-inner.ts; tranId example 9689322392). The sign of `income` (received positive?) is NOT verified (funding-pnl task 1.1). Replace with a recorded, de-identified demo response when task 1.1 is done.",
+  "request": "GET /fapi/v1/income?symbol=BTCUSDT&incomeType=FUNDING_FEE&startTime=...&endTime=...&page=1&limit=1000",
+  "response": [
+    {"symbol": "BTCUSDT", "incomeType": "FUNDING_FEE", "income": "-0.12000000", "asset": "USDT", "info": "FUNDING_FEE", "time": 1791187200000, "tranId": 9689322392, "tradeId": ""},
+    {"symbol": "BTCUSDT", "incomeType": "FUNDING_FEE", "income": "0.03500000", "asset": "USDT", "info": "FUNDING_FEE", "time": 1791216000000, "tranId": 9689322393, "tradeId": ""},
+    {"symbol": "BTCUSDT", "incomeType": "COMMISSION", "income": "-0.01000000", "asset": "USDT", "info": "COMMISSION", "time": 1791216100000, "tranId": 9689322394, "tradeId": "2059192"}
+  ]
+}

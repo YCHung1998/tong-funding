@@ -94,6 +94,33 @@ impl std::str::FromStr for PairState {
     }
 }
 
+/// The "PnL computed" confirmation that entering `FINALIZED` needs (funding-pnl, pair-lifecycle
+/// MODIFIED "FINALIZED 須確認已平倉"). `Recorded` points at a `PAIR_PNL_COMPUTED` /
+/// `PAIR_PNL_RECOMPUTED` event, whether that result is COMPLETE or INCOMPLETE. A SIMULATION pair
+/// never gets a PnL (pnl-accounting: no real fills, no funding ledger), so for it the confirmation
+/// is the explicit `NotApplicableSimulated`; the engine gives it only to simulated pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PnlGate {
+    /// No PnL event exists: entering FINALIZED is refused.
+    Missing,
+    /// A PnL event of the pair exists (COMPLETE or INCOMPLETE).
+    Recorded,
+    /// The pair ran in SIMULATION: there is no actual PnL by design.
+    NotApplicableSimulated,
+}
+
+impl PnlGate {
+    pub const ALL: [PnlGate; 3] = [PnlGate::Missing, PnlGate::Recorded, PnlGate::NotApplicableSimulated];
+
+    /// True when the confirmation allows FINALIZED.
+    pub const fn is_satisfied(self) -> bool {
+        match self {
+            PnlGate::Missing => false,
+            PnlGate::Recorded | PnlGate::NotApplicableSimulated => true,
+        }
+    }
+}
+
 /// Events produced automatically by the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemEvent {
@@ -123,8 +150,9 @@ pub enum SystemEvent {
     TimeoutUndetermined,
     /// Scheduled close begins.
     ScheduledClose,
-    /// Close finished; `verified_flat` = both legs at zero position and no open orders.
-    ClosedConfirmed { verified_flat: bool },
+    /// Close finished; `verified_flat` = both legs at zero position and no open orders; `pnl` =
+    /// the "PnL computed" confirmation (funding-pnl). Both are needed for FINALIZED.
+    ClosedConfirmed { verified_flat: bool, pnl: PnlGate },
     /// A leg failed to close, or closed only partially.
     CloseFailed,
     /// Restart reconciliation found a single filled leg / partial state.
@@ -138,8 +166,9 @@ pub enum SystemEvent {
 }
 
 impl SystemEvent {
-    /// Every system event (both `verified_flat` values); `ALL[i].ordinal() == i` is checked at compile time.
-    pub const ALL: [SystemEvent; 20] = [
+    /// Every system event (every `verified_flat` x `pnl` combination); `ALL[i].ordinal() == i` is
+    /// checked at compile time.
+    pub const ALL: [SystemEvent; 24] = [
         SystemEvent::StartCheck,
         SystemEvent::CheckPassed,
         SystemEvent::CheckFailed,
@@ -153,8 +182,12 @@ impl SystemEvent {
         SystemEvent::TimeoutPartialFill,
         SystemEvent::TimeoutUndetermined,
         SystemEvent::ScheduledClose,
-        SystemEvent::ClosedConfirmed { verified_flat: true },
-        SystemEvent::ClosedConfirmed { verified_flat: false },
+        SystemEvent::ClosedConfirmed { verified_flat: true, pnl: PnlGate::Missing },
+        SystemEvent::ClosedConfirmed { verified_flat: true, pnl: PnlGate::Recorded },
+        SystemEvent::ClosedConfirmed { verified_flat: true, pnl: PnlGate::NotApplicableSimulated },
+        SystemEvent::ClosedConfirmed { verified_flat: false, pnl: PnlGate::Missing },
+        SystemEvent::ClosedConfirmed { verified_flat: false, pnl: PnlGate::Recorded },
+        SystemEvent::ClosedConfirmed { verified_flat: false, pnl: PnlGate::NotApplicableSimulated },
         SystemEvent::CloseFailed,
         SystemEvent::RestartFoundPartial,
         SystemEvent::RestartUndetermined,
@@ -178,13 +211,17 @@ impl SystemEvent {
             SystemEvent::TimeoutPartialFill => 10,
             SystemEvent::TimeoutUndetermined => 11,
             SystemEvent::ScheduledClose => 12,
-            SystemEvent::ClosedConfirmed { verified_flat: true } => 13,
-            SystemEvent::ClosedConfirmed { verified_flat: false } => 14,
-            SystemEvent::CloseFailed => 15,
-            SystemEvent::RestartFoundPartial => 16,
-            SystemEvent::RestartUndetermined => 17,
-            SystemEvent::Retry => 18,
-            SystemEvent::Recheck => 19,
+            SystemEvent::ClosedConfirmed { verified_flat: true, pnl: PnlGate::Missing } => 13,
+            SystemEvent::ClosedConfirmed { verified_flat: true, pnl: PnlGate::Recorded } => 14,
+            SystemEvent::ClosedConfirmed { verified_flat: true, pnl: PnlGate::NotApplicableSimulated } => 15,
+            SystemEvent::ClosedConfirmed { verified_flat: false, pnl: PnlGate::Missing } => 16,
+            SystemEvent::ClosedConfirmed { verified_flat: false, pnl: PnlGate::Recorded } => 17,
+            SystemEvent::ClosedConfirmed { verified_flat: false, pnl: PnlGate::NotApplicableSimulated } => 18,
+            SystemEvent::CloseFailed => 19,
+            SystemEvent::RestartFoundPartial => 20,
+            SystemEvent::RestartUndetermined => 21,
+            SystemEvent::Retry => 22,
+            SystemEvent::Recheck => 23,
         }
     }
 }
@@ -204,17 +241,22 @@ pub enum ManualEvent {
     Cancel,
     /// User asks to close the pair.
     RequestClose,
-    /// User confirms the pair is closed; `verified_flat` = both legs verified at zero and no open orders.
-    ConfirmClosed { verified_flat: bool },
+    /// User confirms the pair is closed; `verified_flat` = both legs verified at zero and no open
+    /// orders; `pnl` = the "PnL computed" confirmation (funding-pnl), needed as for the system path.
+    ConfirmClosed { verified_flat: bool, pnl: PnlGate },
 }
 
 impl ManualEvent {
-    /// Every manual event (both `verified_flat` values).
-    pub const ALL: [ManualEvent; 4] = [
+    /// Every manual event (every `verified_flat` x `pnl` combination).
+    pub const ALL: [ManualEvent; 8] = [
         ManualEvent::Cancel,
         ManualEvent::RequestClose,
-        ManualEvent::ConfirmClosed { verified_flat: true },
-        ManualEvent::ConfirmClosed { verified_flat: false },
+        ManualEvent::ConfirmClosed { verified_flat: true, pnl: PnlGate::Missing },
+        ManualEvent::ConfirmClosed { verified_flat: true, pnl: PnlGate::Recorded },
+        ManualEvent::ConfirmClosed { verified_flat: true, pnl: PnlGate::NotApplicableSimulated },
+        ManualEvent::ConfirmClosed { verified_flat: false, pnl: PnlGate::Missing },
+        ManualEvent::ConfirmClosed { verified_flat: false, pnl: PnlGate::Recorded },
+        ManualEvent::ConfirmClosed { verified_flat: false, pnl: PnlGate::NotApplicableSimulated },
     ];
 
     /// Exhaustive slot index, same purpose as [`SystemEvent::ordinal`].
@@ -222,8 +264,12 @@ impl ManualEvent {
         match self {
             ManualEvent::Cancel => 0,
             ManualEvent::RequestClose => 1,
-            ManualEvent::ConfirmClosed { verified_flat: true } => 2,
-            ManualEvent::ConfirmClosed { verified_flat: false } => 3,
+            ManualEvent::ConfirmClosed { verified_flat: true, pnl: PnlGate::Missing } => 2,
+            ManualEvent::ConfirmClosed { verified_flat: true, pnl: PnlGate::Recorded } => 3,
+            ManualEvent::ConfirmClosed { verified_flat: true, pnl: PnlGate::NotApplicableSimulated } => 4,
+            ManualEvent::ConfirmClosed { verified_flat: false, pnl: PnlGate::Missing } => 5,
+            ManualEvent::ConfirmClosed { verified_flat: false, pnl: PnlGate::Recorded } => 6,
+            ManualEvent::ConfirmClosed { verified_flat: false, pnl: PnlGate::NotApplicableSimulated } => 7,
         }
     }
 }
@@ -285,7 +331,8 @@ pub fn next(state: PairState, event: impl Into<Event>) -> Result<PairState, Ille
         (S::FillMonitor, System(SystemEvent::TimeoutUndetermined)) => Some(S::Unresolved),
         (S::Reconciled, System(SystemEvent::ScheduledClose))
         | (S::Reconciled, Manual(ManualEvent::RequestClose)) => Some(S::Closing),
-        (S::Closing, System(SystemEvent::ClosedConfirmed { verified_flat: true })) => {
+        // FINALIZED needs both confirmations: flat AND "PnL computed" (funding-pnl).
+        (S::Closing, System(SystemEvent::ClosedConfirmed { verified_flat: true, pnl })) if pnl.is_satisfied() => {
             Some(S::Finalized)
         }
         (S::Closing, System(SystemEvent::CloseFailed)) => Some(S::PartialFailure),
@@ -302,8 +349,8 @@ pub fn next(state: PairState, event: impl Into<Event>) -> Result<PairState, Ille
         }
         (
             S::PartialFailure | S::Imbalanced | S::Unresolved,
-            Manual(ManualEvent::ConfirmClosed { verified_flat: true }),
-        ) => Some(S::Finalized),
+            Manual(ManualEvent::ConfirmClosed { verified_flat: true, pnl }),
+        ) if pnl.is_satisfied() => Some(S::Finalized),
         _ => None,
     };
     to.ok_or(IllegalTransition { from: state, event })

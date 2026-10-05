@@ -488,6 +488,8 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                             ctx.shared.push(SourceUpdate::Pairs(pair_infos(&rows)));
                         }
                         ctx.shared.push(SourceUpdate::PairEntries(pair_entries(&rows)));
+                        // funding-pnl: read-only funding / PnL data of the same pairs.
+                        ctx.shared.push(SourceUpdate::Funding(crate::ui::funding::load_pair_funding(db, &rows, clock_now(&ctx.clock))));
                         if let Some(tx) = ctx.shared.rules_tx.get() {
                             for r in rows.iter().filter(|r| r.status != "FINALIZED" && r.status != "CANCELLED") {
                                 for ex in Exchange::ALL {

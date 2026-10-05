@@ -7,6 +7,7 @@ pub mod config_cli;
 pub mod db;
 pub mod event_query;
 pub mod events;
+pub mod funding_ledger;
 pub mod import_cli;
 pub mod legacy_import;
 pub mod scan_buffer;

@@ -313,6 +313,8 @@ pub struct UiSnapshot {
     pub demo_keys: Option<Result<(), String>>,
     /// Latest command replies (at most [`MAX_REPLIES`], oldest first).
     pub replies: Vec<CommandOutcome>,
+    /// funding-pnl: funding / PnL data per `pair_id` (positions page).
+    pub funding: BTreeMap<String, crate::ui::funding::PairFunding>,
 }
 
 impl UiSnapshot {
@@ -356,6 +358,8 @@ pub enum SourceUpdate {
     LegAccount { simulated: bool, exchange: Exchange, account: LegAccount },
     DemoKeys(Result<(), String>),
     CommandResult(CommandOutcome),
+    /// funding-pnl: replaces the per-pair funding data.
+    Funding(BTreeMap<String, crate::ui::funding::PairFunding>),
 }
 
 impl SourceUpdate {
@@ -435,6 +439,7 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
             let extra = snap.replies.len().saturating_sub(MAX_REPLIES);
             snap.replies.drain(..extra);
         }
+        SourceUpdate::Funding(f) => snap.funding = f,
     }
 }
 

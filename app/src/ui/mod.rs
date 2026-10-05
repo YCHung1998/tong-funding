@@ -40,6 +40,8 @@ pub mod dashboard;
 pub mod engine_view;
 #[path = "vm/format.rs"]
 pub mod format;
+#[path = "vm/funding.rs"]
+pub mod funding;
 #[path = "vm/positions.rs"]
 pub mod positions;
 #[path = "vm/scanner.rs"]

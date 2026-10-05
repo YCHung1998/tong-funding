@@ -274,6 +274,36 @@ fn pair_card(c: &PairCard) -> Div {
     if let Some(p) = &c.pnl_text {
         out = out.child(small(p.clone(), theme::TEXT_PRIMARY));
     }
+    // funding-pnl (settlement-timeline): funding received, running total, timeline, panel.
+    let f = &c.funding;
+    out = out.child(small(f.text.clone(), tone(f.tone))).child(small(f.running_total.clone(), theme::TEXT_SECONDARY));
+    if !f.timeline.is_empty() {
+        out = out.child(small("結算時間軸", theme::TEXT_MUTED));
+        for r in &f.timeline {
+            out = out.child(small(format!("{} · {} · {} · {} · 累計 {}", r.time, r.leg, r.amount, r.state, r.cumulative), tone(r.tone)));
+        }
+    }
+    if let Some(p) = &f.panel {
+        out = out.child(small(format!("預期對實際 · {}", p.mode), theme::TEXT_MUTED));
+        if let Some(s) = &p.status_line {
+            out = out.child(small(s.clone(), theme::WARNING));
+        }
+        for l in &p.lines {
+            out = out.child(small(format!("{} · 預期 {} · 實際 {} · 差異 {}", l.label, l.expected, l.actual, l.diff), theme::TEXT_SECONDARY));
+        }
+        if let Some(s) = &p.safety_margin {
+            out = out.child(small(format!("安全邊際 {s}"), theme::TEXT_MUTED));
+        }
+        if let Some(s) = &p.settlement_note {
+            out = out.child(small(s.clone(), theme::WARNING));
+        }
+        for (k, v) in &p.breakdown {
+            out = out.child(small(format!("{k} {v}"), theme::TEXT_SECONDARY));
+        }
+    }
+    for (_, a) in &f.alerts {
+        out = out.child(small(a.clone(), theme::WARNING));
+    }
     out
 }
 
@@ -329,7 +359,11 @@ pub fn positions_page(vm: &PositionsVm, selected_ex: &dyn Fn(Exchange) -> bool, 
                 let cells = r.cells();
                 let mut line = div().flex().gap_2();
                 for (i, c) in cells.into_iter().enumerate() {
-                    let color = if i == 7 { tone(r.pnl_tone()) } else { theme::TEXT_SECONDARY };
+                    let color = match i {
+                        7 => tone(r.pnl_tone()),
+                        8 => tone(r.funding_tone),
+                        _ => theme::TEXT_SECONDARY,
+                    };
                     line = line.child(small(c, color).w(px(120.0)));
                 }
                 if r.unpaired {

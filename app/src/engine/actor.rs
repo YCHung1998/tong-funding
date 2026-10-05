@@ -72,6 +72,7 @@ use crate::store::state::{AddPairOutcome, ConfigChange, FLAG_EXECUTION_MODE, Int
 
 #[cfg(test)]
 mod flow_tests;
+mod pnl_gate;
 
 /// Command queue bound: a UI that floods commands waits (backpressure) instead of growing memory.
 pub const COMMAND_CAPACITY: usize = 64;
@@ -91,6 +92,9 @@ pub const ORDER_SUBMITTED: &str = "ORDER_SUBMITTED";
 /// A later lookup reported a changed fill of a pair's order (cumulative quantity, average price,
 /// fee and fee asset); carries `simulated`.
 pub const ORDER_FILL: &str = "ORDER_FILL";
+/// `reference_source` of a close reference price: a fresh single-symbol refetch made right before
+/// the reduce-only closes were sent (funding-pnl gap 2).
+pub const CLOSE_REFERENCE_SOURCE: &str = "refetch_before_close";
 /// Alert: a leg's actual position differs from the pair's recorded fill by more than the
 /// effective `max_leg_imbalance_pct` (or the recorded fill is unknown); nothing is closed.
 pub const CLOSE_QUANTITY_MISMATCH: &str = "CLOSE_QUANTITY_MISMATCH";
@@ -360,10 +364,15 @@ struct Flow {
     /// symbol that is not the pair's (left untouched). The flat check compares against it.
     close_residual: [Decimal; 2],
     flat_inflight: bool,
+    /// funding-pnl: set at `CLOSE_CONFIRMED` while the PnL waits (`pnl_gate`).
+    pnl_wait_since: Option<i64>,
     /// When the entry / the close was triggered (injected clock): the start of the latency the
     /// T-5 decision depends on (`ORDER_LATENCY.triggered_at`).
     open_triggered_ms: Option<i64>,
     close_triggered_ms: Option<i64>,
+    /// funding-pnl gap 2: per leg, the close reference (price, local observed time) fetched right
+    /// before the reduce-only closes were sent, or why there is none. Written on the close events.
+    close_reference: [Option<Result<(Decimal, i64), String>>; 2],
 }
 
 impl Flow {
@@ -724,6 +733,7 @@ impl Actor {
                     self.poll(&id, OrderAction::Open);
                     self.check_fills(&id, now);
                 }
+                PairState::Closing if !orphan && self.awaiting_pnl(&id) => self.finalize_closed(&id),
                 PairState::Closing if !orphan => {
                     self.poll(&id, OrderAction::Close);
                     self.check_close(&id, now);
@@ -1284,6 +1294,7 @@ impl Actor {
         flow.orphan = false;
         flow.close = None;
         flow.close_residual = [Decimal::ZERO; 2];
+        flow.close_reference = [None, None];
         flow.flat_inflight = false;
         // The pair's own orders per leg: open fills minus earlier close fills is what it holds.
         let mut orders: [Vec<PairOrder>; 2] = [Vec::new(), Vec::new()];
@@ -1301,17 +1312,23 @@ impl Actor {
                 return CommandReply::Accepted;
             }
         }
-        let (account, executor, tx) = (self.account_for(view.simulated), self.executor.clone(), self.event_tx.clone());
+        let (account, executor, market, tx) = (self.account_for(view.simulated), self.executor.clone(), self.market.clone(), self.event_tx.clone());
         let (le, se, sym, pair) = (view.long_exchange, view.short_exchange, view.symbol.clone(), pair.to_string());
         let [long_orders, short_orders] = orders;
         tokio::spawn(async move {
             let (long, short) =
                 tokio::join!(signed_position(account.as_ref(), le, &sym), signed_position(account.as_ref(), se, &sym));
-            let (long_recorded, short_recorded) = tokio::join!(
+            // The close reference price is fetched last, in parallel with the recorded fills, so
+            // it is as close as possible to the moment the closes are sent (gap 2).
+            let (long_recorded, short_recorded, long_reference, short_reference) = tokio::join!(
                 recorded_fill(executor.as_ref(), le, &sym, &long_orders),
-                recorded_fill(executor.as_ref(), se, &sym, &short_orders)
+                recorded_fill(executor.as_ref(), se, &sym, &short_orders),
+                market.refetch(le, &sym),
+                market.refetch(se, &sym)
             );
-            let _ = tx.send(Event::ClosePositionsFetched { pair, long, short, long_recorded, short_recorded }).await;
+            let _ = tx
+                .send(Event::ClosePositionsFetched { pair, long, short, long_recorded, short_recorded, long_reference, short_reference })
+                .await;
         });
         CommandReply::Accepted
     }
@@ -1431,7 +1448,7 @@ impl Actor {
     /// CLOSING: a rejected close → PARTIAL_FAILURE; all closes over (or timed out) → flat check.
     fn check_close(&mut self, pair: &str, now: i64) {
         let Some(view) = self.pairs.get(pair).cloned() else { return };
-        if view.state != PairState::Closing {
+        if view.state != PairState::Closing || self.awaiting_pnl(pair) {
             return;
         }
         let Some(flow) = self.flows.get(pair) else { return };
@@ -1477,7 +1494,8 @@ impl Actor {
                 }
                 // The confirmation is recorded before FINALIZED; without it nothing is finalized.
                 if self.events.append(CLOSE_CONFIRMED, Some(pair), payload).is_ok() {
-                    let _ = self.land(pair, SystemEvent::ClosedConfirmed { verified_flat: true }, json!({ "source": "flat check" }));
+                    // funding-pnl: FINALIZED also needs "PnL computed" (pnl_gate).
+                    self.begin_pnl_wait(pair);
                 }
             }
             // Position updates may lag: re-checked on the next tick until the close timeout.
@@ -1489,6 +1507,20 @@ impl Actor {
                 let _ = self.land(pair, SystemEvent::CloseFailed, json!({ "reason": format!("flat check failed: {e}") }));
             }
             Err(_) => {} // retried on the next tick until the timeout
+        }
+    }
+
+    /// funding-pnl gap 2: the leg's close reference next to the close fill details. Only a price
+    /// fetched before the closes were sent is a reference; the fill price never is.
+    fn add_close_reference(&self, pair: &str, leg: Leg, payload: &mut Value) {
+        match self.flows.get(pair).and_then(|f| f.close_reference[idx(leg)].as_ref()) {
+            Some(Ok((price, observed_at_ms))) => {
+                payload["reference_price"] = json!(dstr(*price));
+                payload["reference_observed_at_ms"] = json!(observed_at_ms);
+                payload["reference_source"] = json!(CLOSE_REFERENCE_SOURCE);
+            }
+            Some(Err(e)) => payload["reference_error"] = json!(format!("close reference refetch failed: {e}")),
+            None => payload["reference_error"] = json!("no close reference recorded (closes not sent by this run)"),
         }
     }
 
@@ -1647,8 +1679,11 @@ impl Actor {
                     }
                 }
                 if let Some(mut p) = fill_event {
-                    if let Some((leg, _)) = ids::leg_action_of(&client_order_id) {
+                    if let Some((leg, a)) = ids::leg_action_of(&client_order_id) {
                         p["leg"] = json!(leg.as_str());
+                        if a == OrderAction::Close {
+                            self.add_close_reference(&pair, leg, &mut p);
+                        }
                     }
                     self.note(ORDER_FILL, Some(&pair), p);
                 }
@@ -1673,7 +1708,13 @@ impl Actor {
                 payload["simulated"] = json!(self.executor.is_simulated());
                 self.note(MANUAL_CANCEL_RESULT, None, payload);
             }
-            Event::ClosePositionsFetched { pair, long, short, long_recorded, short_recorded } => {
+            Event::ClosePositionsFetched { pair, long, short, long_recorded, short_recorded, long_reference, short_reference } => {
+                if self.pairs.get(&pair).map(|v| v.state) == Some(PairState::Closing)
+                    && let Some(flow) = self.flows.get_mut(&pair)
+                {
+                    let keep = |q: Result<FreshQuote, String>| Some(q.map(|q| (q.price, q.price_observed_at_ms)));
+                    flow.close_reference = [keep(long_reference), keep(short_reference)];
+                }
                 self.on_close_positions(&pair, [long, short], [long_recorded, short_recorded]);
             }
             Event::FlatChecked { pair, flat } => self.on_flat_checked(&pair, flat),
@@ -1700,6 +1741,9 @@ impl Actor {
             };
             payload["exchange"] = json!(exchange.name());
             payload["symbol"] = json!(v.symbol);
+        }
+        if action == OrderAction::Close {
+            self.add_close_reference(pair, leg, &mut payload);
         }
         self.note(ORDER_SUBMITTED, Some(pair), payload);
         let Some(o) = self.flows.get_mut(pair).and_then(|f| f.set_mut(action)).and_then(|s| s.find_mut(client_order_id)) else {
@@ -2210,13 +2254,22 @@ impl Actor {
         let simulated = self.pairs.get(pair).is_some_and(|v| v.simulated);
         let reply = match result {
             Ok(r) if r.is_flat() => {
-                let detail = json!({ "source": "user", "verified_by": "system re-query of positions and open orders" });
-                match self.land(pair, ManualEvent::ConfirmClosed { verified_flat: true }, detail) {
-                    Ok(_) => {
-                        self.note(MANUAL_CONFIRM_RESULT, Some(pair), json!({ "accepted": true, "simulated": simulated }));
-                        CommandReply::Accepted
+                // funding-pnl: FINALIZED also needs "PnL computed"; recorded before the transition.
+                match self.manual_confirm_pnl(pair) {
+                    Ok((pnl, pnl_event_id)) => {
+                        let detail = json!({ "source": "user", "verified_by": "system re-query of positions and open orders", "pnl_event_id": pnl_event_id });
+                        match self.land(pair, ManualEvent::ConfirmClosed { verified_flat: true, pnl }, detail) {
+                            Ok(_) => {
+                                self.note(MANUAL_CONFIRM_RESULT, Some(pair), json!({ "accepted": true, "simulated": simulated, "pnl_event_id": pnl_event_id }));
+                                CommandReply::Accepted
+                            }
+                            Err(e) => CommandReply::Rejected(e),
+                        }
                     }
-                    Err(e) => CommandReply::Rejected(e),
+                    Err(e) => {
+                        self.note(MANUAL_CONFIRM_RESULT, Some(pair), json!({ "accepted": false, "error": format!("PnL not recorded: {e}"), "simulated": simulated }));
+                        CommandReply::Rejected(format!("PnL not recorded, not finalized: {e}"))
+                    }
                 }
             }
             Ok(r) => {
