@@ -8,4 +8,6 @@ pub mod health;
 pub mod public;
 pub mod reqwest_transport;
 pub mod signed;
+#[cfg(test)]
+mod static_checks;
 pub mod transport;
