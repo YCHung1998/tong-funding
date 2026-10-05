@@ -385,6 +385,8 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                     ctx.shared.push(SourceUpdate::System(read_system_flags(db, clock_now(&ctx.clock))));
                     if let Ok(rows) = db.list_pairs() {
                         ctx.shared.push(SourceUpdate::Pairs(pair_infos(&rows)));
+                        // funding-pnl: read-only funding / PnL data of the same pairs.
+                        ctx.shared.push(SourceUpdate::Funding(crate::ui::funding::load_pair_funding(db, &rows, clock_now(&ctx.clock))));
                     }
                 }
                 push_health(&ctx, &feed_health);

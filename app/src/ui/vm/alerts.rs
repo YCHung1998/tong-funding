@@ -19,6 +19,9 @@ pub enum Category {
     Halted,
     Disconnected,
     Stale,
+    /// funding-pnl: reconciliation MISMATCH / FAILED, ledger conflict, ledger fetch error,
+    /// INCOMPLETE PnL. Not dismissible: it stays until the data changes (settlement-timeline).
+    FundingData,
     RateLimitOrClock,
 }
 
@@ -29,12 +32,13 @@ impl Category {
             Category::Halted => "停機",
             Category::Disconnected => "斷線",
             Category::Stale => "資料過期",
+            Category::FundingData => "資料問題",
             Category::RateLimitOrClock => "限流 / 時鐘",
         }
     }
     /// Manual-attention and halt alerts have no close control.
     pub fn dismissible(self) -> bool {
-        !matches!(self, Category::ManualAttention | Category::Halted)
+        !matches!(self, Category::ManualAttention | Category::Halted | Category::FundingData)
     }
 }
 
@@ -177,6 +181,14 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
         if let Some(until) = h.rate_limited_until.filter(|u| *u > now_ms) {
             let ex = id.exchange().name();
             push(Category::RateLimitOrClock, format!("{ex} 限流"), format!("{ex} 限流退避中，剩 {} 秒", format::secs(until - now_ms)), None, None);
+        }
+    }
+
+    // funding-pnl: funding / PnL data problems, each pointing at its event in the system log.
+    for (pair_id, f) in &snap.funding {
+        for al in &f.alerts {
+            let msg = format!("{}（事件 #{}，見系統日誌）· 不會自動修正", al.text, al.event_id);
+            push(Category::FundingData, format!("{pair_id} {}", al.event_type), msg, None, Some(Page::SystemLogs));
         }
     }
 

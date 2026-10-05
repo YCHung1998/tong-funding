@@ -12,10 +12,12 @@ use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::bridge::{AccountState, PairInfo, UiSnapshot, ACCOUNT_EXCHANGES};
 use super::format::{self, DASH};
+use super::funding::{self as fv, PairFunding, PnlPanel, TimelineRow};
 use crate::exchange::signed::models::Position;
 use crate::ui::theme::Tone;
 
-pub const PNL_NOTE: &str = "PnL 未扣手續費與資金費";
+/// funding-pnl (settlement-timeline): replaces Figma's "PnL 未扣手續費與資金費".
+pub const PNL_NOTE: &str = fv::SPREAD_NOTE;
 pub const OKX_NOTE: &str = "OKX 僅比價，不顯示持倉";
 pub const MANUAL_NOTE: &str = "需人工處理";
 
@@ -81,6 +83,8 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
         let tolerance = effective_for_pair(&snap.settings.risk, &snap.settings.overrides, info.long_exchange, info.short_exchange).max_leg_imbalance_pct;
         let pct = imbalance_pct(long.quantity, short.quantity);
         let imbalanced = pct > tolerance;
+        let spread = long.pnl.zip(short.pnl).map(|(l, s)| l + s);
+        let funding = FundingView::of(snap.funding.get(&info.pair_id), spread);
         cards.push(PairCard {
             symbol: info.symbol.clone(),
             label: Some(format!("{} · {}% IMBALANCE", if imbalanced { "IMBALANCED" } else { "HEDGED" }, format::fixed(pct, 2))),
@@ -89,6 +93,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
             long: Some(long),
             short: Some(short),
             state_warning: None,
+            funding,
         });
     }
     for p in &snap.pairs {
@@ -100,7 +105,9 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
         let find = |e: Exchange, side: Side| g.rows.iter().find(|r| r.exchange == e && r.symbol == p.symbol && r.side == side).map(leg);
         let (long, short) = (find(p.long_exchange, Side::Long), find(p.short_exchange, Side::Short));
         let pnl = long.as_ref().zip(short.as_ref()).map(|(l, s)| pnl_text(l, s));
-        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning) });
+        let spread = long.as_ref().and_then(|l| l.pnl).zip(short.as_ref().and_then(|s| s.pnl)).map(|(l, s)| l + s);
+        let funding = FundingView::of(snap.funding.get(&p.pair_id), spread);
+        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding });
     }
     cards
 }
@@ -123,6 +130,9 @@ pub struct PosRow {
     pub leverage: Option<Decimal>,
     pub unrealized_pnl: Option<Decimal>,
     pub unpaired: bool,
+    /// funding-pnl: the "Funding 收到" cell ("—" plus a reason when unknown, never 0) and its tone.
+    pub funding: String,
+    pub funding_tone: Tone,
 }
 
 impl PosRow {
@@ -141,8 +151,7 @@ impl PosRow {
             opt(self.mark_price),
             self.leverage.map_or_else(|| DASH.to_string(), |l| format!("{}×", l.normalize())),
             self.unrealized_pnl.map_or_else(|| DASH.to_string(), |p| format!("{} USDT", format::signed(p, 2))),
-            // Funding received: filled in by `funding-pnl`; until then always a dash, never 0.00.
-            DASH.to_string(),
+            self.funding.clone(),
         ]
     }
     pub fn pnl_tone(&self) -> Tone {
@@ -175,6 +184,48 @@ pub struct PairCard {
     pub pnl_text: Option<String>,
     /// `PARTIAL_FAILURE · 需人工處理` for locked pairs (warning tone).
     pub state_warning: Option<String>,
+    /// funding-pnl: funding received, running total, timeline, PnL panel, alerts.
+    pub funding: FundingView,
+}
+
+/// The funding part of a pair card (settlement-timeline).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FundingView {
+    /// `Funding 收到 +0.24 USDT（−0.12 USDT / +0.36 USDT）· 更新 …` or `Funding 收到 —（尚未取得）`.
+    pub text: String,
+    pub tone: Tone,
+    /// `已付開倉手續費 … · 進行中合計 …（尚未包含平倉成本）`.
+    pub running_total: String,
+    pub timeline: Vec<TimelineRow>,
+    pub panel: Option<PnlPanel>,
+    /// Data problems (event id, text), shown with a link to the system log.
+    pub alerts: Vec<(i64, String)>,
+}
+
+impl FundingView {
+    fn of(f: Option<&PairFunding>, spread_unrealized: Option<Decimal>) -> FundingView {
+        match f {
+            None => FundingView {
+                text: format!("Funding 收到 {DASH}（尚未取得）"),
+                tone: Tone::Muted,
+                running_total: format!("已付開倉手續費 {DASH} · 進行中合計 {DASH}（{}）", fv::NOT_INCLUDING_CLOSE),
+                timeline: Vec::new(),
+                panel: None,
+                alerts: Vec::new(),
+            },
+            Some(f) => {
+                let (text, tone) = fv::pair_funding_text(f);
+                FundingView {
+                    text,
+                    tone,
+                    running_total: fv::running_total_text(f, spread_unrealized),
+                    timeline: fv::timeline_rows(f),
+                    panel: fv::pnl_panel(f),
+                    alerts: f.alerts.iter().map(|a| (a.event_id, format!("{}（事件 #{}）", a.text, a.event_id))).collect(),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -207,11 +258,25 @@ pub struct PositionsVm {
 
 pub fn build(snap: &UiSnapshot, filter: &Filter) -> PositionsVm {
     let g = group(snap);
+    // funding-pnl: each grouped row's leg funding; unpaired rows have none ("—").
+    let mut leg_of_row: BTreeMap<usize, (String, usize)> = BTreeMap::new();
+    for grp in &g.grouping.groups {
+        let id = g.pairs[grp.pair_index].pair_id.clone();
+        leg_of_row.insert(grp.long_row, (id.clone(), 0));
+        leg_of_row.insert(grp.short_row, (id, 1));
+    }
     let all: Vec<PosRow> = g
         .rows
         .iter()
         .enumerate()
-        .map(|(i, p)| PosRow {
+        .map(|(i, p)| {
+            let (funding, funding_tone) = match leg_of_row.get(&i) {
+                Some((id, leg)) => fv::leg_cell(snap.funding.get(id).map(|f| &f.legs[*leg])),
+                None => (DASH.to_string(), Tone::Muted),
+            };
+            (i, p, funding, funding_tone)
+        })
+        .map(|(i, p, funding, funding_tone)| PosRow {
             exchange: p.exchange,
             symbol: p.symbol.clone(),
             side: p.side,
@@ -221,6 +286,8 @@ pub fn build(snap: &UiSnapshot, filter: &Filter) -> PositionsVm {
             leverage: p.leverage,
             unrealized_pnl: p.unrealized_pnl,
             unpaired: g.is_unpaired(i),
+            funding,
+            funding_tone,
         })
         .collect();
 
