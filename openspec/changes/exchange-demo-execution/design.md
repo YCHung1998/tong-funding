@@ -143,3 +143,53 @@ Python 版用配對記錄的數量與方向，若成交量有偏差、被強平�
 - **成交明細（價格、數量、手續費、手續費幣別）寫入不可變事件**（`funding-pnl` Open Question 2）。
 - 已在 `engine-simulation` 處理：core 的 `CLOSING → PARTIAL_FAILURE`、`FILL_MONITOR → IMBALANCED` 轉移已存在（Open Question 7）；不平衡量為幣本位相對差（對較大者，Open Question 6）。
 - 金鑰只放 macOS Keychain；雲端開發環境連不到交易所，真實 demo 驗證（4.2）一律在使用者的 Mac 上執行。
+
+## 實作時的決定（2026-10-05，tasks 1.1–1.4、2.1–2.2、3.1–3.3、4.1）
+
+以下為實作時須自行決定之處，一律取保守選項；標「未驗證」者在 4.2 實測後回寫。
+
+**模組與靜態檢查**
+- 下單程式只在 `app/src/exchange/execution/**`。原本 `static_checks` 的「簽名請求只能 GET」規則**有意地**演進為：POST / PUT / DELETE / PATCH 只准出現在 `execution/`（`non_get_methods_only_in_execution`：`exchange/` 其他檔以簽名客戶端的完整清單掃描，crate 其餘部分掃 HTTP method 寫法）；`execution/` 必須通過簽名客戶端的其餘全部規則（無正式主機、無主機參數或公開主機欄位、不讀環境變數或設定檔、不用可組出主機的巨集或跳脫、不引用 `public`、只允許完整的 `#[cfg(test)] mod`）；`execution/` 的字串常值不得含任何網址或網域，識別字除 `Exchange::Okx` 與兩個「不支援」常數外不得含 `okx`。下單類函式名稱只准在 `execution/`。
+- 主機只能經 `DemoEnv`（包住 `signed::endpoints` 的 `BinanceHost` / `BybitHost`）選擇；`OrderHttpRequest` 沒有接受網址的建構子；真實傳輸層再以 `HostPolicy::SignedDemo` 擋一次。
+- 為重用既有簽名與 JSON 解析，`signed::signing::Credentials` 欄位與 `signed::models` 的欄位解析函式由 `pub(super)` 放寬為 `pub(in crate::exchange)`；未修改 core 與 store。
+
+**結果分類（D4）**
+- 四分類在 `execution::classify::SubmitClass`；引擎共用契約 `SubmitOutcome` 維持三個變體：**被限流對引擎回報為 `Unknown`**（429 是否保證未處理未驗證，所以先以同一 id 查單，查到前意圖不會是 FAILED）。延遲事件的 `result` 為 `unknown`，原因字串以 `rate limited` 開頭。
+- 「結果未知」：逾時、連線失敗、無法解析的 2xx、5xx、沒有交易所錯誤碼的 4xx、Binance `-1000/-1001/-1006/-1007`、Bybit `10000/10016`。「已拒絕」：帶錯誤碼的 4xx、Bybit HTTP 200 且 `retCode` 非 0。「被限流」：HTTP 429 / 418、Binance `-1003`、Bybit `10006/10018`。各錯誤碼清單**未驗證**。
+- **沒送出就是確定的拒絕**：OKX、非 `demo` 前綴或格式不符的 id、未校時、限流退避中、持倉模式非單向或查不到 → `Rejected`（`code = not_sent`），意圖 FAILED 是事實（交易所上沒有這張單）。
+- 限流器與唯讀簽名請求共用 `RateLimiter`（`RequestClass::Signed`，每所獨立）；退避中送單直接拒絕、查單回 `Failed`（該腿狀態不變，下一個 tick 再查）。
+
+**請求細節（全部未驗證，4.2 實測）**
+- Binance：參數放在簽名的 query string（POST / DELETE 亦同）、`type=MARKET`、`newOrderRespType=RESULT`、只有 reduce-only 單帶 `reduceOnly=true`；查單 / 撤單用 `origClientOrderId`（或 `orderId`）；手續費不在委託物件內，`query` 在有成交時加查 `userTrades` 並在單一手續費幣別時加總，否則回報「未提供」而不猜。送單 ACK 已成交但無手續費時，引擎額外查一次以寫入 `ORDER_FILL`（成交明細含手續費，使用者決定）。
+- Bybit：JSON body（serde_json 排序後的鍵；簽名的字串即送出的字串）、`positionIdx: 0`、`reduceOnly` 明確給值；查單先 `realtime` 再退到 `history`；撤單成功後再查一次取得狀態；`cumExecFee` 的幣別假設為 USDT。
+- 持倉模式：Binance 為帳戶層級（`positionSide/dual`），Bybit 為逐標的（`position/list` 的 `positionIdx`，沒有任何列 = 不明 → 不送單）。**只快取確認為單向的結果 60 秒**（`POSITION_MODE_TTL_MS`），不明或雙向從不快取；送單延遲因此在快取失效時包含一次模式查詢。
+- `client_order_id`：只接受引擎產生的 `demo` id（`[A-Za-z0-9_-]`、≤ 36），執行器原樣傳遞不改寫。spec 例子 `demo_ab12_L_open_1` 不是引擎格式，測試改用引擎產生的 id。
+
+**工廠、金鑰與帳戶**
+- `DemoExecutorFactory` 只為 `EXCHANGE_DEMO` 建立執行器，**Binance 與 Bybit 的金鑰都必須存在且非空**（OKX 不能下單，所以每個 demo 配對都需要兩者）；讀不到、空字串或 Keychain 錯誤一律 `Err`（不送任何請求，錯誤字串只含交易所與原因）。金鑰在建立時讀一次並保存在執行器內，不每單讀 Keychain（避免反覆授權提示）；更換金鑰須切回 SIMULATION 再切回。
+- `DemoAccountView` 走既有唯讀簽名 GET：持倉帶正負號（Bybit `size` + `side` 由 adapter 正規化）；**出現任何雙向持倉即回 `Err`**（引擎假設單向，加總兩邊會掩蓋曝險）；可用保證金取 USDT 的 `available`，未提供即 `Err`（失敗即封閉；Bybit UNIFIED 帳戶的 `availableToWithdraw` 可能為空，屆時 Margin 檢查會 BLOCK，**未驗證**，可能需改讀帳戶層 `totalAvailableBalance`）。
+- 工廠、執行器、帳戶檢視都已實作並以錄製回應測試，但**尚未接到 `main.rs`**（本 change 不得修改；真實組裝需 `ReqwestOrderTransport`、`GatedTransport`、ClockSync 的偏移）。在接線前，4.2 以 `exchange::execution::live_probe`（`#[ignore]`，需環境變數確認）在 Mac 上實測。
+
+**延遲事件（1.3，T−5 決策依據）**
+- 每次送單寫一筆 `ORDER_LATENCY`：`request_sent_at` 取在意圖落地之後、`Executor::submit` 之前，`ack_at` 取在其回傳時（注入的時鐘）；`triggered_at` 為進場觸發（`StartCheck` 落地）或開始平倉的時間；`trigger_to_ack_ms` 一併寫入。兩腿各自 spawn，第二腿不等第一腿。
+- `engine::latency::LatencyReport::from_events`：最近秩百分位（nearest rank）；`entry_to_both_accepted` = 同一次進場兩腿皆 accepted 時「較晚的 ACK − 觸發」，有一腿非 accepted 的進場排除並計數；模擬事件預設排除。`t5_criterion_met()` = p99 < 2,500 ms。
+
+**逾時與成交確認（2.1、2.2）**
+- 成交判定沿用 engine-simulation 的 `fill::fill_decision`（以 order id 查單、幣本位不平衡、等於門檻視為通過），未重寫。
+- **逾時撤單改依本 spec**：engine-simulation wave 2 的「殘留委託不自動撤單」是實作時的選擇而非使用者決定，與本 spec「逾時只撤銷自己未成交的單、撤後再查最終成交量」衝突，依 spec 實作。到達生效逾時（自送單集合建立時起算，略早於最早的 `request_sent_at`，偏保守）時，對本配對尚未結束（未成交完或結果未知）的開倉單各送一次撤單再查一次，以**最終**狀態呼叫 `fill_decision`；撤後仍為未結束、或查單失敗 / 查無 → 該腿為未知 → `UNRESOLVED`。撤單結果寫 `ORDER_CANCEL_RESULT`。撤單期間舊的輪詢結果不覆蓋最終查詢。平倉單逾時不撤（已平倉確認負責）。
+- `TimeoutUndetermined` 的警示原因：有一腿的送單從未得到可用回覆 → `SUBMIT_UNKNOWN`，否則 `FILL_UNCONFIRMED`。
+
+**警示（3.1）**
+- Snapshot 新增 `alerts`（由處於 `PARTIAL_FAILURE` / `IMBALANCED` / `UNRESOLVED` 的配對推導；重啟後第一份 Snapshot 即有）。每次進入警示狀態寫一筆 `PAIR_ALERT`（恰好一個原因：`SUBMIT_REJECTED`、`SUBMIT_UNKNOWN`、`FILL_TIMEOUT_ONE_LEG`、`IMBALANCE`、`RECONCILE_MISMATCH`、`CLOSE_LEG_FAILED`、`FILL_UNCONFIRMED`、`OTHER`；含兩腿的委託與成交資料）並呼叫一次 `Notifier`。
+- 「同一次進入」以進入該狀態的 `PAIR_TRANSITION` 事件 id 為鍵：其後已有 `PAIR_ALERT` / `ALERT_NOTIFIED` / `ALERT_NOTIFY_FAILED` 即不再寫或通知，重啟亦同；對帳器造成的警示在對帳完成後補寫與通知。**通知失敗也算已處理**（寫 `ALERT_NOTIFY_FAILED`，不自動重試，避免洗版；橫幅與事件照常）。通知在 blocking 執行緒呼叫，不卡 actor。
+- macOS 通知機制**未決定**：目前只有 `LogNotifier`（寫 stderr，不是系統通知）與測試用 `RecordingNotifier`；需在 Mac 上試 `osascript` 後再實作（TODO.md）。
+- `alert::count_by_reason`：任一期間各原因次數（所有原因都列出，總和 = 警示事件數）。
+
+**人工出口與平倉（3.2、3.3）**
+- 「人工確認已平倉」**不採信 `verified_flat`**：只接受警示狀態的配對，系統重新查詢兩腿該標的的持倉與兩所的未成交委託（清單須完整），持倉皆為 0 且無委託才落地 `ConfirmClosed { verified_flat: true }` → `FINALIZED`，否則拒絕並回報兩腿持倉與委託數；Command 的回覆延到重查結束；結果寫 `MANUAL_CONFIRM_RESULT`。不屬於本配對的同標的部位也會使確認失敗（保守，與 D10 一致）。
+- 已平倉確認在平倉逾時內重試（持倉更新延遲），逾時仍非 0 或仍有委託才 `PARTIAL_FAILURE`；取代原本第一次查到非 0 即失敗。
+- **與 spec 衝突、依使用者決定**：pair-close spec「一腿已被強平 → 只對另一腿送單」與 2026-10-05 晚的決定「平倉量 = min(記錄量, 實際持倉)，差異超過 `max_leg_imbalance_pct` 轉人工」衝突（強平後實際 0 對記錄 10 是 100% 差異）。依使用者決定：兩腿都不送、寫 `CLOSE_QUANTITY_MISMATCH`、`PARTIAL_FAILURE`（測試 `a_liquidated_leg_is_a_quantity_mismatch_and_nothing_is_closed_per_the_user_decision`）。spec 例子「實際 0.019 對記錄 0.020」在門檻內，平 0.019 與 spec 一致。人工再平倉時，已平完的腿（記錄量 0、持倉 0）略過，只處理剩餘腿。
+
+**驗證**
+- 4.1：`cargo test -p tong-funding exchange_replay -- --nocapture`，真實工廠 / 執行器 / 帳戶檢視在錄製回應上跑完整引擎，並檢查所有請求主機在允許清單、事件不含金鑰與簽名、每次送單恰有一筆延遲事件。
+- 紅燈的取得方式：先寫測試，再對「刻意退回的實作」（拿掉 id 參數、Python 式例外即失敗、不撤單、採信使用者旗標、不寫事件等）執行取得失敗輸出，然後恢復實作確認綠燈；2.1 的行為已存在於 engine-simulation，測試首次執行即綠燈。

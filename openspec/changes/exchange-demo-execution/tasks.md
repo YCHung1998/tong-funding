@@ -3,24 +3,35 @@
 
 ## 1. 下單
 
-- [ ] 1.1 Binance、Bybit 的簽名請求建構（送單、撤單、查單、持倉模式查詢）：寫死主機、`newClientOrderId` / `orderLinkId`、reduce-only 旗標、簽名。驗收：先寫測試（所有請求主機在允許清單內、無法覆寫主機、`client_order_id` 出現在請求中、簽名與以標準庫獨立算出的 HMAC-SHA256 向量一致、OKX 無下單函式、無 `client_order_id` 無法建構）並確認紅燈，再實作；reduce-only 與 client id 的參數名稱以 4.2 實測為準，實測前標為未驗證
-- [ ] 1.2 傳輸層與結果分類：已接受 / 已拒絕 / 被限流 / 結果未知；Bybit HTTP 200 且 `retCode` 非 0 為已拒絕；與共用限流器整合。驗收：先寫以錄製回應為輸入的測試（逾時、連線重置、無法解析、HTTP 4xx、Bybit retCode、429 含 `Retry-After`），斷言逾時與斷線不會被歸為已拒絕，確認紅燈後實作
-- [ ] 1.3 兩腿並行送出與 latency 事件：兩請求都在任一回應前送出；事件含 `request_sent_at`、`ack_at`、`latency_ms`、`client_order_id`，並經遮蔽。驗收：先寫假時鐘測試（各 200 毫秒的兩腿總耗時約 200）、latency 為 180 的案例、掃描事件不含簽名與金鑰，紅燈後實作
-- [ ] 1.4 查單（依 `client_order_id` 與 order id）、限定撤單（只限 `order_intents` 內）、持倉模式確認、真實執行器工廠與 `Executor` 契約測試套件。驗收：契約測試對 `SimulatedExecutor` 與真實執行器（錄製傳輸層）各跑一次皆通過；撤銷非自己的委託被拒；持倉模式不符或查詢失敗不送單
+- [x] 1.1 Binance、Bybit 的簽名請求建構（送單、撤單、查單、持倉模式查詢）：寫死主機、`newClientOrderId` / `orderLinkId`、reduce-only 旗標、簽名。驗收：先寫測試（所有請求主機在允許清單內、無法覆寫主機、`client_order_id` 出現在請求中、簽名與以標準庫獨立算出的 HMAC-SHA256 向量一致、OKX 無下單函式、無 `client_order_id` 無法建構）並確認紅燈，再實作；reduce-only 與 client id 的參數名稱以 4.2 實測為準，實測前標為未驗證
+  - 證據：`exchange/execution/{binance,bybit,order,http}.rs` 測試（主機在允許清單、`newClientOrderId`/`orderLinkId`、reduce-only、簽名與手寫 RFC 2104 HMAC 一致、無 id 無法建構）＋ `static_checks` 的 `execution_*` / `non_get_methods_only_in_execution`；紅燈：拿掉 id / reduce-only 參數時 4 個測試失敗。參數名稱標未驗證（4.2）
+- [x] 1.2 傳輸層與結果分類：已接受 / 已拒絕 / 被限流 / 結果未知；Bybit HTTP 200 且 `retCode` 非 0 為已拒絕；與共用限流器整合。驗收：先寫以錄製回應為輸入的測試（逾時、連線重置、無法解析、HTTP 4xx、Bybit retCode、429 含 `Retry-After`），斷言逾時與斷線不會被歸為已拒絕，確認紅燈後實作
+  - 證據：`execution/executor_tests.rs`（逾時、連線重置、無法解析、5xx、Binance -1007、HTTP 4xx 帶碼、Bybit retCode、429 + `Retry-After` 與退避）；紅燈：以 Python 式「例外即失敗」分類時逾時被歸為 Rejected
+- [x] 1.3 兩腿並行送出與 latency 事件：兩請求都在任一回應前送出；事件含 `request_sent_at`、`ack_at`、`latency_ms`、`client_order_id`，並經遮蔽。驗收：先寫假時鐘測試（各 200 毫秒的兩腿總耗時約 200）、latency 為 180 的案例、掃描事件不含簽名與金鑰，紅燈後實作
+  - 證據：`engine::actor::tests::both_legs_are_sent_before_either_answers_and_latency_events_carry_sent_ack_and_latency`（假時鐘 180/200 ms，總耗時 200）、`engine/latency.rs`（p50/p95/p99 + T−5 判定）、`exchange_replay_*` 掃描事件無金鑰與簽名；紅燈：不寫 `ORDER_LATENCY` 時 0 筆
+- [x] 1.4 查單（依 `client_order_id` 與 order id）、限定撤單（只限 `order_intents` 內）、持倉模式確認、真實執行器工廠與 `Executor` 契約測試套件。驗收：契約測試對 `SimulatedExecutor` 與真實執行器（錄製傳輸層）各跑一次皆通過；撤銷非自己的委託被拒；持倉模式不符或查詢失敗不送單
+  - 證據：`execution/contract_tests.rs`（同一套契約對 `SimulatedExecutor` 與 `DemoExecutor` 各跑一次）、撤銷非 `order_intents` 的單被拒且零請求、持倉模式不符或查詢逾時不送單、`DemoExecutorFactory` 缺金鑰即 Err；紅燈：拿掉持倉模式與所有權檢查（並同時拿掉 1.1 的 id 參數）時，持倉模式 2、所有權 1、Demo 契約 1 個測試失敗
 
 ## 2. 確認與逾時
 
-- [ ] 2.1 依 order id 的成交確認、部分成交、不平衡計算（`|L−S| ÷ max(L,S) × 100`）與 `RECONCILED` / `IMBALANCED` 分流。驗收：先寫測試（同標的既有持倉不算成交、部分成交、查單失敗為結果未知、0.5% 在容許內、5% 超過）並確認紅燈，再實作
-- [ ] 2.2 實作生效 `order_timeout_seconds`（雙腿取小、自最早 `request_sent_at` 起算）、逾時只撤銷自己未成交的單、撤單後再查最終成交量、依 `next()` 轉狀態、輪詢遵守限流。驗收：先寫測試（逾時前已成交不撤單、撤單與成交競爭、撤單結果無法確認轉 `UNRESOLVED`、一腿 100% 一腿 70% 時送單請求總數仍為 2、429 時輪詢退避），紅燈後實作
+- [x] 2.1 依 order id 的成交確認、部分成交、不平衡計算（`|L−S| ÷ max(L,S) × 100`）與 `RECONCILED` / `IMBALANCED` 分流。驗收：先寫測試（同標的既有持倉不算成交、部分成交、查單失敗為結果未知、0.5% 在容許內、5% 超過）並確認紅燈，再實作
+  - 證據：成交判定沿用 engine-simulation 的 `fill::fill_decision`（以 order id 查單）；新增 spec 數字測試（0.5% / 5% / 0.014 部分成交）、既有持倉不算成交與查單逾時為未知（executor 與 flow 測試）。首次執行即綠燈（行為已存在），無紅燈
+- [x] 2.2 實作生效 `order_timeout_seconds`（雙腿取小、自最早 `request_sent_at` 起算）、逾時只撤銷自己未成交的單、撤單後再查最終成交量、依 `next()` 轉狀態、輪詢遵守限流。驗收：先寫測試（逾時前已成交不撤單、撤單與成交競爭、撤單結果無法確認轉 `UNRESOLVED`、一腿 100% 一腿 70% 時送單請求總數仍為 2、429 時輪詢退避），紅燈後實作
+  - 證據：flow 測試 `at_the_timeout_the_unfilled_rest_...`、`a_cancel_that_races_a_fill_...`、`a_cancel_whose_result_cannot_be_confirmed_...`、`fills_complete_before_the_timeout_send_no_cancel`；429 退避在 executor 層（`a_429_with_retry_after_...`）；紅燈：不撤單時 4 個測試失敗
 
 ## 3. 警示與平倉
 
 - [ ] 3.1 警示：Snapshot 的警示由配對狀態推導、macOS 系統通知（`Notifier` 介面，機制於本 task 實機試驗後決定並記錄）、事件含原因分類與兩腿成交資料、通知失敗不影響、重啟不重複通知、警示期間零自動送單與撤單。驗收：先寫假時鐘前進 1 小時而 `Executor` 呼叫次數不變的測試、重啟不重複通知的測試、依原因計數的查詢測試，紅燈後實作；實機貼出一次通知實際出現的證據
-- [ ] 3.2 人工出口：「人工要求平倉」與「人工確認已平倉」（重新查詢兩腿持倉與委託，非零即拒絕）。驗收：先寫「確認時仍有持倉被拒」「確認成功警示消失」測試，紅燈後實作
-- [ ] 3.3 reduce-only 平倉：先查實際持倉、`Quantity::from_exchange_position`、方向由持倉正負決定、腿已無持倉不送單、兩腿並行、單腿失敗轉 `PARTIAL_FAILURE`、已平倉確認（持倉為 0 且兩所皆無未成交委託，逾時內重試）才 `FINALIZED`；手動平倉同路徑。驗收：先寫測試（實際 0.019 對記錄 0.020、空單買進、一腿被強平只送一單、仍有未成交委託不 `FINALIZED`、持倉更新延遲第二次查詢通過、人工再平倉只處理剩餘腿），紅燈後實作
+  - 程式部分完成（`engine/alert.rs`、Snapshot `alerts`、`PAIR_ALERT` / `ALERT_NOTIFIED` / `ALERT_NOTIFY_FAILED`、一小時零送單與重啟不重複通知等 flow 測試）；**未勾選**：macOS 通知機制需在 Mac 上試驗（目前只有 `LogNotifier` 與測試用 `RecordingNotifier`），見 TODO.md
+- [x] 3.2 人工出口：「人工要求平倉」與「人工確認已平倉」（重新查詢兩腿持倉與委託，非零即拒絕）。驗收：先寫「確認時仍有持倉被拒」「確認成功警示消失」測試，紅燈後實作
+  - 證據：flow 測試 `confirm_closed_is_refused_while_a_leg_still_holds_a_position_and_accepted_once_flat`（系統重查兩腿持倉與委託，不採信使用者的 `verified_flat`）；紅燈：沿用使用者旗標時被接受
+- [x] 3.3 reduce-only 平倉：先查實際持倉、`Quantity::from_exchange_position`、方向由持倉正負決定、腿已無持倉不送單、兩腿並行、單腿失敗轉 `PARTIAL_FAILURE`、已平倉確認（持倉為 0 且兩所皆無未成交委託，逾時內重試）才 `FINALIZED`；手動平倉同路徑。驗收：先寫測試（實際 0.019 對記錄 0.020、空單買進、一腿被強平只送一單、仍有未成交委託不 `FINALIZED`、持倉更新延遲第二次查詢通過、人工再平倉只處理剩餘腿），紅燈後實作
+  - 證據：flow 測試 `a_lagging_position_update_...`、`an_open_order_left_on_the_symbol_...`、`a_rejected_close_leg_..._remaining_leg`、`a_liquidated_leg_...`（依使用者決定改為不平倉轉人工，見 design.md）；紅燈：無重試時延遲持倉轉 PARTIAL_FAILURE
 
 ## 4. 驗證
 
-- [ ] 4.1 以錄製回應跑引擎端到端：逾時、拒單、部分成交、429、結果未知後對帳，輸出每個案例的事件序列供檢視。驗收：`cargo test -p app --test exchange_replay`（路徑以實作為準，回報實際指令）
+- [x] 4.1 以錄製回應跑引擎端到端：逾時、拒單、部分成交、429、結果未知後對帳，輸出每個案例的事件序列供檢視。驗收：`cargo test -p app --test exchange_replay`（路徑以實作為準，回報實際指令）
+  - 證據：`cargo test -p tong-funding exchange_replay -- --nocapture`（`exchange/execution/replay_tests.rs`，6 個案例：兩腿成交、逾時、拒單、部分成交、429、結果未知×2，真實 `DemoExecutorFactory` + `DemoAccountView` 於錄製回應上）
 - [ ] 4.2 真實 demo/testnet 小量驗證（使用者在場）：確認 Binance demo 主機、`client_order_id` 長度與字元集被接受、reduce-only 與持倉模式參數、小量開倉、兩腿成交、平倉、reduce-only 對無持倉被拒的行為，並在兩個時點終止程式重啟以驗證對帳。驗收：貼出指令、事件序列與交易所端的持倉與委託對帳結果；任何與 design.md 未驗證假設不符之處回寫到 design.md
+  - 需使用者在場：輔助工具 `exchange::execution::live_probe::live_demo_probe`（`#[ignore]`、需環境變數確認），步驟見 TODO.md
 - [ ] 4.3 統計驗證期間（含 4.2 與使用者決定的運行期間）各原因的警示次數與頻率，連同 Python 版的對照與其可能被測試資料汙染的說明，回報使用者，由使用者判斷完全人工的負擔是否可接受。驗收：貼出資料庫查詢與結果
