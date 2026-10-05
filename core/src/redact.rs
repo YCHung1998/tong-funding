@@ -338,6 +338,36 @@ fn sensitive_before(chars: &[char], sep: usize) -> Option<Kind> {
     classify_name(&token)
 }
 
+/// For a `,` at `sep`: the sensitive name of a tuple-style pair `("NAME", "value")` (Rust `{:?}`
+/// of `(&str, &str)`, Python tuple reprs). Only a quoted name directly after `(` counts, so a plain
+/// list of names such as `["api_key", "symbol"]` is left alone.
+fn sensitive_tuple_name_before(chars: &[char], sep: usize) -> Option<Kind> {
+    let mut j = sep;
+    while j > 0 && chars[j - 1].is_whitespace() && !matches!(chars[j - 1], '\n' | '\r') {
+        j -= 1;
+    }
+    if j == 0 || !is_quote(chars[j - 1]) {
+        return None;
+    }
+    let q = chars[j - 1];
+    let end = j - 1;
+    let mut k = end;
+    while k > 0 && is_name_char(chars[k - 1]) {
+        k -= 1;
+    }
+    if k == end || k == 0 || chars[k - 1] != q {
+        return None;
+    }
+    let mut b = k - 1;
+    while b > 0 && chars[b - 1].is_whitespace() {
+        b -= 1;
+    }
+    if b == 0 || chars[b - 1] != '(' {
+        return None;
+    }
+    classify_name(&chars[k..end].iter().collect::<String>())
+}
+
 /// Index of the bracket that closes the one at `open` (or the end of the text).
 fn balanced_end(chars: &[char], open: usize) -> usize {
     let (o, c) = if chars[open] == '{' { ('{', '}') } else { ('[', ']') };
@@ -437,6 +467,22 @@ fn redact_patterns(text: &str) -> String {
                     continue;
                 }
             }
+        } else if c == ',' {
+            if let Some(kind) = sensitive_tuple_name_before(&chars, p) {
+                let mut q = p + 1;
+                while q < chars.len() && chars[q].is_whitespace() {
+                    q += 1;
+                }
+                if q < chars.len() && is_quote(chars[q]) {
+                    if let Some((vs, ve)) = value_range(&chars, p + 1, kind) {
+                        if vs < ve && !is_placeholder(vs, ve) {
+                            ranges.push((canon[vs].start, canon[ve - 1].end));
+                        }
+                        p = ve.max(p + 1);
+                        continue;
+                    }
+                }
+            }
         } else if (c == 'b' || c == 'B') && (p == 0 || !is_name_char(chars[p - 1])) {
             // a bare `Bearer <token>`
             let word: String = chars[p..(p + 6).min(chars.len())].iter().collect();
@@ -472,6 +518,20 @@ pub fn redact_secrets(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tuple_style_header_pairs_are_masked() {
+        // Rust `{:?}` of `(&str, &str)` / a `Vec` of them, and Python tuple reprs.
+        assert_eq!(redact_secrets(r#"("X-MBX-APIKEY", "realkey")"#), r#"("X-MBX-APIKEY", "[REDACTED]")"#);
+        assert_eq!(
+            redact_secrets(r#"[("symbol", "BTCUSDT"), ("OK-ACCESS-SIGN", "s1g"), ("x", "y")]"#),
+            r#"[("symbol", "BTCUSDT"), ("OK-ACCESS-SIGN", "[REDACTED]"), ("x", "y")]"#
+        );
+        assert_eq!(redact_secrets("('signature', 'abc')"), "('signature', '[REDACTED]')");
+        // A plain list of names is not a name/value pair: nothing is removed.
+        assert_eq!(redact_secrets(r#"{"missing": ["api_key", "symbol"]}"#), r#"{"missing": ["api_key", "symbol"]}"#);
+        assert_eq!(redact_secrets(r#"("symbol", "signature")"#), r#"("symbol", "signature")"#);
+    }
 
     #[test]
     fn url_signature_is_masked_other_params_kept() {
