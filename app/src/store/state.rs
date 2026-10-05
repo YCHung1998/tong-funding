@@ -338,6 +338,77 @@ impl Db {
         })
     }
 
+    /// Land one pair state change: `status` moves `expected_from -> to` and one immutable event is
+    /// written, in ONE transaction. `Ok(false)` (nothing written) when the row is missing or not in
+    /// `expected_from`. Any other failure halts the store: a transition that did not land must
+    /// never be acted on (engine "land then act").
+    pub fn transition_pair(
+        &self,
+        internal_uuid: &str,
+        expected_from: PairState,
+        to: PairState,
+        event_type: &str,
+        payload: &Value,
+    ) -> Result<bool, StoreError> {
+        let res = self.with_conn(|c| {
+            let now = self.now_ms();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let n = tx.execute(
+                "UPDATE pairs SET status = ?3, updated_ms = ?4 WHERE internal_uuid = ?1 AND status = ?2",
+                params![internal_uuid, expected_from.as_str(), to.as_str(), now],
+            )?;
+            if n == 0 {
+                return Ok(false); // dropping `tx` rolls back (nothing was written anyway)
+            }
+            insert_event_on(&tx, now, event_type, Some(internal_uuid), payload)?;
+            tx.commit()?;
+            Ok(true)
+        });
+        match res {
+            Err(StoreError::Halted(r)) => Err(StoreError::Halted(r)),
+            Err(e) => Err(self.event_write_failed(event_type, &e)),
+            Ok(v) => Ok(v),
+        }
+    }
+
+    /// Every pair, oldest first. A read failure halts the store (it feeds the open-pair count).
+    pub fn list_pairs(&self) -> Result<Vec<PairRow>, StoreError> {
+        let res = self.with_conn(|c| {
+            let mut st = c.prepare(
+                "SELECT internal_uuid, pair_id, symbol, status, entry_json, created_ms, updated_ms FROM pairs ORDER BY created_ms, rowid",
+            )?;
+            let rows = st.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get::<_, String>(4)?, r.get(5)?, r.get(6)?))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (internal_uuid, pair_id, symbol, status, entry, created_ms, updated_ms) = row?;
+                out.push(PairRow { internal_uuid, pair_id, symbol, status, entry: serde_json::from_str(&entry)?, created_ms, updated_ms });
+            }
+            Ok(out)
+        });
+        self.fail_closed(res, HaltReason::ConfigReadFailed)
+    }
+
+    /// Set a non-reserved flag (e.g. `trigger_mode`) and write `event_type` in the same
+    /// transaction. A failed event write halts the store and leaves the flag unchanged.
+    pub fn set_flag_with_event(&self, key: &str, value: &str, event_type: &str, payload: &Value) -> Result<(), StoreError> {
+        if key.eq_ignore_ascii_case(FLAG_KILL_SWITCH) {
+            return Err(StoreError::ReservedFlag(key.to_string()));
+        }
+        if redact_secrets(value) != value {
+            return Err(StoreError::SecretInValue { field: format!("system_flags.{key}") });
+        }
+        self.with_conn(|c| {
+            let now = self.now_ms();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            upsert_flag(&tx, key, value, now)?;
+            insert_event_on(&tx, now, event_type, None, payload).map_err(|e| self.event_write_failed(event_type, &e))?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     // ---- order intents ----------------------------------------------------------------
 
     /// Persist an `INTENDED` order before it is sent. A reused `client_order_id` is rejected.
@@ -1230,5 +1301,89 @@ mod tests {
         assert!(db.get_pair("u1").unwrap().is_none());
         p.entry = json!({"edge": "0.001"});
         assert_eq!(db.add_pair_if_not_pending(&p).unwrap(), AddPairOutcome::Added);
+    }
+
+    // ---- engine additions: land-then-act transition, pair listing, flag + event ----
+
+    #[test]
+    fn transition_pair_moves_status_and_writes_one_event_atomically() {
+        let (_d, db, clock) = open_tmp();
+        db.add_pair_if_not_pending(&pair("u1", "BTCUSDT", PairState::Prepared)).unwrap();
+        clock.set(2_000_000);
+        let before = event_count(&db);
+        assert!(db.transition_pair("u1", PairState::Prepared, PairState::Cancelled, "PAIR_TRANSITION", &json!({"why": "x"})).unwrap());
+        let p = db.get_pair("u1").unwrap().unwrap();
+        assert_eq!((p.status.as_str(), p.updated_ms), ("CANCELLED", 2_000_000));
+        assert_eq!(event_count(&db), before + 1);
+        assert_eq!(events_of(&db, "PAIR_TRANSITION"), vec![(Some("u1".to_string()), json!({"why": "x"}))]);
+    }
+
+    #[test]
+    fn transition_pair_from_the_wrong_state_or_unknown_pair_writes_nothing() {
+        let (_d, db, _) = open_tmp();
+        db.add_pair_if_not_pending(&pair("u1", "BTCUSDT", PairState::Prepared)).unwrap();
+        let before = event_count(&db);
+        assert!(!db.transition_pair("u1", PairState::Reconciled, PairState::Closing, "PAIR_TRANSITION", &json!({})).unwrap());
+        assert!(!db.transition_pair("nope", PairState::Prepared, PairState::Cancelled, "PAIR_TRANSITION", &json!({})).unwrap());
+        assert_eq!(db.get_pair("u1").unwrap().unwrap().status, "PREPARED");
+        assert_eq!(event_count(&db), before);
+        assert!(!db.is_halted());
+    }
+
+    #[test]
+    fn transition_pair_event_failure_rolls_back_the_status_and_halts() {
+        let (_d, db, _) = open_tmp();
+        db.add_pair_if_not_pending(&pair("u1", "BTCUSDT", PairState::Prepared)).unwrap();
+        break_event_inserts(&db);
+        let r = db.transition_pair("u1", PairState::Prepared, PairState::Cancelled, "PAIR_TRANSITION", &json!({}));
+        assert!(matches!(r, Err(StoreError::Halted(HaltReason::EventWriteFailed(_)))), "{r:?}");
+        assert!(db.is_halted());
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        let status: String = plain.query_row("SELECT status FROM pairs WHERE internal_uuid = 'u1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "PREPARED", "status must roll back with the event");
+    }
+
+    #[test]
+    fn list_pairs_returns_every_pair_oldest_first() {
+        let (_d, db, clock) = open_tmp();
+        db.add_pair_if_not_pending(&pair("u1", "BTCUSDT", PairState::Prepared)).unwrap();
+        clock.advance(1);
+        db.add_pair_if_not_pending(&pair("u2", "ETHUSDT", PairState::Prepared)).unwrap();
+        db.set_pair_status("u1", PairState::Finalized).unwrap();
+        let rows = db.list_pairs().unwrap();
+        let got: Vec<(&str, &str)> = rows.iter().map(|r| (r.internal_uuid.as_str(), r.status.as_str())).collect();
+        assert_eq!(got, vec![("u1", "FINALIZED"), ("u2", "PREPARED")]);
+        assert_eq!(rows[1].entry, json!({"edge": "0.0012"}));
+    }
+
+    #[test]
+    fn list_pairs_read_failure_halts_the_store() {
+        let (_d, db, _) = open_tmp();
+        db.with_raw_conn_for_tests(|c| {
+            Ok(c.execute_batch("INSERT INTO pairs VALUES ('u9','p','X','PREPARED','{}',1,1); DROP INDEX uniq_prepared_symbol; ALTER TABLE pairs RENAME TO pairs_gone;")?)
+        })
+        .ok();
+        assert!(db.list_pairs().is_err());
+        assert!(db.is_halted());
+    }
+
+    #[test]
+    fn set_flag_with_event_writes_both_or_neither() {
+        let (_d, db, _) = open_tmp();
+        db.set_flag_with_event(FLAG_TRIGGER_MODE, "AUTO", "TRIGGER_MODE_CHANGED", &json!({"to": "AUTO"})).unwrap();
+        assert_eq!(db.flag_get(FLAG_TRIGGER_MODE).unwrap().as_deref(), Some("AUTO"));
+        assert_eq!(events_of(&db, "TRIGGER_MODE_CHANGED"), vec![(None, json!({"to": "AUTO"}))]);
+        assert!(matches!(
+            db.set_flag_with_event("Kill_Switch", "OFF", "X", &json!({})),
+            Err(StoreError::ReservedFlag(_))
+        ));
+        assert!(matches!(
+            db.set_flag_with_event("note", "api_key=abc123", "X", &json!({})),
+            Err(StoreError::SecretInValue { .. })
+        ));
+        break_event_inserts(&db);
+        assert!(db.set_flag_with_event(FLAG_TRIGGER_MODE, "MANUAL", "TRIGGER_MODE_CHANGED", &json!({})).is_err());
+        assert!(db.is_halted());
+        assert_eq!(plain_flag(&db, FLAG_TRIGGER_MODE), "AUTO", "flag rolls back with the event");
     }
 }
