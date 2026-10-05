@@ -9,7 +9,7 @@
 #### Scenario: 意圖先於呼叫
 
 - **WHEN** 引擎準備送出某腿訂單，並在 `Executor` 的送單函式入口記錄當時 store 內容
-- **THEN** 此時 `order_intents` 已有該 `client_order_id` 且狀態為已意圖
+- **THEN** 此時 `order_intents` 已有該 `client_order_id`（先寫已意圖、再標已送出，兩者都在呼叫之前完成）
 
 #### Scenario: 意圖寫入失敗
 

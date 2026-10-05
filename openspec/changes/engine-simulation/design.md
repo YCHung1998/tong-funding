@@ -125,6 +125,20 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 6. **SIMULATION 的保證金**：讀交易所 demo 帳戶的真實餘額（唯讀簽名 GET，經 `AccountView`）。金鑰在使用者 Mac 的 Keychain；讀不到餘額時 `Margin` 檢查失敗（BLOCK，失敗即封閉），不使用預設值或虛擬餘額。測試一律用假的 `AccountView`。
 7. **SIMULATION 中斷後的配對一律 `UNRESOLVED`。**
 
+## 實作時的決定（wave 1，2026-10-05）
+
+- **一腿數量不足（低於 `min_qty`）時兩腿都不送**（`BothSubmitsFailed` → `CANCELLED`），避免刻意開出裸倉。
+- **出場時偏移不可用改用本機時間**（`ExitClock::LocalFallback`），出場不因校時失敗卡住；進場仍失敗即封閉。
+- **進場需兩腿交易所皆有偏移**；進場起點以「時鐘最落後的一腿」到達 `T − entry_lead_ms`，視窗在「最超前的一腿」到達 `T` 時關閉。
+- **PREPARED 重新評估時設定不完整即取消**（尚無曝險，失敗即封閉）。
+- **不平衡量**：兩腿以幣本位成交量的相對差（對較大者的百分比），等於門檻視為通過。
+- **`entry_json` 格式**：`PairEnvelope { long_exchange, short_exchange, settlement_ms, simulated, scan }`，`scan` 內 `long_scan_price`、`short_scan_price`、`notional_usdt`、`leverage` 一律為字串（拒絕浮點數）。
+- **模式旗標遺失或讀取失敗時預設 `MANUAL` + `SIMULATION`**（安全組合）；儲存的 `EXCHANGE_DEMO` 在啟動時若建不出執行器，退回 `SIMULATION` 並寫 `EXECUTION_MODE_FALLBACK`。
+- **PREPARED 也算已開啟配對**（依 spec 定義），所以有 PREPARED 配對時不能切換 `execution_mode`。
+- **意圖在呼叫前先寫 INTENDED、再標 SUBMITTED**，兩次寫入都成功才呼叫 `Executor`；因此崩潰後資料庫一定是 SUBMITTED（不會出現「已呼叫但仍是 INTENDED」）。重啟對帳時「SUBMITTED + 查無 + 兩腿持倉與委託皆無曝險」判為未送達（D12）。
+- **`client_order_id`**：`<sim|demo><l|s><o|c><seq base36 4 碼><uuid 的 FNV-1a 13 碼><uuid 前 0–8 個英數字>`，只用小寫英數、≤ 31 字元（比 spec 的 36 更保守，也落在 OKX `clOrdId` 32 字元以內，**OKX 規則未查證**）。
+- **系統時鐘掃描**只放行 `tokio::time::Instant::now`（可在測試中暫停的計時器，只用於 Snapshot 推送間隔，不蓋事件時間戳）。
+
 ## Open Questions
 
 - Snapshot 最小間隔 250 毫秒、`client_order_id` 長度 36 與字元集、交易所查單保留期限、SQLite 寫入延遲、actor panic 行為皆**未驗證**，分別在 task 1.2、4.1、`exchange-demo-execution` 的驗證中確認。

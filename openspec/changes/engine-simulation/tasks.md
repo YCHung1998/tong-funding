@@ -3,9 +3,10 @@
 
 ## 1. Actor 與通訊
 
-- [ ] 1.1 `Command` / `Event` / `Snapshot` 型別與 `opens_exposure()` 窮舉 match。驗收：先寫「新增變體未分類即編譯失敗」的測試（trybuild 或 clippy `wildcard_enum_match_arm` 於 CI，二選一，先驗證所選方式真的會失敗）與「手動下單依 `reduce_only` 分類」的測試，紅燈後實作；`cargo test -p app engine::command`
-- [ ] 1.2 actor 主迴圈：單一擁有者、I/O 以 spawn task 執行並回送 Event、行情走獨立 `watch`、Snapshot 限頻。驗收：先寫三個測試（下單呼叫永遠不回應時 tick 仍被處理、1 秒 1,000 筆行情只推 ≤ 4 份 Snapshot、UI 停止讀取時記憶體不線性成長）並確認紅燈，再實作；使用 tokio 暫停時間，不實際等待
-- [ ] 1.3 「先落地再生效」的轉移執行器：呼叫 core `next()`、與 store 同一 transaction 寫狀態與事件、寫入失敗即停機；原子 `add_if_not_pending` 與「已開啟配對」定義。驗收：先寫故障注入測試（寫入失敗時 `Executor` 呼叫 0 次、之後 `opens_exposure` Command 被拒）與「兩 Command 對同標的只成功一個」測試，紅燈後實作
+- [x] 1.1 `Command` / `Event` / `Snapshot` 型別與 `opens_exposure()` 窮舉 match。驗收：先寫「新增變體未分類即編譯失敗」的測試（trybuild 或 clippy `wildcard_enum_match_arm` 於 CI，二選一，先驗證所選方式真的會失敗）與「手動下單依 `reduce_only` 分類」的測試，紅燈後實作；`cargo test -p app engine::command`
+- [x] 1.2 actor 主迴圈：單一擁有者、I/O 以 spawn task 執行並回送 Event、行情走獨立 `watch`、Snapshot 限頻。驗收：先寫三個測試（下單呼叫永遠不回應時 tick 仍被處理、1 秒 1,000 筆行情只推 ≤ 4 份 Snapshot、UI 停止讀取時記憶體不線性成長）並確認紅燈，再實作；使用 tokio 暫停時間，不實際等待
+- [x] 1.3 「先落地再生效」的轉移執行器：呼叫 core `next()`、與 store 同一 transaction 寫狀態與事件、寫入失敗即停機；原子 `add_if_not_pending` 與「已開啟配對」定義。驗收：先寫故障注入測試（寫入失敗時 `Executor` 呼叫 0 次、之後 `opens_exposure` Command 被拒）與「兩 Command 對同標的只成功一個」測試，紅燈後實作
+  - 進度（wave 1）：2.1–2.4 的純邏輯已完成（`schedule.rs`、`node0.rs`、`fill.rs`，含時鐘掃描）；接進 actor 與完整一輪事件序列在 wave 2
 
 ## 2. 排程與流程
 
@@ -18,8 +19,10 @@
 
 - [ ] 3.1 `Executor` / `AccountView` 介面、`SimulatedExecutor`（無 client、可腳本化、模擬持倉與委託帳、`sim` 前綴、事件標記模擬）、真實執行器工廠注入與模式切換規則。驗收：先寫「整輪 SIMULATION 工廠呼叫 0 次且網路攔截器 0 請求」「有進行中配對時拒絕切換」「金鑰讀取失敗維持 SIMULATION」測試，紅燈後實作；另附 `cargo tree -p app` 輸出與掃描 `SimulatedExecutor` 模組不引用下單型別的測試
 - [ ] 3.2 `trigger_mode` 與 `execution_mode` 獨立開關、單一下單路徑（手動下單與排程共用 `Executor`）、kill switch 只攔 `opens_exposure` 者且不強平、讀取失敗視為停機。驗收：先寫四種模式組合、停機不自行平倉、停機時人工平倉被接受、讀取失敗視為停機的測試，紅燈後實作
+  - 進度（wave 1）：`SimulatedExecutor`、`SimAccountView`、`CountingFactory`、模式切換與 kill switch 判斷已完成；「整輪 SIMULATION 工廠 0 次」與停機時人工平倉被接受，待 wave 2 接上流程後驗證
 
 ## 4. 恢復
 
 - [ ] 4.1 送單前落地意圖與 `client_order_id` 規則（≤ 36 字元、`[A-Za-z0-9_-]`、決定性）；結果未知不換 id 重送、以原 id 查詢。驗收：先寫「意圖先於呼叫」「意圖寫入失敗不呼叫」「逾時後只查詢不重送」測試，紅燈後實作
 - [ ] 4.2 重啟對帳（唯讀）與啟動關卡：未結束意圖逐一查詢、依規則表轉 `CANCELLED` / `PARTIAL_FAILURE` / `UNRESOLVED` / 正常、對帳完成前拒絕增加曝險、`sim` 意圖轉 `UNRESOLVED`。驗收：崩潰測試在「意圖已寫入未呼叫」與「已呼叫未寫回」兩時點終止並以同一資料庫檔重啟，斷言未重複下單、狀態符合規則、警示已觸發；回報指令與測試檔路徑
+  - 進度（wave 1）：4.1 的 `client_order_id` 與意圖先落地的輔助函式已完成並有測試（意圖先於呼叫、寫入失敗 0 次呼叫、結果未知只查不重送）；4.2 在 wave 2
