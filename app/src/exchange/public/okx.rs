@@ -21,7 +21,8 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::adapter::{
     BATCH_TIMEOUT, ExchangeAdapter, InstrumentRules, ListingStatus, META_TTL_MS, RawObservation, RulesLookup,
-    SINGLE_TIMEOUT, TtlCell, assemble, dec, http_get, int, parse_json, str_field,
+    SINGLE_TIMEOUT, TtlCell, assemble, classify_exchange_body, dec_field, http_get, int, parse_json,
+    percent_encode_value, str_field, validate_symbol,
 };
 use super::endpoints::{
     OKX_FUNDING_RATE, OKX_INSTRUMENTS, OKX_MARK_PRICE, OKX_TICKER, OKX_TICKERS, okx_url,
@@ -64,6 +65,9 @@ fn inst_id_of(symbol: &str) -> Option<String> {
 
 /// OKX failures are `code != "0"` with HTTP 200. Returns the `data` array.
 fn parse_okx_body(body: &str) -> Result<Vec<Value>, AdapterError> {
+    if let Some(limited) = classify_exchange_body(Exchange::Okx, body) {
+        return Err(limited);
+    }
     let v = parse_json(body)?;
     let code = v.get("code").and_then(|c| c.as_str().map(str::to_string).or_else(|| int(c).map(|n| n.to_string())));
     let Some(code) = code else { return Err(AdapterError::parse("response has no code")) };
@@ -77,11 +81,17 @@ fn parse_okx_body(body: &str) -> Result<Vec<Value>, AdapterError> {
         .ok_or_else(|| AdapterError::parse("response has no data array"))
 }
 
-fn parse_rules(symbol: &str, row: &Value) -> Result<InstrumentRules, String> {
-    let step_size = row.get("lotSz").and_then(dec).filter(|s| *s > Decimal::ZERO).ok_or("lotSz missing")?;
-    let min_qty = row.get("minSz").and_then(dec).ok_or("minSz missing")?;
-    let ct_val = row.get("ctVal").and_then(dec).filter(|v| *v > Decimal::ZERO).ok_or("ctVal missing")?;
-    Ok(InstrumentRules {
+/// Outer error: a field is a JSON number instead of a string (`Parse`). Inner error: a required
+/// field is missing, so the rules are unavailable.
+fn parse_rules(symbol: &str, row: &Value) -> Result<Result<InstrumentRules, String>, AdapterError> {
+    let step_size = dec_field(row, "lotSz")?.filter(|s| *s > Decimal::ZERO);
+    let min_qty = dec_field(row, "minSz")?;
+    let ct_val = dec_field(row, "ctVal")?.filter(|v| *v > Decimal::ZERO);
+    let ct_mult = dec_field(row, "ctMult")?;
+    let (Some(step_size), Some(min_qty), Some(ct_val)) = (step_size, min_qty, ct_val) else {
+        return Ok(Err("lotSz, minSz or ctVal missing".into()));
+    };
+    Ok(Ok(InstrumentRules {
         exchange: Exchange::Okx,
         symbol: symbol.to_string(),
         step_size,
@@ -92,8 +102,8 @@ fn parse_rules(symbol: &str, row: &Value) -> Result<InstrumentRules, String> {
         market_max_qty: None,
         min_notional: None,
         ct_val: Some(ct_val),
-        ct_mult: row.get("ctMult").and_then(dec),
-    })
+        ct_mult,
+    }))
 }
 
 fn parse_catalog(body: &str) -> Result<Catalog, AdapterError> {
@@ -101,18 +111,18 @@ fn parse_catalog(body: &str) -> Result<Catalog, AdapterError> {
     for row in parse_okx_body(body)? {
         let Some(symbol) = str_field(&row, "instId").and_then(symbol_of) else { continue };
         let tradable = str_field(&row, "state") == Some("live") && str_field(&row, "ctType") == Some("linear");
-        let rules = parse_rules(&symbol, &row);
+        let rules = parse_rules(&symbol, &row)?;
         map.insert(symbol, Instrument { tradable, rules });
     }
     Ok(Catalog(map))
 }
 
 /// `volCcy24h * last`; empty when either is missing, unparsable or non-positive (never the coin amount).
-fn quote_volume(ticker: Option<&Value>) -> Option<Decimal> {
-    let t = ticker?;
-    let coins = t.get("volCcy24h").and_then(dec)?;
-    let last = t.get("last").and_then(dec).filter(|p| *p > Decimal::ZERO)?;
-    coins.checked_mul(last)
+fn quote_volume(ticker: Option<&Value>) -> Result<Option<Decimal>, AdapterError> {
+    let Some(t) = ticker else { return Ok(None) };
+    let coins = dec_field(t, "volCcy24h")?;
+    let last = dec_field(t, "last")?.filter(|p| *p > Decimal::ZERO);
+    Ok(coins.zip(last).and_then(|(c, l)| c.checked_mul(l)))
 }
 
 fn find_row<'a>(rows: &'a [Value], inst_id: &str) -> Option<&'a Value> {
@@ -146,8 +156,8 @@ impl<T: HttpTransport> OkxAdapter<T> {
         ticker: Option<&Value>,
         catalog: &Result<Arc<Catalog>, AdapterError>,
         observed_at: i64,
-    ) -> Option<FundingObservation> {
-        let symbol = str_field(funding, "instId").and_then(symbol_of)?;
+    ) -> Result<Option<FundingObservation>, AdapterError> {
+        let Some(symbol) = str_field(funding, "instId").and_then(symbol_of) else { return Ok(None) };
         let mut base = match catalog {
             Err(_) => DataStatus::DataError,
             Ok(c) => match c.0.get(&symbol) {
@@ -163,13 +173,16 @@ impl<T: HttpTransport> OkxAdapter<T> {
         let raw = RawObservation {
             exchange: Exchange::Okx,
             symbol,
-            funding_rate: funding.get("fundingRate").and_then(dec),
-            mark_price: mark.and_then(|m| m.get("markPx")).and_then(dec),
+            funding_rate: dec_field(funding, "fundingRate")?,
+            mark_price: match mark {
+                Some(m) => dec_field(m, "markPx")?,
+                None => None,
+            },
             next_funding_time: funding_time,
             exchange_timestamp: funding.get("ts").and_then(int),
-            volume_24h_quote: quote_volume(ticker),
+            volume_24h_quote: quote_volume(ticker)?,
         };
-        Some(assemble(raw, base, interval, observed_at).0)
+        Ok(Some(assemble(raw, base, interval, observed_at).0))
     }
 }
 
@@ -198,20 +211,23 @@ impl<T: HttpTransport> ExchangeAdapter for OkxAdapter<T> {
             rows.iter().filter_map(|r| Some((str_field(r, "instId")?.to_string(), r.clone()))).collect()
         };
         let (mark, tickers) = (by_id(&mark), by_id(&tickers));
-        Ok(funding
-            .iter()
-            .filter_map(|row| {
-                let id = str_field(row, "instId")?;
-                Self::observation(row, mark.get(id), tickers.get(id), &catalog, observed_at)
-            })
-            .collect())
+        let mut out = Vec::with_capacity(funding.len());
+        for row in &funding {
+            let Some(id) = str_field(row, "instId") else { continue };
+            if let Some(obs) = Self::observation(row, mark.get(id), tickers.get(id), &catalog, observed_at)? {
+                out.push(obs);
+            }
+        }
+        Ok(out)
     }
 
     async fn refetch_symbol(&self, symbol: &str) -> Result<FundingObservation, AdapterError> {
-        let inst_id = inst_id_of(symbol).ok_or_else(|| AdapterError::parse(format!("{symbol} is not a BASEUSDT symbol")))?;
-        let funding_q = format!("{OKX_FUNDING_RATE}?instId={inst_id}");
-        let mark_q = format!("{OKX_MARK_PRICE}?instId={inst_id}");
-        let ticker_q = format!("{OKX_TICKER}?instId={inst_id}");
+        validate_symbol(symbol)?;
+        let inst_id = inst_id_of(symbol).ok_or_else(|| AdapterError::parse("symbol is not a BASEUSDT symbol"))?;
+        let encoded = percent_encode_value(&inst_id);
+        let funding_q = format!("{OKX_FUNDING_RATE}?instId={encoded}");
+        let mark_q = format!("{OKX_MARK_PRICE}?instId={encoded}");
+        let ticker_q = format!("{OKX_TICKER}?instId={encoded}");
         let (funding, mark, ticker, catalog) = tokio::join!(
             self.timed_get(&funding_q, SINGLE_TIMEOUT),
             self.timed_get(&mark_q, SINGLE_TIMEOUT),
@@ -227,7 +243,7 @@ impl<T: HttpTransport> ExchangeAdapter for OkxAdapter<T> {
         let funding = find_row(&funding, &inst_id).ok_or_else(|| missing("funding-rate"))?;
         let mark = find_row(&mark, &inst_id).ok_or_else(|| missing("mark-price"))?;
         let ticker = find_row(&ticker, &inst_id).ok_or_else(|| missing("ticker"))?;
-        Self::observation(funding, Some(mark), Some(ticker), &catalog, observed_at)
+        Self::observation(funding, Some(mark), Some(ticker), &catalog, observed_at)?
             .ok_or_else(|| AdapterError::parse("funding-rate row has no usable instId"))
     }
 
@@ -476,10 +492,23 @@ mod tests {
 
     #[test]
     fn nonzero_code_with_http_200_is_an_exchange_error() {
-        let body = r#"{"code":"50011","msg":"Too many requests; OK-ACCESS-KEY: SECRETKEY999","data":[]}"#;
+        let body = r#"{"code":"51000","msg":"Parameter error; OK-ACCESS-KEY: SECRETKEY999","data":[]}"#;
         let err = snapshot(fake_with(Ok(HttpResponse::ok(body)), ok("okx/tickers_swap.json"), ok("okx/instruments_swap.json"))).unwrap_err();
-        assert!(matches!(&err, AdapterError::Exchange { code, .. } if code == "50011"), "{err:?}");
+        assert!(matches!(&err, AdapterError::Exchange { code, .. } if code == "51000"), "{err:?}");
         assert!(!err.to_string().contains("SECRETKEY999"));
+    }
+
+    #[test]
+    fn rate_limit_codes_with_http_200_are_rate_limited() {
+        for code in ["50011", "50013"] {
+            let body = format!(r#"{{"code":"{code}","msg":"Too Many Requests","data":[]}}"#);
+            let err = snapshot(fake_with(Ok(HttpResponse::ok(body)), ok("okx/tickers_swap.json"), ok("okx/instruments_swap.json"))).unwrap_err();
+            assert_eq!(err, AdapterError::RateLimited { retry_after_ms: None }, "{code}");
+        }
+        let mut banned = HttpResponse::with_status(418, "");
+        banned.headers.push(("Retry-After".into(), "3".into()));
+        let err = snapshot(fake_with(Ok(banned), ok("okx/tickers_swap.json"), ok("okx/instruments_swap.json"))).unwrap_err();
+        assert_eq!(err, AdapterError::RateLimited { retry_after_ms: Some(3_000) });
     }
 
     #[test]
@@ -651,6 +680,62 @@ mod tests {
             .on(INSTRUMENTS, ok("okx/instruments_swap.json"));
         let (_, adapter, _) = setup(fake, 0);
         assert_eq!(block_on(adapter.refetch_symbol("BTCUSDT")).unwrap().volume_24h_quote, None);
+    }
+
+    // ----- round 2 -----
+
+    #[test]
+    fn rate_limit_code_on_a_refetch_request_is_rate_limited() {
+        let fake = FakeTransport::new()
+            .on(FR_ONE, Ok(HttpResponse::ok(r#"{"code":"50011","msg":"x","data":[]}"#)))
+            .on(MARK_ONE, ok("okx/mark_price_btc.json"))
+            .on(TICKER_ONE, ok("okx/ticker_btc.json"))
+            .on(INSTRUMENTS, ok("okx/instruments_swap.json"));
+        let (_, adapter, _) = setup(fake, 0);
+        assert_eq!(block_on(adapter.refetch_symbol("BTCUSDT")), Err(AdapterError::RateLimited { retry_after_ms: None }));
+    }
+
+    #[test]
+    fn symbol_with_url_metacharacters_is_rejected_before_any_request() {
+        let (t, adapter, _) = setup(refetch_fake(), 0);
+        for bad in ["BTC&x=1USDT", "BTCUSDT#@evil.com", "", "a b", "USDT"] {
+            assert!(matches!(block_on(adapter.refetch_symbol(bad)), Err(AdapterError::Parse(_))), "{bad:?}");
+        }
+        assert!(t.requests().is_empty());
+    }
+
+    #[test]
+    fn json_number_where_a_decimal_string_is_expected_is_a_parse_error() {
+        let fr = mutated("okx/funding_rate_any.json", |v| edit_row(v, "BTC-USDT-SWAP", |r| r["fundingRate"] = serde_json::json!(1e-4)));
+        let r = snapshot(fake_with(ok_json(&fr), ok("okx/tickers_swap.json"), ok("okx/instruments_swap.json")));
+        assert!(matches!(r, Err(AdapterError::Parse(_))), "{r:?}");
+        let inst = mutated("okx/instruments_swap.json", |v| edit_row(v, "BTC-USDT-SWAP", |r| r["lotSz"] = serde_json::json!(0.01)));
+        let fake = FakeTransport::new().on(INSTRUMENTS, ok_json(&inst));
+        let (_, adapter, _) = setup(fake, 0);
+        assert!(matches!(block_on(adapter.instrument_rules("BTCUSDT")), Err(AdapterError::Parse(_))));
+    }
+
+    #[test]
+    fn past_settlement_time_is_data_error_even_with_a_valid_interval() {
+        let fr = mutated("okx/funding_rate_any.json", |v| {
+            edit_row(v, "ETH-USDT-SWAP", |r| {
+                let ts: i64 = r["ts"].as_str().unwrap().parse().unwrap();
+                let past = ts - 3_600_000;
+                r["fundingTime"] = Value::from(past.to_string());
+                r["nextFundingTime"] = Value::from((past + 8 * 3_600_000).to_string());
+            })
+        });
+        let all = snapshot(fake_with(ok_json(&fr), ok("okx/tickers_swap.json"), ok("okx/instruments_swap.json"))).unwrap();
+        assert_eq!(find(&all, "ETHUSDT").data_status, DataStatus::DataError);
+        assert_eq!(find(&all, "BTCUSDT").data_status, DataStatus::Listed);
+    }
+
+    #[test]
+    fn real_recorded_responses_are_not_rejected_by_the_string_only_rule() {
+        assert!(snapshot(happy_fake()).is_ok());
+        let (_, adapter, _) = setup(refetch_fake(), 0);
+        assert!(block_on(adapter.refetch_symbol("BTCUSDT")).is_ok());
+        assert!(matches!(block_on(adapter.instrument_rules("BTCUSDT")), Ok(RulesLookup::Available(_))));
     }
 
     #[test]

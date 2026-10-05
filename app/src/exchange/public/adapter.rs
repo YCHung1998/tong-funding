@@ -17,6 +17,7 @@ use tong_funding_core::quantity::LotSize;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use crate::exchange::error::AdapterError;
+use crate::exchange::health::ratelimit::rate_limit_error;
 use crate::exchange::transport::{HttpRequest, HttpResponse, HttpTransport};
 
 /// Single-symbol requests (pre-trade re-fetch). Proposed value, not yet validated (design D10).
@@ -62,9 +63,27 @@ pub struct InstrumentRules {
 }
 
 impl InstrumentRules {
-    /// The lot size `core` uses for rounding (`step_size`, `min_qty`).
+    /// Lot size of ordinary LIMIT orders (`step_size`, `min_qty`), for `core`'s rounding.
+    ///
+    /// UNIT WARNING: Binance and Bybit quantities are in the BASE COIN; OKX quantities are in
+    /// CONTRACTS (one contract is `ct_val` of the base coin). The two must never be mixed; convert
+    /// with `Quantity::okx_contracts` for OKX.
+    ///
+    /// `core::LotSize` has no upper bound, so `max_qty` (limit orders) and `market_max_qty` (market
+    /// orders: Binance `MARKET_LOT_SIZE.maxQty`, Bybit `maxMktOrderQty`) are NOT part of the returned
+    /// value. They stay on `InstrumentRules` and the pre-trade check must read them from there.
     pub fn lot_size(&self) -> LotSize {
         LotSize { step_size: self.step_size, min_qty: self.min_qty }
+    }
+
+    /// Lot size of MARKET orders: the `market_*` fields, each falling back to the limit-order value
+    /// when the exchange gave none. A market order's cap (`market_max_qty`) can be far smaller than
+    /// the limit cap (e.g. 120 vs 1000); see the unit and cap notes on [`Self::lot_size`].
+    pub fn market_lot_size(&self) -> LotSize {
+        LotSize {
+            step_size: self.market_step_size.unwrap_or(self.step_size),
+            min_qty: self.market_min_qty.unwrap_or(self.min_qty),
+        }
     }
 }
 
@@ -100,16 +119,10 @@ pub trait ExchangeAdapter: Send + Sync {
 // shared helpers
 // ---------------------------------------------------------------------------------------------
 
-/// `Retry-After` in whole seconds to milliseconds; an HTTP-date or garbage gives `None`.
-pub(crate) fn retry_after_ms(resp: &HttpResponse) -> Option<u64> {
-    let secs: u64 = resp.header_value("retry-after")?.trim().parse().ok()?;
-    secs.checked_mul(1000)
-}
-
-/// 429 gives `RateLimited`, other non-2xx gives `Http`, 2xx gives the body.
+/// 429 and 418 give `RateLimited` (with `Retry-After`), other non-2xx give `Http`, 2xx gives the body.
 pub(crate) fn classify_response(resp: HttpResponse) -> Result<String, AdapterError> {
-    if resp.status == 429 {
-        return Err(AdapterError::RateLimited { retry_after_ms: retry_after_ms(&resp) });
+    if let Some(e) = rate_limit_error(&resp) {
+        return Err(e);
     }
     if !(200..300).contains(&resp.status) {
         return Err(AdapterError::Http { status: resp.status });
@@ -125,19 +138,63 @@ pub(crate) async fn http_get<T: HttpTransport>(
     classify_response(transport.get(HttpRequest::get(url, timeout)).await?)
 }
 
+/// A symbol or instrument id that is about to be put into a URL: only `[A-Za-z0-9_-]`, non-empty.
+/// Anything else is a `Parse` error and no request may be sent.
+pub(crate) fn validate_symbol(symbol: &str) -> Result<(), AdapterError> {
+    let ok = !symbol.is_empty() && symbol.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if ok { Ok(()) } else { Err(AdapterError::parse("symbol contains characters that are not allowed in a request")) }
+}
+
+/// RFC 3986 percent-encoding, unreserved characters kept. The same rule as the signed client's
+/// `percent_encode`; every external string that goes into a query value passes through here
+/// (a Bybit cursor is therefore encoded once more, e.g. `%3D` becomes `%253D`).
+pub(crate) fn percent_encode_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Rate-limit failures that arrive as HTTP 200 with an error body: Bybit `retCode` 10006 / 10018 and
+/// OKX `code` "50011" / "50013". TEMPORARY local copy of the shared helper
+/// `health::ratelimit::classify_exchange_body` (same signature); to be replaced by it.
+pub(crate) fn classify_exchange_body(exchange: Exchange, body: &str) -> Option<AdapterError> {
+    let v: Value = serde_json::from_str(body).ok()?;
+    let limited = match exchange {
+        Exchange::Bybit => matches!(v.get("retCode").and_then(int), Some(10006 | 10018)),
+        Exchange::Okx => matches!(v.get("code").and_then(Value::as_str), Some("50011" | "50013")),
+        Exchange::Binance => false,
+    };
+    limited.then_some(AdapterError::RateLimited { retry_after_ms: None })
+}
+
+/// A decimal from an object field. Real responses carry decimals as STRINGS, so a JSON number is
+/// refused (`Parse`) instead of being routed through floating point; missing, null and "" are `None`.
+pub(crate) fn dec_field(obj: &Value, key: &str) -> Result<Option<Decimal>, AdapterError> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(_)) => Ok(obj.get(key).and_then(dec)),
+        Some(_) => Err(AdapterError::parse(format!("field {key} is not a decimal string"))),
+    }
+}
+
 pub(crate) fn parse_json(body: &str) -> Result<Value, AdapterError> {
     serde_json::from_str(body).map_err(|e| AdapterError::parse(format!("invalid JSON: {e}")))
 }
 
-/// A decimal from a JSON string or number; empty strings and anything unparsable give `None`.
-/// Numbers go through their text form, never through `f64` arithmetic.
+/// A decimal from a JSON STRING; numbers, empty strings and anything unparsable give `None`
+/// (nothing is ever parsed through `f64`).
 pub(crate) fn dec(v: &Value) -> Option<Decimal> {
     match v {
         Value::String(s) => {
             let s = s.trim();
             if s.is_empty() { None } else { Decimal::from_str(s).ok() }
         }
-        Value::Number(n) => Decimal::from_str(&n.to_string()).ok(),
         _ => None,
     }
 }
@@ -194,8 +251,8 @@ pub(crate) struct RawObservation {
     pub volume_24h_quote: Option<Decimal>,
 }
 
-/// `next_funding_time - reference` may not exceed the interval plus the tolerance; the reference is
-/// the exchange timestamp, or `observed_at` when the body has none.
+/// `next_funding_time - reference` must lie in `(-tolerance, interval + tolerance]` and the time must
+/// be positive; the reference is the exchange timestamp, or `observed_at` when the body has none.
 pub(crate) fn interval_consistent(
     next_funding_time: i64,
     interval_secs: i64,
@@ -204,7 +261,10 @@ pub(crate) fn interval_consistent(
 ) -> bool {
     let reference = exchange_timestamp.filter(|t| *t > 0).unwrap_or(observed_at);
     let limit = interval_secs.saturating_mul(1000).saturating_add(CONSISTENCY_TOLERANCE_MS);
-    next_funding_time.saturating_sub(reference) <= limit
+    let distance = next_funding_time.saturating_sub(reference);
+    // Upper bound: not further away than one interval. Lower bound: not zero, not already past
+    // (more than the tolerance ago); a settlement time that has gone by is stale data.
+    next_funding_time > 0 && distance > -CONSISTENCY_TOLERANCE_MS && distance <= limit
 }
 
 /// Builds the final observation. `base` is the verdict of the catalog (and any exchange-specific
@@ -358,7 +418,7 @@ mod tests {
         assert_eq!(dec(&serde_json::json!("")), None);
         assert_eq!(dec(&serde_json::json!(null)), None);
         assert_eq!(dec(&serde_json::json!("abc")), None);
-        assert_eq!(dec(&serde_json::json!(12)), Some(d("12")));
+        assert_eq!(dec(&serde_json::json!(12)), None, "numbers are refused");
     }
 
     #[test]
@@ -440,6 +500,124 @@ mod tests {
     fn assemble_keeps_not_listed_and_data_error_verdicts() {
         assert_eq!(assemble(raw(), DataStatus::NotListed, Some(28_800), 2_000).0.data_status, DataStatus::NotListed);
         assert_eq!(assemble(raw(), DataStatus::DataError, Some(28_800), 2_000).0.data_status, DataStatus::DataError);
+    }
+
+    // ----- round 2: rate-limit codes, strict window, symbol/URL safety, market lot, string-only decimals -----
+
+    #[test]
+    fn status_418_is_rate_limited_like_429() {
+        let mut r = HttpResponse::with_status(418, "");
+        r.headers.push(("Retry-After".into(), "120".into()));
+        assert_eq!(classify_response(r), Err(AdapterError::RateLimited { retry_after_ms: Some(120_000) }));
+    }
+
+    #[test]
+    fn body_rate_limit_codes_are_recognised_per_exchange() {
+        let rl = Some(AdapterError::RateLimited { retry_after_ms: None });
+        assert_eq!(classify_exchange_body(Exchange::Bybit, r#"{"retCode":10006,"retMsg":"Too many visits"}"#), rl);
+        assert_eq!(classify_exchange_body(Exchange::Bybit, r#"{"retCode":10018,"retMsg":"exceeded"}"#), rl);
+        assert_eq!(classify_exchange_body(Exchange::Okx, r#"{"code":"50011","msg":"Too Many Requests","data":[]}"#), rl);
+        assert_eq!(classify_exchange_body(Exchange::Okx, r#"{"code":"50013","msg":"busy","data":[]}"#), rl);
+        // other failures and successes are not rate limits; codes are matched per exchange
+        assert_eq!(classify_exchange_body(Exchange::Bybit, r#"{"retCode":10001,"retMsg":"x"}"#), None);
+        assert_eq!(classify_exchange_body(Exchange::Bybit, r#"{"retCode":0,"retMsg":"OK"}"#), None);
+        assert_eq!(classify_exchange_body(Exchange::Okx, r#"{"code":"0","data":[]}"#), None);
+        assert_eq!(classify_exchange_body(Exchange::Okx, r#"{"retCode":10006}"#), None);
+        assert_eq!(classify_exchange_body(Exchange::Binance, r#"{"code":50011,"msg":"x"}"#), None);
+        assert_eq!(classify_exchange_body(Exchange::Bybit, "not json"), None);
+    }
+
+    #[test]
+    fn settlement_time_zero_or_in_the_past_is_inconsistent() {
+        let reference = 10_000_000_i64;
+        assert!(!interval_consistent(0, 28_800, Some(reference), 0), "nextFundingTime = 0");
+        assert!(!interval_consistent(reference - 3_600_000, 28_800, Some(reference), 0), "an hour ago");
+        assert!(!interval_consistent(reference - 60_000, 28_800, Some(reference), 0), "exactly reference - 60 s is outside (strict)");
+        assert!(interval_consistent(reference - 59_999, 28_800, Some(reference), 0), "just inside the tolerance");
+        assert!(interval_consistent(reference + 1, 28_800, Some(reference), 0));
+        assert!(!interval_consistent(-5, 28_800, None, 0));
+    }
+
+    #[test]
+    fn zero_next_funding_time_makes_a_listed_row_a_data_error() {
+        let mut r = raw();
+        r.next_funding_time = Some(0);
+        assert_eq!(assemble(r, DataStatus::Listed, Some(28_800), 2_000).0.data_status, DataStatus::DataError);
+    }
+
+    #[test]
+    fn symbols_are_restricted_to_url_safe_characters() {
+        for ok in ["BTCUSDT", "1000PEPEUSDT", "BTCUSDT-09OCT26", "A_b", "BTC-USDT-SWAP"] {
+            assert!(validate_symbol(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "BTCUSDT&category=inverse#@evil.com", "a b", "a/b", "a%20b", "a?b", "a=b", "é", "a\nb"] {
+            assert!(matches!(validate_symbol(bad), Err(AdapterError::Parse(_))), "{bad:?}");
+        }
+    }
+
+    /// Reference decoder for the round-trip check.
+    fn percent_decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' {
+                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn percent_encoding_matches_the_signed_client_rule_and_round_trips() {
+        assert_eq!(percent_encode_value("AZaz09-._~"), "AZaz09-._~");
+        assert_eq!(percent_encode_value("a b&c=d%"), "a%20b%26c%3Dd%25");
+        assert_eq!(percent_encode_value("x%3D"), "x%253D");
+        for raw in ["first%3D0GUSDT%26last%3DMOCAUSDT", "a%b=c&d", "q?r#s+t u", "é"] {
+            let enc = percent_encode_value(raw);
+            assert!(!enc.contains(['&', '=', '#', '?', ' ', '+']), "{enc}");
+            assert_eq!(percent_decode(&enc), raw);
+        }
+    }
+
+    #[test]
+    fn market_lot_size_uses_market_fields_with_fallback_to_the_limit_lot_size() {
+        let mut r = InstrumentRules {
+            exchange: Exchange::Binance,
+            symbol: "X".into(),
+            step_size: d("0.1"),
+            min_qty: d("0.2"),
+            max_qty: Some(d("1000")),
+            market_step_size: Some(d("0.01")),
+            market_min_qty: Some(d("0.5")),
+            market_max_qty: Some(d("120")),
+            min_notional: None,
+            ct_val: None,
+            ct_mult: None,
+        };
+        assert_eq!(r.market_lot_size(), LotSize { step_size: d("0.01"), min_qty: d("0.5") });
+        assert_eq!(r.lot_size(), LotSize { step_size: d("0.1"), min_qty: d("0.2") });
+        r.market_step_size = None;
+        assert_eq!(r.market_lot_size(), LotSize { step_size: d("0.1"), min_qty: d("0.5") }, "per-field fallback");
+        r.market_min_qty = None;
+        assert_eq!(r.market_lot_size(), r.lot_size());
+        assert_eq!((r.max_qty, r.market_max_qty), (Some(d("1000")), Some(d("120"))), "caps stay available for pre-trade checks");
+    }
+
+    #[test]
+    fn decimal_fields_accept_only_strings() {
+        let row = serde_json::json!({"s":"0.1","n":0.1,"e":1e-4,"i":5,"empty":"","null":null});
+        assert_eq!(dec_field(&row, "s"), Ok(Some(d("0.1"))));
+        assert_eq!(dec_field(&row, "empty"), Ok(None));
+        assert_eq!(dec_field(&row, "null"), Ok(None));
+        assert_eq!(dec_field(&row, "absent"), Ok(None));
+        for k in ["n", "e", "i"] {
+            assert!(matches!(dec_field(&row, k), Err(AdapterError::Parse(_))), "{k}");
+        }
     }
 
     // ----- read-only trait (spec: ExchangeAdapter 是唯讀介面) -----
