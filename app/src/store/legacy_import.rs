@@ -167,7 +167,10 @@ pub(super) fn run_import_on_with_hook(
     let last_idx = segments.len().saturating_sub(1);
     for (i, raw) in segments.iter().enumerate() {
         // CRLF and LF copies of one event are the same event: hash and parse without the CR.
-        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        let mut raw: &[u8] = raw;
+        while let Some(rest) = raw.strip_suffix(b"\r") {
+            raw = rest;
+        }
         report.total_lines += 1;
         let line_no = i + 1;
         let parsed = if !ends_with_newline && i == last_idx {
@@ -296,7 +299,9 @@ fn parse_line(raw: &[u8]) -> Result<(ParsedLine, bool), String> {
         return Err(format!("`ts` {ts} outside the plausible Unix-seconds range"));
     }
     let event_type = match obj.remove("event_type") {
-        Some(serde_json::Value::String(s)) if s.trim().is_empty() => return Err("`event_type` is empty".to_string()),
+        Some(serde_json::Value::String(s)) if s.is_empty() || !s.chars().all(|c| c.is_ascii_graphic()) => {
+            return Err("`event_type` is empty or has characters other than visible ASCII".to_string());
+        }
         Some(serde_json::Value::String(s)) => s,
         Some(_) => return Err("`event_type` is not a string".to_string()),
         None => return Err("missing `event_type`".to_string()),
@@ -858,6 +863,33 @@ mod tests {
         let r = run(&mut c, &p);
         assert_eq!((r.imported, r.existing), (0, 1));
         assert_eq!(rows(&c)[0].4.as_deref(), Some(sha_hex(line.as_bytes()).as_str()));
+    }
+
+    #[test]
+    fn every_trailing_cr_is_stripped_before_hashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = ev(1791090102.0, "A");
+        let p = dir.path().join("events.jsonl");
+        fs::write(&p, format!("{line}\n")).unwrap();
+        let mut c = mem_db();
+        assert_eq!(run(&mut c, &p).imported, 1);
+        for ending in ["\r\n", "\r\r\n", "\r\r\r\n"] {
+            fs::write(&p, format!("{line}{ending}")).unwrap();
+            let r = run(&mut c, &p);
+            assert_eq!((r.imported, r.existing), (0, 1), "ending {ending:?}");
+        }
+        assert_eq!(count(&c), 1);
+    }
+
+    #[test]
+    fn event_type_must_be_visible_ascii() {
+        for bad in ["A\u{200B}B", "ＡＢ", "A B", "A\tB", "A\u{7}B", "é", "A\u{FEFF}"] {
+            let line = json!({"ts": 1791090102.0, "event_type": bad}).to_string();
+            assert!(invalid_reason(&line).contains("event_type"), "{bad:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_src(&dir, &[ev(1791090102.0, "ORDER_SUBMIT-1.v2")]);
+        assert_eq!(run(&mut mem_db(), &p).imported, 1);
     }
 
     #[test]
