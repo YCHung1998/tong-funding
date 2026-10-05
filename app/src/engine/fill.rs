@@ -97,6 +97,8 @@ pub enum LegFill {
     Unknown,
     /// Quantities in base-coin units.
     Known { requested: Decimal, filled: Decimal },
+    /// The order is over (cancelled, expired or rejected) and will not fill any further.
+    Terminal { requested: Decimal, filled: Decimal },
 }
 
 /// Fill-monitor result. There is deliberately no "send an order" variant.
@@ -116,18 +118,23 @@ pub fn timeout_at_ms(eff: &EffectiveConfig, sent_at_ms: i64) -> i64 {
 
 /// Fill-monitor decision. Both legs completely filled → within / beyond
 /// `max_leg_imbalance_pct` (relative difference of base quantities, % of the larger). Otherwise
-/// wait until the timeout, then: any leg unknown → `TimeoutUndetermined` (UNRESOLVED); both zero
-/// → `TimeoutNoFills` (CANCELLED); else → `TimeoutPartialFill` (PARTIAL_FAILURE).
+/// wait until the timeout — or less, once both legs are settled (filled or terminal, e.g. one
+/// filled and the other rejected) — then: any leg unknown → `TimeoutUndetermined` (UNRESOLVED);
+/// both zero → `TimeoutNoFills` (CANCELLED); else → `TimeoutPartialFill` (PARTIAL_FAILURE).
 pub fn fill_decision(eff: &EffectiveConfig, sent_at_ms: i64, now_ms: i64, long: LegFill, short: LegFill) -> FillDecision {
-    // `(requested, filled)` for a usable leg; a non-positive or negative quantity is not a fact.
+    // `(requested, filled, over)` for a usable leg; a non-positive or negative quantity is not a
+    // fact. `over` = the order is terminal and cannot fill any further.
     let usable = |f: LegFill| match f {
         LegFill::Known { requested, filled } if requested > Decimal::ZERO && filled >= Decimal::ZERO => {
-            Some((requested, filled))
+            Some((requested, filled, false))
         }
-        LegFill::Known { .. } | LegFill::Unknown => None,
+        LegFill::Terminal { requested, filled } if requested > Decimal::ZERO && filled >= Decimal::ZERO => {
+            Some((requested, filled, true))
+        }
+        LegFill::Known { .. } | LegFill::Terminal { .. } | LegFill::Unknown => None,
     };
     let (l, s) = (usable(long), usable(short));
-    if let (Some((lr, lf)), Some((sr, sf))) = (l, s)
+    if let (Some((lr, lf, _)), Some((sr, sf, _))) = (l, s)
         && lf >= lr
         && sf >= sr
     {
@@ -140,11 +147,14 @@ pub fn fill_decision(eff: &EffectiveConfig, sent_at_ms: i64, now_ms: i64, long: 
         };
         return FillDecision::Transition(event);
     }
-    if now_ms < timeout_at_ms(eff, sent_at_ms) {
+    // Settled = can no longer change (completely filled, or terminal). When both legs are
+    // settled, waiting for the timeout cannot change the outcome: decide now.
+    let settled = |x: Option<(Decimal, Decimal, bool)>| x.is_some_and(|(r, f, over)| over || f >= r);
+    if !(settled(l) && settled(s)) && now_ms < timeout_at_ms(eff, sent_at_ms) {
         return FillDecision::Wait;
     }
     let event = match (l, s) {
-        (Some((_, lf)), Some((_, sf))) if lf.is_zero() && sf.is_zero() => SystemEvent::TimeoutNoFills,
+        (Some((_, lf, _)), Some((_, sf, _))) if lf.is_zero() && sf.is_zero() => SystemEvent::TimeoutNoFills,
         (Some(_), Some(_)) => SystemEvent::TimeoutPartialFill,
         (None, _) | (_, None) => SystemEvent::TimeoutUndetermined,
     };
@@ -382,6 +392,37 @@ mod tests {
         assert_eq!(
             fill_decision(&eff, 0, 15_000, known("0", "0"), known("1", "0")),
             FillDecision::Transition(SystemEvent::TimeoutUndetermined)
+        );
+    }
+
+    fn terminal(requested: &str, filled: &str) -> LegFill {
+        LegFill::Terminal { requested: dec(requested), filled: dec(filled) }
+    }
+
+    #[test]
+    fn a_terminally_rejected_or_cancelled_leg_decides_before_the_timeout() {
+        let eff = eff_with(RiskOverrides::new());
+        // Long filled, short cancelled with nothing: nothing more can happen -> now, not at 15 s.
+        assert_eq!(
+            fill_decision(&eff, 0, 1_000, known("1", "1"), terminal("1", "0")),
+            FillDecision::Transition(SystemEvent::TimeoutPartialFill)
+        );
+        // Both terminal with nothing filled -> no exposure -> CANCELLED now.
+        assert_eq!(
+            fill_decision(&eff, 0, 1_000, terminal("1", "0"), terminal("1", "0")),
+            FillDecision::Transition(SystemEvent::TimeoutNoFills)
+        );
+        // One terminal, the other still open: it may still fill, keep waiting until the timeout.
+        assert_eq!(fill_decision(&eff, 0, 1_000, known("1", "0.5"), terminal("1", "0")), FillDecision::Wait);
+        assert_eq!(fill_decision(&eff, 0, 1_000, LegFill::Unknown, terminal("1", "0")), FillDecision::Wait);
+        assert_eq!(
+            fill_decision(&eff, 0, 15_000, known("1", "0.5"), terminal("1", "0")),
+            FillDecision::Transition(SystemEvent::TimeoutPartialFill)
+        );
+        // A terminal leg that is completely filled counts as filled.
+        assert_eq!(
+            fill_decision(&eff, 0, 1_000, terminal("1", "1"), known("1", "1")),
+            FillDecision::Transition(SystemEvent::FillsWithinTolerance)
         );
     }
 

@@ -309,6 +309,35 @@ impl Db {
         })
     }
 
+    /// [`Db::add_pair_if_not_pending`] plus one event, in ONE transaction: either the pair and
+    /// its event both exist, or neither does. `AlreadyPending` writes nothing. A failed event
+    /// write halts the store (like every event write).
+    pub fn add_pair_with_event(
+        &self,
+        pair: &NewPair,
+        event_type: &str,
+        payload: &Value,
+    ) -> Result<AddPairOutcome, StoreError> {
+        reject_secret_json("pairs.entry_json", &pair.entry)?;
+        self.with_conn(|c| {
+            let now = self.now_ms();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let n = tx.execute(
+                "INSERT INTO pairs (internal_uuid, pair_id, symbol, status, entry_json, created_ms, updated_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                 ON CONFLICT (symbol) WHERE status = 'PREPARED' DO NOTHING",
+                params![pair.internal_uuid, pair.pair_id, pair.symbol, pair.status.as_str(), pair.entry.to_string(), now],
+            )?;
+            if n != 1 {
+                return Ok(AddPairOutcome::AlreadyPending); // dropping `tx` rolls back (nothing written)
+            }
+            insert_event_on(&tx, now, event_type, Some(&pair.internal_uuid), payload)
+                .map_err(|e| self.event_write_failed(event_type, &e))?;
+            tx.commit()?;
+            Ok(AddPairOutcome::Added)
+        })
+    }
+
     /// `Ok(false)` when no such pair.
     pub fn set_pair_status(&self, internal_uuid: &str, status: PairState) -> Result<bool, StoreError> {
         self.with_conn(|c| {
@@ -1364,6 +1393,26 @@ mod tests {
         let plain = rusqlite::Connection::open(db.path()).unwrap();
         let status: String = plain.query_row("SELECT status FROM pairs WHERE internal_uuid = 'u1'", [], |r| r.get(0)).unwrap();
         assert_eq!(status, "PREPARED", "status must roll back with the event");
+    }
+
+    #[test]
+    fn add_pair_with_event_writes_both_or_neither() {
+        let (_d, db, clock) = open_tmp();
+        clock.set(3_000_000);
+        let ok = db.add_pair_with_event(&pair("u1", "BTCUSDT", PairState::Prepared), "PAIR_PREPARED", &json!({"s": "BTCUSDT"}));
+        assert_eq!(ok.unwrap(), AddPairOutcome::Added);
+        assert_eq!(events_of(&db, "PAIR_PREPARED"), vec![(Some("u1".to_string()), json!({"s": "BTCUSDT"}))]);
+        // Same symbol still PREPARED: nothing at all is written.
+        let dup = db.add_pair_with_event(&pair("u2", "BTCUSDT", PairState::Prepared), "PAIR_PREPARED", &json!({}));
+        assert_eq!(dup.unwrap(), AddPairOutcome::AlreadyPending);
+        assert_eq!(events_of(&db, "PAIR_PREPARED").len(), 1);
+        // A failing event insert rolls the pair back and halts.
+        break_event_inserts(&db);
+        let r = db.add_pair_with_event(&pair("u3", "ETHUSDT", PairState::Prepared), "PAIR_PREPARED", &json!({}));
+        assert!(matches!(r, Err(StoreError::Halted(HaltReason::EventWriteFailed(_)))), "{r:?}");
+        let plain = rusqlite::Connection::open(db.path()).unwrap();
+        let n: i64 = plain.query_row("SELECT COUNT(*) FROM pairs WHERE internal_uuid = 'u3'", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0, "the pair must roll back with its event");
     }
 
     #[test]

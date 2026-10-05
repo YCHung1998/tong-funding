@@ -53,6 +53,8 @@ pub struct Node0Leg<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Node0Context<'a> {
     pub now_ms: i64,
+    /// The pair's symbol; every quote must be of this symbol on its leg's exchange.
+    pub symbol: &'a str,
     pub entry: &'a EntrySnapshot,
     /// `effective_for_pair(global, overrides, long, short)`; never the global values.
     pub effective: &'a EffectiveConfig,
@@ -72,6 +74,8 @@ pub enum Node0Block {
     ConfigIncomplete { missing: Vec<String> },
     /// The stored entry snapshot cannot be used (e.g. leverage <= 0).
     InvalidEntry { reason: String },
+    /// A fetched quote is not of this leg's exchange or of the pair's symbol (wiring bug).
+    DataMismatch { reason: String },
     /// Core's checks failed (canonical order) with human-readable notes for the event log.
     Checks { failed: Vec<Check>, notes: Vec<String> },
 }
@@ -153,6 +157,25 @@ pub fn build_input(
     long: &Node0Leg<'_>,
     short: &Node0Leg<'_>,
 ) -> Result<(PretradeInput, PretradeLimits, Vec<String>), Node0Block> {
+    for (name, leg) in [(Leg::Long, long), (Leg::Short, short)] {
+        let quotes = [("pre-trade", Some(leg.pretrade)), ("baseline", leg.baseline)];
+        for (what, q) in quotes {
+            if let Some(q) = q
+                && (q.funding.exchange != leg.exchange || q.funding.symbol != ctx.symbol)
+            {
+                return Err(Node0Block::DataMismatch {
+                    reason: format!(
+                        "{}: {what} quote is {:?} {} but the leg is {:?} {}",
+                        name.as_str(),
+                        q.funding.exchange,
+                        q.funding.symbol,
+                        leg.exchange,
+                        ctx.symbol
+                    ),
+                });
+            }
+        }
+    }
     let eff = ctx.effective;
     let missing = missing_settings(eff, long.exchange, short.exchange);
     if !missing.is_empty() {
@@ -336,6 +359,7 @@ mod tests {
             let eff = effective_for_pair(&self.cfg, &self.overrides, Exchange::Binance, Exchange::Bybit);
             let ctx = Node0Context {
                 now_ms: self.now,
+                symbol: "BTCUSDT",
                 entry: &self.entry,
                 effective: &eff,
                 max_concurrent_pairs: self.cfg.max_concurrent_pairs,
@@ -412,6 +436,7 @@ mod tests {
         let eff = effective_for_pair(&fx.cfg, &fx.overrides, Exchange::Binance, Exchange::Bybit);
         let ctx = Node0Context {
             now_ms: fx.now,
+            symbol: "BTCUSDT",
             entry: &fx.entry,
             effective: &eff,
             max_concurrent_pairs: 3,
@@ -524,6 +549,20 @@ mod tests {
         let mut fx = Fx::new();
         fx.cfg.allowed_exchanges = vec![Exchange::Binance, Exchange::Okx];
         assert_eq!(fx.failed(), vec![Check::ExchangeAllowed]);
+    }
+
+    #[test]
+    fn quotes_of_another_exchange_or_symbol_are_refused() {
+        let mut fx = Fx::new();
+        fx.pre_s = quote(Exchange::Okx, "0.001", "100.01", 6_000); // short leg is Bybit
+        assert!(
+            matches!(fx.verdict(), Node0Verdict::Block(Node0Block::DataMismatch { ref reason }) if reason.contains("short")),
+            "{:?}",
+            fx.verdict()
+        );
+        let mut fx = Fx::new();
+        fx.base_l.funding.symbol = "ETHUSDT".into();
+        assert!(matches!(fx.verdict(), Node0Verdict::Block(Node0Block::DataMismatch { .. })), "{:?}", fx.verdict());
     }
 
     #[test]
