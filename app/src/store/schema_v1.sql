@@ -27,6 +27,14 @@ CREATE TRIGGER events_no_overwrite BEFORE INSERT ON events
 WHEN NEW.id IS NOT NULL AND EXISTS (SELECT 1 FROM events WHERE id = NEW.id)
 BEGIN SELECT RAISE(ABORT, 'events is append-only: overwrite forbidden'); END;
 
+-- `legacy_hash` is the idempotence key of the legacy importer. A duplicate is IGNOREd (not
+-- ABORTed) so `ON CONFLICT DO NOTHING` stays idempotent, and so that `REPLACE` / `INSERT OR REPLACE`
+-- on a connection without `recursive_triggers` can never delete the original event (the trigger
+-- fires before the conflict is resolved and skips the whole insert).
+CREATE TRIGGER events_legacy_hash_dedupe BEFORE INSERT ON events
+WHEN NEW.legacy_hash IS NOT NULL AND EXISTS (SELECT 1 FROM events WHERE legacy_hash = NEW.legacy_hash)
+BEGIN SELECT RAISE(IGNORE); END;
+
 CREATE TABLE pairs (
     internal_uuid TEXT PRIMARY KEY,
     pair_id       TEXT    NOT NULL,
