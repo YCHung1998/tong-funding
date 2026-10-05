@@ -32,8 +32,8 @@ impl<F: Fn() -> Option<i64> + Send + Sync> ClockOffsetSource for F {
 
 /// API credentials. `Debug` never prints the values.
 pub struct Credentials {
-    pub(super) api_key: String,
-    pub(super) api_secret: String,
+    pub(in crate::exchange) api_key: String,
+    pub(in crate::exchange) api_secret: String,
 }
 
 impl std::fmt::Debug for Credentials {
