@@ -6,12 +6,13 @@
 
 #![allow(dead_code)]
 
-use std::fs::{DirBuilder, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use super::events::insert_event_on;
@@ -44,6 +45,10 @@ pub enum HaltReason {
     ConfigReadFailed(String),
     #[error("cannot read kill switch: {0}")]
     KillSwitchReadFailed(String),
+    #[error("event write failed: {0}")]
+    EventWriteFailed(String),
+    #[error("database is already open in another instance: {0}")]
+    AlreadyOpen(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +69,10 @@ pub enum StoreError {
     IntentNotFound(String),
     #[error("HOME is not set; cannot locate the default database path")]
     HomeNotSet,
+    #[error("illegal order intent transition {from} -> {to}")]
+    IllegalIntentTransition { from: String, to: String },
+    #[error("flag {0:?} is reserved and cannot be written through flag_set")]
+    ReservedFlag(String),
 }
 
 /// A file whose permissions were wider than 0600 and have been tightened.
@@ -71,6 +80,7 @@ pub enum StoreError {
 pub struct Tightened {
     pub path: PathBuf,
     pub old_mode: u32,
+    pub new_mode: u32,
 }
 
 struct Inner {
@@ -78,6 +88,8 @@ struct Inner {
     halt: Mutex<Option<HaltReason>>,
     clock: Arc<dyn Clock>,
     path: PathBuf,
+    /// Single-instance lock; released when the last clone of the handle is dropped.
+    _lock: Option<File>,
 }
 
 /// Cheap to clone; clones share one connection (serialised by a mutex).
@@ -102,13 +114,14 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     o.into()
 }
 
-/// If `path` exists and is wider than 0600, chmod it to 0600 and return its old mode.
-fn tighten(path: &Path) -> std::io::Result<Option<u32>> {
-    match std::fs::metadata(path) {
+/// If `path` exists and has any permission bit outside `max_mode`, chmod it to `max_mode` and
+/// return its old mode. Never follows a symlink (callers reject those first).
+fn tighten(path: &Path, max_mode: u32) -> std::io::Result<Option<u32>> {
+    match std::fs::symlink_metadata(path) {
         Ok(m) => {
             let mode = m.permissions().mode() & 0o777;
-            if mode & !0o600 != 0 {
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            if mode & !max_mode != 0 {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(max_mode))?;
                 Ok(Some(mode))
             } else {
                 Ok(None)
@@ -138,55 +151,202 @@ fn migrate(conn: &mut Connection, migrations: &[Migration], current: i64) -> rus
     Ok(())
 }
 
-/// Open, verify and migrate. Order matters for fail-closed: a non-empty existing file is only
-/// ever read (integrity, schema version) before anything that could write to it; WAL mode is
-/// switched on last, and a fresh file is created 0600 before SQLite writes a single byte.
-fn open_connection(path: &Path, migrations: &[Migration]) -> Result<(Connection, Vec<Tightened>), HaltReason> {
+/// Everything `open_connection` hands back on success.
+struct Opened {
+    conn: Connection,
+    tightened: Vec<Tightened>,
+    /// Held for the life of the handle: the single-instance lock on `<db>.lock`.
+    lock: Option<File>,
+}
+
+/// Refuse to follow a symlink (a planted link could redirect writes elsewhere).
+fn reject_symlink(path: &Path) -> Result<(), HaltReason> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            Err(HaltReason::CannotOpen(format!("{} is a symlink; refusing to follow it", path.display())))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(HaltReason::CannotOpen(e.to_string())),
+    }
+}
+
+/// Take the exclusive advisory lock on `<db>.lock` (released when the returned file is dropped).
+fn acquire_lock(path: &Path) -> Result<File, HaltReason> {
+    let lock_path = sidecar(path, ".lock");
+    let f = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|e| HaltReason::CannotOpen(format!("cannot open lock file {}: {e}", lock_path.display())))?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(HaltReason::AlreadyOpen(format!("{} is locked by another instance", lock_path.display())))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(HaltReason::CannotOpen(format!("cannot lock {}: {e}", lock_path.display()))),
+    }
+}
+
+/// Triggers and indexes the guarantees rest on; a database missing one is not trustworthy.
+const REQUIRED_OBJECTS: &[(&str, &str)] = &[
+    ("trigger", "events_no_update"),
+    ("trigger", "events_no_delete"),
+    ("trigger", "events_no_overwrite"),
+    ("index", "uniq_prepared_symbol"),
+    ("index", "sqlite_autoindex_events_1"),
+];
+
+fn verify_required_objects(conn: &Connection) -> Result<(), HaltReason> {
+    for (kind, name) in REQUIRED_OBJECTS {
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2", [kind, name], |r| r.get(0))
+            .map_err(classify)?;
+        if n == 0 {
+            return Err(HaltReason::Corrupt(format!("required {kind} {name} is missing")));
+        }
+    }
+    Ok(())
+}
+
+/// What the store's own connection refuses to do: weaken the `events` guarantees.
+/// Installed after migrations (which legitimately alter schema) and before any use.
+fn authorize(action: AuthAction<'_>) -> Authorization {
+    let is_events = |t: &str| t.eq_ignore_ascii_case("events");
+    match action {
+        AuthAction::DropTable { table_name }
+        | AuthAction::AlterTable { table_name, .. }
+        | AuthAction::DropTrigger { table_name, .. }
+        | AuthAction::DropIndex { table_name, .. }
+            if is_events(table_name) =>
+        {
+            Authorization::Deny
+        }
+        AuthAction::DropIndex { index_name, .. } if index_name == "uniq_prepared_symbol" => Authorization::Deny,
+        // Reading these pragmas is fine; setting them is not.
+        AuthAction::Pragma { pragma_name, pragma_value: Some(_) }
+            if ["ignore_check_constraints", "writable_schema", "recursive_triggers"]
+                .iter()
+                .any(|p| pragma_name.eq_ignore_ascii_case(p)) =>
+        {
+            Authorization::Deny
+        }
+        _ => Authorization::Allow,
+    }
+}
+
+/// Open, verify and migrate. Order matters for fail-closed: an existing file is only ever read
+/// (read-only connection: integrity, schema version, required triggers) before anything that
+/// could write to it; no connection used for inspection checkpoints on close, so a halted open
+/// leaves the main file and the `-wal` byte-identical. A fresh file is created 0600 before SQLite
+/// writes a byte, and removed again if the open fails.
+fn open_connection(path: &Path, migrations: &[Migration], take_lock: bool) -> Result<Opened, HaltReason> {
     let io = |e: std::io::Error| HaltReason::CannotOpen(e.to_string());
 
+    let mut tightened = Vec::new();
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         DirBuilder::new().recursive(true).mode(0o700).create(parent).map_err(io)?;
+        if let Some(old_mode) = tighten(parent, 0o700).map_err(io)? {
+            tightened.push(Tightened { path: parent.to_path_buf(), old_mode, new_mode: 0o700 });
+        }
     }
-    let created = match OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+    for p in [path.to_path_buf(), sidecar(path, "-wal"), sidecar(path, "-shm"), sidecar(path, ".lock")] {
+        reject_symlink(&p)?;
+    }
+    let lock = if take_lock { Some(acquire_lock(path)?) } else { None };
+
+    let existing = match std::fs::symlink_metadata(path) {
+        Ok(m) if !m.is_file() => return Err(HaltReason::CannotOpen(format!("{} is not a regular file", path.display()))),
+        Ok(m) if m.len() == 0 => {
+            return Err(HaltReason::Corrupt(format!(
+                "資料庫檔為空，拒絕初始化（{}）；若確實要重建請手動刪除 (database file is empty, refusing to initialise it)",
+                path.display()
+            )));
+        }
         Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => return Err(io(e)),
     };
-    let existing = !created && std::fs::metadata(path).map_err(io)?.len() > 0;
-
-    let mut tightened = Vec::new();
-    for p in [path.to_path_buf(), sidecar(path, "-wal"), sidecar(path, "-shm")] {
-        if let Some(old_mode) = tighten(&p).map_err(io)? {
-            tightened.push(Tightened { path: p, old_mode });
+    if !existing {
+        match OpenOptions::new().write(true).create_new(true).mode(0o600).open(path) {
+            Ok(_) => {}
+            Err(e) => return Err(io(e)),
         }
     }
 
-    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(classify)?;
-    conn.busy_timeout(BUSY_TIMEOUT).map_err(classify)?;
-    conn.pragma_update(None, "foreign_keys", true).map_err(classify)?;
-    // Without this, INSERT OR REPLACE can delete an event without firing the DELETE trigger.
-    conn.pragma_update(None, "recursive_triggers", true).map_err(classify)?;
+    match open_inner(path, migrations, existing, &mut tightened) {
+        Ok(conn) => Ok(Opened { conn, tightened, lock }),
+        Err(reason) => {
+            if !existing {
+                // This open created the file: never leave a zero-byte (or half-built) database behind.
+                for p in [path.to_path_buf(), sidecar(path, "-wal"), sidecar(path, "-shm")] {
+                    let _ = std::fs::remove_file(p);
+                }
+            }
+            Err(reason)
+        }
+    }
+}
+
+fn open_inner(path: &Path, migrations: &[Migration], existing: bool, tightened: &mut Vec<Tightened>) -> Result<Connection, HaltReason> {
+    let io = |e: std::io::Error| HaltReason::CannotOpen(e.to_string());
+    let no_ckpt = rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;
+
+    for p in [path.to_path_buf(), sidecar(path, "-wal"), sidecar(path, "-shm")] {
+        if let Some(old_mode) = tighten(&p, 0o600).map_err(io)? {
+            tightened.push(Tightened { path: p, old_mode, new_mode: 0o600 });
+        }
+    }
 
     let supported = migrations.last().map_or(0, |m| m.version);
     let mut current = 0;
     if existing {
-        let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(classify)?;
+        let ro = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(classify)?;
+        ro.set_db_config(no_ckpt, true).map_err(classify)?;
+        ro.busy_timeout(BUSY_TIMEOUT).map_err(classify)?;
+        let check: String = ro.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(classify)?;
         if check != "ok" {
             return Err(HaltReason::Corrupt(format!("quick_check: {check}")));
         }
-        let has_version_table: i64 = conn
+        let has_version_table: i64 = ro
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'", [], |r| r.get(0))
             .map_err(classify)?;
         if has_version_table == 0 {
             return Err(HaltReason::Corrupt("not a tong-funding database (no schema_version table)".into()));
         }
-        current = conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0)).map_err(classify)?;
+        current = ro.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0)).map_err(classify)?;
         if current > supported {
             return Err(HaltReason::SchemaTooNew { found: current, supported });
         }
+        verify_required_objects(&ro)?;
     }
 
+    let mut conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(classify)?;
+    // Until the open has fully succeeded, closing this connection must not checkpoint.
+    conn.set_db_config(no_ckpt, true).map_err(classify)?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true).map_err(classify)?;
+    conn.busy_timeout(BUSY_TIMEOUT).map_err(classify)?;
+    conn.pragma_update(None, "foreign_keys", true).map_err(classify)?;
+    // Belt and braces next to the `events_no_overwrite` trigger: REPLACE must fire the DELETE trigger.
+    conn.pragma_update(None, "recursive_triggers", true).map_err(classify)?;
+    // On macOS `synchronous` alone does not issue F_FULLFSYNC; without it a power cut can lose
+    // an intent that was already reported as persisted.
+    conn.pragma_update(None, "fullfsync", true).map_err(classify)?;
+    conn.pragma_update(None, "checkpoint_fullfsync", true).map_err(classify)?;
+
     migrate(&mut conn, migrations, current).map_err(|e| HaltReason::MigrationFailed(e.to_string()))?;
+    verify_required_objects(&conn)?;
 
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).map_err(classify)?;
     if !mode.eq_ignore_ascii_case("wal") {
@@ -195,9 +355,12 @@ fn open_connection(path: &Path, migrations: &[Migration]) -> Result<(Connection,
     // Touch the database once so the -wal/-shm files exist, then make them 0600 as well.
     conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).map_err(classify)?;
     for suffix in ["-wal", "-shm"] {
-        tighten(&sidecar(path, suffix)).map_err(io)?;
+        tighten(&sidecar(path, suffix), 0o600).map_err(io)?;
     }
-    Ok((conn, tightened))
+    conn.authorizer(Some(|ctx: AuthContext<'_>| authorize(ctx.action))).map_err(classify)?;
+    // Success: from here on a normal close may checkpoint.
+    conn.set_db_config(no_ckpt, false).map_err(classify)?;
+    Ok(conn)
 }
 
 impl Db {
@@ -211,17 +374,28 @@ impl Db {
         Db::open_with(path, clock, MIGRATIONS)
     }
 
+    /// Test-only: like [`Db::open`] but without the single-instance lock, so a test can hold
+    /// two handles on one file (to exercise contention between connections).
+    #[cfg(test)]
+    pub(crate) fn open_unlocked(path: &Path, clock: Arc<dyn Clock>) -> Db {
+        Db::open_impl(path, clock, MIGRATIONS, false)
+    }
+
     /// Like [`Db::open`] with an explicit migration list (tests inject failing migrations).
     pub fn open_with(path: &Path, clock: Arc<dyn Clock>, migrations: &[Migration]) -> Db {
-        match open_connection(path, migrations) {
-            Ok((conn, tightened)) => {
-                let db = Db::from_parts(Some(conn), None, clock, path);
+        Db::open_impl(path, clock, migrations, true)
+    }
+
+    fn open_impl(path: &Path, clock: Arc<dyn Clock>, migrations: &[Migration], take_lock: bool) -> Db {
+        match open_connection(path, migrations, take_lock) {
+            Ok(Opened { conn, tightened, lock }) => {
+                let db = Db::from_parts(Some(conn), None, clock, path, lock);
                 for t in tightened {
                     let ts = db.now_ms();
                     let payload = serde_json::json!({
                         "path": t.path.display().to_string(),
                         "old_mode": format!("{:o}", t.old_mode),
-                        "new_mode": "600",
+                        "new_mode": format!("{:o}", t.new_mode),
                     });
                     let r = db.with_conn(|c| Ok(insert_event_on(c, ts, "PERMISSIONS_TIGHTENED", None, &payload)?));
                     if let Err(e) = r {
@@ -230,12 +404,14 @@ impl Db {
                 }
                 db
             }
-            Err(reason) => Db::from_parts(None, Some(reason), clock, path),
+            Err(reason) => Db::from_parts(None, Some(reason), clock, path, None),
         }
     }
 
-    fn from_parts(conn: Option<Connection>, halt: Option<HaltReason>, clock: Arc<dyn Clock>, path: &Path) -> Db {
-        Db { inner: Arc::new(Inner { conn: Mutex::new(conn), halt: Mutex::new(halt), clock, path: path.to_path_buf() }) }
+    fn from_parts(conn: Option<Connection>, halt: Option<HaltReason>, clock: Arc<dyn Clock>, path: &Path, lock: Option<File>) -> Db {
+        Db {
+            inner: Arc::new(Inner { conn: Mutex::new(conn), halt: Mutex::new(halt), clock, path: path.to_path_buf(), _lock: lock }),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -264,6 +440,12 @@ impl Db {
     }
 
     /// Run `f` on the connection unless the store is halted.
+    ///
+    /// RISK: `f` gets the raw connection, so it can run arbitrary SQL against every table
+    /// (including `events`). The connection's authorizer refuses the worst (dropping `events`,
+    /// its triggers/indexes, `ALTER TABLE events`, `ignore_check_constraints`, ...) but this is
+    /// still a back door around the typed API: keep it `pub(crate)`, never expose it outside this
+    /// crate, and prefer adding a typed method over calling it from feature code.
     pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T, StoreError>) -> Result<T, StoreError> {
         if let Some(r) = self.halt_reason() {
             return Err(StoreError::Halted(r));
@@ -281,14 +463,60 @@ pub(crate) mod test_support {
     use super::*;
     use crate::ports::ManualClock;
 
+    /// A temp directory that already has the 0700 mode the store insists on (some platforms
+    /// create temp dirs 0755, which would trigger a PERMISSIONS_TIGHTENED event).
+    pub fn tempdir() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+        d
+    }
+
     pub fn clock(ms: i64) -> (Arc<dyn Clock>, ManualClock) {
         let c = ManualClock::new(ms);
         (Arc::new(c.clone()), c)
     }
 
+    /// Every value of every column of every table, as one string (to prove a secret is nowhere).
+    pub fn dump_db(db: &Db) -> String {
+        db.with_conn(|c| {
+            let mut out = String::new();
+            let tables: Vec<String> = {
+                let mut st = c.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")?;
+                let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+                rows.collect::<Result<_, _>>()?
+            };
+            for t in tables {
+                let mut st = c.prepare(&format!("SELECT * FROM \"{t}\""))?;
+                let n = st.column_count();
+                let mut rows = st.query([])?;
+                while let Some(r) = rows.next()? {
+                    for i in 0..n {
+                        let v = match r.get_ref(i)? {
+                            rusqlite::types::ValueRef::Text(b) | rusqlite::types::ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+                            other => format!("{other:?}"),
+                        };
+                        out.push_str(&format!("{t}[{i}]={v}\n"));
+                    }
+                }
+            }
+            Ok(out)
+        })
+        .unwrap()
+    }
+
+    /// Whether the raw bytes of the main file or its `-wal` contain `needle`.
+    pub fn files_contain(path: &Path, needle: &str) -> bool {
+        let mut wal = path.as_os_str().to_owned();
+        wal.push("-wal");
+        [path.to_path_buf(), PathBuf::from(wal)]
+            .iter()
+            .filter_map(|p| std::fs::read(p).ok())
+            .any(|b| b.windows(needle.len()).any(|w| w == needle.as_bytes()))
+    }
+
     /// A fresh database inside a temp directory (never a real path).
     pub fn open_tmp() -> (tempfile::TempDir, Db, ManualClock) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempdir();
         let (c, m) = clock(1_000_000);
         let db = Db::open(&dir.path().join("funding.db"), c);
         assert!(!db.is_halted(), "fresh db must open: {:?}", db.halt_reason());
@@ -359,7 +587,7 @@ mod tests {
 
     #[test]
     fn creates_missing_parent_directories() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let (c, _) = clock(1);
         let db = Db::open(&dir.path().join("a/b/funding.db"), c);
         assert!(!db.is_halted(), "{:?}", db.halt_reason());
@@ -409,7 +637,7 @@ mod tests {
 
     #[test]
     fn wide_main_file_permissions_are_tightened_and_an_event_is_written() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -431,7 +659,7 @@ mod tests {
 
     #[test]
     fn wide_wal_and_shm_permissions_are_tightened_too() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         // Keep the WAL files alive by holding a second connection across the reopen.
@@ -451,7 +679,7 @@ mod tests {
 
     #[test]
     fn correct_permissions_write_no_event() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         let (c, _) = clock(9);
@@ -464,7 +692,7 @@ mod tests {
 
     #[test]
     fn schema_newer_than_the_program_halts_and_leaves_the_file_untouched() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 2", []).unwrap();
@@ -479,7 +707,7 @@ mod tests {
 
     #[test]
     fn truncated_database_halts_and_the_original_bytes_are_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         let full = std::fs::read(&p).unwrap();
@@ -496,7 +724,7 @@ mod tests {
 
     #[test]
     fn non_sqlite_garbage_halts_and_is_not_overwritten() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         std::fs::write(&p, b"this is definitely not a sqlite database, just text".repeat(100)).unwrap();
         let before = std::fs::read(&p).unwrap();
@@ -509,7 +737,7 @@ mod tests {
 
     #[test]
     fn a_valid_sqlite_file_that_is_not_ours_halts_instead_of_being_migrated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         Connection::open(&p).unwrap().execute_batch("CREATE TABLE other (x INTEGER); INSERT INTO other VALUES (7);").unwrap();
         let before = std::fs::read(&p).unwrap();
@@ -522,7 +750,7 @@ mod tests {
 
     #[test]
     fn halted_db_refuses_all_access() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         std::fs::write(&p, b"garbage garbage garbage".repeat(200)).unwrap();
         let (c, _) = clock(9);
@@ -541,7 +769,7 @@ mod tests {
 
     #[test]
     fn migration_framework_upgrades_an_older_database() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         let (c, _) = clock(9);
@@ -556,7 +784,7 @@ mod tests {
 
     #[test]
     fn failed_migration_on_an_existing_database_halts_and_rolls_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         let before = std::fs::read(&p).unwrap();
@@ -573,22 +801,22 @@ mod tests {
     }
 
     #[test]
-    fn failed_migration_on_a_fresh_database_halts_and_leaves_it_empty_and_retryable() {
-        let dir = tempfile::tempdir().unwrap();
+    fn failed_migration_on_a_fresh_database_halts_removes_the_file_and_is_retryable() {
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         let bad = vec![Migration { version: 1, sql: "CREATE TABLE half (x INTEGER); NOT SQL;" }];
         let (c, _) = clock(9);
         let db = Db::open_with(&p, c.clone(), &bad);
         assert!(matches!(db.halt_reason(), Some(HaltReason::MigrationFailed(_))), "{:?}", db.halt_reason());
         drop(db);
-        assert_eq!(std::fs::metadata(&p).unwrap().len(), 0, "fresh file stays empty after a failed migration");
+        assert!(!p.exists(), "a fresh file made by this open is removed after a failed migration");
         let db = Db::open(&p, c);
         assert!(!db.is_halted(), "a later start with working migrations succeeds: {:?}", db.halt_reason());
     }
 
     #[test]
     fn reopening_an_existing_database_keeps_its_data() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
         let (c, _) = clock(9);
@@ -596,5 +824,244 @@ mod tests {
         assert!(!db.is_halted());
         let n: i64 = db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 400);
+    }
+
+    // ---- hardening (review round 1) ----
+
+    fn bytes_of(p: &Path) -> Vec<u8> {
+        std::fs::read(p).unwrap_or_default()
+    }
+
+    /// A v1 database whose newest data sits only in the `-wal` (as after a crash), schema bumped to 2.
+    fn crashed_v2_with_wal(p: &Path) {
+        populated(p);
+        let c = Connection::open(p).unwrap();
+        c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
+        c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)).unwrap();
+        c.execute("UPDATE schema_version SET version = 2", []).unwrap();
+        drop(c);
+        assert!(std::fs::metadata(sidecar(p, "-wal")).unwrap().len() > 0, "fixture must leave a -wal behind");
+    }
+
+    #[test]
+    fn halting_on_a_too_new_schema_does_not_rewrite_the_main_file_or_the_wal() {
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        crashed_v2_with_wal(&p);
+        let (main_before, wal_before) = (bytes_of(&p), bytes_of(&sidecar(&p, "-wal")));
+        let (c, _) = clock(9);
+        let db = Db::open(&p, c);
+        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 2, supported: 1 }));
+        drop(db);
+        assert!(bytes_of(&p) == main_before, "main file must be byte-identical");
+        assert!(bytes_of(&sidecar(&p, "-wal")) == wal_before, "-wal must be byte-identical (and still exist)");
+    }
+
+    #[test]
+    fn an_existing_zero_byte_file_halts_and_is_not_initialised() {
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        std::fs::write(&p, b"").unwrap();
+        let (c, _) = clock(9);
+        let db = Db::open(&p, c);
+        match db.halt_reason() {
+            Some(HaltReason::Corrupt(m)) => assert!(m.contains("手動刪除"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+        drop(db);
+        assert_eq!(std::fs::metadata(&p).unwrap().len(), 0, "must not be initialised");
+    }
+
+    #[test]
+    fn a_failed_migration_on_a_file_created_by_this_open_deletes_it() {
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        let bad = vec![Migration { version: 1, sql: "CREATE TABLE half (x INTEGER); NOT SQL;" }];
+        let (c, _) = clock(9);
+        let db = Db::open_with(&p, c.clone(), &bad);
+        assert!(matches!(db.halt_reason(), Some(HaltReason::MigrationFailed(_))));
+        drop(db);
+        assert!(!p.exists(), "no zero-byte leftover");
+        let db = Db::open(&p, c);
+        assert!(!db.is_halted(), "retry works: {:?}", db.halt_reason());
+    }
+
+    #[test]
+    fn a_symlinked_database_path_halts_and_the_target_is_untouched() {
+        let dir = crate::store::db::test_support::tempdir();
+        let target = dir.path().join("elsewhere.bin");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let p = dir.path().join("funding.db");
+        std::os::unix::fs::symlink(&target, &p).unwrap();
+        let (c, _) = clock(9);
+        let db = Db::open(&p, c);
+        assert!(matches!(db.halt_reason(), Some(HaltReason::CannotOpen(m)) if m.contains("symlink")), "{:?}", db.halt_reason());
+        drop(db);
+        assert_eq!(bytes_of(&target), b"");
+        assert_eq!(mode(&target), 0o644);
+    }
+
+    #[test]
+    fn a_symlinked_wal_or_shm_halts() {
+        for suffix in ["-wal", "-shm"] {
+            let dir = crate::store::db::test_support::tempdir();
+            let p = dir.path().join("funding.db");
+            populated(&p);
+            let target = dir.path().join("elsewhere.bin");
+            std::fs::write(&target, b"").unwrap();
+            let _ = std::fs::remove_file(sidecar(&p, suffix));
+            std::os::unix::fs::symlink(&target, sidecar(&p, suffix)).unwrap();
+            let (c, _) = clock(9);
+            let db = Db::open(&p, c);
+            assert!(matches!(db.halt_reason(), Some(HaltReason::CannotOpen(_))), "{suffix}: {:?}", db.halt_reason());
+            assert_eq!(bytes_of(&target), b"", "{suffix}: target untouched");
+        }
+    }
+
+    #[test]
+    fn a_too_wide_parent_directory_is_tightened_to_0700_with_an_event() {
+        let dir = crate::store::db::test_support::tempdir();
+        let parent = dir.path().join("data");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (c, _) = clock(9);
+        let db = Db::open(&parent.join("funding.db"), c);
+        assert!(!db.is_halted(), "{:?}", db.halt_reason());
+        assert_eq!(mode(&parent), 0o700);
+        let payload: String = db
+            .with_conn(|c| {
+                Ok(c.query_row("SELECT payload FROM events WHERE event_type = 'PERMISSIONS_TIGHTENED'", [], |r| r.get(0))?)
+            })
+            .unwrap();
+        assert!(payload.contains("755") && payload.contains("data"), "{payload}");
+    }
+
+    #[test]
+    fn replace_with_an_explicit_id_cannot_overwrite_an_event_even_on_a_plain_connection() {
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        {
+            let (c, _) = clock(1);
+            let db = Db::open(&p, c);
+            db.with_conn(|c| Ok(c.execute("INSERT INTO events (ts_ms, event_type, payload) VALUES (1,'ORIGINAL','{}')", [])?)).unwrap();
+        }
+        // No recursive_triggers, no foreign_keys: the weakest possible connection.
+        let plain = Connection::open(&p).unwrap();
+        let r = plain.execute("REPLACE INTO events (id, ts_ms, event_type, payload) VALUES (1, 2, 'FORGED', '{}')", []);
+        assert!(r.is_err(), "REPLACE must fail");
+        let ty: String = plain.query_row("SELECT event_type FROM events WHERE id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(ty, "ORIGINAL");
+        // Normal AUTOINCREMENT inserts still work on the same connection.
+        plain.execute("INSERT INTO events (ts_ms, event_type, payload) VALUES (3,'NEXT','{}')", []).unwrap();
+    }
+
+    #[test]
+    fn opening_a_database_missing_a_required_trigger_or_index_halts() {
+        for (kind, name) in [
+            ("TRIGGER", "events_no_delete"),
+            ("TRIGGER", "events_no_update"),
+            ("TRIGGER", "events_no_overwrite"),
+            ("INDEX", "uniq_prepared_symbol"),
+        ] {
+            let dir = crate::store::db::test_support::tempdir();
+            let p = dir.path().join("funding.db");
+            populated(&p);
+            Connection::open(&p).unwrap().execute_batch(&format!("DROP {kind} {name}")).unwrap();
+            let (c, _) = clock(9);
+            let db = Db::open(&p, c);
+            assert!(matches!(db.halt_reason(), Some(HaltReason::Corrupt(m)) if m.contains(name)), "{name}: {:?}", db.halt_reason());
+        }
+    }
+
+    #[test]
+    fn the_authorizer_blocks_dropping_or_weakening_the_events_guarantees() {
+        let (_d, db, _) = open_tmp();
+        for sql in [
+            "DROP TRIGGER events_no_delete",
+            "DROP TRIGGER events_no_update",
+            "DROP TRIGGER events_no_overwrite",
+            "DROP TABLE events",
+            "DROP INDEX idx_events_type_ts",
+            "DROP INDEX uniq_prepared_symbol",
+            "ALTER TABLE events ADD COLUMN x TEXT",
+            "ALTER TABLE events RENAME TO events_old",
+            "PRAGMA ignore_check_constraints = ON",
+            "PRAGMA writable_schema = ON",
+            "PRAGMA recursive_triggers = OFF",
+        ] {
+            let r = db.with_conn(|c| Ok(c.execute_batch(sql)?));
+            let e = r.expect_err(sql).to_string();
+            assert!(e.contains("not authorized") || e.contains("authoriz"), "{sql}: {e}");
+        }
+        // Everything is still intact.
+        assert!(table_exists(&db, "events"));
+        let n: i64 = db
+            .with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND tbl_name='events'", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
+    fn the_authorizer_does_not_get_in_the_way_of_normal_work() {
+        let (_d, db, _) = open_tmp();
+        db.with_conn(|c| {
+            c.execute("INSERT INTO events (ts_ms, event_type, payload) VALUES (1,'A','{}')", [])?;
+            c.execute("INSERT INTO pairs (internal_uuid, pair_id, symbol, status, entry_json, created_ms, updated_ms) VALUES ('u','p','BTC','PREPARED','{}',1,1)", [])?;
+            c.execute("UPDATE pairs SET status = 'ORDER_SUBMIT' WHERE internal_uuid = 'u'", [])?;
+            c.execute("INSERT INTO order_intents (client_order_id, pair_uuid, leg, exchange, symbol, side, quantity, state, created_ms, updated_ms) VALUES ('c','u','long','B','BTC','BUY','1','INTENDED',1,1)", [])?;
+            c.execute("UPDATE order_intents SET state = 'SUBMITTED' WHERE client_order_id = 'c'", [])?;
+            // Reading pragmas is fine; only changing the protected ones is not.
+            let _: i64 = c.query_row("PRAGMA recursive_triggers", [], |r| r.get(0))?;
+            // Fault injection by a test (CREATE TRIGGER) must stay possible.
+            c.execute_batch("CREATE TRIGGER t_inject BEFORE INSERT ON events WHEN NEW.event_type='BOOM' BEGIN SELECT RAISE(ABORT,'boom'); END")?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn migrations_run_before_the_authorizer_is_installed() {
+        // A migration that alters events must still work (the authorizer comes after migration).
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        populated(&p);
+        let (c, _) = clock(9);
+        let db = Db::open_with(&p, c, &migrations("ALTER TABLE events ADD COLUMN extra TEXT;"));
+        assert!(!db.is_halted(), "{:?}", db.halt_reason());
+    }
+
+    #[test]
+    fn durability_pragmas_are_on() {
+        let (_d, db, _) = open_tmp();
+        let (ff, cff): (i64, i64) = db
+            .with_conn(|c| Ok((c.query_row("PRAGMA fullfsync", [], |r| r.get(0))?, c.query_row("PRAGMA checkpoint_fullfsync", [], |r| r.get(0))?)))
+            .unwrap();
+        assert_eq!((ff, cff), (1, 1));
+    }
+
+    #[test]
+    fn a_second_instance_on_the_same_path_is_refused_until_the_first_is_dropped() {
+        let dir = crate::store::db::test_support::tempdir();
+        let p = dir.path().join("funding.db");
+        let (c, _) = clock(1);
+        let first = Db::open(&p, c.clone());
+        assert!(!first.is_halted());
+        let second = Db::open(&p, c.clone());
+        assert!(matches!(second.halt_reason(), Some(HaltReason::AlreadyOpen(_))), "{:?}", second.halt_reason());
+        assert!(second.with_conn(|_| Ok(())).is_err());
+        // The refused open must not have damaged the first instance.
+        assert!(first.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0))?)).is_ok());
+        drop(second);
+        drop(first);
+        let third = Db::open(&p, c);
+        assert!(!third.is_halted(), "released lock lets a new instance in: {:?}", third.halt_reason());
+    }
+
+    #[test]
+    fn clones_of_one_handle_share_the_lock_and_do_not_conflict() {
+        let (_d, db, _) = open_tmp();
+        let clone = db.clone();
+        assert!(clone.with_conn(|_| Ok(())).is_ok());
     }
 }

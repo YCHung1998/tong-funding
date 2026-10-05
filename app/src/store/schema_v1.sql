@@ -1,7 +1,9 @@
 -- Schema v1 (openspec/changes/store-sqlite/design.md "Schema 草案").
--- events is append-only: UPDATE and DELETE are blocked by triggers. The connection must also
--- enable `PRAGMA recursive_triggers = ON`, otherwise `INSERT OR REPLACE` could replace an event
--- without firing the DELETE trigger.
+-- events is append-only: UPDATE and DELETE are blocked by triggers. `events_no_overwrite`
+-- additionally blocks `REPLACE INTO events (id, ...)` / `INSERT ... (id = existing)` on ANY
+-- connection, including ones that never set `PRAGMA recursive_triggers = ON` (without that pragma
+-- REPLACE deletes the old row without firing the DELETE trigger). Normal inserts leave id NULL
+-- (AUTOINCREMENT), so they are unaffected.
 
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 INSERT INTO schema_version (version) VALUES (1);
@@ -21,6 +23,9 @@ CREATE TRIGGER events_no_update BEFORE UPDATE ON events
 BEGIN SELECT RAISE(ABORT, 'events is append-only: UPDATE forbidden'); END;
 CREATE TRIGGER events_no_delete BEFORE DELETE ON events
 BEGIN SELECT RAISE(ABORT, 'events is append-only: DELETE forbidden'); END;
+CREATE TRIGGER events_no_overwrite BEFORE INSERT ON events
+WHEN NEW.id IS NOT NULL AND EXISTS (SELECT 1 FROM events WHERE id = NEW.id)
+BEGIN SELECT RAISE(ABORT, 'events is append-only: overwrite forbidden'); END;
 
 CREATE TABLE pairs (
     internal_uuid TEXT PRIMARY KEY,
@@ -60,6 +65,10 @@ CREATE TABLE system_flags (
     value      TEXT    NOT NULL,
     updated_ms INTEGER NOT NULL
 );
+
+-- The kill switch row exists from day one; a missing row means the data was tampered with and the
+-- store treats it as "halted" (fail closed).
+INSERT INTO system_flags (key, value, updated_ms) VALUES ('kill_switch', 'OFF', 0);
 
 CREATE TABLE portfolio_history (
     ts_ms      INTEGER NOT NULL,

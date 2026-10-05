@@ -48,6 +48,27 @@ mod tests {
     }
 
     #[test]
+    fn kill_switch_row_is_seeded_off() {
+        let v: String = db().query_row("SELECT value FROM system_flags WHERE key = 'kill_switch'", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, "OFF");
+    }
+
+    #[test]
+    fn explicit_id_cannot_overwrite_an_event_even_without_recursive_triggers() {
+        // The weakest connection: no recursive_triggers, no foreign_keys.
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA_V1).unwrap();
+        insert_event(&c, "A", "{}").unwrap();
+        let r = c.execute("REPLACE INTO events (id, ts_ms, event_type, payload) VALUES (1, 2, 'FORGED', '{}')", []);
+        assert!(r.unwrap_err().to_string().contains("append-only"));
+        // Plain AUTOINCREMENT inserts (NEW.id is not an existing id) are unaffected.
+        insert_event(&c, "B", "{}").unwrap();
+        insert_event(&c, "C", "{}").unwrap();
+        let n: i64 = c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 3);
+    }
+
+    #[test]
     fn event_payload_must_be_valid_json() {
         assert!(insert_event(&db(), "X", "not json").is_err());
     }
