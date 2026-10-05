@@ -6,5 +6,6 @@ pub mod net_edge;
 pub mod pair;
 pub mod pretrade;
 pub mod quantity;
+pub mod redact;
 pub mod risk;
 pub mod types;
