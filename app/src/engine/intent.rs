@@ -413,6 +413,8 @@ mod tests {
             exchange_order_id: Some("X1".into()),
             filled_quantity: d("0.019"),
             avg_price: Some(d("1")),
+            fee: None,
+            fee_asset: None,
             state: OrderState::Filled,
         };
         let st = record_submit_outcome(&db, &r, &SubmitOutcome::Accepted(status.clone()), false).unwrap();
@@ -440,6 +442,8 @@ mod tests {
                 exchange_order_id: None,
                 filled_quantity: Decimal::ZERO,
                 avg_price: None,
+                fee: None,
+                fee_asset: None,
                 state: os,
             };
             assert_eq!(record_query_outcome(&db, &r.client_order_id, &QueryOutcome::Found(status), true).unwrap(), want, "{os:?}");

@@ -47,20 +47,36 @@
 - **WHEN** 檢查 `SimulatedExecutor` 所在模組的 `use` 與依賴
 - **THEN** 它不引用 `exchange` 模組中任何具備下單能力的型別（以測試掃描並於 CI 執行）
 
-### Requirement: 模式切換只在沒有進行中配對時允許
+### Requirement: 模式切換只在所有已開啟配對都屬於目標模式時允許
 
-切換 `execution_mode` 的 Command SHALL 在存在任何已開啟配對（非 `FINALIZED`、`CANCELLED`、`BLOCKED`）時被拒絕，避免模擬與真實的訂單混在同一配對。
+切換 `execution_mode` 的 Command SHALL 在存在任何屬於另一模式（依配對建立時的模式）的已開啟配對（非 `FINALIZED`、`CANCELLED`、`BLOCKED`）時被拒絕並說明原因，避免模擬與真實的訂單混在同一配對；所有已開啟配對都屬於目標模式（或沒有已開啟配對）時 SHALL 允許。
 切換至 `EXCHANGE_DEMO` 時，引擎 SHALL 先取得金鑰並建立真實執行器；任一步驟失敗 SHALL 維持 `SIMULATION` 並回報原因。
+啟動時儲存的模式是 `EXCHANGE_DEMO` 但無法建立真實執行器時，引擎 SHALL 退回 `SIMULATION`、寫入退回事件，並在 `Snapshot` 中顯示給使用者的提醒，直到成功切回 `EXCHANGE_DEMO`。
 
-#### Scenario: 有進行中配對時拒絕切換
+#### Scenario: 有另一模式的配對時拒絕切換
 
-- **WHEN** 存在一組 `RECONCILED` 配對，使用者要求切換 `execution_mode`
+- **WHEN** 存在一組模擬的 `RECONCILED` 配對，使用者要求切換至 `EXCHANGE_DEMO`
+- **THEN** Command 被拒絕並回報原因，模式不變，且未建立真實執行器
+
+#### Scenario: 退回後只剩 demo 配對時可以切回
+
+- **WHEN** 啟動時因金鑰不可用退回 `SIMULATION`，留下一組 demo 配對；金鑰修好後使用者要求切換至 `EXCHANGE_DEMO`
+- **THEN** 引擎先建立真實執行器，成功後切換為 `EXCHANGE_DEMO`，提醒消失
+
+#### Scenario: demo 配對未結束時不能切回 SIMULATION
+
+- **WHEN** 在 `EXCHANGE_DEMO` 下存在一組 demo 配對，使用者要求切換至 `SIMULATION`
 - **THEN** Command 被拒絕並回報原因，模式不變
 
 #### Scenario: 金鑰讀取失敗
 
 - **WHEN** 要求切換至 `EXCHANGE_DEMO`，但讀取金鑰失敗
 - **THEN** `execution_mode` 維持 `SIMULATION`，並回報「未連線」
+
+#### Scenario: 啟動退回時提醒使用者
+
+- **WHEN** 啟動時儲存的模式是 `EXCHANGE_DEMO`，但讀不到金鑰
+- **THEN** `execution_mode` 為 `SIMULATION`，留下退回事件，且 `Snapshot` 含一則說明原因的提醒
 
 ### Requirement: kill switch 只攔增加曝險的 Command 且永不強制平倉
 

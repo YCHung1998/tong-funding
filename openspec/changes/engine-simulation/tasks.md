@@ -33,3 +33,10 @@
   - 4.2 完成：`recovery.rs`（規則表測試）＋接進 actor 啟動流程（失敗每 30 秒重試、對帳未完成只擋 EXCHANGE_DEMO 的開倉）。崩潰測試（`app/src/engine/actor/flow_tests.rs`，完整 actor、同一個資料庫檔、以丟棄 tokio runtime 模擬程序終止）：
     demo 終止點 (a) 兩腿 → `CANCELLED`、2 筆 `ORDER_INTENT_NOT_SENT`、無警示；demo 終止點 (b) 兩腿 → `FILL_MONITOR` → `RECONCILED`、意圖 FILLED；demo 一腿 (b) 一腿 (a) → `PARTIAL_FAILURE` + 1 筆警示；模擬 (a)(b) → `UNRESOLVED` + `SIMULATION_INTERRUPTED`、0 次查詢、0 次工廠呼叫。每個測試重啟後送單 0 次。
     指令：`cargo test -p tong-funding engine::`（188 passed，連跑 3 次）
+
+## 5. 2026-10-05 晚的決定（使用者）
+
+- [x] 5.1 模式切換改為「所有已開啟配對都屬於目標模式」；切到 `EXCHANGE_DEMO` 仍先檢查金鑰；啟動退回 `SIMULATION` 時 `Snapshot.notices` 顯示提醒。驗收（先紅後綠）：`engine::actor::tests::{sim_to_demo_is_allowed_when_every_open_pair_is_a_demo_pair, sim_to_demo_with_keys_still_missing_keeps_simulation, sim_to_demo_is_refused_while_a_sim_pair_is_open, demo_to_sim_is_refused_while_a_demo_pair_is_open, a_startup_fallback_puts_a_notice_in_the_snapshot, no_notice_without_a_fallback}`、`engine::gate::tests::pairs_of_the_target_mode_do_not_hold_the_switch_back`
+- [x] 5.2 平倉數量 = min(配對記錄的成交量, 實際持倉)，差異超過 `max_leg_imbalance_pct` 不平倉、警示並轉 `PARTIAL_FAILURE`，不動不屬於配對的部位。驗收（先紅後綠）：`engine::actor::flow_tests::{an_extra_user_position_on_the_same_symbol_is_left_untouched, a_position_far_from_the_recorded_fill_is_not_closed_and_goes_to_partial_failure, a_small_shortfall_within_tolerance_closes_the_smaller_actual_position, an_unknown_recorded_fill_with_a_position_closes_nothing}`、`engine::ids::tests::leg_and_action_are_read_back_from_an_id`
+- [x] 5.3 成交明細：`OrderStatus.fee` / `fee_asset`、`ORDER_SUBMIT.detail.entry_snapshot`、`ORDER_SUBMITTED` / `ORDER_FILL` 的成交欄位。驗收（先紅後綠）：`engine::sim::tests::a_simulated_fill_reports_a_zero_usdt_fee_also_on_query_and_partial_fills`、`engine::actor::flow_tests::{order_submit_carries_the_entry_snapshot_and_order_events_carry_fill_details, a_fill_reported_by_a_later_query_is_recorded_with_its_details}`
+  - 指令：`cargo test -p tong-funding engine::`（203 passed，連跑 3 次）；`cargo test --workspace --no-fail-fast`（14 個 test result 合計 986 passed、3 ignored、0 failed）

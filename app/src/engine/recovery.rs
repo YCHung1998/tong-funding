@@ -1054,6 +1054,8 @@ mod tests {
                 exchange_order_id: Some(format!("EX-{id}")),
                 filled_quantity: d(qty),
                 avg_price: Some(d("60000")),
+                fee: None,
+                fee_asset: None,
                 state: OrderState::Filled,
             };
             self.orders.lock().unwrap().insert(id.into(), QueryOutcome::Found(st));
@@ -1469,6 +1471,8 @@ mod tests {
                 exchange_order_id: None,
                 filled_quantity: Decimal::ZERO,
                 avg_price: None,
+                fee: None,
+                fee_asset: None,
                 state: OrderState::Rejected,
             };
             fx.orders.lock().unwrap().insert(cid.clone(), QueryOutcome::Found(st));
@@ -1599,6 +1603,8 @@ mod tests {
             exchange_order_id: Some("E".into()),
             filled_quantity: d("0.004"),
             avg_price: None,
+            fee: None,
+            fee_asset: None,
             state: OrderState::Cancelled,
         };
         fx.orders.lock().unwrap().insert(l.clone(), QueryOutcome::Found(st));

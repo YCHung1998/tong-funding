@@ -40,10 +40,12 @@ use tong_funding_core::risk::{
 };
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
-use super::command::{Blocker, Command, CommandReply, Event, ManualOrder, NewPreparedPair, PairUuid, PairView, Snapshot};
+use super::command::{
+    Blocker, Command, CommandReply, Event, ManualOrder, NewPreparedPair, Notice, PairUuid, PairView, Snapshot,
+};
 use super::fill::{self, AutoCancel, FillDecision, LegFill, LegSizing, PreparedRecheck, SubmitPlan};
 use super::gate::{self, ModeSwitch};
-use super::ids::{IdPrefix, client_order_id};
+use super::ids::{self, IdPrefix, client_order_id};
 use super::intent::{self, IntentError};
 use super::node0::{self, EntrySnapshot, Node0Context, Node0Leg, Node0Verdict};
 use super::ports::{
@@ -77,6 +79,12 @@ pub const ENTRY_BLOCKED: &str = "ENTRY_BLOCKED";
 pub const BASELINE_FETCH_FAILED: &str = "BASELINE_FETCH_FAILED";
 /// One per submit result (open or close); carries `simulated`.
 pub const ORDER_SUBMITTED: &str = "ORDER_SUBMITTED";
+/// A later lookup reported a changed fill of a pair's order (cumulative quantity, average price,
+/// fee and fee asset); carries `simulated`.
+pub const ORDER_FILL: &str = "ORDER_FILL";
+/// Alert: a leg's actual position differs from the pair's recorded fill by more than the
+/// effective `max_leg_imbalance_pct` (or the recorded fill is unknown); nothing is closed.
+pub const CLOSE_QUANTITY_MISMATCH: &str = "CLOSE_QUANTITY_MISMATCH";
 /// Both legs verified flat (positions 0, no open order); written right before FINALIZED.
 pub const CLOSE_CONFIRMED: &str = "CLOSE_CONFIRMED";
 /// Result of a manual order (not part of a pair).
@@ -311,6 +319,9 @@ struct Flow {
     last_recheck_ms: Option<i64>,
     open: Option<OrderSet>,
     close: Option<OrderSet>,
+    /// Signed position per leg that is expected to remain after the close: exposure on the same
+    /// symbol that is not the pair's (left untouched). The flat check compares against it.
+    close_residual: [Decimal; 2],
     flat_inflight: bool,
 }
 
@@ -355,6 +366,9 @@ struct Actor {
     /// Pairs (and manual `pair_uuid`s) found in flight at startup that the reconciler has not
     /// decided yet. The reconciler touches only these; the scheduler leaves them alone.
     reconcile_scope: BTreeSet<PairUuid>,
+    /// Shown in every Snapshot until they no longer apply (e.g. the startup mode fallback, until
+    /// EXCHANGE_DEMO is switched on again).
+    notices: Vec<Notice>,
     reconcile_inflight: bool,
     last_reconcile_ms: Option<i64>,
     cmd_rx: mpsc::Receiver<CommandMsg>,
@@ -377,12 +391,21 @@ impl Actor {
             let _ = events.append("MODE_LOAD_WARNING", None, json!({ "warning": w }));
         }
         let mut executor = simulator.clone();
+        let mut notices = Vec::new();
         if execution_mode == ExecutionMode::ExchangeDemo {
             match factory.create(ExecutionMode::ExchangeDemo) {
                 Ok(e) => executor = e,
                 Err(reason) => {
-                    // Fail closed: no order-capable executor -> SIMULATION, persisted and recorded.
+                    // Fail closed: no order-capable executor -> SIMULATION, persisted, recorded and
+                    // told to the user (decision 2026-10-05 evening).
                     execution_mode = ExecutionMode::Simulation;
+                    notices.push(Notice {
+                        code: gate::EXECUTION_MODE_FALLBACK.to_string(),
+                        message: format!(
+                            "儲存的模式是 EXCHANGE_DEMO，但無法建立 demo 執行器（{reason}），已退回 SIMULATION。\
+                             修好金鑰後可切回 EXCHANGE_DEMO（只剩 demo 配對時允許）。"
+                        ),
+                    });
                     let _ = db.set_flag_with_event(
                         FLAG_EXECUTION_MODE,
                         gate::execution_mode_str(ExecutionMode::Simulation),
@@ -424,6 +447,7 @@ impl Actor {
             manual_seq: 0,
             reconciliation_pending,
             reconcile_scope,
+            notices,
             reconcile_inflight: false,
             last_reconcile_ms: None,
             cmd_rx,
@@ -891,7 +915,14 @@ impl Actor {
         match node0::run(&ctx, &long, &short) {
             Node0Verdict::Block(block) => fail(self, json!({ "block": format!("{block:?}"), "notes": notes })),
             Node0Verdict::Pass => {
-                let detail = json!({ "checks": "pass", "baseline_used": base_l.is_some() && base_s.is_some(), "notes": notes });
+                // Lands in the same transaction as ORDER_SUBMIT (funding-pnl's entry record).
+                let snapshot = entry_snapshot_json(&view, &entry, &eff, [&pre_l, &pre_s], [base_l, base_s], &scan);
+                let detail = json!({
+                    "checks": "pass",
+                    "baseline_used": base_l.is_some() && base_s.is_some(),
+                    "notes": notes,
+                    "entry_snapshot": snapshot,
+                });
                 if self.land(pair, SystemEvent::CheckPassed, detail) == Ok(PairState::OrderSubmit) {
                     self.submit_entry(&view, &entry, eff, [pre_l.price, pre_s.price], context.rules);
                 }
@@ -1066,25 +1097,62 @@ impl Actor {
         let flow = self.flows.entry(pair.to_string()).or_default();
         flow.orphan = false;
         flow.close = None;
+        flow.close_residual = [Decimal::ZERO; 2];
         flow.flat_inflight = false;
-        let (account, tx) = (self.account_for(view.simulated), self.event_tx.clone());
+        // The pair's own orders per leg: open fills minus earlier close fills is what it holds.
+        let mut orders: [Vec<PairOrder>; 2] = [Vec::new(), Vec::new()];
+        match self.db.list_intents_for_pair(pair) {
+            Ok(rows) => {
+                for row in rows {
+                    if let Some((leg, action)) = ids::leg_action_of(&row.client_order_id) {
+                        let rejected = IntentState::parse(&row.state) == Some(IntentState::Failed);
+                        orders[idx(leg)].push(PairOrder { client_order_id: row.client_order_id, action, rejected });
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = self.land(pair, SystemEvent::CloseFailed, json!({ "reason": format!("order intents unreadable: {e}") }));
+                return CommandReply::Accepted;
+            }
+        }
+        let (account, executor, tx) = (self.account_for(view.simulated), self.executor.clone(), self.event_tx.clone());
         let (le, se, sym, pair) = (view.long_exchange, view.short_exchange, view.symbol.clone(), pair.to_string());
+        let [long_orders, short_orders] = orders;
         tokio::spawn(async move {
             let (long, short) =
                 tokio::join!(signed_position(account.as_ref(), le, &sym), signed_position(account.as_ref(), se, &sym));
-            let _ = tx.send(Event::ClosePositionsFetched { pair, long, short }).await;
+            let (long_recorded, short_recorded) = tokio::join!(
+                recorded_fill(executor.as_ref(), le, &sym, &long_orders),
+                recorded_fill(executor.as_ref(), se, &sym, &short_orders)
+            );
+            let _ = tx.send(Event::ClosePositionsFetched { pair, long, short, long_recorded, short_recorded }).await;
         });
         CommandReply::Accepted
     }
 
-    fn on_close_positions(&mut self, pair: &str, long: Result<Decimal, String>, short: Result<Decimal, String>) {
+    /// Close quantity per leg = min(the pair's recorded fill, |actual position|) (decision
+    /// 2026-10-05 evening). A leg whose position differs from the recorded fill by more than the
+    /// effective `max_leg_imbalance_pct` (relative to the larger, base coin; equal passes), or
+    /// whose recorded fill is unknown while a position exists, is not the pair's alone: nothing is
+    /// sent on either leg, an alert with both quantities is written and the pair lands
+    /// `CloseFailed` → PARTIAL_FAILURE for the user. Exposure that is not the pair's is never
+    /// touched; the flat check then expects exactly that remainder (`Flow::close_residual`).
+    fn on_close_positions(&mut self, pair: &str, positions: [Result<Decimal, String>; 2], recorded: [Result<Decimal, String>; 2]) {
         let Some(view) = self.pairs.get(pair).cloned() else { return };
         if view.state != PairState::Closing {
             return;
         }
-        let mut legs: [Option<LegOrder>; 2] = [None, None];
-        let prefix = self.id_prefix();
-        for (leg, pos, exchange) in [(Leg::Long, long, view.long_exchange), (Leg::Short, short, view.short_exchange)] {
+        // Closing is never held back by settings: unreadable settings use the defaults.
+        let (risk, overrides) = self.load_risk().unwrap_or_else(|_| (RiskConfig::default(), RiskOverrides::new()));
+        let eff = effective_for_pair(&risk, &overrides, view.long_exchange, view.short_exchange);
+        let tolerance = eff.max_leg_imbalance_pct;
+        let [long_pos, short_pos] = positions;
+        let [long_rec, short_rec] = recorded;
+        let mut plan: [(Decimal, Decimal); 2] = [(Decimal::ZERO, Decimal::ZERO); 2]; // (close qty, residual)
+        let mut mismatches: Vec<Value> = Vec::new();
+        for (leg, pos, rec, exchange) in
+            [(Leg::Long, long_pos, long_rec, view.long_exchange), (Leg::Short, short_pos, short_rec, view.short_exchange)]
+        {
             let pos = match pos {
                 Ok(p) => p,
                 Err(e) => {
@@ -1101,22 +1169,74 @@ impl Actor {
                 let _ = self.land(pair, SystemEvent::CloseFailed, json!({ "reason": reason }));
                 return;
             }
-            if pos.is_zero() {
-                continue; // nothing to close on this leg (e.g. the failed leg of a PARTIAL_FAILURE)
+            let actual = pos.abs();
+            let alert = |recorded: Option<Decimal>, diff_pct: Option<Decimal>, reason: String| {
+                json!({
+                    "leg": leg.as_str(),
+                    "exchange": exchange.name(),
+                    "symbol": view.symbol,
+                    "recorded_quantity": recorded.map(dstr),
+                    "position_quantity": dstr(actual),
+                    "diff_pct": diff_pct.map(dstr),
+                    "tolerance_pct": dstr(tolerance),
+                    "reason": reason,
+                    "simulated": view.simulated,
+                })
+            };
+            // Both quantities are in the leg's order unit, so the relative difference is the same
+            // as in base coin (contracts x ct_val on OKX).
+            let close_qty = match rec {
+                // Nothing held and nothing known (e.g. a simulated pair after a restart: its
+                // ledger is gone): nothing to close.
+                Err(_) if actual.is_zero() => Decimal::ZERO,
+                Err(e) => {
+                    mismatches.push(alert(None, None, format!("recorded fill unknown ({e}); the position may not be the pair's")));
+                    continue;
+                }
+                // Nothing filled and nothing held (e.g. the rejected leg of a PARTIAL_FAILURE).
+                Ok(recorded) if recorded.is_zero() && actual.is_zero() => Decimal::ZERO,
+                Ok(recorded) => {
+                    // Larger of the two is > 0 here.
+                    let diff_pct = (actual - recorded).abs() * Decimal::ONE_HUNDRED / actual.max(recorded);
+                    if diff_pct > tolerance {
+                        mismatches.push(alert(Some(recorded), Some(diff_pct), "position differs from the pair's recorded fill".into()));
+                        continue;
+                    }
+                    actual.min(recorded)
+                }
+            };
+            let residual = match leg {
+                Leg::Long => pos - close_qty,
+                Leg::Short => pos + close_qty,
+            };
+            plan[idx(leg)] = (close_qty, residual);
+        }
+        if !mismatches.is_empty() {
+            for a in &mismatches {
+                self.note(CLOSE_QUANTITY_MISMATCH, Some(pair), a.clone());
+            }
+            let detail = json!({ "reason": "position differs from the pair's recorded fill; nothing closed, left for the user", "legs": mismatches });
+            let _ = self.land(pair, SystemEvent::CloseFailed, detail);
+            return;
+        }
+        let prefix = self.id_prefix();
+        let mut legs: [Option<LegOrder>; 2] = [None, None];
+        for (leg, exchange) in [(Leg::Long, view.long_exchange), (Leg::Short, view.short_exchange)] {
+            let (close_qty, _) = plan[idx(leg)];
+            if close_qty.is_zero() {
+                continue;
             }
             let req = OrderRequest {
                 client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Close),
                 exchange,
                 symbol: view.symbol.clone(),
                 side: OrderSide::for_leg(side_of(leg), OrderAction::Close),
-                quantity: pos.abs(),
+                quantity: close_qty,
                 reduce_only: true,
             };
             legs[idx(leg)] = Some(LegOrder::new(req, Decimal::ONE));
         }
-        // Closing is never held back by settings: unreadable settings use the defaults' timeout.
-        let (risk, overrides) = self.load_risk().unwrap_or_else(|_| (RiskConfig::default(), RiskOverrides::new()));
-        let eff = effective_for_pair(&risk, &overrides, view.long_exchange, view.short_exchange);
+        self.flows.entry(pair.to_string()).or_default().close_residual = [plan[0].1, plan[1].1];
         let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs };
         self.send_set(pair, OrderAction::Close, set);
         self.check_close(pair, self.clock.now_ms());
@@ -1142,9 +1262,11 @@ impl Actor {
         if !(all_over || set.timed_out(now)) || flow.flat_inflight {
             return;
         }
-        self.flows.entry(pair.to_string()).or_default().flat_inflight = true;
+        let flow = self.flows.entry(pair.to_string()).or_default();
+        flow.flat_inflight = true;
+        let residual = flow.close_residual;
         let (account, tx) = (self.account_for(view.simulated), self.event_tx.clone());
-        let legs = [(view.long_exchange, view.symbol.clone()), (view.short_exchange, view.symbol.clone())];
+        let legs = [(view.long_exchange, view.symbol.clone(), residual[0]), (view.short_exchange, view.symbol.clone(), residual[1])];
         let pair = pair.to_string();
         tokio::spawn(async move {
             let flat = is_flat(account.as_ref(), &legs).await;
@@ -1161,7 +1283,12 @@ impl Actor {
         }
         match flat {
             Ok(true) => {
-                let payload = json!({ "verified_flat": true, "simulated": self.pairs.get(pair).is_some_and(|v| v.simulated) });
+                let residual = self.flows.get(pair).map_or([Decimal::ZERO; 2], |f| f.close_residual);
+                let mut payload = json!({ "verified_flat": true, "simulated": self.pairs.get(pair).is_some_and(|v| v.simulated) });
+                if residual.iter().any(|r| !r.is_zero()) {
+                    // Exposure on the same symbol that was not the pair's and was left alone.
+                    payload["left_untouched"] = json!({ "long": dstr(residual[0]), "short": dstr(residual[1]) });
+                }
                 // The confirmation is recorded before FINALIZED; without it nothing is finalized.
                 if self.events.append(CLOSE_CONFIRMED, Some(pair), payload).is_ok() {
                     let _ = self.land(pair, SystemEvent::ClosedConfirmed { verified_flat: true }, json!({ "source": "flat check" }));
@@ -1263,17 +1390,38 @@ impl Actor {
             }
             Event::Queried { pair: Some(pair), client_order_id, outcome } => {
                 let now = self.clock.now_ms();
+                let simulated = self.pairs.get(&pair).is_some_and(|v| v.simulated);
                 let Some(flow) = self.flows.get_mut(&pair) else { return };
                 let mut action = None;
+                let mut fill_event = None;
                 for (a, set) in [(OrderAction::Open, flow.open.as_mut()), (OrderAction::Close, flow.close.as_mut())] {
                     if let Some(o) = set.and_then(|s| s.find_mut(&client_order_id)) {
                         o.query_inflight = false;
                         if let QueryOutcome::Found(status) = &outcome {
+                            if fill_changed(o.status.as_ref(), status) {
+                                let mut p = status_json(status);
+                                p["client_order_id"] = json!(client_order_id);
+                                p["exchange"] = json!(o.req.exchange.name());
+                                p["symbol"] = json!(o.req.symbol);
+                                p["requested_quantity"] = json!(dstr(o.req.quantity));
+                                p["action"] = json!(match a {
+                                    OrderAction::Open => "open",
+                                    OrderAction::Close => "close",
+                                });
+                                p["simulated"] = json!(simulated);
+                                fill_event = Some(p);
+                            }
                             o.status = Some(status.clone());
                         }
                         action = Some(a);
                         break;
                     }
+                }
+                if let Some(mut p) = fill_event {
+                    if let Some((leg, _)) = ids::leg_action_of(&client_order_id) {
+                        p["leg"] = json!(leg.as_str());
+                    }
+                    self.note(ORDER_FILL, Some(&pair), p);
                 }
                 match action {
                     Some(OrderAction::Open) => self.check_fills(&pair, now),
@@ -1288,7 +1436,9 @@ impl Actor {
                 payload["simulated"] = json!(self.executor.is_simulated());
                 self.note(MANUAL_ORDER_RESULT, None, payload);
             }
-            Event::ClosePositionsFetched { pair, long, short } => self.on_close_positions(&pair, long, short),
+            Event::ClosePositionsFetched { pair, long, short, long_recorded, short_recorded } => {
+                self.on_close_positions(&pair, [long, short], [long_recorded, short_recorded]);
+            }
             Event::FlatChecked { pair, flat } => self.on_flat_checked(&pair, flat),
             Event::ReconciliationDone { result } => self.on_reconciliation_done(result),
         }
@@ -1304,6 +1454,14 @@ impl Actor {
             OrderAction::Close => "close",
         });
         payload["simulated"] = json!(simulated);
+        if let Some(v) = self.pairs.get(pair) {
+            let exchange = match leg {
+                Leg::Long => v.long_exchange,
+                Leg::Short => v.short_exchange,
+            };
+            payload["exchange"] = json!(exchange.name());
+            payload["symbol"] = json!(v.symbol);
+        }
         self.note(ORDER_SUBMITTED, Some(pair), payload);
         let Some(o) = self.flows.get_mut(pair).and_then(|f| f.set_mut(action)).and_then(|s| s.find_mut(client_order_id)) else {
             return; // not an order this pair is waiting for
@@ -1419,13 +1577,28 @@ impl Actor {
         }
     }
 
+    /// Allowed iff every open pair belongs to `target` (`PairView::simulated`); see
+    /// `gate::switch_execution_mode`.
     fn set_execution_mode(&mut self, target: ExecutionMode) -> CommandReply {
-        let open = self.pairs.values().filter(|v| transition::is_open(v.state)).count();
-        match gate::switch_execution_mode(&self.db, self.factory.as_ref(), self.execution_mode, target, open) {
+        let target_simulated = target == ExecutionMode::Simulation;
+        let other_mode_open =
+            self.pairs.values().filter(|v| transition::is_open(v.state) && v.simulated != target_simulated).count();
+        match gate::switch_execution_mode(&self.db, self.factory.as_ref(), self.execution_mode, target, other_mode_open) {
             ModeSwitch::Unchanged => CommandReply::Accepted,
             ModeSwitch::Switched { mode, executor } => {
                 self.execution_mode = mode;
                 self.executor = executor.unwrap_or_else(|| self.simulator.clone());
+                match mode {
+                    ExecutionMode::ExchangeDemo => {
+                        // The fallback no longer applies; a pending reconciliation of the demo
+                        // pairs can now use the demo executor (no need to wait for the retry).
+                        self.notices.retain(|n| n.code != gate::EXECUTION_MODE_FALLBACK);
+                        if self.reconciler.is_some() {
+                            self.start_reconciliation();
+                        }
+                    }
+                    ExecutionMode::Simulation => {}
+                }
                 CommandReply::Accepted
             }
             ModeSwitch::Refused(why) => CommandReply::Rejected(why),
@@ -1549,8 +1722,17 @@ impl Actor {
             pairs: self.pairs.values().cloned().collect(),
             blockers: gate::current_blockers(&self.db, self.reconciliation_pending.as_deref()),
             prices: self.market_rx.borrow().iter().map(|((e, s), p)| (*e, s.clone(), *p)).collect(),
+            notices: self.notices.clone(),
         }
     }
+}
+
+/// A lookup reports something new about an order's fill (quantity, state, price or fee).
+fn fill_changed(before: Option<&OrderStatus>, now: &OrderStatus) -> bool {
+    before.is_none_or(|b| {
+        (b.filled_quantity, b.state, b.avg_price, b.fee, &b.fee_asset)
+            != (now.filled_quantity, now.state, now.avg_price, now.fee, &now.fee_asset)
+    })
 }
 
 /// The intent state an order status settles to (mirrors `intent::settled_state`).
@@ -1563,15 +1745,75 @@ fn intent_state_of(status: &OrderStatus) -> IntentState {
     }
 }
 
+/// What Node 0 and Node 1 used for an entry, written with the ORDER_SUBMIT transition: per leg the
+/// expected (pre-trade) price that sized the order, the baseline and scan prices and the funding
+/// data; the Net Edge recomputed from the same pre-trade funding data with its threshold; notional
+/// and leverage. Decimals are strings.
+fn entry_snapshot_json(
+    view: &PairView,
+    entry: &EntrySnapshot,
+    eff: &EffectiveConfig,
+    pretrade: [&FreshQuote; 2],
+    baseline: [Option<&FreshQuote>; 2],
+    scan: &Value,
+) -> Value {
+    let leg = |exchange: Exchange, pre: &FreshQuote, base: Option<&FreshQuote>, scan_price: Decimal| {
+        json!({
+            "exchange": exchange.name(),
+            "expected_price": dstr(pre.price),
+            "price_observed_at_ms": pre.price_observed_at_ms,
+            "baseline_price": base.map(|b| dstr(b.price)),
+            "scan_price": dstr(scan_price),
+            "funding_rate": dstr(pre.funding.funding_rate),
+            "funding_interval_secs": pre.funding.funding_interval_secs,
+            "next_funding_time": pre.funding.next_funding_time,
+            "mark_price": dstr(pre.funding.mark_price),
+        })
+    };
+    let net_edge = match node0::net_edge_with_threshold(&pretrade[0].funding, &pretrade[1].funding, entry.notional_usdt, eff) {
+        Ok((e, threshold)) => json!({
+            "net_edge_pct": dstr(e.net_edge_pct),
+            "net_edge_usdt": dstr(e.net_edge_usdt),
+            "funding_income_usdt": dstr(e.funding_income_usdt),
+            "fee_usdt": dstr(e.fee_usdt),
+            "slippage_usdt": dstr(e.slippage_usdt),
+            "safety_margin_usdt": dstr(e.safety_margin_usdt),
+            "gross_spread": dstr(e.gross_spread),
+            "threshold_pct": dstr(threshold),
+        }),
+        Err(why) => json!({ "unavailable": why }),
+    };
+    json!({
+        "long": leg(view.long_exchange, pretrade[0], baseline[0], entry.long_scan_price),
+        "short": leg(view.short_exchange, pretrade[1], baseline[1], entry.short_scan_price),
+        "notional_usdt": dstr(entry.notional_usdt),
+        "leverage": dstr(entry.leverage),
+        "net_edge": net_edge,
+        "scan_net_edge_pct": scan.get("net_edge_pct").cloned(),
+    })
+}
+
+/// Fill fields of an order status (cumulative for the order at the time of the report; the
+/// latest ORDER_SUBMITTED / ORDER_FILL of a `client_order_id` is its fill). Quantities are in the
+/// exchange order unit (contracts on OKX).
+fn status_json(s: &OrderStatus) -> Value {
+    json!({
+        "state": format!("{:?}", s.state),
+        "filled_quantity": dstr(s.filled_quantity),
+        "avg_price": s.avg_price.map(dstr),
+        "fee": s.fee.map(dstr),
+        "fee_asset": s.fee_asset,
+        "exchange_order_id": s.exchange_order_id,
+    })
+}
+
 fn outcome_json(outcome: &SubmitOutcome) -> Value {
     match outcome {
-        SubmitOutcome::Accepted(s) => json!({
-            "outcome": "accepted",
-            "state": format!("{:?}", s.state),
-            "filled_quantity": dstr(s.filled_quantity),
-            "avg_price": s.avg_price.map(dstr),
-            "exchange_order_id": s.exchange_order_id,
-        }),
+        SubmitOutcome::Accepted(s) => {
+            let mut v = status_json(s);
+            v["outcome"] = json!("accepted");
+            v
+        }
         SubmitOutcome::Rejected { reason } => json!({ "outcome": "rejected", "reason": reason }),
         SubmitOutcome::Unknown { reason } => json!({ "outcome": "unknown", "reason": reason }),
     }
@@ -1598,10 +1840,41 @@ async fn signed_position(account: &dyn AccountView, exchange: Exchange, symbol: 
     Ok(positions.items.iter().filter(|p| p.symbol == symbol).map(|p| p.quantity).sum())
 }
 
-/// Closed confirmation: every leg's position is 0 and no open order is left on its symbol.
-async fn is_flat(account: &dyn AccountView, legs: &[(Exchange, String); 2]) -> Result<bool, String> {
-    for (exchange, symbol) in legs {
-        if !signed_position(account, *exchange, symbol).await?.is_zero() {
+/// One of a pair's orders on a leg, from its order intent.
+#[derive(Debug, Clone)]
+struct PairOrder {
+    client_order_id: String,
+    action: OrderAction,
+    /// Intent FAILED: the order never existed on the exchange.
+    rejected: bool,
+}
+
+/// The pair's recorded fill on one leg (exchange order unit): the `filled_quantity` of its open
+/// orders minus that of its earlier close orders (a retried close after a partial one), each
+/// looked up by `client_order_id` on the pair's executor, so it also works after a restart. A
+/// rejected intent counts 0 without a lookup. An order that cannot be found or looked up makes
+/// the leg unknown (`Err`): never guessed.
+async fn recorded_fill(executor: &dyn Executor, exchange: Exchange, symbol: &str, orders: &[PairOrder]) -> Result<Decimal, String> {
+    let mut total = Decimal::ZERO;
+    for o in orders.iter().filter(|o| !o.rejected) {
+        let filled = match executor.query(exchange, symbol, &o.client_order_id).await {
+            QueryOutcome::Found(status) => status.filled_quantity,
+            QueryOutcome::NotFound => return Err(format!("order {} not found", o.client_order_id)),
+            QueryOutcome::Failed { reason } => return Err(format!("order {} lookup failed: {reason}", o.client_order_id)),
+        };
+        match o.action {
+            OrderAction::Open => total += filled,
+            OrderAction::Close => total -= filled,
+        }
+    }
+    Ok(total.max(Decimal::ZERO))
+}
+
+/// Closed confirmation: every leg's position equals what is expected to remain (the exposure
+/// that is not the pair's; normally 0) and no open order is left on its symbol.
+async fn is_flat(account: &dyn AccountView, legs: &[(Exchange, String, Decimal); 2]) -> Result<bool, String> {
+    for (exchange, symbol, residual) in legs {
+        if signed_position(account, *exchange, symbol).await? != *residual {
             return Ok(false);
         }
         let orders = account.open_orders(*exchange).await?;
@@ -1654,6 +1927,7 @@ fn dummy_snapshot() -> Snapshot {
         pairs: Vec::new(),
         blockers: Vec::<Blocker>::new(),
         prices: Vec::new(),
+        notices: Vec::new(),
     }
 }
 
@@ -2168,6 +2442,95 @@ mod tests {
         assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::Simulation);
         assert_eq!(rig.db.flag_get(FLAG_EXECUTION_MODE).unwrap().as_deref(), Some("SIMULATION"));
         assert_eq!(count_events(&rig.db, crate::engine::gate::EXECUTION_MODE_FALLBACK), 1);
+    }
+
+    /// Like `seed`, but the pair belongs to EXCHANGE_DEMO.
+    fn seed_demo(db: &Db, uuid: &str, symbol: &str, state: PairState) {
+        seed(db, uuid, symbol, state);
+        let sql = format!("UPDATE pairs SET entry_json = json_set(entry_json, '$.simulated', json('false')) WHERE internal_uuid = '{uuid}'");
+        db.with_conn(|c| Ok(c.execute(&sql, [])?)).unwrap();
+    }
+
+    /// The post-fallback recovery path (decision 2026-10-05 evening): a stored EXCHANGE_DEMO fell
+    /// back to SIMULATION for lack of keys, leaving a demo pair open. Once the keys work, switching
+    /// to EXCHANGE_DEMO is allowed because every open pair belongs to EXCHANGE_DEMO.
+    #[tokio::test(start_paused = true)]
+    async fn sim_to_demo_is_allowed_when_every_open_pair_is_a_demo_pair() {
+        let (rig, deps) = rig_with(CountingFactory::failing("no keys"));
+        rig.db.flag_set(FLAG_EXECUTION_MODE, "EXCHANGE_DEMO").unwrap();
+        seed_demo(&rig.db, "u1", "BTCUSDT", PairState::Reconciled);
+        let h = start(deps);
+        assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::Simulation, "fell back");
+        *rig.factory.fail.lock().unwrap() = None; // keys fixed
+        let r = ask(&h, Command::SetExecutionMode(ExecutionMode::ExchangeDemo)).await;
+        assert_eq!(r, CommandReply::Accepted);
+        assert_eq!(rig.factory.calls(), 2, "startup attempt + the key check of the switch");
+        assert_eq!(rig.db.flag_get(FLAG_EXECUTION_MODE).unwrap().as_deref(), Some("EXCHANGE_DEMO"));
+        sleep(Duration::from_millis(300)).await;
+        let s = h.snapshots.borrow().clone();
+        assert_eq!(s.execution_mode, ExecutionMode::ExchangeDemo);
+        assert!(s.notices.is_empty(), "the fallback notice is gone once EXCHANGE_DEMO works: {:?}", s.notices);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sim_to_demo_with_keys_still_missing_keeps_simulation() {
+        let (rig, deps) = rig_with(CountingFactory::failing("no keys"));
+        rig.db.flag_set(FLAG_EXECUTION_MODE, "EXCHANGE_DEMO").unwrap();
+        seed_demo(&rig.db, "u1", "BTCUSDT", PairState::Reconciled);
+        let h = start(deps);
+        let r = ask(&h, Command::SetExecutionMode(ExecutionMode::ExchangeDemo)).await;
+        assert!(matches!(&r, CommandReply::Rejected(why) if why.contains("no keys")), "{r:?}");
+        assert_eq!(rig.factory.calls(), 2, "the switch checked the keys again");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::Simulation);
+        assert_eq!(rig.db.flag_get(FLAG_EXECUTION_MODE).unwrap().as_deref(), Some("SIMULATION"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sim_to_demo_is_refused_while_a_sim_pair_is_open() {
+        let (rig, deps) = rig();
+        seed_demo(&rig.db, "u1", "BTCUSDT", PairState::Reconciled);
+        seed(&rig.db, "u2", "ETHUSDT", PairState::Prepared);
+        let h = start(deps);
+        let r = ask(&h, Command::SetExecutionMode(ExecutionMode::ExchangeDemo)).await;
+        assert!(matches!(&r, CommandReply::Rejected(why) if why.contains("SIMULATION")), "{r:?}");
+        assert_eq!(rig.factory.calls(), 0, "refused before the key check");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::Simulation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn demo_to_sim_is_refused_while_a_demo_pair_is_open() {
+        let (rig, deps) = rig();
+        rig.db.flag_set(FLAG_EXECUTION_MODE, "EXCHANGE_DEMO").unwrap();
+        seed_demo(&rig.db, "u1", "BTCUSDT", PairState::Reconciled);
+        let h = start(deps);
+        assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::ExchangeDemo);
+        let r = ask(&h, Command::SetExecutionMode(ExecutionMode::Simulation)).await;
+        assert!(matches!(&r, CommandReply::Rejected(why) if why.contains("EXCHANGE_DEMO")), "{r:?}");
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(h.snapshots.borrow().execution_mode, ExecutionMode::ExchangeDemo);
+        assert_eq!(rig.db.flag_get(FLAG_EXECUTION_MODE).unwrap().as_deref(), Some("EXCHANGE_DEMO"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_startup_fallback_puts_a_notice_in_the_snapshot() {
+        let (rig, deps) = rig_with(CountingFactory::failing("keychain: item not found"));
+        rig.db.flag_set(FLAG_EXECUTION_MODE, "EXCHANGE_DEMO").unwrap();
+        let h = start(deps);
+        let s = h.snapshots.borrow().clone();
+        assert_eq!(s.execution_mode, ExecutionMode::Simulation);
+        assert_eq!(s.notices.len(), 1, "{:?}", s.notices);
+        assert_eq!(s.notices[0].code, crate::engine::gate::EXECUTION_MODE_FALLBACK);
+        assert!(s.notices[0].message.contains("keychain: item not found"), "{:?}", s.notices[0]);
+        assert_eq!(count_events(&rig.db, crate::engine::gate::EXECUTION_MODE_FALLBACK), 1, "the event stays");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_notice_without_a_fallback() {
+        let (_rig, deps) = rig();
+        let h = start(deps);
+        assert!(h.snapshots.borrow().notices.is_empty());
     }
 
     #[tokio::test(start_paused = true)]

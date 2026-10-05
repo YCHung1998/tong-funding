@@ -77,6 +77,11 @@ pub struct OrderStatus {
     /// Same unit as `OrderRequest::quantity` (contracts on OKX).
     pub filled_quantity: Decimal,
     pub avg_price: Option<Price>,
+    /// Cumulative fee charged for this order so far (positive = paid), in `fee_asset`; `None` =
+    /// not reported. The simulator reports 0 USDT (no fees are simulated).
+    pub fee: Option<Decimal>,
+    /// Asset the fee is charged in (e.g. "USDT", "BNB"); `None` = not reported.
+    pub fee_asset: Option<String>,
     pub state: OrderState,
 }
 

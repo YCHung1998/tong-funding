@@ -106,8 +106,16 @@ pub enum Event {
     },
     /// Periodic re-fetch for the PREPARED auto-cancel evaluation (AUTO only).
     RecheckFetched { pair: PairUuid, long: Result<FreshQuote, String>, short: Result<FreshQuote, String> },
-    /// Signed positions (exchange order unit) of both legs' symbol, read before closing.
-    ClosePositionsFetched { pair: PairUuid, long: Result<Decimal, String>, short: Result<Decimal, String> },
+    /// Read before closing: signed positions (exchange order unit) of both legs' symbol, and the
+    /// pair's recorded fill per leg (sum of its open orders' filled quantity, looked up by
+    /// `client_order_id`; `Err` = not known). Close quantity = min(recorded, |position|).
+    ClosePositionsFetched {
+        pair: PairUuid,
+        long: Result<Decimal, String>,
+        short: Result<Decimal, String>,
+        long_recorded: Result<Decimal, String>,
+        short_recorded: Result<Decimal, String>,
+    },
     /// Closed-confirmation read: `Ok(true)` = both legs' positions are 0 and no open order is
     /// left on the symbol (complete lists only).
     FlatChecked { pair: PairUuid, flat: Result<bool, String> },
@@ -139,6 +147,15 @@ pub enum Blocker {
     ReconciliationPending(String),
 }
 
+/// Something the user must be told about (shown as a banner until it no longer applies).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// Machine-readable kind; equals the event type written for it (e.g. `EXECUTION_MODE_FALLBACK`).
+    pub code: String,
+    /// Human-readable text for the user.
+    pub message: String,
+}
+
 /// A read-only copy; contains nothing that can change engine state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -149,6 +166,8 @@ pub struct Snapshot {
     pub blockers: Vec<Blocker>,
     /// Latest known prices by (exchange, symbol), merged from the market `watch` channel.
     pub prices: Vec<(Exchange, String, Decimal)>,
+    /// User notices (additive), e.g. the startup fallback from EXCHANGE_DEMO to SIMULATION.
+    pub notices: Vec<Notice>,
 }
 
 /// Reply to a command (sent on the command's oneshot, if any).

@@ -93,3 +93,20 @@ UI SHALL 只接收限頻的 `Snapshot`；兩次推送之間的最小間隔 SHALL
 
 - **WHEN** 唯一的配對已是 `FINALIZED`
 - **THEN** `RiskLimits` 以已開啟配對數 0 計算
+
+### Requirement: 進場與成交明細寫入不可變事件
+
+為供 `funding-pnl` 計算損益，引擎 SHALL 在 `ORDER_SUBMIT` 轉移事件（與轉移同一 transaction）中記錄進場快照：兩腿的預期價格（Node 1 計算數量所用的送單前價格）、基準價與掃描價、資金費率，以及以同一份送單前資料計算的 Net Edge（各組成與門檻）、名目與槓桿。
+每筆送單結果事件（`ORDER_SUBMITTED`）與之後查詢發現的成交變化事件（`ORDER_FILL`）SHALL 記錄該委託的交易所、標的、狀態、成交數量、成交均價、手續費與手續費幣別；交易所未回報的欄位 SHALL 記為空值，SHALL NOT 以推測值填入。
+`ports::OrderStatus` SHALL 帶有 `fee` 與 `fee_asset`（皆可為空）；`SimulatedExecutor` SHALL 回報手續費 0、幣別 `USDT`，其事件仍標記為模擬。
+
+#### Scenario: 模擬進場留下完整明細
+
+- **WHEN** SIMULATION 的配對通過 Node 0 並完整成交
+- **THEN** `ORDER_SUBMIT` 事件含兩腿預期價格與 Net Edge 快照，兩筆 `ORDER_SUBMITTED` 事件各含成交價、數量、手續費 0 與幣別 `USDT`，且標記為模擬
+
+#### Scenario: 稍後查詢才得知的成交
+
+- **WHEN** 送單時委託尚未成交，之後以原 `client_order_id` 查詢得知已成交
+- **THEN** 寫入一筆 `ORDER_FILL` 事件，含成交價、數量、手續費與手續費幣別
+
