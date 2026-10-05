@@ -128,3 +128,25 @@ Node 1 SHALL 對每一腿以 `Quantity` 的取整函式計算下單數量（含 
 
 - **WHEN** 以假時鐘跑完一輪進場至出場（`SIMULATION`、兩腿完整成交）
 - **THEN** 事件序列依序包含 `PRE_TRADE_CHECK`、`ORDER_SUBMIT`、`FILL_MONITOR`、`RECONCILED`、`CLOSING`、`FINALIZED`，且 `FINALIZED` 前有已平倉確認事件
+
+### Requirement: 平倉數量以配對記錄的成交量為上限，不動不屬於配對的部位
+
+平倉時每腿的數量 SHALL 為 min(配對記錄的成交量, 實際持倉)；記錄的成交量 SHALL 取自該配對自己的委託（以原 `client_order_id` 查詢），不得以帳戶持倉取代。
+實際持倉與記錄量的相對差超過生效的 `max_leg_imbalance_pct`，或記錄量無法確定而該腿有持倉時，引擎 SHALL NOT 送出平倉單，SHALL 寫入附兩個數量的警示事件，並以 `CloseFailed` 轉入 `PARTIAL_FAILURE` 交由人工。
+已平倉確認 SHALL 只要求本配對的部分歸零：不屬於本配對的部位保持不動，不視為未平倉。
+
+#### Scenario: 同標的有使用者自己的部位
+
+- **WHEN** 平倉時 long 腿持倉為 10.05，配對記錄的成交量為 10，差異在門檻內
+- **THEN** 只平倉 10，剩下的 0.05 不動，配對轉為 `FINALIZED`
+
+#### Scenario: 差異超過門檻
+
+- **WHEN** 平倉時 long 腿持倉為 12，配對記錄的成交量為 10，門檻為 1%
+- **THEN** 兩腿都不送平倉單，寫入含 10 與 12 的警示事件，配對轉為 `PARTIAL_FAILURE`
+
+#### Scenario: 持倉略少於記錄量
+
+- **WHEN** 平倉時 long 腿持倉為 9.95，配對記錄的成交量為 10，差異在門檻內
+- **THEN** long 腿平倉 9.95
+

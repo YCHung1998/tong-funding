@@ -135,7 +135,7 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 - **不平衡量**：兩腿以幣本位成交量的相對差（對較大者的百分比），等於門檻視為通過。
 - **`entry_json` 格式**：`PairEnvelope { long_exchange, short_exchange, settlement_ms, simulated, scan }`，`scan` 內 `long_scan_price`、`short_scan_price`、`notional_usdt`、`leverage` 一律為字串（拒絕浮點數）。
 - **模式旗標遺失或讀取失敗時預設 `MANUAL` + `SIMULATION`**（安全組合）；儲存的 `EXCHANGE_DEMO` 在啟動時若建不出執行器，退回 `SIMULATION` 並寫 `EXECUTION_MODE_FALLBACK`。
-- **PREPARED 也算已開啟配對**（依 spec 定義），所以有 PREPARED 配對時不能切換 `execution_mode`。
+- **PREPARED 也算已開啟配對**（依 spec 定義），所以有屬於另一模式的 PREPARED 配對時不能切換 `execution_mode`（切換條件已由 2026-10-05 晚的決定改為「所有已開啟配對都屬於目標模式」）。
 - **意圖在呼叫前先寫 INTENDED、再標 SUBMITTED**，兩次寫入都成功才呼叫 `Executor`；因此崩潰後資料庫一定是 SUBMITTED（不會出現「已呼叫但仍是 INTENDED」）。重啟對帳時「SUBMITTED + 查無 + 兩腿持倉與委託皆無曝險」判為未送達（D12）。
 - **`client_order_id`**：`<sim|demo><l|s><o|c><seq base36 4 碼><uuid 的 FNV-1a 13 碼><uuid 前 0–8 個英數字>`，只用小寫英數、≤ 31 字元（比 spec 的 36 更保守，也落在 OKX `clOrdId` 32 字元以內，**OKX 規則未查證**）。
 - **系統時鐘掃描**只放行 `tokio::time::Instant::now`（可在測試中暫停的計時器，只用於 Snapshot 推送間隔，不蓋事件時間戳）。
@@ -146,7 +146,7 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 - **進場視窗在進場處理內再檢查一次**：`EntryTrigger` 與 `ManualEnter` 在偏移不可用、或時鐘最超前的一腿已到 `T` 時一律拒絕；人工進場可以早於 `T − entry_lead_ms`。
 - **PREPARED 自動撤銷只在 AUTO 執行**：使用基準價資料，外加每 30 秒一次的重新抓取（只在距基準價時點 30 秒以上時進行），讓進場視窗內恰好只有兩次抓取（基準價與送單前）。
 - **送單永遠不回應**：在 `ORDER_SUBMIT` 超過生效的 `order_timeout_seconds` 即視為「結果未知」，進 `FILL_MONITOR` 後以同一 id 查詢，查不到則 `UNRESOLVED`。
-- **平倉數量取自帳戶持倉**（`AccountView`，SIMULATION 時為模擬帳），不取記憶體中的成交量，因此重啟後的人工平倉也正確。沒有持倉的腿略過；方向不符或帳戶不可讀 → `CloseFailed` → `PARTIAL_FAILURE`；平倉後仍有持倉或委託 → `PARTIAL_FAILURE`。
+- ~~平倉數量取自帳戶持倉~~（已由 2026-10-05 晚的決定取代）。**平倉數量 = min(配對記錄的成交量, 實際持倉)**：記錄的成交量 = 該配對該腿各筆開倉單的成交量（以原 `client_order_id` 經 `Executor::query` 查詢，重啟後也正確）減去先前平倉單的成交量；`FAILED` 的意圖算 0 不查詢；任一筆查無或查詢失敗即「記錄量未知」（不猜）。實際持倉來自 `AccountView`（SIMULATION 時為模擬帳）。兩者以下單單位比較（OKX 為張數，相對差等於幣本位相對差），差異 > 生效的 `max_leg_imbalance_pct`（對較大者的百分比，等於門檻視為通過）、或記錄量未知但有持倉 → **兩腿都不送平倉單**，每個不符的腿寫一筆 `CLOSE_QUANTITY_MISMATCH` 警示（記錄量、持倉量、差異、門檻），配對以 `CloseFailed` → `PARTIAL_FAILURE` 轉人工。持倉為 0 的腿略過（記錄量為 0 或未知時）。不屬於本配對的部位（持倉 − 平倉量）不動，已平倉確認改為「持倉 = 平倉前算出的剩餘量（通常為 0）且無未成交委託」，剩餘量寫入 `CLOSE_CONFIRMED.left_untouched`。方向不符或帳戶不可讀 → `CloseFailed` → `PARTIAL_FAILURE`；平倉後持倉不等於剩餘量或仍有委託 → `PARTIAL_FAILURE`。
 - **殘留委託不自動撤單**（逾時與平倉前都不撤）：符合「單腿與不平衡完全人工處理」；部分成交後仍掛著的委託會使已平倉確認失敗而轉 `PARTIAL_FAILURE`。
 - **帳戶列表不可讀或不完整視為有外部曝險**（Node 0 的 `ExistingExposure` 失敗）。
 - **kill switch 讀取失敗時不寫 `COMMAND_REFUSED`**：讀取失敗會讓 store 停機，事件無法寫入；停機原因本身即是紀錄。
@@ -168,7 +168,7 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 
 ## Open Questions
 
-- **demo 配對在 SIMULATION 下可能一直卡住（需使用者決定）**：啟動時 EXCHANGE_DEMO 因金鑰不可用退回 SIMULATION 並持久化後，未對帳的 demo 配對每次重啟都維持未對帳；而有已開啟配對時不允許切換模式，修好金鑰重啟也仍在 SIMULATION。可選：(1) 只剩未對帳的 demo 配對時允許切換到 EXCHANGE_DEMO；(2) 啟動時若儲存的模式是 EXCHANGE_DEMO 而建不出執行器，不持久化退回值（下次啟動再試）。
+- ~~demo 配對在 SIMULATION 下可能一直卡住~~：已由 2026-10-05 晚的決定解決（切換條件改為「所有已開啟配對都屬於目標模式」，見文末實作紀錄）。
 
 - Snapshot 最小間隔 250 毫秒、`client_order_id` 長度 36 與字元集、交易所查單保留期限、SQLite 寫入延遲、actor panic 行為皆**未驗證**，分別在 task 1.2、4.1、`exchange-demo-execution` 的驗證中確認。
 - Node 0 發現結算時間或週期改變時是否另行 BLOCK（D10），目前不另設檢查。
@@ -179,3 +179,9 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 - **模式切換的條件改為「所有已開啟配對都屬於目標模式」**：取代原本的「完全沒有已開啟配對」。如此，因金鑰問題退回 SIMULATION 而留下的 demo 配對，在金鑰修好後可以切回 EXCHANGE_DEMO 對帳與處理；模擬配對與 demo 配對永遠不會用到對方的執行器。
 - **平倉數量 = min(配對記錄的成交量, 實際持倉)**；實際持倉與記錄量差異超過 `max_leg_imbalance_pct` 時不自動平倉，轉人工（`CloseFailed` → `PARTIAL_FAILURE`，附差異的警示事件），不動到不屬於本配對的部位。取代 wave 2「平倉數量取自帳戶持倉」。
 - **成交明細寫入不可變事件**（供 `funding-pnl`）：下單當下的預期價格與 Net Edge 快照、每筆成交的價格、數量、手續費與手續費幣別。
+
+## 實作時的決定（2026-10-05 晚的決定落地）
+
+- **模式切換**：`gate::switch_execution_mode` 收「屬於另一模式的已開啟配對數」（依 `PairView.simulated`），> 0 即拒絕並說明是哪個模式的配對；否則切到 `EXCHANGE_DEMO` 仍先呼叫工廠（金鑰檢查），失敗維持 `SIMULATION`。切換成功到 `EXCHANGE_DEMO` 時，若有待完成的啟動對帳，立即以 demo 執行器重跑一次（不等 30 秒重試）。
+- **退回提醒**：`Snapshot` 新增 `notices: Vec<Notice>`（`Notice { code, message }`，附加欄位）。啟動退回 `SIMULATION` 時加入 `code = EXECUTION_MODE_FALLBACK` 的提醒（含原因），`EXECUTION_MODE_FALLBACK` 事件照寫；之後成功切回 `EXCHANGE_DEMO` 即移除。
+- **成交明細**：`ports::OrderStatus` 新增 `fee: Option<Decimal>`、`fee_asset: Option<String>`（附加欄位；模擬回報 0 / `USDT`）。`ORDER_SUBMIT` 轉移事件的 `detail.entry_snapshot` 記錄 Node 0 與 Node 1 用的資料：兩腿的預期價格（送單前價格，即下單數量的依據）、基準價、掃描價、資金費率與週期，以及用同一份送單前資料重算的 Net Edge（各組成與門檻）、名目與槓桿；與轉移在同一 transaction 落地。`ORDER_SUBMITTED` 帶 `exchange`、`symbol`、`state`、`filled_quantity`、`avg_price`、`fee`、`fee_asset`；之後查詢發現成交有變化時寫 `ORDER_FILL`（同欄位加 `leg`、`action`、`requested_quantity`）。數量為交易所下單單位（OKX 為張數），金額為該筆委託到回報當下的累計值；同一 `client_order_id` 最新的一筆即為其成交。

@@ -3,8 +3,8 @@
 //! exchange module (a source-scan test below enforces that), so it cannot place an order.
 //!
 //! Outcomes are scripted per order (by `client_order_id` prefix or by exchange + symbol); the
-//! default is a full fill at the injected latest price, with no fees and no slippage (not a claim
-//! about reality). A simulated ledger of positions and open orders backs `query`, `cancel` and
+//! default is a full fill at the injected latest price, with no fees (reported as fee 0 USDT) and
+//! no slippage (not a claim about reality). A simulated ledger of positions and open orders backs `query`, `cancel` and
 //! [`SimAccountView`]. It lives in memory only: after a restart simulated pairs go to UNRESOLVED
 //! (decision 7), they are never "recovered" from this ledger.
 //!
@@ -21,6 +21,9 @@ use super::ports::{
     AccountOrder, AccountPosition, AccountView, BoxFut, Executor, Listed, OrderRequest, OrderSide, OrderState, OrderStatus,
     QueryOutcome, SubmitOutcome,
 };
+
+/// Fee asset reported by simulated fills (the fee itself is always 0).
+pub const SIM_FEE_ASSET: &str = "USDT";
 
 /// Latest price used for simulated fills. `None` = no price -> the order is rejected.
 pub trait SimPrices: Send + Sync {
@@ -130,6 +133,9 @@ impl SimLedger {
             exchange_order_id: Some(format!("sim-{}", self.next_order_no)),
             filled_quantity: filled,
             avg_price: Some(price),
+            // No fees are simulated; reported explicitly as 0 USDT so funding-pnl never guesses.
+            fee: Some(Decimal::ZERO),
+            fee_asset: Some(SIM_FEE_ASSET.to_string()),
             state: if filled == quantity { OrderState::Filled } else { OrderState::Open },
         };
         let mut recorded = req.clone();
@@ -448,6 +454,23 @@ mod tests {
         assert!(st.exchange_order_id.as_deref().is_some_and(|e| e.starts_with("sim-")), "{st:?}");
         assert_eq!(ex.position(Exchange::Binance, "BTCUSDT"), d("0.019"));
         assert_eq!(ready(ex.query(Exchange::Binance, "BTCUSDT", &cid)), QueryOutcome::Found(st));
+    }
+
+    /// funding-pnl reads fees from the fill; the simulation charges none and says so explicitly.
+    #[test]
+    fn a_simulated_fill_reports_a_zero_usdt_fee_also_on_query_and_partial_fills() {
+        let (ex, _) = sim();
+        let cid = id(Leg::Long, OrderAction::Open, 0);
+        let st = accepted(ready(ex.submit(req(&cid, Exchange::Binance, OrderSide::Buy, "0.019"))));
+        assert_eq!((st.fee, st.fee_asset.as_deref()), (Some(Decimal::ZERO), Some("USDT")), "{st:?}");
+        match ready(ex.query(Exchange::Binance, "BTCUSDT", &cid)) {
+            QueryOutcome::Found(q) => assert_eq!((q.fee, q.fee_asset.as_deref()), (Some(Decimal::ZERO), Some("USDT"))),
+            other => panic!("{other:?}"),
+        }
+        let part = id(Leg::Short, OrderAction::Open, 0);
+        ex.script_prefix(&part, SimBehavior::Partial(d("0.5")));
+        let st = accepted(ready(ex.submit(req(&part, Exchange::Bybit, OrderSide::Sell, "1"))));
+        assert_eq!((st.state, st.fee, st.fee_asset.as_deref()), (OrderState::Open, Some(Decimal::ZERO), Some("USDT")));
     }
 
     #[test]

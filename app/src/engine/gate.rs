@@ -131,22 +131,32 @@ pub enum ModeSwitch {
     Refused(String),
 }
 
-/// Switch `execution_mode`: refused while any open pair exists; switching to EXCHANGE_DEMO builds
-/// the executor through the factory first (failure keeps SIMULATION). The factory is called only
-/// for an actual switch to EXCHANGE_DEMO. Never touches `trigger_mode`.
+/// Switch `execution_mode`: allowed only when every open pair belongs to `target` (decision
+/// 2026-10-05 evening; `other_mode_open` = open pairs created in the OTHER mode, counted by the
+/// caller from `PairView::simulated`). Thus demo pairs left open by a startup fallback to
+/// SIMULATION can be taken back to EXCHANGE_DEMO, while a pair is never traded through the other
+/// mode's executor. Switching to EXCHANGE_DEMO builds the executor through the factory first (the
+/// key check; failure keeps SIMULATION). The factory is called only for an actual, otherwise
+/// allowed switch to EXCHANGE_DEMO. Never touches `trigger_mode`.
 pub fn switch_execution_mode(
     db: &Db,
     factory: &dyn ExecutorFactory,
     current: ExecutionMode,
     target: ExecutionMode,
-    open_pairs: usize,
+    other_mode_open: usize,
 ) -> ModeSwitch {
     if current == target {
         return ModeSwitch::Unchanged;
     }
-    if open_pairs > 0 {
+    if other_mode_open > 0 {
+        let other = match target {
+            ExecutionMode::ExchangeDemo => ExecutionMode::Simulation,
+            ExecutionMode::Simulation => ExecutionMode::ExchangeDemo,
+        };
         return ModeSwitch::Refused(format!(
-            "{open_pairs} open pair(s); finish or cancel them before switching execution_mode"
+            "{other_mode_open} open pair(s) belong to {}; finish or cancel them before switching execution_mode to {}",
+            execution_mode_str(other),
+            execution_mode_str(target)
         ));
     }
     let executor = match target {
@@ -402,6 +412,16 @@ mod tests {
     }
 
     #[test]
+    fn pairs_of_the_target_mode_do_not_hold_the_switch_back() {
+        // The caller passes only pairs of the OTHER mode; pairs of the target mode are fine.
+        let (_d, db, _) = open_tmp();
+        let f = CountingFactory::ok();
+        let r = switch_execution_mode(&db, f.as_ref(), ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, 0);
+        assert!(matches!(r, ModeSwitch::Switched { mode: ExecutionMode::ExchangeDemo, executor: Some(_) }));
+        assert_eq!(f.calls(), 1, "the key check still runs");
+    }
+
+    #[test]
     fn switching_is_refused_while_a_pair_is_open() {
         let (_d, db, _) = open_tmp();
         let f = CountingFactory::ok();
@@ -410,7 +430,8 @@ mod tests {
             (ExecutionMode::ExchangeDemo, ExecutionMode::Simulation),
         ] {
             let r = switch_execution_mode(&db, f.as_ref(), cur, tgt, 1);
-            assert!(matches!(&r, ModeSwitch::Refused(why) if why.contains("open")), "{cur:?}->{tgt:?}");
+            let other = execution_mode_str(cur);
+            assert!(matches!(&r, ModeSwitch::Refused(why) if why.contains("open") && why.contains(other)), "{cur:?}->{tgt:?}");
         }
         assert_eq!(f.calls(), 0, "refused before the factory");
         assert_eq!(flag(&db, FLAG_EXECUTION_MODE), None);

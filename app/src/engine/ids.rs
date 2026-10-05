@@ -43,6 +43,24 @@ impl IdPrefix {
     }
 }
 
+/// Leg and action encoded in an id produced by [`client_order_id`]; `None` for any other id.
+pub fn leg_action_of(client_order_id: &str) -> Option<(Leg, OrderAction)> {
+    let prefix = IdPrefix::of(client_order_id)?;
+    let b = client_order_id.as_bytes();
+    let at = prefix.as_str().len();
+    let leg = match b[at] {
+        b'l' => Leg::Long,
+        b's' => Leg::Short,
+        _ => return None,
+    };
+    let action = match b[at + 1] {
+        b'o' => OrderAction::Open,
+        b'c' => OrderAction::Close,
+        _ => return None,
+    };
+    Some((leg, action))
+}
+
 /// Upper bound on the id length (spec: ≤ 36).
 pub const MAX_LEN: usize = 36;
 
@@ -131,6 +149,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn leg_and_action_are_read_back_from_an_id() {
+        for prefix in [IdPrefix::Sim, IdPrefix::Demo] {
+            for leg in Leg::BOTH {
+                for action in ACTIONS {
+                    let id = client_order_id(prefix, "6f1c2d3e-4b5a", leg, action, 7);
+                    assert_eq!(leg_action_of(&id), Some((leg, action)), "{id}");
+                }
+            }
+        }
+        assert_eq!(leg_action_of("manual-123"), None);
+        assert_eq!(leg_action_of(""), None);
     }
 
     #[test]

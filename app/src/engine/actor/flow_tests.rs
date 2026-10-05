@@ -150,6 +150,8 @@ impl Executor for FakeDemo {
             exchange_order_id: Some("demo-1".into()),
             filled_quantity: req.quantity,
             avg_price: Some(dec("100")),
+            fee: None,
+            fee_asset: None,
             state: OrderState::Filled,
         };
         self.orders.lock().unwrap().insert(req.client_order_id.clone(), status.clone());
@@ -195,6 +197,8 @@ impl NeverFills {
             exchange_order_id: Some("sim-x".into()),
             filled_quantity: Decimal::ZERO,
             avg_price: None,
+            fee: None,
+            fee_asset: None,
             state: OrderState::Open,
         }
     }
@@ -897,6 +901,194 @@ async fn a_manual_order_goes_through_the_simulator_with_an_intent() {
     assert_eq!(rig.factory.calls(), 0);
 }
 
+// ---- close quantity = min(recorded fill, actual position) (decision 2026-10-05 evening) -----
+
+/// A user's own order on the long leg's symbol (Binance), straight to the simulated ledger and
+/// behind the pair's back.
+async fn user_order(rig: &Rig, side: OrderSide, qty: &str, reduce_only: bool) {
+    let action = if reduce_only { OrderAction::Close } else { OrderAction::Open };
+    let req = OrderRequest {
+        client_order_id: client_order_id(IdPrefix::Sim, "user-own-position", Leg::Long, action, 0),
+        exchange: Exchange::Binance,
+        symbol: SYM.into(),
+        side,
+        quantity: dec(qty),
+        reduce_only,
+    };
+    let out = rig.sim.submit(req).await;
+    assert!(matches!(out, SubmitOutcome::Accepted(_)), "{out:?}");
+}
+
+/// The pair's close orders that reached the simulator, per leg.
+fn pair_closes(rig: &Rig) -> Vec<(Leg, Decimal)> {
+    let sent = rig.sim.submitted();
+    Leg::BOTH
+        .into_iter()
+        .filter_map(|leg| sent.iter().find(|r| r.client_order_id == sim_id(leg, OrderAction::Close)).map(|r| (leg, r.quantity)))
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_extra_user_position_on_the_same_symbol_is_left_untouched() {
+    let (rig, _h) = started(Opts::default()).await;
+    run_until(&rig.clock, T - 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED");
+    user_order(&rig, OrderSide::Buy, "0.05", false).await; // 10.05 long, 0.5 % off: within 1 %
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), dec("10.05"));
+    run_until(&rig.clock, T + 16_000).await;
+    assert_eq!(pair_closes(&rig), vec![(Leg::Long, dec("10")), (Leg::Short, dec("10"))], "close = the pair's recorded fill");
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), dec("0.05"), "the user's own 0.05 is still there");
+    assert_eq!(rig.sim.position(Exchange::Bybit, SYM), Decimal::ZERO);
+    assert_eq!(status(&rig.db, UUID), "FINALIZED", "the pair's part is flat; the user's part is not the pair's");
+    assert_eq!(count(&rig.db, CLOSE_QUANTITY_MISMATCH), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_position_far_from_the_recorded_fill_is_not_closed_and_goes_to_partial_failure() {
+    let (rig, _h) = started(Opts::default()).await;
+    run_until(&rig.clock, T - 5_000).await;
+    user_order(&rig, OrderSide::Buy, "2", false).await; // 12 long vs 10 recorded: 16.7 % > 1 %
+    run_until(&rig.clock, T + 16_000).await;
+    assert!(pair_closes(&rig).is_empty(), "no close order at all: {:?}", pair_closes(&rig));
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), dec("12"), "nothing touched");
+    assert_eq!(rig.sim.position(Exchange::Bybit, SYM), dec("-10"), "nothing touched");
+    let alerts: Vec<Value> = events(&rig.db).into_iter().filter(|(_, l, _)| l == CLOSE_QUANTITY_MISMATCH).map(|(_, _, p)| p).collect();
+    assert_eq!(alerts.len(), 1, "{alerts:?}");
+    let a = &alerts[0];
+    assert_eq!((a["leg"].clone(), a["recorded_quantity"].clone(), a["position_quantity"].clone()), (json!("long"), json!("10"), json!("12")), "{a}");
+    assert_eq!(a["tolerance_pct"], json!("1"), "{a}");
+    assert_eq!(a["simulated"], json!(true), "{a}");
+    let failed = events(&rig.db).into_iter().find(|(_, l, _)| l == "PARTIAL_FAILURE").unwrap().2;
+    assert!(failed.to_string().contains("recorded"), "{failed}");
+    assert!(rig.db.list_unfinished_intents().unwrap().is_empty(), "no close intent written");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_small_shortfall_within_tolerance_closes_the_smaller_actual_position() {
+    let (rig, _h) = started(Opts::default()).await;
+    run_until(&rig.clock, T - 5_000).await;
+    user_order(&rig, OrderSide::Sell, "0.05", true).await; // 9.95 long: 0.5 % short of 10
+    run_until(&rig.clock, T + 16_000).await;
+    assert_eq!(pair_closes(&rig), vec![(Leg::Long, dec("9.95")), (Leg::Short, dec("10"))], "close = min(recorded, position)");
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO);
+    assert_eq!(status(&rig.db, UUID), "FINALIZED");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_recorded_fill_with_a_position_closes_nothing() {
+    let (rig, _h) = started(Opts::default()).await;
+    run_until(&rig.clock, T - 5_000).await;
+    rig.sim.fail_queries(Some("exchange unreachable (scripted)".into()));
+    run_until(&rig.clock, T + 16_000).await;
+    assert!(pair_closes(&rig).is_empty(), "never guessed: {:?}", pair_closes(&rig));
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    assert_eq!(count(&rig.db, CLOSE_QUANTITY_MISMATCH), 2, "one alert per leg");
+    let a = events(&rig.db).into_iter().find(|(_, l, _)| l == CLOSE_QUANTITY_MISMATCH).unwrap().2;
+    assert_eq!(a["recorded_quantity"], Value::Null, "{a}");
+    assert!(a["reason"].as_str().unwrap().contains("unreachable"), "{a}");
+}
+
+// ---- fill details for funding-pnl (decision 2026-10-05 evening) ---------------------------
+
+#[tokio::test(start_paused = true)]
+async fn order_submit_carries_the_entry_snapshot_and_order_events_carry_fill_details() {
+    let (rig, _h) = started(Opts::default()).await;
+    run_until(&rig.clock, T - 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED");
+    let submit = events(&rig.db).into_iter().find(|(_, l, _)| l == "ORDER_SUBMIT").unwrap().2;
+    let snap = &submit["detail"]["entry_snapshot"];
+    assert_eq!(snap["long"]["exchange"], json!("Binance"), "{submit}");
+    assert_eq!(snap["short"]["exchange"], json!("Bybit"), "{submit}");
+    assert_eq!(snap["long"]["expected_price"], json!("100"), "{submit}");
+    assert_eq!(snap["short"]["expected_price"], json!("100"), "{submit}");
+    assert_eq!(snap["long"]["baseline_price"], json!("100"), "{submit}");
+    assert_eq!(snap["long"]["funding_rate"], json!("-0.001"), "{submit}");
+    assert_eq!(snap["short"]["funding_rate"], json!("0.001"), "{submit}");
+    assert_eq!(snap["notional_usdt"], json!("1000"), "{submit}");
+    assert_eq!(snap["leverage"], json!("5"), "{submit}");
+    assert_eq!(snap["net_edge"]["threshold_pct"], json!("0.05"), "{submit}");
+    for k in ["net_edge_pct", "net_edge_usdt", "funding_income_usdt", "fee_usdt", "slippage_usdt", "safety_margin_usdt", "gross_spread"] {
+        assert!(snap["net_edge"][k].is_string(), "{k} missing: {submit}");
+    }
+    assert_eq!(submit["detail"]["simulated"], json!(true));
+
+    let orders: Vec<Value> = events(&rig.db).into_iter().filter(|(_, l, _)| l == ORDER_SUBMITTED).map(|(_, _, p)| p).collect();
+    assert_eq!(orders.len(), 2);
+    for p in &orders {
+        assert_eq!(p["avg_price"], json!("100"), "{p}");
+        assert_eq!(p["filled_quantity"], json!("10"), "{p}");
+        assert_eq!(p["fee"], json!("0"), "{p}");
+        assert_eq!(p["fee_asset"], json!("USDT"), "{p}");
+        assert_eq!(p["simulated"], json!(true), "{p}");
+        assert!(p["exchange"].is_string() && p["symbol"] == json!(SYM), "{p}");
+    }
+}
+
+/// Accepts every order unfilled; the first lookup reports it filled at 100.5 with a BNB fee.
+#[derive(Default)]
+struct FillsOnQuery {
+    requests: Mutex<HashMap<String, OrderRequest>>,
+}
+impl Executor for FillsOnQuery {
+    fn is_simulated(&self) -> bool {
+        true
+    }
+    fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {
+        self.requests.lock().unwrap().insert(req.client_order_id.clone(), req.clone());
+        let status = OrderStatus {
+            client_order_id: req.client_order_id,
+            exchange_order_id: Some("sim-q".into()),
+            filled_quantity: Decimal::ZERO,
+            avg_price: None,
+            fee: None,
+            fee_asset: None,
+            state: OrderState::Open,
+        };
+        Box::pin(std::future::ready(SubmitOutcome::Accepted(status)))
+    }
+    fn cancel(&self, _: Exchange, _: &str, _: &str) -> BoxFut<'_, QueryOutcome> {
+        Box::pin(std::future::ready(QueryOutcome::NotFound))
+    }
+    fn query(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        let out = self.requests.lock().unwrap().get(id).map_or(QueryOutcome::NotFound, |r| {
+            QueryOutcome::Found(OrderStatus {
+                client_order_id: id.into(),
+                exchange_order_id: Some("sim-q".into()),
+                filled_quantity: r.quantity,
+                avg_price: Some(dec("100.5")),
+                fee: Some(dec("0.0123")),
+                fee_asset: Some("BNB".into()),
+                state: OrderState::Filled,
+            })
+        });
+        Box::pin(std::future::ready(out))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_fill_reported_by_a_later_query_is_recorded_with_its_details() {
+    let exec = Arc::new(FillsOnQuery::default());
+    let (rig, _h) = started(Opts { simulator: Some(exec.clone()), ..Opts::default() }).await;
+    run_until(&rig.clock, T - 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED");
+    let fills: Vec<Value> = events(&rig.db).into_iter().filter(|(_, l, _)| l == ORDER_FILL).map(|(_, _, p)| p).collect();
+    assert_eq!(fills.len(), 2, "one per leg, written once: {fills:?}");
+    let mut legs: Vec<String> = fills.iter().map(|p| p["leg"].as_str().unwrap().to_string()).collect();
+    legs.sort();
+    assert_eq!(legs, vec!["long", "short"]);
+    for p in &fills {
+        assert_eq!(p["action"], json!("open"), "{p}");
+        assert_eq!(p["state"], json!("Filled"), "{p}");
+        assert_eq!(p["filled_quantity"], json!("10"), "{p}");
+        assert_eq!(p["avg_price"], json!("100.5"), "{p}");
+        assert_eq!(p["fee"], json!("0.0123"), "{p}");
+        assert_eq!(p["fee_asset"], json!("BNB"), "{p}");
+        assert_eq!(p["simulated"], json!(true), "{p}");
+        assert!(p["client_order_id"].as_str().unwrap().starts_with("sim"), "{p}");
+    }
+}
+
 // ---- dedupe ------------------------------------------------------------------------------
 
 #[tokio::test(start_paused = true)]
@@ -1204,6 +1396,8 @@ impl CrashExchange {
             exchange_order_id: Some(format!("x-{}", req.client_order_id)),
             filled_quantity: req.quantity,
             avg_price: Some(dec("100")),
+            fee: None,
+            fee_asset: None,
             state: OrderState::Filled,
         };
         self.orders.lock().unwrap().insert(req.client_order_id.clone(), status.clone());
