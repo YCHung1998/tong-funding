@@ -1,6 +1,13 @@
 use tong_funding_core::pair::{
-    next, Event, IllegalTransition, ManualEvent as M, PairState as S, SystemEvent as E,
+    next, Event, IllegalTransition, ManualEvent as M, PairState as S, PnlGate as P, SystemEvent as E,
 };
+
+/// funding-pnl: the closed confirmation with both confirmations present.
+const CLOSED_OK: E = E::ClosedConfirmed { verified_flat: true, pnl: P::Recorded };
+/// funding-pnl: a SIMULATION pair has no PnL by design; "not applicable" is its confirmation.
+const CLOSED_SIM: E = E::ClosedConfirmed { verified_flat: true, pnl: P::NotApplicableSimulated };
+const CONFIRM_OK: M = M::ConfirmClosed { verified_flat: true, pnl: P::Recorded };
+const CONFIRM_SIM: M = M::ConfirmClosed { verified_flat: true, pnl: P::NotApplicableSimulated };
 
 fn sys(e: E) -> Event {
     Event::System(e)
@@ -30,7 +37,8 @@ fn table() -> Vec<(S, Event, S)> {
         (S::FillMonitor, sys(E::TimeoutUndetermined), S::Unresolved),
         (S::Reconciled, sys(E::ScheduledClose), S::Closing),
         (S::Reconciled, man(M::RequestClose), S::Closing),
-        (S::Closing, sys(E::ClosedConfirmed { verified_flat: true }), S::Finalized),
+        (S::Closing, sys(CLOSED_OK), S::Finalized),
+        (S::Closing, sys(CLOSED_SIM), S::Finalized),
         (S::Closing, sys(E::CloseFailed), S::PartialFailure),
         // engine-simulation: a simulated pair's ledger is gone after a restart.
         (S::Reconciled, sys(E::RestartUndetermined), S::Unresolved),
@@ -41,7 +49,8 @@ fn table() -> Vec<(S, Event, S)> {
     }
     for s in locked {
         t.push((s, man(M::RequestClose), S::Closing));
-        t.push((s, man(M::ConfirmClosed { verified_flat: true }), S::Finalized));
+        t.push((s, man(CONFIRM_OK), S::Finalized));
+        t.push((s, man(CONFIRM_SIM), S::Finalized));
     }
     t
 }
@@ -61,8 +70,10 @@ fn run(state: S, e: Event) -> Result<S, IllegalTransition> {
 
 #[test]
 fn table_has_expected_row_count() {
-    // 18 single rows (incl. RECONCILED restart, engine-simulation) + 3 in-flight * 2 + 3 locked * 2 = 30
-    assert_eq!(table().len(), 30);
+    // 19 single rows (incl. RECONCILED restart, engine-simulation; CLOSING -> FINALIZED once with a
+    // recorded PnL and once "not applicable" for SIMULATION, funding-pnl) + 3 in-flight * 2
+    // + 3 locked * 3 (request close, confirm with recorded PnL, confirm SIMULATION) = 34
+    assert_eq!(table().len(), 34);
 }
 
 #[test]
@@ -92,7 +103,11 @@ fn everything_outside_the_table_is_rejected_exhaustively() {
             }
         }
     }
-    assert_eq!(rejected, 12 * 24 - 30);
+    // 24 system events (ClosedConfirmed: 2 flat values x 3 PnL values) + 8 manual events
+    // (ConfirmClosed: 2 x 3) = 32 events per state.
+    assert_eq!(E::ALL.len(), 24);
+    assert_eq!(M::ALL.len(), 8);
+    assert_eq!(rejected, 12 * 32 - 34);
 }
 
 #[test]
@@ -137,9 +152,13 @@ fn system_event_all_is_complete_and_ordered() {
         assert!(!name.is_empty());
         assert_eq!(e.ordinal(), i);
     }
-    // Both verified_flat values present.
-    assert!(E::ALL.contains(&E::ClosedConfirmed { verified_flat: true }));
-    assert!(E::ALL.contains(&E::ClosedConfirmed { verified_flat: false }));
+    // Every verified_flat x PnL combination present.
+    for flat in [true, false] {
+        for pnl in P::ALL {
+            assert!(E::ALL.contains(&E::ClosedConfirmed { verified_flat: flat, pnl }));
+            assert!(M::ALL.contains(&M::ConfirmClosed { verified_flat: flat, pnl }));
+        }
+    }
 }
 
 // ---- Scenarios -------------------------------------------------------------
@@ -152,7 +171,7 @@ fn scenario_normal_path() {
         (sys(E::BothLegsSubmitted), S::FillMonitor),
         (sys(E::FillsWithinTolerance), S::Reconciled),
         (sys(E::ScheduledClose), S::Closing),
-        (sys(E::ClosedConfirmed { verified_flat: true }), S::Finalized),
+        (sys(CLOSED_OK), S::Finalized),
     ];
     let mut st = S::Prepared;
     for (ev, expect) in steps {
@@ -210,10 +229,10 @@ fn scenario_restart_single_leg() {
 #[test]
 fn scenario_manual_confirm_without_verification_is_rejected() {
     for from in [S::PartialFailure, S::Imbalanced, S::Unresolved] {
-        let r = next(from, M::ConfirmClosed { verified_flat: false });
+        let r = next(from, M::ConfirmClosed { verified_flat: false, pnl: P::Recorded });
         assert!(r.is_err());
         // state "stays": caller keeps `from`; verify retry with verification succeeds.
-        assert_eq!(next(from, M::ConfirmClosed { verified_flat: true }), Ok(S::Finalized));
+        assert_eq!(next(from, CONFIRM_OK), Ok(S::Finalized));
     }
 }
 
@@ -230,7 +249,8 @@ fn scenario_system_events_cannot_leave_partial_failure() {
         E::TimeoutUndetermined,
         E::Retry,
         E::Recheck,
-        E::ClosedConfirmed { verified_flat: true },
+        CLOSED_OK,
+        CLOSED_SIM,
         E::ScheduledClose,
     ] {
         assert!(next(S::PartialFailure, ev).is_err(), "{ev:?}");
@@ -251,8 +271,42 @@ fn scenario_timeout_splits_by_fill_status() {
 
 #[test]
 fn scenario_finalized_requires_flat_confirmation() {
-    assert!(next(S::Closing, E::ClosedConfirmed { verified_flat: false }).is_err());
-    assert_eq!(next(S::Closing, E::ClosedConfirmed { verified_flat: true }), Ok(S::Finalized));
+    assert!(next(S::Closing, E::ClosedConfirmed { verified_flat: false, pnl: P::Recorded }).is_err());
+    assert_eq!(next(S::Closing, CLOSED_OK), Ok(S::Finalized));
+}
+
+// ---- funding-pnl 3.1: FINALIZED needs the closed confirmation AND "PnL computed" -------------
+
+#[test]
+fn pair_lifecycle_missing_pnl_confirmation_is_rejected() {
+    let ev = E::ClosedConfirmed { verified_flat: true, pnl: P::Missing };
+    assert_eq!(next(S::Closing, ev), Err(IllegalTransition { from: S::Closing, event: sys(ev) }));
+}
+
+#[test]
+fn pair_lifecycle_missing_closed_confirmation_is_rejected_even_with_pnl() {
+    for pnl in P::ALL {
+        assert!(next(S::Closing, E::ClosedConfirmed { verified_flat: false, pnl }).is_err(), "{pnl:?}");
+    }
+}
+
+#[test]
+fn pair_lifecycle_both_confirmations_finalize() {
+    assert_eq!(next(S::Closing, CLOSED_OK), Ok(S::Finalized));
+}
+
+#[test]
+fn pair_lifecycle_manually_closed_pairs_need_pnl_too() {
+    // PARTIAL_FAILURE -> (manual close) CLOSING -> closed confirmation without PnL: refused.
+    let closing = next(S::PartialFailure, M::RequestClose).unwrap();
+    assert_eq!(closing, S::Closing);
+    assert!(next(closing, E::ClosedConfirmed { verified_flat: true, pnl: P::Missing }).is_err());
+    assert_eq!(next(closing, CLOSED_OK), Ok(S::Finalized));
+    // The direct manual confirmation from a locked state is gated the same way.
+    for from in [S::PartialFailure, S::Imbalanced, S::Unresolved] {
+        assert!(next(from, M::ConfirmClosed { verified_flat: true, pnl: P::Missing }).is_err(), "{from}");
+        assert_eq!(next(from, CONFIRM_OK), Ok(S::Finalized));
+    }
 }
 
 #[test]
@@ -260,12 +314,13 @@ fn finalized_only_reachable_with_flat_confirmation() {
     for from in S::ALL {
         for ev in all_events() {
             if next(from, ev) == Ok(S::Finalized) {
-                let flat = matches!(
-                    ev,
-                    Event::System(E::ClosedConfirmed { verified_flat: true })
-                        | Event::Manual(M::ConfirmClosed { verified_flat: true })
-                );
+                let (flat, pnl) = match ev {
+                    Event::System(E::ClosedConfirmed { verified_flat, pnl })
+                    | Event::Manual(M::ConfirmClosed { verified_flat, pnl }) => (verified_flat, pnl),
+                    other => panic!("{from} on {other:?} reached FINALIZED"),
+                };
                 assert!(flat, "{from} on {ev:?} reached FINALIZED without verification");
+                assert!(pnl.is_satisfied(), "{from} on {ev:?} reached FINALIZED without PnL");
             }
         }
     }

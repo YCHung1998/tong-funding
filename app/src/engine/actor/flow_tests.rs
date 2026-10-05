@@ -554,6 +554,26 @@ async fn mode_combo(trigger: &'static str, demo: bool) {
     }
     // Both modes run the same exit path.
     run_until(&rig.clock, T + 16_000).await;
+    if demo {
+        // funding-pnl 3.1: closed and confirmed flat, but FINALIZED also needs the PnL; with no
+        // funding ledger fetched it waits for the retry window, then records INCOMPLETE.
+        assert_eq!(status(&rig.db, UUID), "CLOSING", "{trigger}/{demo}: waiting for the PnL");
+        assert_eq!(count(&rig.db, CLOSE_CONFIRMED), 1);
+        assert_eq!(count(&rig.db, super::pnl_gate::PNL_PENDING), 1, "written once");
+        assert_eq!(count(&rig.db, crate::funding::PAIR_PNL_COMPUTED), 0);
+        run_until(&rig.clock, T + 15_000 + crate::funding::PNL_RETRY_WINDOW_MS + 2_000).await;
+        assert_eq!(count(&rig.db, CLOSE_CONFIRMED), 1, "no second flat check while waiting");
+        let l = labels(&rig.db);
+        let pnl_at = l.iter().position(|x| x == crate::funding::PAIR_PNL_COMPUTED).expect("PnL recorded");
+        let fin_at = l.iter().position(|x| x == "FINALIZED").expect("finalized");
+        assert!(pnl_at < fin_at, "the PnL event lands before FINALIZED: {l:?}");
+        let pnl = events(&rig.db).into_iter().find(|(_, l, _)| l == crate::funding::PAIR_PNL_COMPUTED).unwrap().2;
+        assert_eq!(pnl["status"], json!("INCOMPLETE"));
+        let fin = events(&rig.db).into_iter().find(|(_, l, _)| l == "FINALIZED").unwrap().2;
+        assert_eq!(fin["detail"]["pnl_status"], json!("INCOMPLETE"));
+    } else {
+        assert_eq!(count(&rig.db, crate::funding::PAIR_PNL_COMPUTED), 0, "SIMULATION produces no PnL");
+    }
     assert_eq!(status(&rig.db, UUID), "FINALIZED", "{trigger}/{demo}");
     let simulated = events(&rig.db).into_iter().find(|(_, l, _)| l == ORDER_SUBMITTED).unwrap().2["simulated"].clone();
     assert_eq!(simulated, json!(!demo));
@@ -1587,4 +1607,44 @@ fn simulation_kill_points_a_and_b_end_unresolved_without_any_exchange_request() 
         assert_eq!(count(&r.db, SIMULATION_INTERRUPTED), 1, "{on:?}");
         assert!(r.blockers.is_empty(), "{on:?}: {:?}", r.blockers);
     }
+}
+
+// ---- funding-pnl 3.1: a manual "confirmed closed" needs the PnL too -------------------------
+
+/// A pair already locked in PARTIAL_FAILURE when the engine starts (not in flight: no reconciler).
+async fn started_locked(simulated: bool) -> (Rig, EngineHandle) {
+    let (rig, deps) = rig(Opts { demo: !simulated, ..Opts::default() });
+    let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: T, simulated, scan: pair_at(UUID, SYM, T).entry };
+    let p = crate::store::state::NewPair {
+        internal_uuid: UUID.into(),
+        pair_id: format!("pid-{UUID}"),
+        symbol: SYM.into(),
+        status: PairState::Prepared,
+        entry: serde_json::to_value(env).unwrap(),
+    };
+    rig.db.add_pair_if_not_pending(&p).unwrap();
+    rig.db.set_pair_status(UUID, PairState::PartialFailure).unwrap();
+    let h = start(deps);
+    (rig, h)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_confirm_on_a_demo_pair_records_the_pnl_before_finalized() {
+    let (rig, h) = started_locked(false).await;
+    let unverified = ask(&h, Command::ConfirmClosed { pair: UUID.into(), verified_flat: false }).await;
+    assert!(matches!(unverified, CommandReply::Rejected(_)), "{unverified:?}");
+    assert_eq!(count(&rig.db, crate::funding::PAIR_PNL_COMPUTED), 0, "a refused confirmation writes no PnL");
+    assert_eq!(ask(&h, Command::ConfirmClosed { pair: UUID.into(), verified_flat: true }).await, CommandReply::Accepted);
+    assert_eq!(status(&rig.db, UUID), "FINALIZED");
+    let l = labels(&rig.db);
+    let pnl_at = l.iter().position(|x| x == crate::funding::PAIR_PNL_COMPUTED).expect("PnL recorded");
+    assert!(pnl_at < l.iter().position(|x| x == "FINALIZED").unwrap(), "{l:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_confirm_on_a_simulated_pair_finalizes_without_any_pnl() {
+    let (rig, h) = started_locked(true).await;
+    assert_eq!(ask(&h, Command::ConfirmClosed { pair: UUID.into(), verified_flat: true }).await, CommandReply::Accepted);
+    assert_eq!(status(&rig.db, UUID), "FINALIZED");
+    assert_eq!(count(&rig.db, crate::funding::PAIR_PNL_COMPUTED), 0, "SIMULATION produces no PnL");
 }

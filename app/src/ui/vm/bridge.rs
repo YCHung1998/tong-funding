@@ -203,6 +203,8 @@ pub struct UiSnapshot {
     pub scan_capacity: usize,
     /// Number of market updates merged so far (diagnostics; lets tests prove nothing was dropped).
     pub market_updates: u64,
+    /// funding-pnl: funding / PnL data per `pair_id` (positions page).
+    pub funding: BTreeMap<String, crate::ui::funding::PairFunding>,
 }
 
 impl UiSnapshot {
@@ -238,6 +240,8 @@ pub enum SourceUpdate {
     Pairs(Vec<PairInfo>),
     System(SystemFlags),
     ScanRuns { records: Vec<ScanRecord>, capacity: usize },
+    /// funding-pnl: replaces the per-pair funding data.
+    Funding(BTreeMap<String, crate::ui::funding::PairFunding>),
 }
 
 impl SourceUpdate {
@@ -294,6 +298,7 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
             snap.scan_runs = records;
             snap.scan_capacity = capacity;
         }
+        SourceUpdate::Funding(f) => snap.funding = f,
     }
 }
 

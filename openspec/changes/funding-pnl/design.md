@@ -131,3 +131,26 @@ Bybit 流水有 `orderId`、`size`，但 funding 結算並非由訂單產生；B
 
 - **重試窗結束仍缺資料：允許 `FINALIZED` 並標記 `INCOMPLETE`**（Open Question 1），列出缺少的項目，之後資料到齊可重算；釋出 `max_concurrent_pairs` 名額。
 - **同意在 `engine-simulation` 與 `exchange-demo-execution` 的 spec 納入預期價格、Net Edge 快照與成交明細**（Open Question 2）。
+
+## 實作紀錄（2026-10-05，agent；tasks 1.2、1.3、1.4、2.1–2.5、3.1、4.1 的程式部分）
+
+規格有歧義處一律取保守解讀；下列每項都可由使用者推翻。
+
+1. **SIMULATION 配對的 FINALIZED（需使用者確認）**：pair-lifecycle 的 MODIFIED 要求「PnL 已計算」，pnl-accounting 又要求 SIMULATION 不產生 PnL，兩者同時成立時模擬配對永遠無法 FINALIZED（並持續佔用 `max_concurrent_pairs`）。實作為 core `PnlGate` 三值：`Missing`（拒絕）、`Recorded`（指向 `PAIR_PNL_COMPUTED`/`RECOMPUTED`）、`NotApplicableSimulated`（只由引擎給模擬配對）。delta spec 已補一句與一個 scenario。
+2. **人工確認已平倉同樣受限**：delta 寫「進入 FINALIZED 的事件 SHALL 同時附帶兩項確認」，因此 `PARTIAL_FAILURE`／`IMBALANCED`／`UNRESOLVED` 直接 `ConfirmClosed` 的路徑也要 PnL。引擎收到使用者確認時先以「最後一次嘗試」記錄 PnL（缺資料即 INCOMPLETE），再轉移；轉移會被拒絕時（未驗證平倉）不寫 PnL 事件。
+3. **core 轉移表**：`ClosedConfirmed`／`ConfirmClosed` 各帶 `verified_flat × PnlGate`（各 6 種），`SystemEvent::ALL` 20→24、`ManualEvent::ALL` 4→8；合法列 30→34（CLOSING→FINALIZED 兩列、鎖定狀態各三列），窮舉拒絕 12×32−34 = 350 列。
+4. **引擎的等待條件**：`CLOSE_CONFIRMED` 後 EXCHANGE_DEMO 配對維持 `CLOSING`，每個 tick 重算；只有「等待可能解決」的原因（缺少結算流水、流水尚未取得、取得失敗）才等待，最長 `PNL_RETRY_WINDOW_MS`（D9 暫定 10 分鐘，自 `CLOSE_CONFIRMED` 起算、注入時鐘）；其他 INCOMPLETE 原因（無參考價、手續費幣別…）不會因等待而改變，立即記錄後 FINALIZED。等待期間寫一次 `PNL_PENDING`，不重做平倉確認。
+5. **等待只在記憶體**：重啟後 `CLOSING` 配對交給重啟對帳；對帳判定已平倉時以現有資料記錄 PnL（最後一次嘗試）再 FINALIZED，之後資料到齊以 `PAIR_PNL_RECOMPUTED` 補算。
+6. **平倉參考價缺口（跨 change，需使用者決定）**：引擎只在進場時保存參考價（`entry_snapshot.*.expected_price`），平倉送單沒有記錄參考價，因此平倉成交的滑價一律「無參考價」，**目前每筆 demo PnL 都會是 INCOMPLETE**。依 spec 不以成交價代替參考價。建議由 `engine-simulation`／`exchange-demo-execution` 在平倉送單時記錄參考價（例如當下行情價）。
+7. **成交時間**：引擎事件沒有交易所端成交時間，以該訂單最新一筆 `ORDER_SUBMITTED`／`ORDER_FILL` 的寫入時間（`ts_ms`）作為成交時間；歸屬窗與預期結算都以此為界。
+8. **OKX 腿**：成交數量是張數且事件沒有記錄面值，且 OKX 沒有流水客戶端；其價格分量視為未知、funding 視為未取得（INCOMPLETE），不猜。
+9. **Bybit transaction-log 沒有 symbol 參數**：每窗取回所有 USDT 永續的 `SETTLEMENT`，全部寫入事件表；不屬於任何配對的保留為「未歸屬」。Binance income 以 symbol 查詢。
+10. **分頁與限流**：Binance `limit=1000`，整頁滿即取下一頁、短頁為耗盡；Bybit `limit=50`、`nextPageCursor` 空為耗盡；每窗最多 20 頁，cursor 重複或到頁數上限視為不完整。429／Bybit `10006` 最多重試 3 次，無 `Retry-After` 時退避 2 秒。Binance 保留範圍以 90 天計（「三個月」的確切天數未驗證，取較短者）。以上數字皆未驗證（task 1.1）。
+11. **「已取得」的證據**：每次取得寫一筆 `FUNDING_LEDGER_FETCHED`（交易所、symbol 或 null、窗、`complete`／`incomplete`／`beyond_retention`、新增／略過／衝突筆數）；不完整時另寫 `FETCH_ERROR`（`source = funding_ledger`）。PnL 以「有覆蓋該腿持倉窗的完整取得」判定流水已取得，否則為「尚未取得」，不把沒取過當成沒有流水。
+12. **對帳**：每次對帳一筆 `PNL_RECONCILIATION`（整體與逐腿 `OK`／`MISMATCH`／`FAILED`、本地與重新取得的合計、差異 = 重新取得 − 本地、筆數、兩邊缺少的去重鍵）。`FAILED`（重新取得失敗或超出保留範圍）也使 PnL 為 INCOMPLETE；交易所多出的流水只回報、不寫入（不自動修正）。對帳後若結果改變寫 `PAIR_PNL_RECOMPUTED`。
+13. **去重與衝突**：v2 migration 的部分唯一表達式索引經測試在 bundled SQLite 可用，`ON CONFLICT DO NOTHING` 以受影響列數判定新增；同鍵不同金額寫 `FUNDING_LEDGER_CONFLICT`，同一個新值只寫一次（避免每次取得都重複警示）；金額比較以正規化後的 Decimal（`-0.1000` 與 `-0.1` 相同）。v1 資料庫若已有重複鍵，建索引失敗、整個 migration 回滾並停機，不猜要留哪一筆。舊匯入器接受 schema v1..=v2。
+14. **其他 INCOMPLETE 判定**：funding 流水幣別不是 USDT 也算無法換算；沒有任何成交紀錄的配對（`NoFillsRecorded`）不會被算成完整的 0。
+15. **預期結算次數**：以 `entry_snapshot` 的 `next_funding_time` 與 `funding_interval_secs` 推格點，計 `開倉最後成交 < t ≤ 平倉最後成交`；持倉期間交易所改週期時會算錯（保守地可能誤報缺少）。預期對實際的「實際結算次數」取兩腿中較多者。時間軸以 ±60 秒容差把流水對到時段（未驗證）。
+16. **持倉頁**：`ui-readonly-pages` 的 `pair_infos` 不顯示 `FINALIZED` 配對，因此 PnL 面板只在 `CLOSING`／鎖定狀態的配對卡上看得到；已結束配對的歷史／詳情頁不在本 change 範圍（需使用者決定是否另開）。資料問題警示新增不可關閉的 `FundingData` 類別，連到系統日誌並帶事件編號。
+17. **尚未接上執行中的迴圈**：`funding::fetch::plan_fetches`（何時該取）、真實 `LedgerSource`（包簽名客戶端）與 `reconcile_pair` 都已實作與測試，但 App 目前沒有啟動引擎（`EngineDeps` 只在測試建立），所以也沒有啟動流水排程；接上引擎時一併接上（每 `FETCH_RETRY_MS` 跑一次 `plan_fetches` → `fetch_and_store`，平倉確認後跑 `reconcile_pair`）。
+18. **未改的檔案**：沒有修改 `exchange/static_checks.rs` 與既有簽名客戶端；新程式在 `exchange/signed/ledger.rs`、`funding/**`、`store/funding_ledger.rs`、`engine/actor/pnl_gate.rs`。

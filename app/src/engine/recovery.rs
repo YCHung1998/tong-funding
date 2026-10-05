@@ -55,7 +55,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
-use tong_funding_core::pair::{PairState, SystemEvent};
+use tong_funding_core::pair::{PairState, PnlGate, SystemEvent};
 use tong_funding_core::risk::{ExecutionMode, effective_for_pair};
 use tong_funding_core::types::{Decimal, Exchange};
 
@@ -759,7 +759,13 @@ impl Run<'_> {
                 // Already FILL_MONITOR: stays; the actor's fill decision takes it from here.
                 (OrderAction::Open, _) => (None, Verdict::Normal { fills }, "both legs filled".into()),
                 (OrderAction::Close, _) => {
-                    (Some(SystemEvent::ClosedConfirmed { verified_flat: true }), Verdict::Normal { fills }, "both legs closed and flat".into())
+                    // funding-pnl: FINALIZED also needs "PnL computed"; recorded now with whatever
+                    // data exists (late entries are recomputed later).
+                    let pnl = match crate::funding::pnl_record::settle_pnl(self.db, &cand.uuid, self.now_ms, true) {
+                        Ok(_) => PnlGate::Recorded,
+                        Err(why) => return Self::outcome(cand, Some(state), Some(state), Verdict::Pending, format!("PnL not recorded: {why}")),
+                    };
+                    (Some(SystemEvent::ClosedConfirmed { verified_flat: true, pnl }), Verdict::Normal { fills }, "both legs closed and flat".into())
                 }
             },
             Decision::Cancelled => {
@@ -1499,6 +1505,10 @@ mod tests {
         assert_eq!(r.pending, None, "{r:?}");
         assert_eq!(fx.queries(), vec![lc, sc], "only unfinished intents are queried");
         assert_eq!(pair_state(&db), "FINALIZED");
+        // funding-pnl 3.1: the PnL is recorded (with whatever data exists) before FINALIZED.
+        let pnl = events(&db, crate::funding::PAIR_PNL_COMPUTED);
+        assert_eq!(pnl.len(), 1);
+        assert_eq!(pnl[0]["status"], serde_json::json!("INCOMPLETE"), "no fills / ledger recorded in this fixture");
         fx.assert_read_only();
     }
 

@@ -86,7 +86,8 @@ fn summary_cards_entry_notional_and_pnl() {
 fn a_row_renders_like_the_spec() {
     let vm = build(&four(), &Filter::default());
     let r = &rows(&vm)[0];
-    assert_eq!(r.cells().join(" · "), "Binance · BTCUSDT · LONG · 0.020000 BTC · 60,000.00 · 60,200.00 · 3× · +4.00 USDT · —");
+    // funding-pnl: no ledger data yet: a dash with the reason, never 0.00.
+    assert_eq!(r.cells().join(" · "), "Binance · BTCUSDT · LONG · 0.020000 BTC · 60,000.00 · 60,200.00 · 3× · +4.00 USDT · —（尚未取得）");
     assert_eq!(r.pnl_tone(), Tone::Positive);
     assert_eq!(rows(&vm)[2].pnl_tone(), Tone::Negative);
 }
@@ -94,14 +95,15 @@ fn a_row_renders_like_the_spec() {
 #[test]
 fn tiny_size_is_not_shown_as_zero() {
     let p = position(Binance, "BTCUSDT", "0.0000004", "60000", "60000", "3", "0", None);
-    let row = PosRow { exchange: p.exchange, symbol: p.symbol, side: p.side, quantity: p.quantity, entry_price: None, mark_price: None, leverage: None, unrealized_pnl: None, unpaired: true };
+    let row = PosRow { exchange: p.exchange, symbol: p.symbol, side: p.side, quantity: p.quantity, entry_price: None, mark_price: None, leverage: None, unrealized_pnl: None, unpaired: true, funding: "—".into(), funding_tone: Tone::Muted };
     assert_eq!(row.cells()[3], "0.0000004 BTC");
 }
 
 #[test]
-fn funding_column_is_a_dash_for_every_row() {
+fn funding_column_is_a_dash_for_every_row_without_ledger_data() {
+    // funding-pnl: paired rows say why ("尚未取得"); never 0.00.
     let vm = build(&four(), &Filter::default());
-    assert!(rows(&vm).iter().all(|r| r.cells()[8] == "—"));
+    assert!(rows(&vm).iter().all(|r| r.cells()[8] == "—（尚未取得）"), "{:?}", rows(&vm).iter().map(|r| r.cells()[8].clone()).collect::<Vec<_>>());
 }
 
 #[test]

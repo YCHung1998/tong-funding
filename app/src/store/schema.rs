@@ -2,6 +2,10 @@
 //! (append-only events, valid JSON, one PREPARED pair per symbol).
 
 pub const SCHEMA_V1: &str = include_str!("schema_v1.sql");
+/// funding-pnl: unique dedupe key of `FUNDING_LEDGER_ENTRY` events (partial expression index).
+pub const SCHEMA_V2: &str = include_str!("schema_v2.sql");
+/// Name of the index created by [`SCHEMA_V2`] (required from schema v2 on).
+pub const FUNDING_LEDGER_INDEX: &str = "uniq_funding_ledger_dedupe";
 
 #[cfg(test)]
 mod tests {

@@ -26,6 +26,8 @@ pub mod bridge;
 pub mod dashboard;
 #[path = "vm/format.rs"]
 pub mod format;
+#[path = "vm/funding.rs"]
+pub mod funding;
 #[path = "vm/positions.rs"]
 pub mod positions;
 #[path = "vm/scanner.rs"]
