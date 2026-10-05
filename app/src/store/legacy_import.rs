@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
+use tong_funding_core::redact::redact_secrets;
+
+use crate::store::db::{Db, StoreError};
+use crate::store::secrets::safe_event_payload;
+
 /// Plausible Unix-seconds range for `ts` (2000-01-01 .. 2100-01-01).
 pub const TS_MIN_SECS: f64 = 946_684_800.0;
 pub const TS_MAX_SECS: f64 = 4_102_444_800.0;
@@ -30,15 +35,23 @@ pub struct InvalidLine {
     /// 1-based.
     pub line_no: usize,
     pub reason: String,
-    /// Lossy-UTF-8 copy of the raw line (without the newline).
+    /// Lossy-UTF-8 copy of the raw line (without the newline), passed through `redact_secrets`:
+    /// a reported line never carries a credential.
     pub content: String,
 }
 
+/// What an import did. Note: **idempotent is not line-faithful** — byte-identical lines in the
+/// source share one `legacy_hash`, so only the first becomes a row and the rest count as `existing`
+/// (re-running the import therefore adds nothing, but duplicate source lines are not preserved).
+/// Also, payloads are redacted on the way in (see `payloads_redacted`), while `legacy_hash` is
+/// computed over the raw line, so the stored payload may differ from the source on purpose.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportReport {
     pub total_lines: u64,
     pub valid_lines: u64,
     pub imported: u64,
+    /// Newly imported rows whose payload was changed by secret redaction.
+    pub payloads_redacted: u64,
     /// Valid lines already present (same `legacy_hash`).
     pub existing: u64,
     /// Valid lines deliberately not imported, by reason (e.g. `SCAN_RUN`).
@@ -69,6 +82,7 @@ impl fmt::Display for ImportReport {
         writeln!(f, "total lines:   {}", self.total_lines)?;
         writeln!(f, "valid lines:   {}", self.valid_lines)?;
         writeln!(f, "imported:      {}", self.imported)?;
+        writeln!(f, "payloads redacted: {} (of the imported rows)", self.payloads_redacted)?;
         writeln!(f, "already there: {}", self.existing)?;
         writeln!(f, "skipped:       {}", self.skipped())?;
         for (reason, n) in &self.skipped_by_reason {
@@ -76,7 +90,8 @@ impl fmt::Display for ImportReport {
         }
         writeln!(f, "invalid lines: {}", self.invalid.len())?;
         for l in &self.invalid {
-            writeln!(f, "  - line {}: {} | {}", l.line_no, l.reason, l.content)?;
+            // redacted again at print time: `content` is a public field and may be hand-built
+            writeln!(f, "  - line {}: {} | {}", l.line_no, redact_secrets(&l.reason), redact_secrets(&l.content))?;
         }
         writeln!(f, "imported by event_type:")?;
         for (t, n) in &self.imported_by_type {
@@ -101,23 +116,45 @@ pub enum ImportError {
     InvalidLines(Box<ImportReport>),
     #[error("source changed during import (sha256 {before} -> {after}); rolled back")]
     SourceChanged { before: String, after: String },
+    #[error("the connection is not configured for import (PRAGMA recursive_triggers must be ON)")]
+    ConnectionNotConfigured,
+    #[error("unsupported schema version {found} (the importer needs 1)")]
+    UnsupportedSchema { found: i64 },
+    #[error("source is {size} bytes, over the {limit} byte limit")]
+    SourceTooLarge { size: u64, limit: u64 },
+    #[error("store: {0}")]
+    Store(#[from] StoreError),
 }
 
-/// Imports `source` into `conn`'s `events` table (schema v1 must exist; connection should have
-/// `recursive_triggers = ON`). All-or-nothing: one transaction.
-pub fn run_import(conn: &mut Connection, source: &Path, opts: ImportOptions) -> Result<ImportReport, ImportError> {
-    run_import_with_hook(conn, source, opts, &mut || {})
+/// Largest source file the importer will read into memory.
+pub const MAX_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Imports `source` into the store's `events` table through `Db::with_conn` (so a halted store
+/// refuses). All-or-nothing: one transaction. Payloads are redacted with `safe_event_payload`;
+/// `legacy_hash` stays the SHA-256 of the raw line (CR stripped).
+///
+/// `run_import_on` is the test entry point on a bare connection. It refuses connections without
+/// `recursive_triggers = ON` (INSERT OR REPLACE could otherwise bypass the append-only trigger)
+/// and schemas other than v1.
+pub fn run_import(db: &Db, source: &Path, opts: ImportOptions) -> Result<ImportReport, ImportError> {
+    // `with_conn` refuses to run on a halted store; the inner result carries the import's own errors.
+    db.with_conn(|conn| Ok(run_import_on(conn, source, opts)))?
+}
+
+pub(super) fn run_import_on(conn: &mut Connection, source: &Path, opts: ImportOptions) -> Result<ImportReport, ImportError> {
+    run_import_on_with_hook(conn, source, opts, &mut || {})
 }
 
 /// Like [`run_import`], calling `before_final_check` after all rows are written but before the
 /// source is re-hashed (lets tests simulate a concurrent writer).
-pub fn run_import_with_hook(
+pub(super) fn run_import_on_with_hook(
     conn: &mut Connection,
     source: &Path,
     opts: ImportOptions,
     before_final_check: &mut dyn FnMut(),
 ) -> Result<ImportReport, ImportError> {
-    let bytes = std::fs::read(source).map_err(|e| ImportError::Io { path: source.to_path_buf(), source: e })?;
+    check_connection(conn)?;
+    let bytes = read_source(source)?;
     let mut report = ImportReport { sha256_before: sha_hex(&bytes), ..ImportReport::default() };
 
     // Phase 1: validate every line (no database access).
@@ -129,6 +166,8 @@ pub fn run_import_with_hook(
     }
     let last_idx = segments.len().saturating_sub(1);
     for (i, raw) in segments.iter().enumerate() {
+        // CRLF and LF copies of one event are the same event: hash and parse without the CR.
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
         report.total_lines += 1;
         let line_no = i + 1;
         let parsed = if !ends_with_newline && i == last_idx {
@@ -137,7 +176,7 @@ pub fn run_import_with_hook(
             parse_line(raw)
         };
         match parsed {
-            Ok(p) => {
+            Ok((p, redacted)) => {
                 report.valid_lines += 1;
                 if p.event_type == SKIP_SCAN_RUN {
                     *report.skipped_by_reason.entry(SKIP_SCAN_RUN.to_string()).or_default() += 1;
@@ -146,13 +185,13 @@ pub fn run_import_with_hook(
                         Some((a, b)) => (a.min(p.ts_ms), b.max(p.ts_ms)),
                         None => (p.ts_ms, p.ts_ms),
                     });
-                    candidates.push(Candidate { hash: sha_hex(raw), parsed: p });
+                    candidates.push(Candidate { hash: sha_hex(raw), parsed: p, redacted });
                 }
             }
             Err(reason) => report.invalid.push(InvalidLine {
                 line_no,
                 reason,
-                content: String::from_utf8_lossy(raw).into_owned(),
+                content: redact_secrets(&String::from_utf8_lossy(raw)),
             }),
         }
     }
@@ -174,6 +213,7 @@ pub fn run_import_with_hook(
             let n = stmt.execute(rusqlite::params![p.ts_ms, p.event_type, p.pair_id, p.payload, c.hash])?;
             if n == 1 {
                 report.imported += 1;
+                report.payloads_redacted += u64::from(c.redacted);
                 *report.imported_by_type.entry(p.event_type.clone()).or_default() += 1;
             } else {
                 report.existing += 1;
@@ -182,7 +222,7 @@ pub fn run_import_with_hook(
     }
 
     before_final_check();
-    let after = std::fs::read(source).map_err(|e| ImportError::Io { path: source.to_path_buf(), source: e })?;
+    let after = read_source(source)?;
     report.sha256_after = sha_hex(&after);
     if report.sha256_after != report.sha256_before {
         return Err(ImportError::SourceChanged { before: report.sha256_before, after: report.sha256_after });
@@ -191,9 +231,41 @@ pub fn run_import_with_hook(
     Ok(report)
 }
 
+fn check_connection(conn: &Connection) -> Result<(), ImportError> {
+    let recursive: i64 = conn.query_row("PRAGMA recursive_triggers", [], |r| r.get(0))?;
+    if recursive != 1 {
+        return Err(ImportError::ConnectionNotConfigured);
+    }
+    let found: i64 = conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0))?;
+    if found != 1 {
+        return Err(ImportError::UnsupportedSchema { found });
+    }
+    Ok(())
+}
+
+/// Reads the whole source, refusing anything over [`MAX_SOURCE_BYTES`] (checked on the file size
+/// first, and again on what was actually read in case the file grows while we read).
+fn read_source(source: &Path) -> Result<Vec<u8>, ImportError> {
+    use std::io::Read;
+    let io = |e| ImportError::Io { path: source.to_path_buf(), source: e };
+    let mut file = std::fs::File::open(source).map_err(io)?;
+    let size = file.metadata().map_err(io)?.len();
+    if size > MAX_SOURCE_BYTES {
+        return Err(ImportError::SourceTooLarge { size, limit: MAX_SOURCE_BYTES });
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    (&mut file).take(MAX_SOURCE_BYTES + 1).read_to_end(&mut bytes).map_err(io)?;
+    if bytes.len() as u64 > MAX_SOURCE_BYTES {
+        return Err(ImportError::SourceTooLarge { size: bytes.len() as u64, limit: MAX_SOURCE_BYTES });
+    }
+    Ok(bytes)
+}
+
 struct Candidate {
     hash: String,
     parsed: ParsedLine,
+    /// Redaction changed the payload.
+    redacted: bool,
 }
 
 struct ParsedLine {
@@ -209,7 +281,7 @@ fn sha_hex(bytes: &[u8]) -> String {
 }
 
 /// Validates one raw line and maps it to an event; `Err` is the human-readable reason.
-fn parse_line(raw: &[u8]) -> Result<ParsedLine, String> {
+fn parse_line(raw: &[u8]) -> Result<(ParsedLine, bool), String> {
     let text = std::str::from_utf8(raw).map_err(|_| "not valid UTF-8".to_string())?;
     let value: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
     let serde_json::Value::Object(mut obj) = value else {
@@ -224,20 +296,20 @@ fn parse_line(raw: &[u8]) -> Result<ParsedLine, String> {
         return Err(format!("`ts` {ts} outside the plausible Unix-seconds range"));
     }
     let event_type = match obj.remove("event_type") {
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => return Err("`event_type` is empty".to_string()),
         Some(serde_json::Value::String(s)) => s,
         Some(_) => return Err("`event_type` is not a string".to_string()),
         None => return Err("missing `event_type`".to_string()),
     };
-    let pair_id = match obj.get("pair_id") {
+    // Redact first so `pair_id` and `payload` agree and no secret reaches any column.
+    let original = serde_json::Value::Object(obj);
+    let safe = safe_event_payload(original.clone());
+    let redacted = safe != original;
+    let pair_id = match safe.get("pair_id") {
         Some(serde_json::Value::String(s)) => Some(s.clone()),
         _ => None,
     };
-    Ok(ParsedLine {
-        ts_ms: (ts * 1000.0).round() as i64,
-        event_type,
-        pair_id,
-        payload: serde_json::Value::Object(obj).to_string(),
-    })
+    Ok((ParsedLine { ts_ms: (ts * 1000.0).round() as i64, event_type, pair_id, payload: safe.to_string() }, redacted))
 }
 
 #[cfg(test)]
@@ -280,7 +352,7 @@ mod tests {
     }
 
     fn run(c: &mut Connection, p: &Path) -> ImportReport {
-        run_import(c, p, ImportOptions::default()).unwrap()
+        run_import_on(c, p, ImportOptions::default()).unwrap()
     }
 
     type Row = (i64, String, Option<String>, String, Option<String>);
@@ -485,7 +557,7 @@ mod tests {
             let mut f = fs::OpenOptions::new().append(true).open(&p2).unwrap();
             writeln!(f, "{}", ev(1791090104.0, "LATE")).unwrap();
         };
-        let err = run_import_with_hook(&mut c, &p, ImportOptions::default(), &mut hook).unwrap_err();
+        let err = run_import_on_with_hook(&mut c, &p, ImportOptions::default(), &mut hook).unwrap_err();
         assert!(matches!(err, ImportError::SourceChanged { .. }), "{err:?}");
         assert_eq!(count(&c), 0, "rows written before the check must be rolled back");
     }
@@ -493,7 +565,7 @@ mod tests {
     #[test]
     fn missing_source_is_an_io_error() {
         let mut c = mem_db();
-        let err = run_import(&mut c, Path::new("/nonexistent/events.jsonl"), ImportOptions::default()).unwrap_err();
+        let err = run_import_on(&mut c, Path::new("/nonexistent/events.jsonl"), ImportOptions::default()).unwrap_err();
         assert!(matches!(err, ImportError::Io { .. }));
     }
 
@@ -506,7 +578,7 @@ mod tests {
         let full = ev(1791090102.0, "A");
         fs::write(&p, format!("{full}\n{{\"ts\": 1791090103.0, \"event_ty")).unwrap();
         let mut c = mem_db();
-        let err = run_import(&mut c, &p, ImportOptions::default()).unwrap_err();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
         let ImportError::InvalidLines(rep) = err else { panic!("expected InvalidLines, got {err:?}") };
         assert_eq!(rep.invalid.len(), 1);
         assert_eq!(rep.invalid[0].line_no, 2);
@@ -521,7 +593,7 @@ mod tests {
         let p = dir.path().join("events.jsonl");
         fs::write(&p, format!("{}\n{}", ev(1791090102.0, "A"), ev(1791090103.0, "B"))).unwrap();
         let mut c = mem_db();
-        let err = run_import(&mut c, &p, ImportOptions::default()).unwrap_err();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
         let ImportError::InvalidLines(rep) = err else { panic!("{err:?}") };
         assert_eq!(rep.invalid[0].line_no, 2);
         assert!(rep.invalid[0].reason.contains("newline"), "{}", rep.invalid[0].reason);
@@ -532,7 +604,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_src(&dir, &[line.to_string()]);
         let mut c = mem_db();
-        let err = run_import(&mut c, &p, ImportOptions::default()).unwrap_err();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
         let ImportError::InvalidLines(rep) = err else { panic!("{line}: {err:?}") };
         assert_eq!(rep.invalid.len(), 1, "{line}");
         assert_eq!(count(&c), 0);
@@ -558,7 +630,7 @@ mod tests {
         let p = dir.path().join("events.jsonl");
         fs::write(&p, b"\xff\xfe{\n").unwrap();
         let mut c = mem_db();
-        let err = run_import(&mut c, &p, ImportOptions::default()).unwrap_err();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
         assert!(matches!(err, ImportError::InvalidLines(_)));
     }
 
@@ -580,7 +652,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = two_bad_source(&dir);
         let mut c = mem_db();
-        let err = run_import(&mut c, &p, ImportOptions::default()).unwrap_err();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
         let ImportError::InvalidLines(rep) = err else { panic!("{err:?}") };
         let nums: Vec<usize> = rep.invalid.iter().map(|l| l.line_no).collect();
         assert_eq!(nums, [2, 4]);
@@ -592,7 +664,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = two_bad_source(&dir);
         let mut c = mem_db();
-        let r = run_import(&mut c, &p, ImportOptions { skip_invalid: true }).unwrap();
+        let r = run_import_on(&mut c, &p, ImportOptions { skip_invalid: true }).unwrap();
         assert_eq!(count(&c), 2);
         assert_eq!((r.total_lines, r.valid_lines, r.imported), (5, 3, 2));
         assert_eq!(r.invalid.len(), 2);
@@ -662,8 +734,158 @@ mod tests {
              BEGIN SELECT RAISE(ABORT, 'poisoned'); END;",
         )
         .unwrap();
-        let err = run_import(&mut c, &p, ImportOptions::default()).unwrap_err();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
         assert!(matches!(err, ImportError::Db(_)), "{err:?}");
+        assert_eq!(count(&c), 0);
+    }
+
+    // ---- review fixes ----
+
+    fn dump_events(c: &Connection) -> String {
+        c.prepare("SELECT ts_ms || '|' || event_type || '|' || COALESCE(pair_id,'') || '|' || payload || '|' || COALESCE(legacy_hash,'') FROM events")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+    }
+
+    #[test]
+    fn imported_payloads_are_redacted_but_the_hash_is_of_the_raw_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = r#"{"ts": 1791090102.0, "event_type": "FETCH_ERROR", "pair_id": "p1", "error": "GET https://x?symbol=B&signature=LEGSIG", "apiKey": "LEGKEY", "headers": [["X-MBX-APIKEY", "LEGHDR"]]}"#;
+        let p = write_src(&dir, &[raw.to_string(), ev(1791090103.0, "PLAIN")]);
+        let mut c = mem_db();
+        let r = run(&mut c, &p);
+        let dump = dump_events(&c);
+        for leaked in ["LEGSIG", "LEGKEY", "LEGHDR"] {
+            assert!(!dump.contains(leaked), "{leaked} in db: {dump}");
+        }
+        assert!(dump.contains("symbol=B"), "{dump}");
+        assert_eq!(rows(&c)[0].4.as_deref(), Some(sha_hex(raw.as_bytes()).as_str()), "hash stays over the raw bytes");
+        assert_eq!((r.imported, r.payloads_redacted), (2, 1));
+    }
+
+    #[test]
+    fn an_ordinary_payload_is_unchanged_and_not_counted_as_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_src(&dir, &[ev(1791090102.0, "A")]);
+        let mut c = mem_db();
+        let r = run(&mut c, &p);
+        assert_eq!(r.payloads_redacted, 0);
+        let pv: Value = serde_json::from_str(&rows(&c)[0].3).unwrap();
+        assert_eq!(pv, json!({"symbol": "BTCUSDT"}));
+    }
+
+    #[test]
+    fn invalid_line_report_never_prints_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_src(&dir, &["garbage https://x?symbol=B&signature=INVSIG tail".to_string()]);
+        let mut c = mem_db();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
+        let ImportError::InvalidLines(rep) = &err else { panic!("{err:?}") };
+        assert!(rep.invalid[0].content.contains("symbol=B"), "{}", rep.invalid[0].content);
+        for text in [rep.to_string(), format!("{rep:?}"), format!("{err:?}"), err.to_string(), format!("{:?}", rep.invalid)] {
+            assert!(!text.contains("INVSIG"), "{text}");
+        }
+        let r = run_import_on(&mut c, &p, ImportOptions { skip_invalid: true }).unwrap();
+        assert!(!r.to_string().contains("INVSIG") && !format!("{r:?}").contains("INVSIG"));
+    }
+
+    fn configured_db() -> (tempfile::TempDir, Db) {
+        let (dir, db, _) = crate::store::db::test_support::open_tmp();
+        (dir, db)
+    }
+
+    fn count_in_file(db: &Db) -> i64 {
+        let c = Connection::open_with_flags(db.path(), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        c.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn run_import_goes_through_db_and_is_idempotent() {
+        let (dir, db) = configured_db();
+        let p = write_src(&dir, &[ev(1791090102.0, "A"), ev(1791090103.0, "B")]);
+        let r = run_import(&db, &p, ImportOptions::default()).unwrap();
+        assert_eq!((r.imported, r.existing), (2, 0));
+        let r2 = run_import(&db, &p, ImportOptions::default()).unwrap();
+        assert_eq!((r2.imported, r2.existing), (0, 2));
+        assert_eq!(count_in_file(&db), 2);
+    }
+
+    #[test]
+    fn run_import_on_a_halted_store_errors_and_writes_nothing() {
+        let (dir, db) = configured_db();
+        let p = write_src(&dir, &[ev(1791090102.0, "A")]);
+        db.halt(crate::store::db::HaltReason::Corrupt("test".into()));
+        let err = run_import(&db, &p, ImportOptions::default()).unwrap_err();
+        assert!(matches!(err, ImportError::Store(StoreError::Halted(_))), "{err:?}");
+        assert_eq!(count_in_file(&db), 0);
+    }
+
+    #[test]
+    fn unconfigured_connection_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_src(&dir, &[ev(1791090102.0, "A")]);
+        let mut c = Connection::open_in_memory().unwrap(); // recursive_triggers left at its default (off)
+        c.execute_batch(SCHEMA_V1).unwrap();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
+        assert!(matches!(err, ImportError::ConnectionNotConfigured), "{err:?}");
+        assert_eq!(count(&c), 0);
+    }
+
+    #[test]
+    fn wrong_schema_version_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_src(&dir, &[ev(1791090102.0, "A")]);
+        let mut c = mem_db();
+        c.execute("UPDATE schema_version SET version = 2", []).unwrap();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
+        assert!(matches!(err, ImportError::UnsupportedSchema { found: 2 }), "{err:?}");
+        assert_eq!(count(&c), 0);
+    }
+
+    #[test]
+    fn crlf_and_lf_versions_of_the_same_event_are_one_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = ev(1791090102.0, "A");
+        let p = dir.path().join("events.jsonl");
+        fs::write(&p, format!("{line}\n")).unwrap();
+        let mut c = mem_db();
+        assert_eq!(run(&mut c, &p).imported, 1);
+        fs::write(&p, format!("{line}\r\n")).unwrap();
+        let r = run(&mut c, &p);
+        assert_eq!((r.imported, r.existing), (0, 1));
+        assert_eq!(rows(&c)[0].4.as_deref(), Some(sha_hex(line.as_bytes()).as_str()));
+    }
+
+    #[test]
+    fn blank_event_type_is_an_invalid_line() {
+        assert!(invalid_reason(r#"{"ts":1791090102.0,"event_type":""}"#).contains("event_type"));
+        assert!(invalid_reason(r#"{"ts":1791090102.0,"event_type":"  \t"}"#).contains("event_type"));
+    }
+
+    #[test]
+    fn idempotent_does_not_mean_line_faithful_for_identical_source_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = ev(1791090102.0, "A");
+        let p = write_src(&dir, &[l.clone(), l.clone(), l]);
+        let mut c = mem_db();
+        let r = run(&mut c, &p);
+        assert_eq!((r.valid_lines, r.imported, r.existing), (3, 1, 2));
+        assert_eq!(count(&c), 1, "three identical source lines become one row");
+    }
+
+    #[test]
+    fn oversized_source_is_refused_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("events.jsonl");
+        let f = fs::File::create(&p).unwrap();
+        f.set_len(MAX_SOURCE_BYTES + 1).unwrap(); // sparse: no real 256 MiB written
+        let mut c = mem_db();
+        let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
+        assert!(matches!(err, ImportError::SourceTooLarge { size, limit } if size == MAX_SOURCE_BYTES + 1 && limit == MAX_SOURCE_BYTES), "{err:?}");
         assert_eq!(count(&c), 0);
     }
 
