@@ -63,6 +63,7 @@ use crate::store::state::{AddPairOutcome, FLAG_EXECUTION_MODE, IntentState, NewP
 
 #[cfg(test)]
 mod flow_tests;
+mod pnl_gate;
 
 /// Command queue bound: a UI that floods commands waits (backpressure) instead of growing memory.
 pub const COMMAND_CAPACITY: usize = 64;
@@ -323,6 +324,8 @@ struct Flow {
     /// symbol that is not the pair's (left untouched). The flat check compares against it.
     close_residual: [Decimal; 2],
     flat_inflight: bool,
+    /// funding-pnl: set at `CLOSE_CONFIRMED` while the PnL waits (`pnl_gate`).
+    pnl_wait_since: Option<i64>,
 }
 
 impl Flow {
@@ -614,9 +617,7 @@ impl Actor {
             Command::CancelPrepared { pair, reason } => {
                 self.transition(&pair, ManualEvent::Cancel, json!({ "reason": reason }))
             }
-            Command::ConfirmClosed { pair, verified_flat } => {
-                self.transition(&pair, ManualEvent::ConfirmClosed { verified_flat }, json!({ "source": "user" }))
-            }
+            Command::ConfirmClosed { pair, verified_flat } => self.confirm_closed(&pair, verified_flat),
             Command::SetTriggerMode(m) => self.set_trigger_mode(m),
             Command::SetExecutionMode(m) => self.set_execution_mode(m),
             Command::UpdateConfig { key, value } => self.update_config(&key, value),
@@ -644,6 +645,7 @@ impl Actor {
                     self.poll(&id, OrderAction::Open);
                     self.check_fills(&id, now);
                 }
+                PairState::Closing if !orphan && self.awaiting_pnl(&id) => self.finalize_closed(&id),
                 PairState::Closing if !orphan => {
                     self.poll(&id, OrderAction::Close);
                     self.check_close(&id, now);
@@ -1245,7 +1247,7 @@ impl Actor {
     /// CLOSING: a rejected close → PARTIAL_FAILURE; all closes over (or timed out) → flat check.
     fn check_close(&mut self, pair: &str, now: i64) {
         let Some(view) = self.pairs.get(pair).cloned() else { return };
-        if view.state != PairState::Closing {
+        if view.state != PairState::Closing || self.awaiting_pnl(pair) {
             return;
         }
         let Some(flow) = self.flows.get(pair) else { return };
@@ -1291,7 +1293,8 @@ impl Actor {
                 }
                 // The confirmation is recorded before FINALIZED; without it nothing is finalized.
                 if self.events.append(CLOSE_CONFIRMED, Some(pair), payload).is_ok() {
-                    let _ = self.land(pair, SystemEvent::ClosedConfirmed { verified_flat: true }, json!({ "source": "flat check" }));
+                    // funding-pnl: FINALIZED also needs "PnL computed" (pnl_gate).
+                    self.begin_pnl_wait(pair);
                 }
             }
             Ok(false) => {
