@@ -4,6 +4,7 @@ pub mod funding;
 pub mod grouping;
 pub mod net_edge;
 pub mod pair;
+pub mod pnl;
 pub mod pretrade;
 pub mod quantity;
 pub mod redact;
