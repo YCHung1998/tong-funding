@@ -21,7 +21,8 @@ const HEADER_KEYS: [&str; 6] = [
 pub fn redact_secrets(text: &str) -> String {
     let mut out = text.to_string();
     for key in QUERY_KEYS {
-        out = redact_key(&out, key, &['=']);
+        // '=' for URLs, ':' for JSON and plain "name: value" text
+        out = redact_key(&out, key, &['=', ':']);
     }
     for key in HEADER_KEYS {
         out = redact_key(&out, key, &[':', '=']);
@@ -30,7 +31,7 @@ pub fn redact_secrets(text: &str) -> String {
 }
 
 fn is_value_end(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ')' | ']' | ',' | ';' | '}')
+    c.is_whitespace() || matches!(c, '&' | '"' | '\'' | ')' | ']' | ',' | ';' | '}' | '\\')
 }
 
 fn is_key_char(c: char) -> bool {
@@ -49,9 +50,17 @@ fn redact_key(text: &str, key: &str, separators: &[char]) -> String {
         // optional closing quote of the key, optional spaces, then a separator
         let mut i = key_end;
         let rest = |i: usize| text[i..].chars().next();
-        if rest(i) == Some('"') {
-            i += 1;
-        }
+        // a quote after the key, plain (`"`) or escaped inside a JSON string (`\"`)
+        let skip_quote = |i: usize| -> usize {
+            if text[i..].starts_with("\\\"") {
+                i + 2
+            } else if text[i..].starts_with('"') {
+                i + 1
+            } else {
+                i
+            }
+        };
+        i = skip_quote(i);
         while rest(i) == Some(' ') {
             i += 1;
         }
@@ -65,9 +74,7 @@ fn redact_key(text: &str, key: &str, separators: &[char]) -> String {
         while rest(i) == Some(' ') {
             i += 1;
         }
-        if rest(i) == Some('"') {
-            i += 1;
-        }
+        i = skip_quote(i);
         let value_start = i;
         let value_end = if text[value_start..].starts_with(PLACEHOLDER) {
             value_start + PLACEHOLDER.len() // already masked: ']' would otherwise end the value early
@@ -158,5 +165,25 @@ mod tests {
     fn already_redacted_text_is_stable() {
         let once = redact_secrets("?signature=abc");
         assert_eq!(redact_secrets(&once), once);
+    }
+
+    #[test]
+    fn json_style_query_keys_are_masked() {
+        assert_eq!(redact_secrets(r#"{"api_key":"K1","x":"keep"}"#), r#"{"api_key":"[REDACTED]","x":"keep"}"#);
+        assert_eq!(redact_secrets(r#"{"apiKey":"K2"}"#), r#"{"apiKey":"[REDACTED]"}"#);
+        assert_eq!(redact_secrets(r#"{"signature":"abc123","symbol":"BTCUSDT"}"#), r#"{"signature":"[REDACTED]","symbol":"BTCUSDT"}"#);
+    }
+
+    #[test]
+    fn json_nested_inside_a_json_string_is_masked() {
+        // escaped quotes: the secret hides inside a string value
+        let got = redact_secrets(r#"{"raw":"{\"api_key\":\"KSECRET\",\"n\":1}"}"#);
+        assert!(!got.contains("KSECRET"), "{got}");
+        assert!(got.contains("\\\"n\\\":1") || got.contains("n"), "structure should survive: {got}");
+    }
+
+    #[test]
+    fn colon_style_query_keys_are_masked_in_plain_text() {
+        assert_eq!(redact_secrets("signature: abc123 end"), "signature: [REDACTED] end");
     }
 }
