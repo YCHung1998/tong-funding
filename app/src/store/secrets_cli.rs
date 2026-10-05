@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! tong-funding secrets set <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)
+//! tong-funding secrets import-env <path/to/.env>   (the Python version's .env format)
 //! tong-funding secrets status
 //! tong-funding secrets delete <binance|bybit|okx> <api-key|api-secret|passphrase>
 //! ```
@@ -20,7 +21,7 @@ use crate::store::secrets::{KeyStore, KeychainSecrets};
 
 pub const SUBCOMMAND: &str = "secrets";
 
-const USAGE: &str = "usage:\n  tong-funding secrets set <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)\n  tong-funding secrets status\n  tong-funding secrets delete <binance|bybit|okx> <api-key|api-secret|passphrase>";
+const USAGE: &str = "usage:\n  tong-funding secrets set <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)\n  tong-funding secrets import-env <path/to/.env>\n  tong-funding secrets status\n  tong-funding secrets delete <binance|bybit|okx> <api-key|api-secret|passphrase>";
 
 fn parse_exchange(s: &str) -> Option<Exchange> {
     match s.to_ascii_lowercase().as_str() {
@@ -127,6 +128,10 @@ fn run_with<S: KeyStore>(secrets: &KeychainSecrets<S>, args: &[String], stdin: &
                 }
             }
         }
+        Some((cmd, rest)) if cmd == "import-env" => match rest {
+            [path] => import_env(secrets, path, out, err),
+            _ => usage(err, "expected <path/to/.env>"),
+        },
         Some((cmd, rest)) if cmd == "status" && rest.is_empty() => {
             let mut code = 0;
             for ex in Exchange::ALL {
@@ -146,6 +151,61 @@ fn run_with<S: KeyStore>(secrets: &KeychainSecrets<S>, args: &[String], stdin: &
         }
         _ => usage(err, "unknown or missing secrets command"),
     }
+}
+
+/// `.env` variable names of the Python version and the secret each one holds.
+const ENV_KEYS: [(&str, Exchange, SecretName); 7] = [
+    ("BINANCE_API_KEY", Exchange::Binance, SecretName::ApiKey),
+    ("BINANCE_API_SECRET", Exchange::Binance, SecretName::ApiSecret),
+    ("BYBIT_API_KEY", Exchange::Bybit, SecretName::ApiKey),
+    ("BYBIT_API_SECRET", Exchange::Bybit, SecretName::ApiSecret),
+    ("OKX_DEMO_API_KEY", Exchange::Okx, SecretName::ApiKey),
+    ("OKX_DEMO_API_SECRET", Exchange::Okx, SecretName::ApiSecret),
+    ("OKX_DEMO_PASSPHRASE", Exchange::Okx, SecretName::Passphrase),
+];
+
+/// Stores every known credential of a Python-style `.env` file. Values are never printed: the
+/// report names only variables and secrets. Other variables (base URLs, account type) are ignored.
+fn import_env<S: KeyStore>(secrets: &KeychainSecrets<S>, path: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(err, "cannot read {path}: {}", redact_secrets(&e.to_string()));
+            return 1;
+        }
+    };
+    let mut code = 0;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r').trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((name, raw)) = line.split_once('=') else { continue };
+        let name = name.trim().trim_start_matches("export ").trim();
+        let raw = raw.trim();
+        let value = match (raw.chars().next(), raw.chars().last()) {
+            (Some('"'), Some('"')) | (Some('\''), Some('\'')) if raw.len() >= 2 => &raw[1..raw.len() - 1],
+            _ => raw,
+        };
+        let Some(&(_, ex, secret)) = ENV_KEYS.iter().find(|(k, _, _)| *k == name) else {
+            let _ = writeln!(out, "ignored {name}");
+            continue;
+        };
+        if value.is_empty() {
+            let _ = writeln!(out, "skipped {} {} (empty)", ex.name(), name_str(secret));
+            continue;
+        }
+        match secrets.set_secret(ex, secret, value) {
+            Ok(()) => {
+                let _ = writeln!(out, "stored {} {}", ex.name(), name_str(secret));
+            }
+            Err(e) => {
+                code = 1;
+                let _ = writeln!(err, "{} {}: {e}", ex.name(), name_str(secret));
+            }
+        }
+    }
+    code
 }
 
 #[cfg(test)]
@@ -215,5 +275,39 @@ mod tests {
             assert_eq!(code, 2, "{bad:?}");
             assert!(err.contains("usage:"), "{err}");
         }
+    }
+
+    #[test]
+    fn import_env_reads_the_python_env_format_and_never_prints_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".env");
+        std::fs::write(
+            &p,
+            "# comment\nBINANCE_API_KEY=bk-AAAA1111\nBINANCE_API_SECRET=\"bs-BBBB2222\"\nBINANCE_BASE_URL=https://testnet.binancefuture.com\n\nBYBIT_API_KEY=\nBYBIT_API_SECRET=ys-CCCC3333\r\nBYBIT_ACCOUNT_TYPE=UNIFIED\nOKX_DEMO_API_KEY='ok-DDDD4444'\nOKX_DEMO_API_SECRET=os-EEEE5555\nOKX_DEMO_PASSPHRASE=my pass phrase\nSOMETHING_ELSE=zzz\n",
+        )
+        .unwrap();
+        let s = KeychainSecrets::new(Mem::default());
+        let (code, out, err) = call(&s, &["import-env", p.to_str().unwrap()], "");
+        assert_eq!(code, 0, "{out}{err}");
+        let got = |e, n| s.get(e, n).unwrap();
+        assert_eq!(got(Exchange::Binance, SecretName::ApiKey).as_deref(), Some("bk-AAAA1111"));
+        assert_eq!(got(Exchange::Binance, SecretName::ApiSecret).as_deref(), Some("bs-BBBB2222"), "double quotes stripped");
+        assert_eq!(got(Exchange::Bybit, SecretName::ApiKey), None, "empty values are skipped, not stored");
+        assert_eq!(got(Exchange::Bybit, SecretName::ApiSecret).as_deref(), Some("ys-CCCC3333"), "CRLF stripped");
+        assert_eq!(got(Exchange::Okx, SecretName::ApiKey).as_deref(), Some("ok-DDDD4444"), "single quotes stripped");
+        assert_eq!(got(Exchange::Okx, SecretName::Passphrase).as_deref(), Some("my pass phrase"), "inner spaces kept");
+        for v in ["AAAA1111", "BBBB2222", "CCCC3333", "DDDD4444", "EEEE5555", "pass phrase", "zzz"] {
+            assert!(!out.contains(v) && !err.contains(v), "value {v} printed:\n{out}{err}");
+        }
+        assert!(out.contains("stored Binance api-key") && out.contains("skipped Bybit api-key (empty)"), "{out}");
+        assert!(out.contains("ignored BINANCE_BASE_URL") && out.contains("ignored SOMETHING_ELSE"), "{out}");
+    }
+
+    #[test]
+    fn import_env_with_a_missing_file_fails_without_echoing_anything() {
+        let s = KeychainSecrets::new(Mem::default());
+        let (code, _, err) = call(&s, &["import-env", "/nonexistent/.env"], "");
+        assert_eq!(code, 1, "{err}");
+        assert_eq!(call(&s, &["import-env"], "").0, 2);
     }
 }
