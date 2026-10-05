@@ -1,7 +1,7 @@
 //! Pre-trade validation: ten named checks, all must pass (spec: pretrade-validation).
 //! Pure function; the current time is injected (milliseconds).
 
-use crate::types::{Exchange, Notional, Pct, Price};
+use crate::types::{Exchange, Pct, Price};
 use rust_decimal::Decimal;
 
 /// The ten named pre-trade checks.
@@ -33,8 +33,8 @@ pub struct LegInput {
     pub available_margin: Decimal,
     pub listed: bool,
     pub exchange_allowed: bool,
-    /// Order-book depth available for this leg, in quote notional.
-    pub available_depth_notional: Notional,
+    /// 24h quote (USDT) volume for this leg; `None` (missing data) fails the liquidity check.
+    pub volume_24h_quote: Option<Decimal>,
     /// A position/open order on this symbol that does not belong to this pair.
     pub has_foreign_exposure: bool,
 }
@@ -46,7 +46,6 @@ pub struct PretradeInput {
     pub net_edge_qualified: bool,
     pub long: LegInput,
     pub short: LegInput,
-    pub order_notional: Notional,
     pub margin_needed: Decimal,
     pub leverage: Decimal,
     pub open_pair_count: u32,
@@ -60,6 +59,8 @@ pub struct PretradeLimits {
     pub stale_data_threshold_ms: i64,
     pub max_leverage: Decimal,
     pub max_concurrent_pairs: u32,
+    /// Both legs' 24h quote volume must be at least this (USDT).
+    pub min_24h_volume_usdt: Decimal,
 }
 
 /// PASS, or BLOCK with every failed check (in canonical order).
@@ -98,7 +99,10 @@ pub fn evaluate_pretrade(input: &PretradeInput, limits: &PretradeLimits) -> Pret
     flag(Check::ExchangeAllowed, legs.iter().any(|l| !l.exchange_allowed));
     flag(Check::NetEdgeQualified, !input.net_edge_qualified);
     flag(Check::PriceDrift, legs.iter().any(|l| drift_exceeds(l, limits.max_price_drift_pct)));
-    flag(Check::Liquidity, legs.iter().any(|l| l.available_depth_notional < input.order_notional));
+    flag(
+        Check::Liquidity,
+        legs.iter().any(|l| l.volume_24h_quote.is_none_or(|v| v < limits.min_24h_volume_usdt)),
+    );
     flag(Check::Margin, legs.iter().any(|l| l.available_margin < input.margin_needed));
     flag(Check::Leverage, input.leverage > limits.max_leverage);
     flag(Check::ExistingExposure, legs.iter().any(|l| l.has_foreign_exposure));

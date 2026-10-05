@@ -33,6 +33,35 @@
 - **WHEN** 漂移恰為 0.05%
 - **THEN** `PriceDrift` 通過
 
+### Requirement: Liquidity 以 24 小時成交量判定且缺資料視為失敗
+
+`Liquidity` SHALL 在任一腿的 24 小時成交量（以 USDT 計）小於生效的 `min_24h_volume_usdt` 時失敗；恰好等於門檻則通過。
+任一腿缺少成交量資料時 SHALL 視為失敗（失敗即封閉），不得視為無限大或 0 以外的預設值。
+
+#### Scenario: 一腿低於門檻
+
+- **WHEN** `min_24h_volume_usdt` 為 50000，short 腿成交量為 49999.99
+- **THEN** `Liquidity` 失敗
+
+#### Scenario: 恰好等於門檻
+
+- **WHEN** 一腿成交量恰為 50000
+- **THEN** `Liquidity` 通過
+
+#### Scenario: 缺少成交量資料
+
+- **WHEN** 某腿沒有成交量資料
+- **THEN** `Liquidity` 失敗
+
+### Requirement: 無法計算漂移時 PriceDrift 失敗
+
+基準價或最新價小於或等於 0 時，`PriceDrift` SHALL 失敗，SHALL NOT 略過該腿的檢查（Python 版在基準價為 0 時會略過而靜默通過）。
+
+#### Scenario: 基準價為 0
+
+- **WHEN** 某腿的基準價為 0
+- **THEN** `PriceDrift` 失敗
+
 ### Requirement: 資料過期即阻擋
 
 任一腿的價格或 funding 觀測，其 `observed_at` 距目前時間超過 `stale_data_threshold_ms` 時，`DataFresh` SHALL 失敗。

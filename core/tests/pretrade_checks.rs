@@ -18,7 +18,7 @@ fn leg(exchange: Exchange) -> LegInput {
         available_margin: d("1000"),
         listed: true,
         exchange_allowed: true,
-        available_depth_notional: d("100000"),
+        volume_24h_quote: Some(d("1000000")),
         has_foreign_exposure: false,
     }
 }
@@ -29,7 +29,6 @@ fn input() -> PretradeInput {
         net_edge_qualified: true,
         long: leg(Exchange::Binance),
         short: leg(Exchange::Bybit),
-        order_notional: d("1000"),
         margin_needed: d("500"),
         leverage: d("3"),
         open_pair_count: 0,
@@ -42,6 +41,7 @@ fn limits() -> PretradeLimits {
         stale_data_threshold_ms: 5000,
         max_leverage: d("4"),
         max_concurrent_pairs: 3,
+        min_24h_volume_usdt: d("50000"),
     }
 }
 
@@ -145,9 +145,23 @@ fn price_drift_nonpositive_baseline_is_a_failure_not_a_skip() {
 }
 
 #[test]
-fn liquidity_fails_alone() {
+fn liquidity_fails_alone_when_a_leg_is_below_the_volume_floor() {
     let mut i = input();
-    i.short.available_depth_notional = d("999");
+    i.short.volume_24h_quote = Some(d("49999.99"));
+    assert_eq!(failed(&i), [Check::Liquidity]);
+}
+
+#[test]
+fn liquidity_passes_when_volume_equals_the_floor() {
+    let mut i = input();
+    i.long.volume_24h_quote = Some(d("50000"));
+    assert!(failed(&i).is_empty());
+}
+
+#[test]
+fn liquidity_missing_volume_fails_closed() {
+    let mut i = input();
+    i.long.volume_24h_quote = None;
     assert_eq!(failed(&i), [Check::Liquidity]);
 }
 
@@ -206,7 +220,7 @@ fn everything_failing_lists_all_ten() {
     i.long.exchange_allowed = false;
     i.net_edge_qualified = false;
     i.long.latest_price = d("200");
-    i.long.available_depth_notional = d("1");
+    i.long.volume_24h_quote = Some(d("1"));
     i.long.available_margin = d("1");
     i.leverage = d("10");
     i.long.has_foreign_exposure = true;
