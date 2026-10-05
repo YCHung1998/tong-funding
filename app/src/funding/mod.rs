@@ -8,6 +8,7 @@
 pub mod fetch;
 pub mod pnl_record;
 pub mod reconcile;
+pub mod runner;
 
 /// First ledger fetch after an expected settlement (design D9, provisional).
 pub const FETCH_DELAY_MS: i64 = 60_000;
