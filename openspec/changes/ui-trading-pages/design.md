@@ -117,3 +117,9 @@ Python 版只在 MANUAL 顯示「立即執行」。Figma 的一鍵送出沒有�
 ## 決定紀錄（2026-10-05，使用者）
 
 - 掃幣頁的「加入交易單」欄與 Candidate List 由本 change 承接（原本不屬於任何 change）：需求待撰寫，列入 task 1.x 的擴充；實作前先補 spec。
+
+## 決定紀錄（2026-10-05 晚，使用者）
+
+- **AUTO 模式也提供一鍵送出**（Open Question 4），仍需二次確認；送出前檢查該配對沒有被排程器觸發中，避免重複進場。
+- **「Min Expected Net PnL %」與 `net_edge_threshold_pct` 兩個都保留**（Open Question 1）：需在 `core` 的 `risk-config` 新增 `min_expected_net_pnl_pct` 並納入送單前檢查（作為本 change 對 `risk-config` / `pretrade-validation` 的 MODIFIED）。
+- 手動下單已有 `reduce_only`，kill switch 啟動時 reduce-only 手動單仍可送出（`engine-simulation` D5，Open Question 3 已解）。

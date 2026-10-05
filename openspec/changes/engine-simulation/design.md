@@ -172,3 +172,10 @@ Python 版 `now >= entry_trigger_ms` 沒有上限，重啟後可能在結算後�
 
 - Snapshot 最小間隔 250 毫秒、`client_order_id` 長度 36 與字元集、交易所查單保留期限、SQLite 寫入延遲、actor panic 行為皆**未驗證**，分別在 task 1.2、4.1、`exchange-demo-execution` 的驗證中確認。
 - Node 0 發現結算時間或週期改變時是否另行 BLOCK（D10），目前不另設檢查。
+
+## 決定紀錄（2026-10-05 晚，使用者）
+
+- **金鑰與模式**：啟動時儲存的模式是 `EXCHANGE_DEMO` 但讀不到金鑰 → 跳提醒並退回 `SIMULATION`（現行行為加上提醒）；`SIMULATION` 切到 `EXCHANGE_DEMO` 前先檢查金鑰（建立執行器），失敗即不切換。
+- **模式切換的條件改為「所有已開啟配對都屬於目標模式」**：取代原本的「完全沒有已開啟配對」。如此，因金鑰問題退回 SIMULATION 而留下的 demo 配對，在金鑰修好後可以切回 EXCHANGE_DEMO 對帳與處理；模擬配對與 demo 配對永遠不會用到對方的執行器。
+- **平倉數量 = min(配對記錄的成交量, 實際持倉)**；實際持倉與記錄量差異超過 `max_leg_imbalance_pct` 時不自動平倉，轉人工（`CloseFailed` → `PARTIAL_FAILURE`，附差異的警示事件），不動到不屬於本配對的部位。取代 wave 2「平倉數量取自帳戶持倉」。
+- **成交明細寫入不可變事件**（供 `funding-pnl`）：下單當下的預期價格與 Net Edge 快照、每筆成交的價格、數量、手續費與手續費幣別。

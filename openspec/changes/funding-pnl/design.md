@@ -126,3 +126,8 @@ Bybit 流水有 `orderId`、`size`，但 funding 結算並非由訂單產生；B
 - SQLite 表達式部分唯一索引與 `ON CONFLICT DO NOTHING` 的行為。
 - `openspec archive` 對 MODIFIED 的實際行為（封存順序節）。
 - D9 的延遲、重試間隔、重試窗（暫定值，非查證結果）。
+
+## 決定紀錄（2026-10-05 晚，使用者）
+
+- **重試窗結束仍缺資料：允許 `FINALIZED` 並標記 `INCOMPLETE`**（Open Question 1），列出缺少的項目，之後資料到齊可重算；釋出 `max_concurrent_pairs` 名額。
+- **同意在 `engine-simulation` 與 `exchange-demo-execution` 的 spec 納入預期價格、Net Edge 快照與成交明細**（Open Question 2）。

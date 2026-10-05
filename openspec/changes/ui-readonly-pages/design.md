@@ -133,3 +133,9 @@ Figma 有一個可編輯的「達標門檻 %」輸入框（舊的 gross spread �
 - **費率與門檻的輸入**：在 `ui-trading-pages` 的風控頁完成前，以開發用子命令（寫入 store 的設定表）輸入；Net Edge 在設定前顯示「未設定」。
 - **「加入交易單」欄與 Candidate List**：屬於會改變狀態的操作，歸入 `ui-trading-pages`（交易單頁），本 change 不做。
 - 其餘 agent 提出的解讀（OKX 僅比價、日誌「FEED_RECOVERED」獨立事件、總資產不含名目本金等）：使用者無異議。
+
+## 決定紀錄（2026-10-05 晚，使用者）
+
+- **OKX 不提示**：維持只比價（Open Question 3）。
+- **掃幣頁的 Net Edge 門檻唯讀**，到風控頁修改（Open Question 4）。
+- 不平衡率：`engine-simulation` 已定為幣本位 `|Δ| ÷ max`（Open Question 5）。
