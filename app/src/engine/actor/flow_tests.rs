@@ -50,6 +50,9 @@ struct FakeMarket {
     frozen: Mutex<bool>,
     first: Mutex<HashMap<Exchange, FreshQuote>>,
     rules: Mutex<HashMap<Exchange, OrderRules>>,
+    /// gap 2: a price that later (unfrozen) fetches return instead of 100, and a forced failure.
+    price: Mutex<Option<Decimal>>,
+    fail: Mutex<Option<String>>,
 }
 
 impl FakeMarket {
@@ -61,6 +64,8 @@ impl FakeMarket {
             frozen: Mutex::new(false),
             first: Mutex::default(),
             rules: Mutex::new(Exchange::ALL.into_iter().map(|e| (e, lot)).collect()),
+            price: Mutex::default(),
+            fail: Mutex::default(),
         })
     }
     fn calls(&self) -> Vec<(Exchange, String, i64)> {
@@ -93,7 +98,13 @@ impl MarketData for FakeMarket {
     fn refetch(&self, exchange: Exchange, symbol: &str) -> BoxFut<'_, Result<FreshQuote, String>> {
         let now = self.clock.now_ms();
         self.calls.lock().unwrap().push((exchange, symbol.to_string(), now));
-        let fresh = FakeMarket::quote(exchange, symbol, now);
+        if let Some(e) = self.fail.lock().unwrap().clone() {
+            return Box::pin(std::future::ready(Err(e)));
+        }
+        let mut fresh = FakeMarket::quote(exchange, symbol, now);
+        if let Some(p) = *self.price.lock().unwrap() {
+            fresh.price = p;
+        }
         let mut first = self.first.lock().unwrap();
         let q = if *self.frozen.lock().unwrap() { first.entry(exchange).or_insert(fresh).clone() } else {
             first.entry(exchange).or_insert_with(|| fresh.clone());
@@ -505,11 +516,11 @@ async fn a_full_simulation_round_from_t_minus_20_to_t_plus_20() {
     assert_eq!((sent[0].side, sent[1].side, sent[2].side, sent[3].side), (OrderSide::Buy, OrderSide::Sell, OrderSide::Sell, OrderSide::Buy));
     assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO);
     assert_eq!(rig.sim.position(Exchange::Bybit, SYM), Decimal::ZERO);
-
-    // Baseline at T-15 and pre-trade at T-10: two separate fetches per leg, nothing else.
+    // Baseline at T-15, pre-trade at T-10 and the close reference at T+15 (funding-pnl gap 2):
+    // three separate fetches per leg, nothing else.
     let calls = rig.market.calls();
     let times: Vec<i64> = calls.iter().map(|(_, _, t)| t - T).collect();
-    assert_eq!(times, vec![-15_000, -15_000, -10_000, -10_000], "{calls:?}");
+    assert_eq!(times, vec![-15_000, -15_000, -10_000, -10_000, 15_000, 15_000], "{calls:?}");
 
     // Every order event is marked simulated and carries a sim id.
     let orders: Vec<Value> = events(&rig.db).into_iter().filter(|(_, l, _)| l == ORDER_SUBMITTED).map(|(_, _, p)| p).collect();
@@ -2068,4 +2079,51 @@ async fn a_rejected_close_leg_is_partial_failure_and_a_manual_close_handles_only
     assert_eq!(new.len(), 1, "only the remaining (short) leg: {new:?}");
     assert_eq!((new[0].exchange, new[0].side, new[0].quantity, new[0].reduce_only), (Exchange::Bybit, OrderSide::Buy, dec("10"), true));
     assert_eq!(status(&rig.db, UUID), "FINALIZED");
+}
+
+// ---- gap 2: a reference price per leg is recorded when the close orders are sent ------------
+
+fn close_submits(db: &Db) -> Vec<(i64, Value)> {
+    events(db).into_iter().filter(|(_, l, p)| l == ORDER_SUBMITTED && p["action"] == json!("close")).map(|(t, _, p)| (t, p)).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_demo_close_records_a_freshly_fetched_reference_price_per_leg_never_the_fill_price() {
+    let (rig, _h) = started(Opts { demo: true, ..Opts::default() }).await;
+    run_until(&rig.clock, T - 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED");
+    let before = rig.market.calls().len();
+    // The market moved: a fresh fetch says 101 while the demo account still fills at 100.
+    *rig.market.price.lock().unwrap() = Some(dec("101"));
+    run_until(&rig.clock, T + 16_000).await;
+    let closes = close_submits(&rig.db);
+    assert_eq!(closes.len(), 2, "{:?}", labels(&rig.db));
+    let refetches: Vec<(Exchange, String, i64)> = rig.market.calls().into_iter().skip(before).collect();
+    assert_eq!(refetches.iter().map(|(e, s, _)| (*e, s.as_str())).collect::<Vec<_>>(), vec![(Exchange::Binance, SYM), (Exchange::Bybit, SYM)], "one single-symbol refetch per leg");
+    for (ts, p) in &closes {
+        assert_eq!(p["reference_price"], json!("101"), "{p}");
+        assert_eq!(p["avg_price"], json!("100"), "the fill itself");
+        assert_eq!(p["reference_source"], json!("refetch_before_close"), "{p}");
+        let observed = p["reference_observed_at_ms"].as_i64().unwrap();
+        assert!(observed <= *ts, "observed before the close was sent: {p}");
+        assert!(refetches.iter().all(|(_, _, t)| *t == observed), "{refetches:?} / {p}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_close_reference_fetch_never_holds_the_close_back_and_is_recorded() {
+    let (rig, _h) = started(Opts { demo: true, ..Opts::default() }).await;
+    run_until(&rig.clock, T - 5_000).await;
+    *rig.market.fail.lock().unwrap() = Some("ticker timeout".into());
+    run_until(&rig.clock, T + 15_000 + crate::funding::PNL_RETRY_WINDOW_MS + 2_000).await;
+    assert_eq!(status(&rig.db, UUID), "FINALIZED", "{:?}", labels(&rig.db));
+    let closes = close_submits(&rig.db);
+    assert_eq!(closes.len(), 2);
+    for (_, p) in &closes {
+        assert!(p.get("reference_price").is_none_or(Value::is_null), "{p}");
+        assert!(p["reference_error"].as_str().unwrap().contains("ticker timeout"), "{p}");
+    }
+    let pnl = events(&rig.db).into_iter().find(|(_, l, _)| l == crate::funding::PAIR_PNL_COMPUTED).unwrap().2;
+    assert_eq!(pnl["status"], json!("INCOMPLETE"));
+    assert!(pnl["reasons"].to_string().contains("無參考價"), "{pnl}");
 }
