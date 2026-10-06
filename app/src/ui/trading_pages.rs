@@ -18,7 +18,7 @@ use super::bridge::{Settings, SourceUpdate, UiSnapshot};
 use super::candidates::{self, CandidateList};
 use super::contract_settings::{self, CalcMode, ContractForm};
 use super::format::{self, DASH};
-use super::manual_order::{self, CancelForm, ManualConfirm, ManualForm};
+use super::manual_order::{self, CancelForm, CancelPrefill, ManualConfirm, ManualForm, ManualPrefill, PickState};
 use super::nav::{Page, DEBUG_WARNING};
 use super::pages::{card, small, text, title, ClickFn};
 use super::risk_settings::{self, Field, RiskForm, GLOBAL_FIELDS, MODE_OPTIONS, OVERRIDE_FIELDS};
@@ -27,7 +27,7 @@ use super::shell::Shell;
 use super::staged_orders::{self, CloseConfirm, PendingConfirm, RunningRow};
 use super::theme;
 use crate::engine::command::{Command, CommandReply};
-use crate::engine::ports::OrderSide;
+use crate::engine::ports::{AccountPosition, OrderSide};
 
 /// The "加入交易單" cell of one scanner row.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -75,6 +75,9 @@ pub struct TradingState {
     pub m_reduce: bool,
     pub x_exchange: Exchange,
     m_requested: String,
+    /// A picker click's values, written into the inputs on the next render (needs a `Window`).
+    pending_manual: Option<ManualPrefill>,
+    pending_cancel: Option<CancelPrefill>,
     pub manual_confirm: Option<ManualConfirm>,
 }
 
@@ -135,6 +138,8 @@ impl TradingState {
             m_reduce: false,
             x_exchange: Exchange::Binance,
             m_requested: String::new(),
+            pending_manual: None,
+            pending_cancel: None,
             manual_confirm: None,
         }
     }
@@ -164,6 +169,19 @@ impl TradingState {
 
     /// Fills the forms from the stored settings once they are known (and after each save).
     pub fn load_forms(&mut self, snap: &UiSnapshot, window: &mut Window, cx: &mut Context<Shell>) {
+        if let Some(p) = self.pending_manual.take() {
+            set_val(&self.m_symbol, p.symbol, window, cx);
+            set_val(&self.m_qty, p.quantity, window, cx);
+            self.m_exchange = p.exchange;
+            self.m_side = p.side;
+            self.m_reduce = p.reduce_only;
+            self.manual_confirm = None;
+        }
+        if let Some(p) = self.pending_cancel.take() {
+            set_val(&self.x_symbol, p.symbol, window, cx);
+            set_val(&self.x_id, p.order_id, window, cx);
+            self.x_exchange = p.exchange;
+        }
         if !self.settings_seen {
             return;
         }
@@ -781,6 +799,67 @@ impl Shell {
 
     // ---- manual order ---------------------------------------------------------------------------
 
+    /// "目前持倉": one row per non-zero position with a button that only fills the form.
+    fn position_picker(&self, cx: &mut Context<Self>) -> Div {
+        let mut d = div().flex().flex_col().gap_1().child(small("目前持倉（點「帶入平倉」只會填入表單，仍須確認才送出）", theme::TEXT_SECONDARY));
+        for list in manual_order::open_positions(&self.snap) {
+            let name = list.exchange.name();
+            let age = list.fetched_at.map(|t| format!(" · 更新於 {} 秒前", ((self.snap.engine.as_ref().map_or(t, |e| e.now_ms) - t) / 1000).max(0))).unwrap_or_default();
+            match list.state {
+                PickState::NotQueried => d = d.child(small(format!("{name} 尚未查詢持倉"), theme::WARNING)),
+                PickState::Failed(e) => d = d.child(small(format!("{name} 持倉讀取失敗：{e}"), theme::NEGATIVE)),
+                PickState::Rows { rows, incomplete } => {
+                    if incomplete {
+                        d = d.child(small(format!("{name} 清單可能不完整"), theme::WARNING));
+                    }
+                    if rows.is_empty() {
+                        d = d.child(small(format!("{name} 目前沒有持倉{age}"), theme::TEXT_SECONDARY));
+                    }
+                    for r in rows {
+                        let pos = AccountPosition { exchange: r.exchange, symbol: r.symbol.clone(), quantity: r.quantity };
+                        let label = format!("{name} · {} · {} {}{age}", r.symbol, if r.is_long { "多" } else { "空" }, r.quantity.abs().normalize());
+                        d = d.child(div().flex().gap_2().items_center().child(small(label, theme::TEXT_PRIMARY)).child(btn(
+                            SharedString::from(format!("m-pick-{name}-{}", r.symbol)),
+                            "帶入平倉",
+                            true,
+                            self.click(cx, move |this, _| this.trading.pending_manual = Some(manual_order::close_prefill(&pos))),
+                        )));
+                    }
+                }
+            }
+        }
+        d
+    }
+
+    /// "目前掛單": click fills the cancel form; orders without an id are shown but not pickable.
+    fn order_picker(&self, cx: &mut Context<Self>) -> Div {
+        let mut d = div().flex().flex_col().gap_1().child(small("目前掛單（點選只會填入表單）", theme::TEXT_SECONDARY));
+        for list in manual_order::open_orders(&self.snap) {
+            let name = list.exchange.name();
+            match list.state {
+                PickState::NotQueried => d = d.child(small(format!("{name} 尚未查詢掛單"), theme::WARNING)),
+                PickState::Failed(e) => d = d.child(small(format!("{name} 掛單讀取失敗：{e}"), theme::NEGATIVE)),
+                PickState::Rows { rows, incomplete } => {
+                    if incomplete {
+                        d = d.child(small(format!("{name} 清單可能不完整"), theme::WARNING));
+                    }
+                    if rows.is_empty() {
+                        d = d.child(small(format!("{name} 目前沒有掛單"), theme::TEXT_SECONDARY));
+                    }
+                    for (i, r) in rows.into_iter().enumerate() {
+                        let label = format!("{name} · {} · 剩餘 {} · {}", r.symbol, r.remaining.normalize(), r.order_id.as_deref().unwrap_or("無 Order ID，無法由此撤單"));
+                        let row = div().flex().gap_2().items_center().child(small(label, if r.order_id.is_some() { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }));
+                        d = d.child(match manual_order::cancel_prefill(&r) {
+                            Some(p) => row.child(btn(SharedString::from(format!("x-pick-{name}-{i}")), "帶入撤單", true, self.click(cx, move |this, _| this.trading.pending_cancel = Some(p.clone())))),
+                            None => row,
+                        });
+                    }
+                }
+            }
+        }
+        d
+    }
+
     pub(crate) fn manual_order_page(&mut self, cx: &mut Context<Self>) -> Div {
         let form = self.trading.manual_form(cx);
         let cancel_form = self.trading.cancel_form(cx);
@@ -815,6 +894,7 @@ impl Shell {
         let reduce = btn("m-reduce", if self.trading.m_reduce { "☑ reduce_only" } else { "☐ reduce_only" }, true, self.click(cx, |this, _| this.trading.m_reduce = !this.trading.m_reduce));
         let mut order = card()
             .child(text("單腿下單 · 市價單", theme::TEXT_PRIMARY))
+            .child(self.position_picker(cx))
             .child(panels)
             .child(field_row("Symbol", "", &self.trading.m_symbol, None))
             .child(div().flex().gap_2().child(side(self, cx, OrderSide::Buy)).child(side(self, cx, OrderSide::Sell)).child(reduce))
@@ -857,6 +937,7 @@ impl Shell {
         }
         let mut cancel = card()
             .child(text(format!("撤單 · {}", self.trading.x_exchange.name()), theme::TEXT_PRIMARY))
+            .child(self.order_picker(cx))
             .child(field_row("Symbol", "", &self.trading.x_symbol, None))
             .child(field_row("Order ID（client_order_id）", "", &self.trading.x_id, None));
         let mut crow = div().flex().gap_2().items_center().child(btn("x-cancel", "Cancel", vm.cancel_disabled.is_empty(), self.click(cx, |this, cx| {
