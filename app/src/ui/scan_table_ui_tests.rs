@@ -118,10 +118,15 @@ impl Rig {
         .unwrap();
         self.settle(cx);
     }
+    /// (shown columns, sort, row order). Reads the shell's own state AND what the table is drawing,
+    /// and requires them to agree: a state change that never reaches the table is a bug too.
     fn view(&self, cx: &mut TestAppContext) -> (Vec<ScanColumn>, Option<SortState>, Vec<String>) {
         self.shell.read_with(cx, |s, cx| {
             let t = s.table.read(cx).delegate();
-            (t.visible.clone(), t.sort, t.rows.iter().map(|r| r.symbol.clone()).collect())
+            let (own_visible, own_sort) = (s.view.visibility.visible(), s.view.sort);
+            assert_eq!(t.visible, own_visible, "the table draws different columns than the shell state says");
+            assert_eq!(t.sort, own_sort, "the table shows a different sort than the shell state says");
+            (own_visible, own_sort, t.rows.iter().map(|r| r.symbol.clone()).collect())
         })
     }
 }
