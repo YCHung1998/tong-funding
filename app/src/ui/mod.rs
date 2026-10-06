@@ -14,6 +14,7 @@ pub mod shell;
 pub mod status;
 pub mod theme;
 pub mod trading_pages;
+pub mod symbol_select;
 pub mod units;
 pub mod zoom_ui;
 pub mod wiring;
@@ -32,6 +33,8 @@ pub mod candidates;
 pub mod contract_settings;
 #[path = "vm/manual_order.rs"]
 pub mod manual_order;
+#[path = "vm/symbol_options.rs"]
+pub mod symbol_options;
 #[path = "vm/risk_settings.rs"]
 pub mod risk_settings;
 #[path = "vm/staged_orders.rs"]

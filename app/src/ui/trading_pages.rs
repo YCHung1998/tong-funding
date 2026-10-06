@@ -25,6 +25,8 @@ use super::risk_settings::{self, Field, RiskForm, GLOBAL_FIELDS, MODE_OPTIONS, O
 use super::scanner::ScanRow;
 use super::shell::Shell;
 use super::staged_orders::{self, CloseConfirm, PendingConfirm, RunningRow};
+use super::symbol_options;
+use super::symbol_select::{CoinPicker, SymbolPicker};
 use super::theme;
 use super::units::rx;
 use crate::engine::command::{Command, CommandReply};
@@ -53,7 +55,7 @@ pub struct TradingState {
     c_notional: In,
     c_leverage: In,
     c_margin: In,
-    c_symbol: In,
+    c_symbol: SymbolPicker,
     pub c_mode: CalcMode,
     contract_loaded: bool,
     contract_reload: bool,
@@ -62,14 +64,14 @@ pub struct TradingState {
     r_over: BTreeMap<(Exchange, Field), In>,
     pub r_over_on: BTreeSet<(Exchange, Field)>,
     pub r_allowed: BTreeSet<Exchange>,
-    r_coins: In,
+    r_coins: CoinPicker,
     risk_loaded: bool,
     risk_reload: bool,
     pub mode_confirm: Option<ExecutionMode>,
     pub mode_error: Option<String>,
-    m_symbol: In,
+    m_symbol: SymbolPicker,
     m_qty: In,
-    x_symbol: In,
+    x_symbol: SymbolPicker,
     x_id: In,
     pub m_exchange: Exchange,
     pub m_side: OrderSide,
@@ -116,7 +118,7 @@ impl TradingState {
             c_notional: new_input(window, cx, "1000"),
             c_leverage: new_input(window, cx, "5"),
             c_margin: new_input(window, cx, "200"),
-            c_symbol: new_input(window, cx, "BTCUSDT"),
+            c_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             c_mode: CalcMode::LeverageToMargin,
             contract_loaded: false,
             contract_reload: false,
@@ -125,14 +127,14 @@ impl TradingState {
             r_over,
             r_over_on: BTreeSet::new(),
             r_allowed: Exchange::ALL.into_iter().collect(),
-            r_coins: new_input(window, cx, ""),
+            r_coins: CoinPicker::new(window, cx),
             risk_loaded: false,
             risk_reload: false,
             mode_confirm: None,
             mode_error: None,
-            m_symbol: new_input(window, cx, "BTCUSDT"),
+            m_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             m_qty: new_input(window, cx, ""),
-            x_symbol: new_input(window, cx, "BTCUSDT"),
+            x_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             x_id: new_input(window, cx, ""),
             m_exchange: Exchange::Binance,
             m_side: OrderSide::Buy,
@@ -170,8 +172,19 @@ impl TradingState {
 
     /// Fills the forms from the stored settings once they are known (and after each save).
     pub fn load_forms(&mut self, snap: &UiSnapshot, window: &mut Window, cx: &mut Context<Shell>) {
+        // Candidates follow the snapshot (replaced only when they changed) and the chosen exchange.
+        self.c_symbol.sync(symbol_options::all_symbol_options(snap), window, cx);
+        self.r_coins.sync(symbol_options::coin_options(snap), window, cx);
+        if let Some(p) = &self.pending_manual {
+            self.m_exchange = p.exchange;
+        }
+        if let Some(p) = &self.pending_cancel {
+            self.x_exchange = p.exchange;
+        }
+        self.m_symbol.sync(symbol_options::symbol_options(snap, self.m_exchange), window, cx);
+        self.x_symbol.sync(symbol_options::open_order_symbols(snap, self.x_exchange), window, cx);
         if let Some(p) = self.pending_manual.take() {
-            set_val(&self.m_symbol, p.symbol, window, cx);
+            self.m_symbol.set_value(&p.symbol, window, cx);
             set_val(&self.m_qty, p.quantity, window, cx);
             self.m_exchange = p.exchange;
             self.m_side = p.side;
@@ -179,7 +192,7 @@ impl TradingState {
             self.manual_confirm = None;
         }
         if let Some(p) = self.pending_cancel.take() {
-            set_val(&self.x_symbol, p.symbol, window, cx);
+            self.x_symbol.set_value(&p.symbol, window, cx);
             set_val(&self.x_id, p.order_id, window, cx);
             self.x_exchange = p.exchange;
         }
@@ -209,7 +222,7 @@ impl TradingState {
                 }
             }
             self.r_allowed = form.allowed_exchanges.clone();
-            set_val(&self.r_coins, form.allowed_coins.clone(), window, cx);
+            self.r_coins.set_text(&form.allowed_coins, window, cx);
             self.risk_loaded = true;
         }
     }
@@ -233,16 +246,16 @@ impl TradingState {
             }
         }
         form.allowed_exchanges = self.r_allowed.clone();
-        form.allowed_coins = val(&self.r_coins, cx);
+        form.allowed_coins = self.r_coins.text(cx);
         form
     }
 
     fn manual_form(&self, cx: &App) -> ManualForm {
-        ManualForm { exchange: self.m_exchange, symbol: val(&self.m_symbol, cx), side: self.m_side, quantity: val(&self.m_qty, cx), reduce_only: self.m_reduce }
+        ManualForm { exchange: self.m_exchange, symbol: self.m_symbol.value(cx), side: self.m_side, quantity: val(&self.m_qty, cx), reduce_only: self.m_reduce }
     }
 
     fn cancel_form(&self, cx: &App) -> CancelForm {
-        CancelForm { exchange: self.x_exchange, symbol: val(&self.x_symbol, cx), order_id: val(&self.x_id, cx) }
+        CancelForm { exchange: self.x_exchange, symbol: self.x_symbol.value(cx), order_id: val(&self.x_id, cx) }
     }
 }
 
@@ -271,6 +284,23 @@ fn field_row(label: impl Into<SharedString>, unit: &str, input: &In, error: Opti
         .child(small(unit.to_string(), theme::TEXT_MUTED));
     if let Some(e) = error {
         row = row.child(small(e.clone(), theme::NEGATIVE));
+    }
+    row
+}
+
+/// A symbol dropdown row; `unlisted` = names the selected values missing from the candidate list.
+fn pick_row(label: impl Into<SharedString>, picker: impl IntoElement, loaded: bool, list_name: &str, unlisted: Option<String>) -> Div {
+    let mut row = div()
+        .flex()
+        .gap_2()
+        .items_center()
+        .child(small(label.into(), theme::TEXT_SECONDARY).w(rx(260.0)))
+        .child(div().w(rx(220.0)).child(picker));
+    if !loaded {
+        row = row.child(small("行情載入中（仍可直接輸入）", theme::TEXT_MUTED));
+    }
+    if let Some(u) = unlisted {
+        row = row.child(small(format!("{u} 不在目前{list_name}清單中"), theme::WARNING));
     }
     row
 }
@@ -598,7 +628,7 @@ impl Shell {
         let mode = self.snap.engine.as_ref().map(|e| e.execution_mode);
         let form = self.trading.contract_form(cx);
         let vm = contract_settings::evaluate(&form, &self.snap.settings, mode);
-        let symbol = val(&self.trading.c_symbol, cx).trim().to_ascii_uppercase();
+        let symbol = self.trading.c_symbol.value(cx).trim().to_ascii_uppercase();
         if symbol != self.trading.c_requested {
             for ex in Exchange::ALL {
                 self.source.request_rules(ex, &symbol);
@@ -641,7 +671,7 @@ impl Shell {
             .child(small(format!("雙腿合計：Notional {} · Initial Margin {}", opt_money(vm.pair_notional), opt_money(vm.pair_margin)), theme::TEXT_SECONDARY))
             .child(small("預期數量：LONG / SHORT 各一腿（不跨所加總）", theme::TEXT_SECONDARY))
             .child(small(contract_settings::QUOTE_NOTE, theme::TEXT_MUTED));
-        let mut quote = card().child(field_row("試算標的", "", &self.trading.c_symbol, None));
+        let mut quote = card().child(pick_row("試算標的", self.trading.c_symbol.element("BTCUSDT"), self.trading.c_symbol.loaded(), "行情", self.trading.c_symbol.is_unlisted(cx).then(|| symbol.clone())));
         match vm.notional {
             Some(n) => {
                 for q in contract_settings::quote(&symbol, n, &self.snap, self.now_ms) {
@@ -693,7 +723,7 @@ impl Shell {
                 }
             })));
         }
-        global = global.child(allowed).child(field_row("allowed_coins（逗號分隔，空白 = 不限制）", "", &self.trading.r_coins, None)).child(small(vm.formula.clone(), theme::TEXT_SECONDARY));
+        global = global.child(allowed).child(pick_row("allowed_coins（可多選，空白 = 不限制）", self.trading.r_coins.element("不限制"), self.trading.r_coins.loaded(), "行情", Some(self.trading.r_coins.unlisted(cx).join(", ")).filter(|u| !u.is_empty()))).child(small(vm.formula.clone(), theme::TEXT_SECONDARY));
         for (k, e) in &vm.field_errors {
             if !GLOBAL_FIELDS.iter().any(|f| &f.key() == k) {
                 global = global.child(small(e.clone(), theme::NEGATIVE));
@@ -897,7 +927,7 @@ impl Shell {
             .child(text("單腿下單 · 市價單", theme::TEXT_PRIMARY))
             .child(self.position_picker(cx))
             .child(panels)
-            .child(field_row("Symbol", "", &self.trading.m_symbol, None))
+            .child(pick_row("Symbol", self.trading.m_symbol.element("BTCUSDT"), self.trading.m_symbol.loaded(), "行情", self.trading.m_symbol.is_unlisted(cx).then(|| self.trading.m_symbol.value(cx))))
             .child(div().flex().gap_2().child(side(self, cx, OrderSide::Buy)).child(side(self, cx, OrderSide::Sell)).child(reduce))
             .child(field_row("Quantity", "", &self.trading.m_qty, None))
             .child(small(
@@ -939,7 +969,7 @@ impl Shell {
         let mut cancel = card()
             .child(text(format!("撤單 · {}", self.trading.x_exchange.name()), theme::TEXT_PRIMARY))
             .child(self.order_picker(cx))
-            .child(field_row("Symbol", "", &self.trading.x_symbol, None))
+            .child(pick_row("Symbol", self.trading.x_symbol.element("BTCUSDT"), true, "掛單", self.trading.x_symbol.is_unlisted(cx).then(|| self.trading.x_symbol.value(cx))))
             .child(field_row("Order ID（client_order_id）", "", &self.trading.x_id, None));
         let mut crow = div().flex().gap_2().items_center().child(btn("x-cancel", "Cancel", vm.cancel_disabled.is_empty(), self.click(cx, |this, cx| {
             let form = this.trading.cancel_form(cx);
