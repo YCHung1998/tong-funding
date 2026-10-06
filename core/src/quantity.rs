@@ -24,6 +24,8 @@ pub enum QuantityError {
     InvalidPrice(Decimal),
     #[error("exchange reports no open position")]
     NoPosition,
+    #[error("no common step for {0} and {1}")]
+    NoCommonStep(Decimal, Decimal),
 }
 
 /// A tradable quantity. Only constructible via step rounding or from an exchange position.
@@ -90,6 +92,84 @@ fn format_decimal(value: Decimal, lot: &LotSize) -> String {
         v.rescale(step_decimals);
         v.to_string()
     }
+}
+
+/// The finest base-coin unit a paired quantity is ever sized to (1e-6).
+pub const DEFAULT_QTY_PRECISION: Decimal = Decimal::from_parts(1, 0, 0, false, 6);
+
+/// One leg of a paired entry: its price, its lot filter in the exchange's order unit and, on OKX,
+/// the contract value (base coin per contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchedLeg {
+    pub price: Price,
+    pub lot: LotSize,
+    pub ct_val: Option<Decimal>,
+}
+
+/// The same base-coin quantity for both legs, and each leg's order quantity (contracts on OKX).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchedQuantity {
+    pub base_qty: Decimal,
+    pub common_step: Decimal,
+    pub long: Quantity,
+    pub short: Quantity,
+}
+
+/// Sizes a pair to ONE base-coin quantity (spec: quantity-precision, "配對開倉的兩腿使用同一數量").
+/// Common step = LCM of both legs' steps (in base coin; OKX `lotSz × ctVal`) and
+/// [`DEFAULT_QTY_PRECISION`]; minimum = the larger base-coin minimum; quantity =
+/// `notional / max(long price, short price)` floored to the common step, so each leg's value is
+/// at most `notional` and as close to it as the step allows.
+pub fn matched_quantity(notional: Notional, long: &MatchedLeg, short: &MatchedLeg) -> Result<MatchedQuantity, QuantityError> {
+    let (long_step, long_min) = base_lot(long)?;
+    let (short_step, short_min) = base_lot(short)?;
+    let common_step = lcm(lcm(long_step, short_step)?, DEFAULT_QTY_PRECISION)?;
+    let min_qty = long_min.max(short_min);
+    let raw = notional / long.price.max(short.price);
+    let base_qty = (raw - raw % common_step).normalize();
+    if base_qty <= Decimal::ZERO || base_qty < min_qty {
+        return Err(QuantityError::BelowMinimum { adjusted: base_qty, min_qty });
+    }
+    // The common step is a multiple of every leg's step, so these are exact.
+    let order = |leg: &MatchedLeg| Quantity(leg.ct_val.map_or(base_qty, |ct| (base_qty / ct).normalize()));
+    Ok(MatchedQuantity { base_qty, common_step, long: order(long), short: order(short) })
+}
+
+/// A leg's step and minimum in base-coin units, validating price, step and contract value.
+fn base_lot(leg: &MatchedLeg) -> Result<(Decimal, Decimal), QuantityError> {
+    if leg.price <= Decimal::ZERO {
+        return Err(QuantityError::InvalidPrice(leg.price));
+    }
+    if leg.lot.step_size <= Decimal::ZERO {
+        return Err(QuantityError::InvalidStepSize(leg.lot.step_size));
+    }
+    match leg.ct_val {
+        Some(ct) if ct <= Decimal::ZERO => Err(QuantityError::InvalidContractValue(ct)),
+        Some(ct) => Ok(((leg.lot.step_size * ct).normalize(), leg.lot.min_qty * ct)),
+        None => Ok((leg.lot.step_size.normalize(), leg.lot.min_qty)),
+    }
+}
+
+/// Exact least common multiple of two positive decimals (as integers at their common scale).
+fn lcm(a: Decimal, b: Decimal) -> Result<Decimal, QuantityError> {
+    let scale = a.scale().max(b.scale());
+    let int = |x: Decimal| {
+        let mut x = x;
+        x.rescale(scale);
+        x.mantissa()
+    };
+    let (ia, ib) = (int(a), int(b));
+    let gcd = |mut x: i128, mut y: i128| {
+        while y != 0 {
+            (x, y) = (y, x % y);
+        }
+        x
+    };
+    (ia / gcd(ia, ib))
+        .checked_mul(ib)
+        .and_then(|m| Decimal::try_from_i128_with_scale(m, scale).ok())
+        .map(|d| d.normalize())
+        .ok_or(QuantityError::NoCommonStep(a, b))
 }
 
 /// A quantity for CLOSING a position, taken from the exchange-reported position (absolute value,

@@ -6,7 +6,7 @@
 use rust_decimal::Decimal;
 use tong_funding_core::funding::FundingObservation;
 use tong_funding_core::pair::{PairState, SystemEvent};
-use tong_funding_core::quantity::{LotSize, Quantity, QuantityError};
+use tong_funding_core::quantity::{LotSize, MatchedLeg, Quantity, QuantityError, matched_quantity};
 use tong_funding_core::risk::EffectiveConfig;
 use tong_funding_core::types::{Exchange, Notional, Pct, Price};
 
@@ -76,16 +76,39 @@ impl SubmitPlan {
     pub const ABORT_EVENT: SystemEvent = SystemEvent::BothSubmitsFailed;
 }
 
-/// Sizes both legs; any failure aborts the whole submission before anything is sent.
+/// Sizes both legs to ONE base-coin quantity (core `matched_quantity`, spec quantity-precision
+/// "配對開倉的兩腿使用同一數量"): the per-leg notional is a cap, the higher price sets the
+/// quantity, the coarser common step keeps it valid on both exchanges. Any failure aborts the
+/// whole submission before anything is sent.
 pub fn plan_submit(long: &LegSizing, short: &LegSizing) -> SubmitPlan {
-    match (size_leg(long), size_leg(short)) {
-        (Ok(long), Ok(short)) => SubmitPlan::Send { long, short },
+    let as_matched = |s: &LegSizing| match (s.exchange, s.okx_ct_val) {
+        (Exchange::Okx, None) => Err(SizingError::MissingContractValue),
+        (Exchange::Okx, ct) => Ok(MatchedLeg { price: s.price, lot: s.lot, ct_val: ct }),
+        (Exchange::Binance | Exchange::Bybit, _) => Ok(MatchedLeg { price: s.price, lot: s.lot, ct_val: None }),
+    };
+    let (l, sh) = match (as_matched(long), as_matched(short)) {
+        (Ok(l), Ok(s)) => (l, s),
         (l, s) => {
-            let failed = [(Leg::Long, l), (Leg::Short, s)]
-                .into_iter()
-                .filter_map(|(leg, r)| r.err().map(|e| (leg, e)))
-                .collect();
-            SubmitPlan::Abort { failed }
+            let failed = [(Leg::Long, l), (Leg::Short, s)].into_iter().filter_map(|(leg, r)| r.err().map(|e| (leg, e))).collect();
+            return SubmitPlan::Abort { failed };
+        }
+    };
+    match matched_quantity(long.notional.min(short.notional), &l, &sh) {
+        Ok(m) => SubmitPlan::Send {
+            long: SizedLeg { order_qty: m.long, base_qty: m.base_qty },
+            short: SizedLeg { order_qty: m.short, base_qty: m.base_qty },
+        },
+        Err(e) => {
+            // Blame the leg(s) whose minimum is not met; otherwise (bad price / step) both.
+            let base_min = |m: &MatchedLeg| m.lot.min_qty * m.ct_val.unwrap_or(Decimal::ONE);
+            let blamed: Vec<Leg> = match &e {
+                QuantityError::BelowMinimum { adjusted, .. } => {
+                    [(Leg::Long, &l), (Leg::Short, &sh)].into_iter().filter(|(_, m)| base_min(m) > *adjusted).map(|(leg, _)| leg).collect()
+                }
+                _ => vec![Leg::Long, Leg::Short],
+            };
+            let blamed = if blamed.is_empty() { vec![Leg::Long, Leg::Short] } else { blamed };
+            SubmitPlan::Abort { failed: blamed.into_iter().map(|leg| (leg, SizingError::Quantity(e.clone()))).collect() }
         }
     }
 }
@@ -313,6 +336,39 @@ mod tests {
                 assert_eq!(long.order_qty.value(), dec("10"));
                 assert_eq!(short.order_qty.value(), dec("10"));
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn both_legs_get_the_same_coin_quantity_at_most_the_notional() {
+        // matched-leg-quantity: 1000 / max(100, 101) = 9.90… floored to the common step 0.4 -> 9.6, on both legs.
+        let long = sizing(Exchange::Binance, "0.1", "0.1");
+        let mut short = sizing(Exchange::Bybit, "0.4", "0.1");
+        short.price = dec("101");
+        match plan_submit(&long, &short) {
+            SubmitPlan::Send { long, short } => {
+                assert_eq!((long.base_qty, short.base_qty), (dec("9.6"), dec("9.6")));
+                assert!(long.base_qty * dec("100") <= dec("1000") && short.base_qty * dec("101") <= dec("1000"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn okx_leg_of_a_pair_is_sent_in_contracts_of_the_shared_quantity() {
+        let mut okx = sizing(Exchange::Okx, "1", "1");
+        okx.okx_ct_val = Some(dec("0.01"));
+        match plan_submit(&okx, &sizing(Exchange::Binance, "0.001", "0.001")) {
+            SubmitPlan::Send { long, short } => {
+                assert_eq!((long.order_qty.value(), long.base_qty), (dec("1000"), dec("10")));
+                assert_eq!((short.order_qty.value(), short.base_qty), (dec("10"), dec("10")));
+            }
+            other => panic!("{other:?}"),
+        }
+        okx.okx_ct_val = None;
+        match plan_submit(&okx, &sizing(Exchange::Binance, "0.001", "0.001")) {
+            SubmitPlan::Abort { failed } => assert_eq!(failed, vec![(Leg::Long, SizingError::MissingContractValue)]),
             other => panic!("{other:?}"),
         }
     }

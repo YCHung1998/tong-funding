@@ -115,3 +115,58 @@ fn no_position_is_error() {
     let e = ClosingQuantity::from_exchange_position(d("0")).unwrap_err();
     assert_eq!(e, QuantityError::NoPosition);
 }
+
+// ---- matched-leg-quantity: both legs trade the same coin quantity ----
+
+use tong_funding_core::quantity::{MatchedLeg, matched_quantity, DEFAULT_QTY_PRECISION};
+
+fn leg(price: &str, step: &str, min: &str) -> MatchedLeg {
+    MatchedLeg { price: d(price), lot: lot(step, min), ct_val: None }
+}
+
+#[test]
+fn matched_uses_the_coarser_common_step_and_the_higher_price() {
+    let m = matched_quantity(d("1000"), &leg("60000", "0.001", "0.001"), &leg("60100", "0.0001", "0.0001")).unwrap();
+    assert_eq!(m.common_step, d("0.001"));
+    assert_eq!(m.base_qty, d("0.016"));
+    assert_eq!((m.long.value(), m.short.value()), (d("0.016"), d("0.016")));
+    assert!(m.base_qty * d("60000") <= d("1000") && m.base_qty * d("60100") <= d("1000"));
+}
+
+#[test]
+fn matched_never_goes_finer_than_the_default_precision() {
+    assert_eq!(DEFAULT_QTY_PRECISION, d("0.000001"));
+    let m = matched_quantity(d("1000"), &leg("3000", "0.00000001", "0.00000001"), &leg("3000", "0.00000001", "0.00000001")).unwrap();
+    assert_eq!((m.common_step, m.base_qty), (d("0.000001"), d("0.333333")));
+}
+
+#[test]
+fn matched_common_step_is_the_least_common_multiple() {
+    let m = matched_quantity(d("100"), &leg("9", "0.002", "0.002"), &leg("9", "0.005", "0.005")).unwrap();
+    assert_eq!((m.common_step, m.base_qty), (d("0.01"), d("11.11")));
+}
+
+#[test]
+fn matched_okx_leg_is_sent_in_whole_contracts() {
+    let okx = MatchedLeg { price: d("60000"), lot: lot("1", "1"), ct_val: Some(d("0.01")) };
+    let m = matched_quantity(d("1000"), &okx, &leg("60000", "0.001", "0.001")).unwrap();
+    assert_eq!((m.common_step, m.base_qty), (d("0.01"), d("0.01")));
+    assert_eq!((m.long.value(), m.short.value()), (d("1"), d("0.01")));
+}
+
+#[test]
+fn matched_below_the_larger_minimum_is_an_error() {
+    let e = matched_quantity(d("4"), &leg("1000", "0.001", "0.001"), &leg("1000", "0.001", "0.005")).unwrap_err();
+    assert_eq!(e, QuantityError::BelowMinimum { adjusted: d("0.004"), min_qty: d("0.005") });
+}
+
+#[test]
+fn matched_rejects_non_positive_inputs_and_overflow_without_panicking() {
+    assert!(matches!(matched_quantity(d("1000"), &leg("0", "0.001", "0.001"), &leg("1", "0.001", "0.001")), Err(QuantityError::InvalidPrice(_))));
+    assert!(matches!(matched_quantity(d("1000"), &leg("1", "0", "0"), &leg("1", "0.001", "0.001")), Err(QuantityError::InvalidStepSize(_))));
+    let okx = MatchedLeg { price: d("1"), lot: lot("1", "1"), ct_val: Some(d("0")) };
+    assert!(matches!(matched_quantity(d("1000"), &okx, &leg("1", "0.001", "0.001")), Err(QuantityError::InvalidContractValue(_))));
+    // Co-prime 28-digit steps: the LCM does not fit; an error, never a panic.
+    let big = matched_quantity(d("1000"), &leg("1", "0.9999999999999999999999999999", "0"), &leg("1", "0.9999999999999999999999999997", "0"));
+    assert!(matches!(big, Err(QuantityError::NoCommonStep(..))), "{big:?}");
+}

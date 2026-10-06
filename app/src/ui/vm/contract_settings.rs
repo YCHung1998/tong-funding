@@ -3,7 +3,7 @@
 //! derived. The quantity quote floors with `core::quantity` (OKX in contracts) and never shows a
 //! quantity from a stale price or from missing rules.
 
-use tong_funding_core::quantity::{Quantity, QuantityError};
+use tong_funding_core::quantity::{MatchedLeg, Quantity, QuantityError, matched_quantity};
 use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::{Decimal, Exchange};
 
@@ -215,6 +215,81 @@ pub fn leg_quantity(exchange: Exchange, symbol: &str, notional: Decimal, price: 
             Ok(q) => QuoteCell::Qty { qty: q.value(), text: format!("{} {coin}", q.to_order_string(&rules.lot)) },
             Err(e) => below(e),
         },
+    }
+}
+
+/// Both legs of a pair at ONE shared quantity (core `matched_quantity`: the notional is a cap,
+/// the higher price sets the quantity, the coarser common step keeps it valid on both). Each cell
+/// shows the shared quantity and that leg's value at its own price. Pure.
+pub fn pair_quantity(
+    symbol: &str,
+    notional: Decimal,
+    long: (Exchange, Decimal, Option<&Result<OrderRules, String>>),
+    short: (Exchange, Decimal, Option<&Result<OrderRules, String>>),
+) -> (QuoteCell, QuoteCell) {
+    let both = |c: QuoteCell| (c.clone(), c);
+    let leg = |(ex, price, rules): (Exchange, Decimal, Option<&Result<OrderRules, String>>)| -> Result<MatchedLeg, QuoteCell> {
+        let rules = match rules {
+            None => return Err(QuoteCell::RulesPending),
+            Some(Err(why)) => return Err(QuoteCell::NoRules(why.clone())),
+            Some(Ok(r)) => r,
+        };
+        if price <= Decimal::ZERO {
+            return Err(QuoteCell::NoPrice);
+        }
+        match (ex, rules.okx_ct_val) {
+            (Exchange::Okx, None) => Err(QuoteCell::NoRules("ctVal missing".into())),
+            (Exchange::Okx, ct) => Ok(MatchedLeg { price, lot: rules.lot, ct_val: ct }),
+            (Exchange::Binance | Exchange::Bybit, _) => Ok(MatchedLeg { price, lot: rules.lot, ct_val: None }),
+        }
+    };
+    let (l, sh) = match (leg(long), leg(short)) {
+        (Ok(l), Ok(s)) => (l, s),
+        (Err(c), _) | (_, Err(c)) => return both(c),
+    };
+    let m = match matched_quantity(notional, &l, &sh) {
+        Ok(m) => m,
+        Err(QuantityError::BelowMinimum { .. }) => return both(QuoteCell::BelowMinimum),
+        Err(e) => return both(QuoteCell::NoRules(e.to_string())),
+    };
+    let coin = format::base_coin(symbol);
+    let mut base = m.base_qty;
+    base.rescale(m.common_step.scale());
+    let cell = |ex: Exchange, ml: &MatchedLeg, order: Decimal| {
+        let value = format::money(m.base_qty * ml.price, 2);
+        match ex {
+            Exchange::Okx => QuoteCell::Contracts { contracts: order, base: m.base_qty, text: format!("{} 張（≈ {base} {coin}，≈ {value} USDT）", order.normalize()) },
+            Exchange::Binance | Exchange::Bybit => QuoteCell::Qty { qty: m.base_qty, text: format!("{base} {coin}（≈ {value} USDT）") },
+        }
+    };
+    (cell(long.0, &l, m.long.value()), cell(short.0, &sh, m.short.value()))
+}
+
+/// The Binance↔Bybit shared-quantity line of the contract settings quote: uses the same fresh
+/// prices and rules as the per-exchange rows. Pure.
+pub fn pair_quote(symbol: &str, notional: Decimal, snap: &UiSnapshot, now_ms: i64) -> String {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    let rows = quote(&symbol, notional, snap, now_ms);
+    let row = |ex: Exchange| rows.iter().find(|q| q.exchange == ex).expect("quote covers every exchange");
+    let (b, y) = (row(Exchange::Binance), row(Exchange::Bybit));
+    let head = "Binance↔Bybit 共同數量：";
+    for q in [b, y] {
+        if q.cell.order_qty().is_none() {
+            return format!("{head}無法計算（{} {}）", q.exchange.name(), q.cell.text());
+        }
+    }
+    let (pb, py) = (b.price.unwrap_or_default(), y.price.unwrap_or_default());
+    let rules = |ex: Exchange| snap.rules.get(&(ex, symbol.clone()));
+    let (cb, cy) = pair_quantity(&symbol, notional, (Exchange::Binance, pb, rules(Exchange::Binance)), (Exchange::Bybit, py, rules(Exchange::Bybit)));
+    match (&cb, &cy) {
+        (QuoteCell::Qty { qty, .. }, QuoteCell::Qty { .. }) => format!(
+            "{head}{} {} · Binance ≈ {} USDT · Bybit ≈ {} USDT",
+            qty.normalize(),
+            format::base_coin(&symbol),
+            format::money(*qty * pb, 2),
+            format::money(*qty * py, 2)
+        ),
+        _ => format!("{head}無法計算（{}）", cb.text()),
     }
 }
 
