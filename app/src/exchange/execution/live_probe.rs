@@ -43,7 +43,7 @@ use crate::exchange::signed::signing::Resync;
 use crate::ports::{Clock, SecretProvider, SystemClock};
 use crate::store::db::Db;
 use crate::store::events::EventStore;
-use crate::store::secrets::KeychainSecrets;
+use crate::store::secrets::BundleSecrets;
 
 const CONFIRM: &str = "I_AM_PRESENT_PLACE_DEMO_ORDERS";
 
@@ -144,7 +144,7 @@ async fn live_demo_probe() {
     let db = Db::open(std::path::Path::new(&db_path), clock.clone());
     assert!(!db.is_halted(), "probe db: {:?}", db.halt_reason());
     let events = EventStore::new(db.clone());
-    let secrets: Arc<dyn SecretProvider> = Arc::new(KeychainSecrets::system());
+    let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
 
     // Clock offsets from the demo hosts' public time endpoints.
     let reads = Arc::new(ReqwestTransport::signed_demo().expect("transport"));

@@ -209,8 +209,8 @@ pub struct ScannerVm {
     pub state: TableState,
     /// Errors of sources whose latest attempt failed (shown even when the table is usable).
     pub source_errors: Vec<(Exchange, String)>,
-    /// Header: "Net Edge 門檻 %：…" (read-only; edited on the risk page).
-    pub threshold_text: String,
+    /// Header: the required-spread formula per enabled exchange pair (read-only; edited on the risk page).
+    pub breakdown: Vec<BreakdownLine>,
     /// Qualification can be decided (toggle enabled).
     pub decidable: bool,
     /// When this table was computed (local ms): "最新掃描".
@@ -299,6 +299,93 @@ fn missing_for(settings: &Settings, x: Exchange, y: Exchange) -> Vec<String> {
         out.push(format!("{} taker_fee_pct", y.name()));
     }
     out
+}
+
+/// One exchange pair's "required funding spread" worked out from its merged settings
+/// (spec scanner-threshold-breakdown). The same Net Edge formula as core, moved to the spread side:
+/// `spread >= threshold + 2(fee_L + fee_S) + 4 slippage + safety_margin`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakdownLine {
+    pub pair: (Exchange, Exchange),
+    /// `Err` = the settings that are missing (never replaced by 0).
+    pub calc: Result<Breakdown, Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Breakdown {
+    pub threshold: Decimal,
+    pub fee_long: Decimal,
+    pub fee_short: Decimal,
+    pub slippage: Decimal,
+    pub safety_margin: Decimal,
+    pub min_expected_net_pnl: Decimal,
+}
+
+impl Breakdown {
+    fn costs(&self) -> Decimal {
+        Decimal::from(2) * (self.fee_long + self.fee_short) + Decimal::from(4) * self.slippage
+    }
+    pub fn required(&self) -> Decimal {
+        self.threshold + self.costs() + self.safety_margin
+    }
+    /// The `min_expected_net_pnl_pct` condition (Net Edge before the safety margin).
+    pub fn min_pnl_required(&self) -> Decimal {
+        self.min_expected_net_pnl + self.costs()
+    }
+}
+
+impl BreakdownLine {
+    /// Display lines: the formula, plus a second formula when the minimum-net-PnL condition is stricter.
+    pub fn lines(&self) -> Vec<String> {
+        let name = format!("{}↔{}", self.pair.0.name(), self.pair.1.name());
+        let f = |v: Decimal| format::fixed(v, 4);
+        match &self.calc {
+            Err(missing) => vec![format!("{name}  無法計算：缺少 {}", missing.join("、"))],
+            Ok(b) => {
+                let fees = format!("2×({}+{})", f(b.fee_long), f(b.fee_short));
+                let mut out = vec![format!(
+                    "{name}  所需費率價差 % = {} + {fees} + 4×{} + {} = {}",
+                    f(b.threshold),
+                    f(b.slippage),
+                    f(b.safety_margin),
+                    f(b.required())
+                )];
+                if b.min_pnl_required() > b.required() {
+                    out.push(format!(
+                        "最低淨利 = {} + {fees} + 4×{} = {}　以較嚴者為準：{}",
+                        f(b.min_expected_net_pnl),
+                        f(b.slippage),
+                        f(b.min_pnl_required()),
+                        f(b.min_pnl_required())
+                    ));
+                }
+                out
+            }
+        }
+    }
+}
+
+/// One line per unordered pair of `enabled` exchanges, from the same merged settings core uses.
+pub fn threshold_breakdown(settings: &Settings, enabled: &[Exchange]) -> Vec<BreakdownLine> {
+    pairs_of(enabled)
+        .into_iter()
+        .map(|(x, y)| {
+            let missing = missing_for(settings, x, y);
+            let eff = effective_for_pair(&settings.risk, &settings.overrides, x, y);
+            let calc = match (missing.is_empty(), eff.net_edge_threshold_pct, eff.est_slippage_pct, eff.long_taker_fee_pct, eff.short_taker_fee_pct) {
+                (true, Some(threshold), Some(slippage), Some(fee_long), Some(fee_short)) => Ok(Breakdown {
+                    threshold,
+                    fee_long,
+                    fee_short,
+                    slippage,
+                    safety_margin: eff.safety_margin_pct,
+                    min_expected_net_pnl: eff.min_expected_net_pnl_pct,
+                }),
+                _ => Err(missing),
+            };
+            BreakdownLine { pair: (x, y), calc }
+        })
+        .collect()
 }
 
 fn pairs_of(exchanges: &[Exchange]) -> Vec<(Exchange, Exchange)> {
@@ -484,12 +571,9 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> ScannerVm {
     };
     let oldest_data_age_ms = feeds.iter().filter_map(|(_, f)| f.last_success_at).min().map(|t| (now_ms - t).max(0));
 
-    let threshold_text = match (&settings.error, risk.net_edge_threshold_pct) {
-        (None, Some(v)) => format!("Net Edge 門檻 %：{}", format::fixed(v, 4)),
-        _ => "Net Edge 門檻 %：未設定".to_string(),
-    };
+    let breakdown = threshold_breakdown(settings, &tradable);
 
-    ScannerVm { rows, summary, state, source_errors, threshold_text, decidable, computed_at: now_ms, oldest_data_age_ms }
+    ScannerVm { rows, summary, state, source_errors, breakdown, decidable, computed_at: now_ms, oldest_data_age_ms }
 }
 
 /// The countdown of a row: `target − (now + offset of the target's exchange)`. An unsynced clock

@@ -47,6 +47,7 @@ fn main() {
                 let live = ui::live::LiveSource::start(db);
                 let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = live.clone();
                 let sink: std::sync::Arc<dyn ui::bridge::CommandSink> = live;
+                ui::zoom_ui::install(source.clone(), cx);
                 gpui_kit::open_window(options, cx, move |window, cx| cx.new(|cx| ui::shell::Shell::new(source, sink, window, cx))).expect("failed to open window");
             }
         }

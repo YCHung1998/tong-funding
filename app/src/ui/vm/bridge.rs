@@ -552,6 +552,14 @@ pub trait ReadOnlyDataSource: Send + Sync {
     fn load_events(&self, query: &crate::store::event_query::EventQuery) -> Result<crate::store::event_query::EventPage, String>;
     /// Ask for the market-order lot rules of `symbol` (answered with [`SourceUpdate::Rules`]).
     fn request_rules(&self, _exchange: Exchange, _symbol: &str) {}
+    /// `config.ui_prefs` (ui-font-zoom); `Ok(None)` = never saved.
+    fn load_ui_prefs(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    /// Overwrites `config.ui_prefs`.
+    fn save_ui_prefs(&self, _prefs: &Value) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

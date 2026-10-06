@@ -182,13 +182,13 @@ fn missing_threshold_marks_every_row_not_configured_and_sorts_by_gross() {
     );
     assert!(vm.rows.iter().all(|r| r.qualified == Qualified::NotConfigured));
     assert_eq!(vm.rows[0].symbol, "BUSDT");
-    assert_eq!(vm.threshold_text, "Net Edge 門檻 %：未設定");
+    assert!(vm.breakdown.iter().all(|l| l.lines()[0].contains("無法計算：缺少 net_edge_threshold_pct")));
 }
 
 #[test]
 fn threshold_is_shown_read_only_when_set() {
     let vm = build(&snap(complete_settings("0.01"), &[]), NOW);
-    assert_eq!(vm.threshold_text, "Net Edge 門檻 %：0.0100");
+    assert!(vm.breakdown[0].lines()[0].contains("= 0.0100 + "));
 }
 
 fn twenty_rows_twelve_qualified() -> ScannerVm {
@@ -307,4 +307,92 @@ fn disabled_exchanges_are_not_counted_or_shown() {
     assert_eq!(vm.rows.len(), 1, "ETHUSDT is only on the disabled OKX");
     assert_eq!(vm.rows[0].coverage_text(), "1/2");
     assert_eq!(cell(&vm.rows[0], Okx).text(), "—");
+}
+
+// ---- scanner-readability: threshold breakdown (spec scanner-threshold-breakdown) ----
+
+fn breakdown_settings() -> Settings {
+    let mut s = complete_settings("0.05");
+    s.risk.est_slippage_pct = Some(d("0.02"));
+    s.risk.safety_margin_pct = d("0.01");
+    s.risk.min_expected_net_pnl_pct = d("0");
+    s.risk.taker_fee_pct.insert(Binance, d("0.05"));
+    s.risk.taker_fee_pct.insert(Bybit, d("0.055"));
+    s.risk.taker_fee_pct.insert(Okx, d("0.05"));
+    s
+}
+
+#[test]
+fn breakdown_general_pair_matches_spec_example_0_3500() {
+    let lines = threshold_breakdown(&breakdown_settings(), &[Binance, Bybit]);
+    assert_eq!(lines.len(), 1, "one line per unordered pair");
+    assert_eq!(
+        lines[0].lines(),
+        ["Binance↔Bybit  所需費率價差 % = 0.0500 + 2×(0.0500+0.0550) + 4×0.0200 + 0.0100 = 0.3500"]
+    );
+}
+
+#[test]
+fn breakdown_has_one_line_per_unordered_pair() {
+    let lines = threshold_breakdown(&breakdown_settings(), &[Binance, Bybit, Okx]);
+    assert_eq!(lines.len(), 3);
+    assert!(threshold_breakdown(&breakdown_settings(), &[Binance]).is_empty());
+}
+
+#[test]
+fn breakdown_per_leg_override_applies_only_to_pairs_with_that_leg() {
+    use tong_funding_core::risk::RiskOverride;
+    let mut s = breakdown_settings();
+    s.overrides.insert(Bybit, RiskOverride { net_edge_threshold_pct: Some(d("0.08")), ..Default::default() });
+    let lines = threshold_breakdown(&s, &[Binance, Bybit, Okx]);
+    let text = |a: &str| lines.iter().find(|l| l.lines()[0].starts_with(a)).unwrap().lines()[0].clone();
+    assert!(text("Binance↔Bybit").contains("= 0.0800 + "), "{}", text("Binance↔Bybit"));
+    assert!(text("Bybit↔OKX").contains("= 0.0800 + "));
+    assert!(text("Binance↔OKX").contains("= 0.0500 + "));
+}
+
+#[test]
+fn breakdown_stricter_min_pnl_adds_second_formula() {
+    let mut s = breakdown_settings();
+    s.risk.net_edge_threshold_pct = Some(d("0.01"));
+    s.risk.min_expected_net_pnl_pct = d("0.05");
+    let l = threshold_breakdown(&s, &[Binance, Bybit]).remove(0).lines();
+    assert_eq!(l.len(), 2);
+    // first: 0.01 + 0.21 + 0.08 + 0.01 = 0.3100; second: 0.05 + 0.21 + 0.08 = 0.3400
+    assert!(l[0].ends_with("= 0.3100"), "{}", l[0]);
+    assert_eq!(l[1], "最低淨利 = 0.0500 + 2×(0.0500+0.0550) + 4×0.0200 = 0.3400　以較嚴者為準：0.3400");
+}
+
+#[test]
+fn breakdown_min_pnl_not_stricter_is_not_shown() {
+    let mut s = breakdown_settings();
+    s.risk.min_expected_net_pnl_pct = d("0.03");
+    assert_eq!(threshold_breakdown(&s, &[Binance, Bybit])[0].lines().len(), 1);
+}
+
+#[test]
+fn breakdown_missing_fee_names_the_field_and_does_not_use_zero() {
+    let mut s = breakdown_settings();
+    s.risk.taker_fee_pct.remove(&Bybit);
+    let lines = threshold_breakdown(&s, &[Binance, Bybit, Okx]);
+    let bb = lines.iter().find(|l| l.lines()[0].starts_with("Binance↔Bybit")).unwrap();
+    assert_eq!(bb.lines(), ["Binance↔Bybit  無法計算：缺少 Bybit taker_fee_pct"]);
+    let bo = lines.iter().find(|l| l.lines()[0].starts_with("Binance↔OKX")).unwrap();
+    assert!(bo.lines()[0].contains("= 0."));
+}
+
+#[test]
+fn breakdown_settings_error_reports_unreadable_risk_config() {
+    let mut s = breakdown_settings();
+    s.error = Some("boom".into());
+    let l = threshold_breakdown(&s, &[Binance, Bybit]).remove(0).lines();
+    assert_eq!(l, ["Binance↔Bybit  無法計算：缺少 風控設定（讀取失敗）"]);
+}
+
+#[test]
+fn vm_carries_breakdown_for_tradable_enabled_pairs() {
+    let mut s = breakdown_settings();
+    s.risk.allowed_exchanges = vec![Binance, Bybit];
+    let vm = build(&snap(s, &[]), NOW);
+    assert_eq!(vm.breakdown.len(), 1);
 }

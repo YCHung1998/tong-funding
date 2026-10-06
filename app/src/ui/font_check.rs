@@ -5,6 +5,7 @@ use gpui_kit::*;
 
 use super::fonts::app_font;
 use super::theme;
+use super::units::{fs, rx};
 
 pub struct FontCheck;
 
@@ -14,11 +15,11 @@ fn row(label: &str, font: Font, text: &str) -> Div {
         .gap_4()
         .child(
             div()
-                .w(px(230.0))
+                .w(rx(230.0))
                 .text_color(rgb(theme::TEXT_SECONDARY))
                 .child(label.to_string()),
         )
-        .child(div().font(font).text_size(px(14.0)).child(text.to_string()))
+        .child(div().font(font).text_size(fs(14.0)).child(text.to_string()))
 }
 
 impl Render for FontCheck {
@@ -32,7 +33,7 @@ impl Render for FontCheck {
             .flex()
             .flex_col()
             .gap_3()
-            .text_size(px(theme::FONT_SIZE_BODY))
+            .text_size(fs(theme::FONT_SIZE_BODY))
             .font(app_font(FontWeight::NORMAL))
             .child("font check: bundled Plex Mono; Chinese via system font")
             .child(row("Regular (400)", app_font(FontWeight::NORMAL), sample))

@@ -9,11 +9,11 @@ use tong_funding_core::quantity::Quantity;
 use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::bridge::{CommandSink, UiSnapshot, TRADABLE_EXCHANGES};
+use super::bridge::{CommandSink, LegAccount, UiSnapshot, TRADABLE_EXCHANGES};
 use super::engine_view::{blocker_text, refusing_blockers};
 use super::format;
 use crate::engine::command::{Command, ManualOrder};
-use crate::engine::ports::OrderSide;
+use crate::engine::ports::{AccountPosition, Listed, OrderSide};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManualForm {
@@ -226,6 +226,121 @@ pub fn cancel(vm: &ManualVm, form: &CancelForm, sink: &dyn CommandSink) -> bool 
         Command::ManualCancel { exchange: form.exchange, symbol: form.symbol.trim().to_ascii_uppercase(), client_order_id: form.order_id.trim().to_string() },
     );
     true
+}
+
+// ---- manual-order-position-picker -------------------------------------------------------------
+
+/// What one exchange's list can honestly say: never a stale or guessed row.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PickState<T> {
+    /// No read of this account has arrived yet (not "no positions").
+    NotQueried,
+    /// The read failed; the message is shown and no rows are.
+    Failed(String),
+    /// `incomplete` = the exchange reported a partial list.
+    Rows { rows: Vec<T>, incomplete: bool },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PickList<T> {
+    pub exchange: Exchange,
+    pub fetched_at: Option<i64>,
+    pub state: PickState<T>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PositionRow {
+    pub exchange: Exchange,
+    pub symbol: String,
+    /// Signed: long positive, short negative.
+    pub quantity: Decimal,
+    pub is_long: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderRow {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub order_id: Option<String>,
+    pub remaining: Decimal,
+}
+
+/// Values a "close this position" click writes into the order form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManualPrefill {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub side: OrderSide,
+    pub quantity: String,
+    pub reduce_only: bool,
+}
+
+/// Values a "cancel this order" click writes into the cancel form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelPrefill {
+    pub exchange: Exchange,
+    pub symbol: String,
+    pub order_id: String,
+}
+
+/// The account the engine trades against: simulated ledger unless EXCHANGE_DEMO (engine stopped
+/// reads as simulated).
+fn account_is_simulated(snap: &UiSnapshot) -> bool {
+    snap.engine.as_ref().map(|e| e.execution_mode) != Some(ExecutionMode::ExchangeDemo)
+}
+
+fn pick_lists<A, T>(
+    snap: &UiSnapshot,
+    read: impl Fn(&LegAccount) -> &Result<Listed<A>, String>,
+    row: impl Fn(&A) -> Option<T>,
+) -> Vec<PickList<T>> {
+    let simulated = account_is_simulated(snap);
+    TRADABLE_EXCHANGES
+        .iter()
+        .map(|ex| match snap.leg_accounts.get(&(simulated, *ex)) {
+            None => PickList { exchange: *ex, fetched_at: None, state: PickState::NotQueried },
+            Some(acc) => PickList {
+                exchange: *ex,
+                fetched_at: Some(acc.fetched_at),
+                state: match read(acc) {
+                    Err(e) => PickState::Failed(e.clone()),
+                    Ok(l) => PickState::Rows { rows: l.items.iter().filter_map(&row).collect(), incomplete: !l.complete },
+                },
+            },
+        })
+        .collect()
+}
+
+/// Non-zero positions per tradable exchange, from the account of the current execution mode.
+pub fn open_positions(snap: &UiSnapshot) -> Vec<PickList<PositionRow>> {
+    pick_lists(snap, |a| &a.positions, |p| {
+        (!p.quantity.is_zero()).then(|| PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity, is_long: p.quantity > Decimal::ZERO })
+    })
+}
+
+/// Open orders per tradable exchange; rows without an id are kept (shown, not pickable).
+pub fn open_orders(snap: &UiSnapshot) -> Vec<PickList<OrderRow>> {
+    pick_lists(snap, |a| &a.open_orders, |o| {
+        let order_id = o.client_order_id.as_ref().map(|i| i.trim().to_string()).filter(|i| !i.is_empty());
+        Some(OrderRow { exchange: o.exchange, symbol: o.symbol.clone(), order_id, remaining: o.remaining_quantity })
+    })
+}
+
+/// Close = opposite side, the whole position, reduce-only. Quantity is passed unrounded; `build`
+/// floors it to the exchange step and the confirmation shows the result.
+pub fn close_prefill(p: &AccountPosition) -> ManualPrefill {
+    ManualPrefill {
+        exchange: p.exchange,
+        symbol: p.symbol.clone(),
+        side: if p.quantity > Decimal::ZERO { OrderSide::Sell } else { OrderSide::Buy },
+        quantity: p.quantity.abs().normalize().to_string(),
+        reduce_only: true,
+    }
+}
+
+/// `None` for an order without an id (it cannot be cancelled from here).
+pub fn cancel_prefill(o: &OrderRow) -> Option<CancelPrefill> {
+    o.order_id.clone().map(|order_id| CancelPrefill { exchange: o.exchange, symbol: o.symbol.clone(), order_id })
 }
 
 #[cfg(test)]

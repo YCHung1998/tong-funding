@@ -18,16 +18,19 @@ use super::bridge::{Settings, SourceUpdate, UiSnapshot};
 use super::candidates::{self, CandidateList};
 use super::contract_settings::{self, CalcMode, ContractForm};
 use super::format::{self, DASH};
-use super::manual_order::{self, CancelForm, ManualConfirm, ManualForm};
+use super::manual_order::{self, CancelForm, CancelPrefill, ManualConfirm, ManualForm, ManualPrefill, PickState};
 use super::nav::{Page, DEBUG_WARNING};
 use super::pages::{card, small, text, title, ClickFn};
 use super::risk_settings::{self, Field, RiskForm, GLOBAL_FIELDS, MODE_OPTIONS, OVERRIDE_FIELDS};
 use super::scanner::ScanRow;
 use super::shell::Shell;
 use super::staged_orders::{self, CloseConfirm, PendingConfirm, RunningRow};
+use super::symbol_options;
+use super::symbol_select::{CoinPicker, SymbolPicker};
 use super::theme;
+use super::units::rx;
 use crate::engine::command::{Command, CommandReply};
-use crate::engine::ports::OrderSide;
+use crate::engine::ports::{AccountPosition, OrderSide};
 
 /// The "加入交易單" cell of one scanner row.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -52,7 +55,7 @@ pub struct TradingState {
     c_notional: In,
     c_leverage: In,
     c_margin: In,
-    c_symbol: In,
+    c_symbol: SymbolPicker,
     pub c_mode: CalcMode,
     contract_loaded: bool,
     contract_reload: bool,
@@ -61,20 +64,23 @@ pub struct TradingState {
     r_over: BTreeMap<(Exchange, Field), In>,
     pub r_over_on: BTreeSet<(Exchange, Field)>,
     pub r_allowed: BTreeSet<Exchange>,
-    r_coins: In,
+    r_coins: CoinPicker,
     risk_loaded: bool,
     risk_reload: bool,
     pub mode_confirm: Option<ExecutionMode>,
     pub mode_error: Option<String>,
-    m_symbol: In,
+    m_symbol: SymbolPicker,
     m_qty: In,
-    x_symbol: In,
+    x_symbol: SymbolPicker,
     x_id: In,
     pub m_exchange: Exchange,
     pub m_side: OrderSide,
     pub m_reduce: bool,
     pub x_exchange: Exchange,
     m_requested: String,
+    /// A picker click's values, written into the inputs on the next render (needs a `Window`).
+    pending_manual: Option<ManualPrefill>,
+    pending_cancel: Option<CancelPrefill>,
     pub manual_confirm: Option<ManualConfirm>,
 }
 
@@ -112,7 +118,7 @@ impl TradingState {
             c_notional: new_input(window, cx, "1000"),
             c_leverage: new_input(window, cx, "5"),
             c_margin: new_input(window, cx, "200"),
-            c_symbol: new_input(window, cx, "BTCUSDT"),
+            c_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             c_mode: CalcMode::LeverageToMargin,
             contract_loaded: false,
             contract_reload: false,
@@ -121,20 +127,22 @@ impl TradingState {
             r_over,
             r_over_on: BTreeSet::new(),
             r_allowed: Exchange::ALL.into_iter().collect(),
-            r_coins: new_input(window, cx, ""),
+            r_coins: CoinPicker::new(window, cx),
             risk_loaded: false,
             risk_reload: false,
             mode_confirm: None,
             mode_error: None,
-            m_symbol: new_input(window, cx, "BTCUSDT"),
+            m_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             m_qty: new_input(window, cx, ""),
-            x_symbol: new_input(window, cx, "BTCUSDT"),
+            x_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             x_id: new_input(window, cx, ""),
             m_exchange: Exchange::Binance,
             m_side: OrderSide::Buy,
             m_reduce: false,
             x_exchange: Exchange::Binance,
             m_requested: String::new(),
+            pending_manual: None,
+            pending_cancel: None,
             manual_confirm: None,
         }
     }
@@ -164,6 +172,30 @@ impl TradingState {
 
     /// Fills the forms from the stored settings once they are known (and after each save).
     pub fn load_forms(&mut self, snap: &UiSnapshot, window: &mut Window, cx: &mut Context<Shell>) {
+        // Candidates follow the snapshot (replaced only when they changed) and the chosen exchange.
+        self.c_symbol.sync(symbol_options::all_symbol_options(snap), window, cx);
+        self.r_coins.sync(symbol_options::coin_options(snap), window, cx);
+        if let Some(p) = &self.pending_manual {
+            self.m_exchange = p.exchange;
+        }
+        if let Some(p) = &self.pending_cancel {
+            self.x_exchange = p.exchange;
+        }
+        self.m_symbol.sync(symbol_options::symbol_options(snap, self.m_exchange), window, cx);
+        self.x_symbol.sync(symbol_options::open_order_symbols(snap, self.x_exchange), window, cx);
+        if let Some(p) = self.pending_manual.take() {
+            self.m_symbol.set_value(&p.symbol, window, cx);
+            set_val(&self.m_qty, p.quantity, window, cx);
+            self.m_exchange = p.exchange;
+            self.m_side = p.side;
+            self.m_reduce = p.reduce_only;
+            self.manual_confirm = None;
+        }
+        if let Some(p) = self.pending_cancel.take() {
+            self.x_symbol.set_value(&p.symbol, window, cx);
+            set_val(&self.x_id, p.order_id, window, cx);
+            self.x_exchange = p.exchange;
+        }
         if !self.settings_seen {
             return;
         }
@@ -190,7 +222,7 @@ impl TradingState {
                 }
             }
             self.r_allowed = form.allowed_exchanges.clone();
-            set_val(&self.r_coins, form.allowed_coins.clone(), window, cx);
+            self.r_coins.set_text(&form.allowed_coins, window, cx);
             self.risk_loaded = true;
         }
     }
@@ -214,16 +246,16 @@ impl TradingState {
             }
         }
         form.allowed_exchanges = self.r_allowed.clone();
-        form.allowed_coins = val(&self.r_coins, cx);
+        form.allowed_coins = self.r_coins.text(cx);
         form
     }
 
     fn manual_form(&self, cx: &App) -> ManualForm {
-        ManualForm { exchange: self.m_exchange, symbol: val(&self.m_symbol, cx), side: self.m_side, quantity: val(&self.m_qty, cx), reduce_only: self.m_reduce }
+        ManualForm { exchange: self.m_exchange, symbol: self.m_symbol.value(cx), side: self.m_side, quantity: val(&self.m_qty, cx), reduce_only: self.m_reduce }
     }
 
     fn cancel_form(&self, cx: &App) -> CancelForm {
-        CancelForm { exchange: self.x_exchange, symbol: val(&self.x_symbol, cx), order_id: val(&self.x_id, cx) }
+        CancelForm { exchange: self.x_exchange, symbol: self.x_symbol.value(cx), order_id: val(&self.x_id, cx) }
     }
 }
 
@@ -247,11 +279,28 @@ fn field_row(label: impl Into<SharedString>, unit: &str, input: &In, error: Opti
         .flex()
         .gap_2()
         .items_center()
-        .child(small(label.into(), theme::TEXT_SECONDARY).w(px(260.0)))
-        .child(div().w(px(160.0)).child(Input::new(input)))
+        .child(small(label.into(), theme::TEXT_SECONDARY).w(rx(260.0)))
+        .child(div().w(rx(160.0)).child(Input::new(input)))
         .child(small(unit.to_string(), theme::TEXT_MUTED));
     if let Some(e) = error {
         row = row.child(small(e.clone(), theme::NEGATIVE));
+    }
+    row
+}
+
+/// A symbol dropdown row; `unlisted` = names the selected values missing from the candidate list.
+fn pick_row(label: impl Into<SharedString>, picker: impl IntoElement, loaded: bool, list_name: &str, unlisted: Option<String>) -> Div {
+    let mut row = div()
+        .flex()
+        .gap_2()
+        .items_center()
+        .child(small(label.into(), theme::TEXT_SECONDARY).w(rx(260.0)))
+        .child(div().w(rx(220.0)).child(picker));
+    if !loaded {
+        row = row.child(small("行情載入中（仍可直接輸入）", theme::TEXT_MUTED));
+    }
+    if let Some(u) = unlisted {
+        row = row.child(small(format!("{u} 不在目前{list_name}清單中"), theme::WARNING));
     }
     row
 }
@@ -340,7 +389,7 @@ impl Shell {
                 .flex()
                 .gap_3()
                 .items_center()
-                .child(small(v.symbol.clone(), theme::TEXT_PRIMARY).w(px(110.0)))
+                .child(small(v.symbol.clone(), theme::TEXT_PRIMARY).w(rx(110.0)))
                 .child(small(format!("L {} / S {}", v.long.name(), v.short.name()), theme::TEXT_SECONDARY))
                 .child(small(format!("Gross {}", v.gross_spread.map_or_else(|| DASH.into(), format::rate_pct)), theme::TEXT_SECONDARY))
                 .child(small(format!("Net Edge {}", v.net_edge_pct.map_or_else(|| DASH.into(), |n| format::fixed(n, 4))), theme::TEXT_SECONDARY))
@@ -463,7 +512,7 @@ impl Shell {
                 .gap_3()
                 .items_center()
                 .child(check)
-                .child(small(r.symbol.clone(), theme::TEXT_PRIMARY).w(px(100.0)))
+                .child(small(r.symbol.clone(), theme::TEXT_PRIMARY).w(rx(100.0)))
                 .child(small(r.gross_spread.map_or_else(|| DASH.into(), format::rate_pct), theme::TEXT_SECONDARY))
                 .child(small(r.net_edge_pct.map_or_else(|| DASH.into(), |n| format::fixed(n, 4)), theme::TEXT_SECONDARY))
                 .child(small(format!("L {} {}", r.long.name(), r.long_qty.text()), theme::TEXT_SECONDARY))
@@ -579,7 +628,7 @@ impl Shell {
         let mode = self.snap.engine.as_ref().map(|e| e.execution_mode);
         let form = self.trading.contract_form(cx);
         let vm = contract_settings::evaluate(&form, &self.snap.settings, mode);
-        let symbol = val(&self.trading.c_symbol, cx).trim().to_ascii_uppercase();
+        let symbol = self.trading.c_symbol.value(cx).trim().to_ascii_uppercase();
         if symbol != self.trading.c_requested {
             for ex in Exchange::ALL {
                 self.source.request_rules(ex, &symbol);
@@ -622,7 +671,7 @@ impl Shell {
             .child(small(format!("雙腿合計：Notional {} · Initial Margin {}", opt_money(vm.pair_notional), opt_money(vm.pair_margin)), theme::TEXT_SECONDARY))
             .child(small("預期數量：LONG / SHORT 各一腿（不跨所加總）", theme::TEXT_SECONDARY))
             .child(small(contract_settings::QUOTE_NOTE, theme::TEXT_MUTED));
-        let mut quote = card().child(field_row("試算標的", "", &self.trading.c_symbol, None));
+        let mut quote = card().child(pick_row("試算標的", self.trading.c_symbol.element("BTCUSDT"), self.trading.c_symbol.loaded(), "行情", self.trading.c_symbol.is_unlisted(cx).then(|| symbol.clone())));
         match vm.notional {
             Some(n) => {
                 for q in contract_settings::quote(&symbol, n, &self.snap, self.now_ms) {
@@ -665,7 +714,7 @@ impl Shell {
                 global = global.child(small(format!("目前 {open} / {} 組", base.risk.max_concurrent_pairs), theme::TEXT_MUTED));
             }
         }
-        let mut allowed = div().flex().gap_2().items_center().child(small("allowed_exchanges", theme::TEXT_SECONDARY).w(px(260.0)));
+        let mut allowed = div().flex().gap_2().items_center().child(small("allowed_exchanges", theme::TEXT_SECONDARY).w(rx(260.0)));
         for ex in Exchange::ALL {
             let on = self.trading.r_allowed.contains(&ex);
             allowed = allowed.child(btn(SharedString::from(format!("allow-{}", ex.name())), format!("{} {}", if on { "☑" } else { "☐" }, ex.name()), true, self.click(cx, move |this, _| {
@@ -674,7 +723,7 @@ impl Shell {
                 }
             })));
         }
-        global = global.child(allowed).child(field_row("allowed_coins（逗號分隔，空白 = 不限制）", "", &self.trading.r_coins, None)).child(small(vm.formula.clone(), theme::TEXT_SECONDARY));
+        global = global.child(allowed).child(pick_row("allowed_coins（可多選，空白 = 不限制）", self.trading.r_coins.element("不限制"), self.trading.r_coins.loaded(), "行情", Some(self.trading.r_coins.unlisted(cx).join(", ")).filter(|u| !u.is_empty()))).child(small(vm.formula.clone(), theme::TEXT_SECONDARY));
         for (k, e) in &vm.field_errors {
             if !GLOBAL_FIELDS.iter().any(|f| &f.key() == k) {
                 global = global.child(small(e.clone(), theme::NEGATIVE));
@@ -734,7 +783,7 @@ impl Shell {
         // Per-exchange overrides (exactly the nine fields) and the effective preview.
         let mut ov = div().flex().flex_wrap().gap_3();
         for ex in Exchange::ALL {
-            let mut c = card().w(px(460.0)).child(text(format!("{} 覆寫", ex.name()), theme::TEXT_PRIMARY));
+            let mut c = card().w(rx(460.0)).child(text(format!("{} 覆寫", ex.name()), theme::TEXT_PRIMARY));
             for f in OVERRIDE_FIELDS {
                 let on = self.trading.r_over_on.contains(&(ex, f));
                 let toggle = btn(SharedString::from(format!("ov-{}-{}", ex.name(), f.key())), if on { "☑ 獨立設定" } else { "☐ 獨立設定" }, true, self.click(cx, move |this, _| {
@@ -742,10 +791,10 @@ impl Shell {
                         this.trading.r_over_on.insert((ex, f));
                     }
                 }));
-                let mut row = div().flex().gap_2().items_center().child(small(f.key(), theme::TEXT_SECONDARY).w(px(170.0))).child(toggle);
+                let mut row = div().flex().gap_2().items_center().child(small(f.key(), theme::TEXT_SECONDARY).w(rx(170.0))).child(toggle);
                 row = if on {
                     match self.trading.r_over.get(&(ex, f)) {
-                        Some(i) => row.child(div().w(px(110.0)).child(Input::new(i))),
+                        Some(i) => row.child(div().w(rx(110.0)).child(Input::new(i))),
                         None => row,
                     }
                 } else {
@@ -781,6 +830,67 @@ impl Shell {
 
     // ---- manual order ---------------------------------------------------------------------------
 
+    /// "目前持倉": one row per non-zero position with a button that only fills the form.
+    fn position_picker(&self, cx: &mut Context<Self>) -> Div {
+        let mut d = div().flex().flex_col().gap_1().child(small("目前持倉（點「帶入平倉」只會填入表單，仍須確認才送出）", theme::TEXT_SECONDARY));
+        for list in manual_order::open_positions(&self.snap) {
+            let name = list.exchange.name();
+            let age = list.fetched_at.map(|t| format!(" · 更新於 {} 秒前", ((self.snap.engine.as_ref().map_or(t, |e| e.now_ms) - t) / 1000).max(0))).unwrap_or_default();
+            match list.state {
+                PickState::NotQueried => d = d.child(small(format!("{name} 尚未查詢持倉"), theme::WARNING)),
+                PickState::Failed(e) => d = d.child(small(format!("{name} 持倉讀取失敗：{e}"), theme::NEGATIVE)),
+                PickState::Rows { rows, incomplete } => {
+                    if incomplete {
+                        d = d.child(small(format!("{name} 清單可能不完整"), theme::WARNING));
+                    }
+                    if rows.is_empty() {
+                        d = d.child(small(format!("{name} 目前沒有持倉{age}"), theme::TEXT_SECONDARY));
+                    }
+                    for r in rows {
+                        let pos = AccountPosition { exchange: r.exchange, symbol: r.symbol.clone(), quantity: r.quantity };
+                        let label = format!("{name} · {} · {} {}{age}", r.symbol, if r.is_long { "多" } else { "空" }, r.quantity.abs().normalize());
+                        d = d.child(div().flex().gap_2().items_center().child(small(label, theme::TEXT_PRIMARY)).child(btn(
+                            SharedString::from(format!("m-pick-{name}-{}", r.symbol)),
+                            "帶入平倉",
+                            true,
+                            self.click(cx, move |this, _| this.trading.pending_manual = Some(manual_order::close_prefill(&pos))),
+                        )));
+                    }
+                }
+            }
+        }
+        d
+    }
+
+    /// "目前掛單": click fills the cancel form; orders without an id are shown but not pickable.
+    fn order_picker(&self, cx: &mut Context<Self>) -> Div {
+        let mut d = div().flex().flex_col().gap_1().child(small("目前掛單（點選只會填入表單）", theme::TEXT_SECONDARY));
+        for list in manual_order::open_orders(&self.snap) {
+            let name = list.exchange.name();
+            match list.state {
+                PickState::NotQueried => d = d.child(small(format!("{name} 尚未查詢掛單"), theme::WARNING)),
+                PickState::Failed(e) => d = d.child(small(format!("{name} 掛單讀取失敗：{e}"), theme::NEGATIVE)),
+                PickState::Rows { rows, incomplete } => {
+                    if incomplete {
+                        d = d.child(small(format!("{name} 清單可能不完整"), theme::WARNING));
+                    }
+                    if rows.is_empty() {
+                        d = d.child(small(format!("{name} 目前沒有掛單"), theme::TEXT_SECONDARY));
+                    }
+                    for (i, r) in rows.into_iter().enumerate() {
+                        let label = format!("{name} · {} · 剩餘 {} · {}", r.symbol, r.remaining.normalize(), r.order_id.as_deref().unwrap_or("無 Order ID，無法由此撤單"));
+                        let row = div().flex().gap_2().items_center().child(small(label, if r.order_id.is_some() { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }));
+                        d = d.child(match manual_order::cancel_prefill(&r) {
+                            Some(p) => row.child(btn(SharedString::from(format!("x-pick-{name}-{i}")), "帶入撤單", true, self.click(cx, move |this, _| this.trading.pending_cancel = Some(p.clone())))),
+                            None => row,
+                        });
+                    }
+                }
+            }
+        }
+        d
+    }
+
     pub(crate) fn manual_order_page(&mut self, cx: &mut Context<Self>) -> Div {
         let form = self.trading.manual_form(cx);
         let cancel_form = self.trading.cancel_form(cx);
@@ -815,8 +925,9 @@ impl Shell {
         let reduce = btn("m-reduce", if self.trading.m_reduce { "☑ reduce_only" } else { "☐ reduce_only" }, true, self.click(cx, |this, _| this.trading.m_reduce = !this.trading.m_reduce));
         let mut order = card()
             .child(text("單腿下單 · 市價單", theme::TEXT_PRIMARY))
+            .child(self.position_picker(cx))
             .child(panels)
-            .child(field_row("Symbol", "", &self.trading.m_symbol, None))
+            .child(pick_row("Symbol", self.trading.m_symbol.element("BTCUSDT"), self.trading.m_symbol.loaded(), "行情", self.trading.m_symbol.is_unlisted(cx).then(|| self.trading.m_symbol.value(cx))))
             .child(div().flex().gap_2().child(side(self, cx, OrderSide::Buy)).child(side(self, cx, OrderSide::Sell)).child(reduce))
             .child(field_row("Quantity", "", &self.trading.m_qty, None))
             .child(small(
@@ -857,7 +968,8 @@ impl Shell {
         }
         let mut cancel = card()
             .child(text(format!("撤單 · {}", self.trading.x_exchange.name()), theme::TEXT_PRIMARY))
-            .child(field_row("Symbol", "", &self.trading.x_symbol, None))
+            .child(self.order_picker(cx))
+            .child(pick_row("Symbol", self.trading.x_symbol.element("BTCUSDT"), true, "掛單", self.trading.x_symbol.is_unlisted(cx).then(|| self.trading.x_symbol.value(cx))))
             .child(field_row("Order ID（client_order_id）", "", &self.trading.x_id, None));
         let mut crow = div().flex().gap_2().items_center().child(btn("x-cancel", "Cancel", vm.cancel_disabled.is_empty(), self.click(cx, |this, cx| {
             let form = this.trading.cancel_form(cx);

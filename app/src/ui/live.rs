@@ -73,7 +73,7 @@ use crate::store::db::Db;
 use crate::store::event_query::{EventPage, EventQuery};
 use crate::store::events::{EventStore, SCAN_RUN};
 use crate::store::scan_buffer::DEFAULT_CAPACITY;
-use crate::store::secrets::KeychainSecrets;
+use crate::store::secrets::BundleSecrets;
 use crate::store::state::PairRow;
 
 /// Market poll period (Python version: 10 s; unverified against the rate limits).
@@ -225,6 +225,24 @@ impl ReadOnlyDataSource for LiveSource {
     fn request_rules(&self, exchange: Exchange, symbol: &str) {
         if let Some(tx) = self.shared.rules_tx.get() {
             let _ = tx.send((exchange, symbol.trim().to_ascii_uppercase()));
+        }
+    }
+
+    fn load_ui_prefs(&self) -> Result<Option<serde_json::Value>, String> {
+        let db = self.db.as_ref().ok_or("資料庫不可用")?;
+        db.config_get(super::zoom::KEY_UI_PREFS).map(|e| e.map(|e| e.value)).map_err(|e| e.to_string())
+    }
+
+    /// Optimistic version: on a conflict re-read the latest version once and overwrite.
+    fn save_ui_prefs(&self, prefs: &serde_json::Value) -> Result<(), String> {
+        use crate::store::db::StoreError;
+        let db = self.db.as_ref().ok_or("資料庫不可用")?;
+        let key = super::zoom::KEY_UI_PREFS;
+        let version = |db: &Db| db.config_get(key).map(|e| e.map(|e| e.version)).map_err(|e| e.to_string());
+        match db.config_set(key, prefs, version(db)?) {
+            Ok(_) => Ok(()),
+            Err(StoreError::VersionConflict { .. }) => db.config_set(key, prefs, version(db)?).map(|_| ()).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
         }
     }
 }
@@ -415,7 +433,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     }
 
     // Account polls (the same signed clients back the engine's demo account view).
-    let secrets: Arc<dyn SecretProvider> = Arc::new(KeychainSecrets::system());
+    let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
     let mut signed_clients = None;
     let mut ledger_sources = None;
     if let Some(t) = signed.clone() {

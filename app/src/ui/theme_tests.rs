@@ -54,3 +54,54 @@ fn nan_is_treated_as_neutral_not_a_trend() {
     assert_eq!(funding_tone(f64::NAN), Tone::Muted);
     assert_eq!(trend_indicator(f64::NAN, 0.01_f64), None);
 }
+
+// ---- scanner-readability: table stripe colors (spec design-tokens) ----
+
+fn lin(c: u8) -> f64 {
+    let c = c as f64 / 255.0;
+    if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+fn luminance(x: u32) -> f64 {
+    0.2126 * lin((x >> 16) as u8) + 0.7152 * lin((x >> 8) as u8) + 0.0722 * lin(x as u8)
+}
+fn contrast(a: u32, b: u32) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[test]
+fn table_stripe_colors_are_the_decided_values() {
+    assert_eq!(TABLE_ROW, 0x0B1016);
+    assert_eq!(TABLE_STRIPE, 0x182430);
+}
+
+#[test]
+fn table_row_and_stripe_are_distinguishable() {
+    assert!(contrast(TABLE_ROW, TABLE_STRIPE) >= 1.2, "{}", contrast(TABLE_ROW, TABLE_STRIPE));
+    assert!(contrast(TABLE_HOVER, TABLE_ROW) >= 1.1, "{}", contrast(TABLE_HOVER, TABLE_ROW));
+    assert!(contrast(TABLE_HOVER, TABLE_STRIPE) >= 1.05, "{}", contrast(TABLE_HOVER, TABLE_STRIPE));
+    assert!(TABLE_HOVER != TABLE_ROW && TABLE_HOVER != TABLE_STRIPE);
+}
+
+#[gpui_kit::test]
+fn applied_component_theme_reaches_the_tokens_gpui_component_draws(cx: &mut gpui_kit::TestAppContext) {
+    use gpui_kit::component::theme::Theme;
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        super::component_theme::apply(cx);
+        let tokens = &Theme::global(cx).tokens;
+        let hsla = |x: u32| -> gpui_kit::Hsla { gpui_kit::rgb(x).into() };
+        assert_eq!(tokens.table.color, hsla(TABLE_ROW));
+        assert_eq!(tokens.table_even.color, hsla(TABLE_STRIPE));
+        assert_eq!(tokens.table_hover.color, hsla(TABLE_HOVER));
+    });
+}
+
+#[test]
+fn text_has_at_least_4_5_contrast_on_every_table_background() {
+    for bg in [TABLE_ROW, TABLE_STRIPE, TABLE_HOVER] {
+        for fg in [TEXT_PRIMARY, TEXT_SECONDARY, TEXT_MUTED] {
+            assert!(contrast(fg, bg) >= 4.5, "{fg:06X} on {bg:06X} = {}", contrast(fg, bg));
+        }
+    }
+}

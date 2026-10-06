@@ -14,6 +14,13 @@ pub const BG_CARD: u32 = 0x17222E;
 
 pub const BORDER: u32 = 0x273443;
 
+// Table rows (scanner-readability). Odd and even rows differ clearly (luminance ratio 1.21).
+// HOVER is an indigo tint: muted text must stay >= 4.5:1 on it, which caps its luminance between
+// the two row colors, so it is separated by hue (and a ~1.1 luminance ratio), not by brightness.
+pub const TABLE_ROW: u32 = 0x0B1016;
+pub const TABLE_STRIPE: u32 = 0x182430;
+pub const TABLE_HOVER: u32 = 0x1A1838;
+
 // Text, three levels.
 pub const TEXT_PRIMARY: u32 = 0xE5EDF5;
 pub const TEXT_SECONDARY: u32 = 0x91A2B4;
