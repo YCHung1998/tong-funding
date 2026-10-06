@@ -18,13 +18,14 @@ use super::scan_view::{ScanColumn, ScanEvent, SortDir, SortState};
 use super::scanner::{self, RateCell, ScanRow};
 use super::system_log::{SystemLogVm, Timeline};
 use super::theme::{self, Tone};
+use super::units::{fs, rx};
 
 pub fn text(s: impl Into<SharedString>, color: u32) -> Div {
     div().text_color(rgb(color)).child(s.into())
 }
 
 pub fn small(s: impl Into<SharedString>, color: u32) -> Div {
-    text(s, color).text_size(px(10.0))
+    text(s, color).text_size(fs(10.0))
 }
 
 pub fn card() -> Div {
@@ -36,7 +37,7 @@ pub fn title(zh: &str, en: &str) -> Div {
         .flex()
         .items_end()
         .gap_3()
-        .child(text(zh.to_string(), theme::TEXT_PRIMARY).text_size(px(21.0)))
+        .child(text(zh.to_string(), theme::TEXT_PRIMARY).text_size(fs(21.0)))
         .child(text(en.to_string(), theme::TEXT_SECONDARY))
 }
 
@@ -140,14 +141,14 @@ fn connected_card(c: &ConnectedCard) -> Div {
     let header = div()
         .flex()
         .justify_between()
-        .child(text(c.exchange.name(), theme::TEXT_PRIMARY).text_size(px(14.0)))
+        .child(text(c.exchange.name(), theme::TEXT_PRIMARY).text_size(fs(14.0)))
         .child(small(c.status_label.clone(), theme::POSITIVE));
     let total = div()
         .flex()
         .gap_2()
         .items_end()
         .child(small("EXCHANGE TOTAL", theme::TEXT_MUTED))
-        .child(text(format!("{} USDT", format::money(c.value, 2)), theme::TEXT_PRIMARY).text_size(px(14.0)))
+        .child(text(format!("{} USDT", format::money(c.value, 2)), theme::TEXT_PRIMARY).text_size(fs(14.0)))
         .child(small(DashboardVm::pct_text(c), theme::TEXT_SECONDARY));
     let valued: Vec<_> = c.assets.iter().filter(|a| a.value.is_some()).collect();
     let asset_chart = div()
@@ -173,19 +174,19 @@ fn connected_card(c: &ConnectedCard) -> Div {
         }
     };
     let mut table = div().flex().flex_col().child(
-        div().flex().gap_2().children(["Asset", "Price", "Quantity", "Value (USDT)", "% of Exchange"].map(|h| small(h, theme::TEXT_MUTED).w(px(110.0)))),
+        div().flex().gap_2().children(["Asset", "Price", "Quantity", "Value (USDT)", "% of Exchange"].map(|h| small(h, theme::TEXT_MUTED).w(rx(110.0)))),
     );
     for a in &c.assets {
         table = table.child(div().flex().gap_2().children(
-            [a.name.clone(), a.price_text(), a.quantity_text(), a.value_text(), a.pct_text()].map(|s| small(s, theme::TEXT_SECONDARY).w(px(110.0))),
+            [a.name.clone(), a.price_text(), a.quantity_text(), a.value_text(), a.pct_text()].map(|s| small(s, theme::TEXT_SECONDARY).w(rx(110.0))),
         ));
     }
     table = table
         .child(div().flex().gap_2().children(
-            ["合計".to_string(), String::new(), String::new(), format::money(c.value, 2), "100.0000%".into()].map(|s| small(s, theme::TEXT_PRIMARY).w(px(110.0))),
+            ["合計".to_string(), String::new(), String::new(), format::money(c.value, 2), "100.0000%".into()].map(|s| small(s, theme::TEXT_PRIMARY).w(rx(110.0))),
         ))
         .child(small(dashboard::EQUITY_FOOTNOTE, theme::TEXT_MUTED));
-    let mut out = card().w(px(560.0)).child(header).child(total).child(div().flex().gap_6().child(asset_chart).child(margin_chart)).child(table);
+    let mut out = card().w(rx(560.0)).child(header).child(total).child(div().flex().gap_6().child(asset_chart).child(margin_chart)).child(table);
     if let Some(n) = &c.stale_note {
         out = out.child(small(n.clone(), theme::WARNING));
     }
@@ -195,7 +196,7 @@ fn connected_card(c: &ConnectedCard) -> Div {
 pub fn dashboard_page(vm: &DashboardVm) -> Div {
     let mut total = card()
         .child(small("Total Portfolio Value", theme::TEXT_MUTED))
-        .child(text(format!("{} USDT", format::money(vm.total, 2)), theme::TEXT_PRIMARY).text_size(px(21.0)))
+        .child(text(format!("{} USDT", format::money(vm.total, 2)), theme::TEXT_PRIMARY).text_size(fs(21.0)))
         .child(small("Binance + Bybit · OKX 僅比價", theme::TEXT_SECONDARY));
     for n in [&vm.excluded_note, &vm.unvalued_note].into_iter().flatten() {
         total = total.child(small(n.clone(), theme::WARNING));
@@ -206,7 +207,7 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
             top = top.child(
                 card()
                     .child(small(format!("{} Value", c.exchange.name()), theme::TEXT_MUTED))
-                    .child(text(format::money(c.value, 2), theme::TEXT_PRIMARY).text_size(px(14.0)))
+                    .child(text(format::money(c.value, 2), theme::TEXT_PRIMARY).text_size(fs(14.0)))
                     .child(small(DashboardVm::pct_text(c), theme::TEXT_SECONDARY)),
             );
         }
@@ -214,7 +215,7 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
     top = top.child(
         card()
             .child(small("Open Positions", theme::TEXT_MUTED))
-            .child(text(vm.open_positions.to_string(), theme::TEXT_PRIMARY).text_size(px(14.0)))
+            .child(text(vm.open_positions.to_string(), theme::TEXT_PRIMARY).text_size(fs(14.0)))
             .child(small(vm.positions_note.clone(), theme::TEXT_SECONDARY)),
     );
     let mut cards = div().flex().flex_wrap().gap_3();
@@ -246,7 +247,7 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
 // ---- positions ------------------------------------------------------------------------------
 
 fn pair_card(c: &PairCard) -> Div {
-    let mut out = card().w(px(360.0)).child(
+    let mut out = card().w(rx(360.0)).child(
         div()
             .flex()
             .justify_between()
@@ -351,7 +352,7 @@ pub fn positions_page(vm: &PositionsVm, selected_ex: &dyn Fn(Exchange) -> bool, 
         );
 
     const HEAD: [&str; 9] = ["Exchange", "Symbol", "Side", "Size", "Entry Price", "Mark Price", "Leverage", "Unrealized PnL", "Funding 收到"];
-    let mut table = div().flex().flex_col().gap_1().child(div().flex().gap_2().children(HEAD.map(|h| small(h, theme::TEXT_MUTED).w(px(120.0)))));
+    let mut table = div().flex().flex_col().gap_1().child(div().flex().gap_2().children(HEAD.map(|h| small(h, theme::TEXT_MUTED).w(rx(120.0)))));
     match &vm.table {
         TableView::NothingSelected => table = table.child(text("未選擇任何篩選條件", theme::TEXT_MUTED)),
         TableView::Rows(rows) if rows.is_empty() => table = table.child(text("沒有持倉", theme::TEXT_MUTED)),
@@ -365,7 +366,7 @@ pub fn positions_page(vm: &PositionsVm, selected_ex: &dyn Fn(Exchange) -> bool, 
                         8 => tone(r.funding_tone),
                         _ => theme::TEXT_SECONDARY,
                     };
-                    line = line.child(small(c, color).w(px(120.0)));
+                    line = line.child(small(c, color).w(rx(120.0)));
                 }
                 if r.unpaired {
                     line = line.child(small("未配對", theme::WARNING));
@@ -420,7 +421,7 @@ pub fn system_log_page(
     if let Some(n) = &vm.buffer_note {
         page = page.child(small(n.clone(), theme::TEXT_MUTED));
     }
-    let mut list = div().id("log-list").flex().flex_col().gap_1().overflow_y_scroll().max_h(px(560.0));
+    let mut list = div().id("log-list").flex().flex_col().gap_1().overflow_y_scroll().max_h(rx(560.0));
     match &vm.timeline {
         Timeline::NothingSelected => list = list.child(text("未選擇任何事件類型", theme::TEXT_MUTED)),
         Timeline::Rows(rows) if rows.is_empty() => list = list.child(text("沒有資料", theme::TEXT_MUTED)),

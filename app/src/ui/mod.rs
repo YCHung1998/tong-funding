@@ -14,6 +14,8 @@ pub mod shell;
 pub mod status;
 pub mod theme;
 pub mod trading_pages;
+pub mod units;
+pub mod zoom_ui;
 pub mod wiring;
 
 // Page view-models (ui-readonly-pages, design D1): pure, no GPUI types. Files live in `vm/`,
@@ -52,6 +54,8 @@ pub mod scanner;
 pub mod scanner_refresh;
 #[path = "vm/system_log.rs"]
 pub mod system_log;
+#[path = "vm/zoom.rs"]
+pub mod zoom;
 #[cfg(test)]
 #[path = "vm/testkit.rs"]
 mod testkit;

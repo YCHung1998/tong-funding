@@ -27,6 +27,7 @@ use super::scanner::{self, RowsView, ScannerVm, TableState as ScanState};
 use super::status::{Connection, StatusModel, ENVIRONMENT_LABEL};
 use super::system_log::{self, LogFilter, LogRow, SystemLogVm};
 use super::theme;
+use super::units::{fs, rx};
 use crate::ports::{Clock, SystemClock};
 use crate::store::event_query::EventQuery;
 
@@ -306,7 +307,7 @@ impl Shell {
             .flex()
             .items_center()
             .justify_between()
-            .h(px(44.0))
+            .h(rx(44.0))
             .px_4()
             .bg(rgb(theme::BG_BASE))
             .border_b_1()
@@ -316,7 +317,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(div().text_color(rgb(theme::ACCENT)).text_size(px(14.0)).child("◈ Funding Monitor"))
+                    .child(div().text_color(rgb(theme::ACCENT)).text_size(fs(14.0)).child("◈ Funding Monitor"))
                     .child(div().px_2().py_1().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::WARNING)).child(ENVIRONMENT_LABEL)),
             )
             .child(div().flex().gap_6().child(clock("UTC", c.utc_date, c.utc_time)).child(clock("TAIPEI · UTC+8", c.taipei_date, c.taipei_time)))
@@ -362,17 +363,17 @@ impl Shell {
                 this.go(page);
                 cx.notify();
             }))
-            .child(div().text_size(px(13.0)).text_color(rgb(if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY })).child(page.zh()))
-            .child(div().text_size(px(10.0)).text_color(rgb(theme::TEXT_MUTED)).child(page.en()))
+            .child(div().text_size(fs(13.0)).text_color(rgb(if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY })).child(page.zh()))
+            .child(div().text_size(fs(10.0)).text_color(rgb(theme::TEXT_MUTED)).child(page.en()))
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> Div {
-        let mut bar = div().flex().flex_col().w(px(200.0)).flex_none().bg(rgb(theme::BG_BASE)).border_r_1().border_color(rgb(theme::BORDER));
+        let mut bar = div().flex().flex_col().w(rx(200.0)).flex_none().bg(rgb(theme::BG_BASE)).border_r_1().border_color(rgb(theme::BORDER));
         for (idx, page) in Page::ALL.into_iter().enumerate() {
             if page.is_debug() {
                 bar = bar
                     .child(div().h(px(1.0)).mx_3().my_2().bg(rgb(theme::BORDER)))
-                    .child(div().px_3().pb_1().text_size(px(10.0)).text_color(rgb(theme::WARNING)).child(format!("⚠ {DEBUG_WARNING}")));
+                    .child(div().px_3().pb_1().text_size(fs(10.0)).text_color(rgb(theme::WARNING)).child(format!("⚠ {DEBUG_WARNING}")));
             }
             bar = bar.child(self.nav_item(idx, page, cx));
         }
@@ -444,7 +445,7 @@ impl Shell {
                 theme::TEXT_MUTED,
             ));
         }
-        let summary = |label: &str, value: String| pages::card().child(small(label.to_string(), theme::TEXT_MUTED)).child(text(value, theme::TEXT_PRIMARY).text_size(px(14.0)));
+        let summary = |label: &str, value: String| pages::card().child(small(label.to_string(), theme::TEXT_MUTED)).child(text(value, theme::TEXT_PRIMARY).text_size(fs(14.0)));
         let cards = div()
             .flex()
             .gap_3()
@@ -505,7 +506,7 @@ impl Shell {
         if matches!(vm.visible(self.only_qualified), RowsView::NoneQualified) {
             body = body.child(text("目前沒有達標標的", theme::TEXT_MUTED));
         } else if !matches!(vm.state, ScanState::Loading) {
-            body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(px(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
+            body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(rx(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
         }
         let chips = self.column_chips(cx);
         div().flex().flex_col().gap_3().child(header).child(breakdown).child(cards).child(controls).child(chips).child(body).child(candidate_list)
@@ -627,17 +628,17 @@ impl Shell {
         div().id("content").flex_1().min_w_0().p_6().overflow_y_scroll().child(replies).child(inner)
     }
 
-    fn status_bar(&self) -> Div {
+    fn status_bar(&self, zoom_label: Option<String>) -> Div {
         let bar = div()
             .flex()
             .items_center()
             .justify_between()
-            .h(px(28.0))
+            .h(rx(28.0))
             .px_4()
             .bg(rgb(theme::BG_BASE))
             .border_t_1()
             .border_color(rgb(theme::BORDER))
-            .text_size(px(10.0));
+            .text_size(fs(10.0));
         let mut left = div().flex().items_center().gap_4().child(div().px_2().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::ACCENT)).child(self.status.mode.label()));
         for (name, conn) in &self.status.exchanges {
             let dot = if *conn == Connection::Connected { theme::POSITIVE } else { theme::TEXT_MUTED };
@@ -650,6 +651,10 @@ impl Shell {
                     .child(div().text_color(rgb(theme::TEXT_SECONDARY)).child(*name))
                     .child(div().text_color(rgb(theme::TEXT_MUTED)).child(conn.label())),
             );
+        }
+        // ui-zoom: "縮放 N%" only when not 100%.
+        if let Some(label) = zoom_label {
+            left = left.child(div().text_color(rgb(theme::TEXT_MUTED)).child(label));
         }
         bar.child(left).child(
             div()
@@ -678,7 +683,7 @@ impl Render for Shell {
             .flex_col()
             .bg(rgb(theme::BG_DEEPEST))
             .text_color(rgb(theme::TEXT_PRIMARY))
-            .text_size(px(theme::FONT_SIZE_BODY))
+            .text_size(fs(theme::FONT_SIZE_BODY))
             .font(app_font(FontWeight::NORMAL));
         // Region order comes from the tested `banner::layout`: the banner is on every page.
         for region in banner::layout(self.page) {
@@ -692,7 +697,7 @@ impl Render for Shell {
                     let content = self.content(window, cx);
                     root.child(div().flex().flex_1().min_h_0().child(self.sidebar(cx)).child(content))
                 }
-                Region::StatusBar => root.child(self.status_bar()),
+                Region::StatusBar => root.child(self.status_bar(super::zoom_ui::current(cx).status_label())),
             };
         }
         root

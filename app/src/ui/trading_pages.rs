@@ -26,6 +26,7 @@ use super::scanner::ScanRow;
 use super::shell::Shell;
 use super::staged_orders::{self, CloseConfirm, PendingConfirm, RunningRow};
 use super::theme;
+use super::units::rx;
 use crate::engine::command::{Command, CommandReply};
 use crate::engine::ports::{AccountPosition, OrderSide};
 
@@ -265,8 +266,8 @@ fn field_row(label: impl Into<SharedString>, unit: &str, input: &In, error: Opti
         .flex()
         .gap_2()
         .items_center()
-        .child(small(label.into(), theme::TEXT_SECONDARY).w(px(260.0)))
-        .child(div().w(px(160.0)).child(Input::new(input)))
+        .child(small(label.into(), theme::TEXT_SECONDARY).w(rx(260.0)))
+        .child(div().w(rx(160.0)).child(Input::new(input)))
         .child(small(unit.to_string(), theme::TEXT_MUTED));
     if let Some(e) = error {
         row = row.child(small(e.clone(), theme::NEGATIVE));
@@ -358,7 +359,7 @@ impl Shell {
                 .flex()
                 .gap_3()
                 .items_center()
-                .child(small(v.symbol.clone(), theme::TEXT_PRIMARY).w(px(110.0)))
+                .child(small(v.symbol.clone(), theme::TEXT_PRIMARY).w(rx(110.0)))
                 .child(small(format!("L {} / S {}", v.long.name(), v.short.name()), theme::TEXT_SECONDARY))
                 .child(small(format!("Gross {}", v.gross_spread.map_or_else(|| DASH.into(), format::rate_pct)), theme::TEXT_SECONDARY))
                 .child(small(format!("Net Edge {}", v.net_edge_pct.map_or_else(|| DASH.into(), |n| format::fixed(n, 4))), theme::TEXT_SECONDARY))
@@ -481,7 +482,7 @@ impl Shell {
                 .gap_3()
                 .items_center()
                 .child(check)
-                .child(small(r.symbol.clone(), theme::TEXT_PRIMARY).w(px(100.0)))
+                .child(small(r.symbol.clone(), theme::TEXT_PRIMARY).w(rx(100.0)))
                 .child(small(r.gross_spread.map_or_else(|| DASH.into(), format::rate_pct), theme::TEXT_SECONDARY))
                 .child(small(r.net_edge_pct.map_or_else(|| DASH.into(), |n| format::fixed(n, 4)), theme::TEXT_SECONDARY))
                 .child(small(format!("L {} {}", r.long.name(), r.long_qty.text()), theme::TEXT_SECONDARY))
@@ -683,7 +684,7 @@ impl Shell {
                 global = global.child(small(format!("目前 {open} / {} 組", base.risk.max_concurrent_pairs), theme::TEXT_MUTED));
             }
         }
-        let mut allowed = div().flex().gap_2().items_center().child(small("allowed_exchanges", theme::TEXT_SECONDARY).w(px(260.0)));
+        let mut allowed = div().flex().gap_2().items_center().child(small("allowed_exchanges", theme::TEXT_SECONDARY).w(rx(260.0)));
         for ex in Exchange::ALL {
             let on = self.trading.r_allowed.contains(&ex);
             allowed = allowed.child(btn(SharedString::from(format!("allow-{}", ex.name())), format!("{} {}", if on { "☑" } else { "☐" }, ex.name()), true, self.click(cx, move |this, _| {
@@ -752,7 +753,7 @@ impl Shell {
         // Per-exchange overrides (exactly the nine fields) and the effective preview.
         let mut ov = div().flex().flex_wrap().gap_3();
         for ex in Exchange::ALL {
-            let mut c = card().w(px(460.0)).child(text(format!("{} 覆寫", ex.name()), theme::TEXT_PRIMARY));
+            let mut c = card().w(rx(460.0)).child(text(format!("{} 覆寫", ex.name()), theme::TEXT_PRIMARY));
             for f in OVERRIDE_FIELDS {
                 let on = self.trading.r_over_on.contains(&(ex, f));
                 let toggle = btn(SharedString::from(format!("ov-{}-{}", ex.name(), f.key())), if on { "☑ 獨立設定" } else { "☐ 獨立設定" }, true, self.click(cx, move |this, _| {
@@ -760,10 +761,10 @@ impl Shell {
                         this.trading.r_over_on.insert((ex, f));
                     }
                 }));
-                let mut row = div().flex().gap_2().items_center().child(small(f.key(), theme::TEXT_SECONDARY).w(px(170.0))).child(toggle);
+                let mut row = div().flex().gap_2().items_center().child(small(f.key(), theme::TEXT_SECONDARY).w(rx(170.0))).child(toggle);
                 row = if on {
                     match self.trading.r_over.get(&(ex, f)) {
-                        Some(i) => row.child(div().w(px(110.0)).child(Input::new(i))),
+                        Some(i) => row.child(div().w(rx(110.0)).child(Input::new(i))),
                         None => row,
                     }
                 } else {
