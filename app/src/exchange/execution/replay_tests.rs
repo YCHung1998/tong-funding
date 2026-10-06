@@ -100,7 +100,7 @@ fn empty_account() -> FakeTransport {
         .on("/fapi/v2/balance", Ok(HttpResponse::ok(r#"[{"asset":"USDT","balance":"10000","availableBalance":"10000"}]"#)))
         .on("/v5/position/list", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[],"nextPageCursor":""}}"#)))
         .on("/v5/order/realtime", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[],"nextPageCursor":""}}"#)))
-        .on("/v5/account/wallet-balance", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[{"coin":[{"coin":"USDT","walletBalance":"10000","availableToWithdraw":"10000"}]}]}}"#)))
+        .on("/v5/account/wallet-balance", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[{"accountType":"UNIFIED","totalAvailableBalance":"10000","coin":[{"coin":"USDT","walletBalance":"10000","availableToWithdraw":""}]}]}}"#)))
 }
 
 struct Replay {
