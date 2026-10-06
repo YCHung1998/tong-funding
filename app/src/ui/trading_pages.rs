@@ -21,7 +21,7 @@ use super::format::{self, DASH};
 use super::manual_order::{self, CancelForm, CancelPrefill, ManualConfirm, ManualForm, ManualPrefill, PickState};
 use super::nav::{Page, DEBUG_WARNING};
 use super::pages::{card, small, text, title, ClickFn};
-use super::risk_settings::{self, Field, RiskForm, GLOBAL_FIELDS, MODE_OPTIONS, OVERRIDE_FIELDS};
+use super::risk_settings::{self, Field, RiskForm, Strictness, GLOBAL_FIELDS, MODE_OPTIONS, OVERRIDE_FIELDS};
 use super::scanner::ScanRow;
 use super::shell::Shell;
 use super::staged_orders::{self, CloseConfirm, PendingConfirm, RunningRow};
@@ -275,10 +275,25 @@ fn btn(id: impl Into<ElementId>, label: impl Into<SharedString>, enabled: bool, 
 }
 
 fn field_row(label: impl Into<SharedString>, unit: &str, input: &In, error: Option<&String>) -> Div {
-    let mut row = div()
-        .flex()
-        .gap_2()
-        .items_center()
+    field_row_badged(None, label, unit, input, error)
+}
+
+/// Box fill per direction; the arrow text always accompanies it so colour is never the only cue.
+fn strict_badge(s: Strictness) -> Div {
+    let fill = match s {
+        Strictness::HigherStricter => theme::STRICT_HIGH,
+        Strictness::LowerStricter => theme::STRICT_LOW,
+        Strictness::Fact => theme::BG_SURFACE,
+    };
+    div().px_2().py_0p5().rounded_sm().border_1().border_color(rgb(theme::BORDER)).bg(rgb(fill)).flex_none().child(small(s.badge(), theme::TEXT_PRIMARY))
+}
+
+fn field_row_badged(strict: Option<Strictness>, label: impl Into<SharedString>, unit: &str, input: &In, error: Option<&String>) -> Div {
+    let mut row = div().flex().gap_2().items_center();
+    if let Some(s) = strict {
+        row = row.child(div().w(rx(96.0)).child(strict_badge(s)));
+    }
+    row = row
         .child(small(label.into(), theme::TEXT_SECONDARY).w(rx(260.0)))
         .child(div().w(rx(160.0)).child(Input::new(input)))
         .child(small(unit.to_string(), theme::TEXT_MUTED));
@@ -286,6 +301,44 @@ fn field_row(label: impl Into<SharedString>, unit: &str, input: &In, error: Opti
         row = row.child(small(e.clone(), theme::NEGATIVE));
     }
     row
+}
+
+/// Body of the `?` dialog: formulas, qualify conditions, the merge rule, then every field.
+fn risk_help_body() -> Div {
+    let section = |t: &str| text(t.to_string(), theme::ACCENT);
+    let mut d = div().flex().flex_col().gap_2().pr_2();
+    d = d
+        .child(section("Net Edge"))
+        .child(small(risk_settings::NET_EDGE_FORMULA, theme::TEXT_PRIMARY))
+        .child(small(risk_settings::REQUIRED_SPREAD_FORMULA, theme::TEXT_PRIMARY))
+        .child(section("達標條件（全部成立）"));
+    for c in risk_settings::QUALIFY_CONDITIONS {
+        d = d.child(small(format!("・{c}"), theme::TEXT_SECONDARY));
+    }
+    d = d.child(section("每腿覆寫")).child(small(risk_settings::OVERRIDE_RULE, theme::TEXT_SECONDARY)).child(section("各欄位"));
+    for f in GLOBAL_FIELDS {
+        let h = f.help();
+        let affects = h.affects.iter().map(|a| a.label()).collect::<Vec<_>>().join("、");
+        let mut c = div().flex().flex_col().gap_1().p_2().rounded_sm().bg(rgb(theme::BG_SURFACE)).child(div().flex().gap_2().items_center().child(strict_badge(f.strictness())).child(small(f.key(), theme::TEXT_PRIMARY)));
+        c = c.child(small(h.meaning, theme::TEXT_SECONDARY));
+        if let Some(formula) = h.formula {
+            c = c.child(small(format!("公式：{formula}"), theme::TEXT_MUTED));
+        }
+        c = c.child(small(format!("影響：{affects}"), theme::TEXT_MUTED));
+        d = d.child(c);
+    }
+    d
+}
+
+/// Opens the help dialog (gpui-component `WindowExt::open_dialog`; the Root layer draws it).
+fn open_risk_help(window: &mut Window, cx: &mut App) {
+    use gpui_kit::component::WindowExt as _;
+    window.open_dialog(cx, |dialog, window, _| {
+        dialog
+            .title("風控參數說明")
+            .w(rx(640.0).to_pixels(window.rem_size()))
+            .content(|content, _, _| content.child(div().id("risk-help-scroll").max_h(rx(520.0)).overflow_y_scroll().child(risk_help_body())))
+    });
 }
 
 /// A symbol dropdown row; `unlisted` = names the selected values missing from the candidate list.
@@ -693,7 +746,18 @@ impl Shell {
         let base = self.snap.settings.clone();
         let form = self.trading.risk_form(&base, cx);
         let vm = risk_settings::evaluate(&form, &base);
-        let mut page = div().flex().flex_col().gap_3().child(title("風控設定", "Risk Management"));
+        let help_btn = div()
+            .id("risk-help")
+            .test_support()
+            .px_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(theme::BORDER))
+            .bg(rgb(theme::BG_CARD))
+            .cursor_pointer()
+            .child(text("?", theme::ACCENT))
+            .on_click(|_, window, cx| open_risk_help(window, cx));
+        let mut page = div().flex().flex_col().gap_3().child(div().flex().items_center().gap_3().child(title("風控設定", "Risk Management")).child(help_btn));
         if let Some(t) = &vm.incomplete_text {
             page = page.child(warn_box(vec![t.clone(), "設定不完整時交易單與 EXCHANGE_DEMO 會被禁用".into()]));
         }
@@ -703,13 +767,16 @@ impl Shell {
         let mut global = card().child(text("Global Limits · Layer 1 · Net Edge", theme::TEXT_PRIMARY));
         for f in GLOBAL_FIELDS {
             let label = match f {
-                Field::TakerFee(e) => format!("{} Taker 費率{}", e.name(), " · 必填"),
+                Field::TakerFee(e) => format!("{} Taker 費率 · 必填（請依帳戶手續費等級實填）", e.name()),
                 Field::NetEdgeThresholdPct | Field::EstSlippagePct => format!("{} · 必填", f.label()),
                 _ => f.label().to_string(),
             };
             let key = f.key();
             if let Some(i) = self.trading.r_fields.get(&f) {
-                global = global.child(field_row(format!("{label}（{key}）"), f.unit(), i, vm.field_errors.get(&key)));
+                global = global.child(field_row_badged(Some(f.strictness()), format!("{label}（{key}）"), f.unit(), i, vm.field_errors.get(&key)));
+            }
+            if f == Field::StaleDataThresholdMs {
+                global = global.child(small(risk_settings::STALE_NOTE, theme::TEXT_MUTED));
             }
             if f == Field::MaxConcurrentPairs {
                 let open = self.snap.pairs.iter().filter(|p| p.state.is_ok()).count();
@@ -785,7 +852,7 @@ impl Shell {
         // Per-exchange overrides (exactly the nine fields) and the effective preview.
         let mut ov = div().flex().flex_wrap().gap_3();
         for ex in Exchange::ALL {
-            let mut c = card().w(rx(460.0)).child(text(format!("{} 覆寫", ex.name()), theme::TEXT_PRIMARY));
+            let mut c = card().w(rx(580.0)).child(text(format!("{} 覆寫", ex.name()), theme::TEXT_PRIMARY));
             for f in OVERRIDE_FIELDS {
                 let on = self.trading.r_over_on.contains(&(ex, f));
                 let toggle = btn(SharedString::from(format!("ov-{}-{}", ex.name(), f.key())), if on { "☑ 獨立設定" } else { "☐ 獨立設定" }, true, self.click(cx, move |this, _| {
@@ -793,7 +860,7 @@ impl Shell {
                         this.trading.r_over_on.insert((ex, f));
                     }
                 }));
-                let mut row = div().flex().gap_2().items_center().child(small(f.key(), theme::TEXT_SECONDARY).w(rx(170.0))).child(toggle);
+                let mut row = div().flex().gap_2().items_center().child(div().w(rx(96.0)).child(strict_badge(f.strictness()))).child(small(f.key(), theme::TEXT_SECONDARY).w(rx(170.0))).child(toggle);
                 row = if on {
                     match self.trading.r_over.get(&(ex, f)) {
                         Some(i) => row.child(div().w(rx(110.0)).child(Input::new(i))),

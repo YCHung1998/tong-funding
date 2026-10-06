@@ -23,7 +23,7 @@ fn defaults_match_spec_table() {
     assert_eq!(c.max_leverage, d("5"));
     assert_eq!(c.max_concurrent_pairs, 3);
     assert_eq!(c.max_price_drift_pct, d("0.05"));
-    assert_eq!(c.stale_data_threshold_ms, 1000);
+    assert_eq!(c.stale_data_threshold_ms, 3000);
     assert_eq!(c.safety_margin_pct, d("0.01"));
     assert_eq!(c.order_timeout_seconds, 15);
     assert_eq!(c.max_leg_imbalance_pct, d("1.0"));

@@ -25,7 +25,7 @@ fn units_defaults_and_removed_fields() {
     let f = RiskForm::from_settings(&Settings::default());
     assert_eq!(f.value(Field::OrderTimeoutSeconds), "15");
     assert_eq!(Field::OrderTimeoutSeconds.unit(), "秒");
-    assert_eq!(f.value(Field::StaleDataThresholdMs), "1000");
+    assert_eq!(f.value(Field::StaleDataThresholdMs), "3000");
     assert_eq!(Field::StaleDataThresholdMs.unit(), "ms");
     assert_eq!(Field::MaxPriceDriftPct.unit(), "%");
     assert_eq!(f.value(Field::MinExpectedNetPnlPct), "0.03");
@@ -221,4 +221,116 @@ fn exchange_demo_is_refused_without_demo_keys() {
     let e = request_mode(ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &s, None, &sink).unwrap_err();
     assert_eq!(e, "demo 金鑰尚未確認");
     assert!(sink.0.borrow().is_empty());
+}
+
+// ---- risk-settings-guidance: strictness direction and help ----------------------------------
+
+#[test]
+fn strictness_classification_matches_spec() {
+    use Strictness::*;
+    for f in [Field::NetEdgeThresholdPct, Field::MinExpectedNetPnlPct, Field::SafetyMarginPct, Field::EstSlippagePct, Field::Min24hVolumeUsdt] {
+        assert_eq!(f.strictness(), HigherStricter, "{}", f.key());
+    }
+    for f in [Field::MaxLeverage, Field::MaxPriceDriftPct, Field::StaleDataThresholdMs, Field::OrderTimeoutSeconds, Field::MaxLegImbalancePct, Field::MaxConcurrentPairs] {
+        assert_eq!(f.strictness(), LowerStricter, "{}", f.key());
+    }
+    for e in Exchange::ALL {
+        assert_eq!(Field::TakerFee(e).strictness(), Fact);
+    }
+    assert_eq!(HigherStricter.badge(), "▲ 越高越嚴");
+    assert_eq!(LowerStricter.badge(), "▼ 越低越嚴");
+    assert_eq!(Fact.badge(), "● 事實值");
+}
+
+/// The direction table must not drift from `effective_for_pair`: feed every overridable field the
+/// values 1 (leg A) and 2 (leg B) and see which one the merge keeps.
+#[test]
+fn strictness_agrees_with_effective_for_pair_merge() {
+    use tong_funding_core::risk::RiskOverride;
+    let global = RiskConfig::default();
+    let one = |f: Field| -> RiskOverride {
+        let mut o = RiskOverride::default();
+        set_override(&mut o, f, 1);
+        o
+    };
+    let two = |f: Field| -> RiskOverride {
+        let mut o = RiskOverride::default();
+        set_override(&mut o, f, 2);
+        o
+    };
+    for f in OVERRIDE_FIELDS {
+        let mut ov = RiskOverrides::new();
+        ov.insert(Exchange::Binance, one(f));
+        ov.insert(Exchange::Bybit, two(f));
+        let e = effective_for_pair(&global, &ov, Exchange::Binance, Exchange::Bybit);
+        let got = effective_value(&e, f);
+        let expect = match f.strictness() {
+            Strictness::HigherStricter => 2,
+            Strictness::LowerStricter => 1,
+            Strictness::Fact => panic!("{} is overridable but marked Fact", f.key()),
+        };
+        assert_eq!(got, expect, "{} merge keeps {got}", f.key());
+    }
+}
+
+fn set_override(o: &mut tong_funding_core::risk::RiskOverride, f: Field, v: u32) {
+    let dv = d(&v.to_string());
+    match f {
+        Field::MaxLeverage => o.max_leverage = Some(dv),
+        Field::MaxPriceDriftPct => o.max_price_drift_pct = Some(dv),
+        Field::StaleDataThresholdMs => o.stale_data_threshold_ms = Some(v as u64),
+        Field::OrderTimeoutSeconds => o.order_timeout_seconds = Some(v),
+        Field::MaxLegImbalancePct => o.max_leg_imbalance_pct = Some(dv),
+        Field::Min24hVolumeUsdt => o.min_24h_volume_usdt = Some(dv),
+        Field::NetEdgeThresholdPct => o.net_edge_threshold_pct = Some(dv),
+        Field::EstSlippagePct => o.est_slippage_pct = Some(dv),
+        Field::SafetyMarginPct => o.safety_margin_pct = Some(dv),
+        _ => panic!("not overridable"),
+    }
+}
+
+fn effective_value(e: &tong_funding_core::risk::EffectiveConfig, f: Field) -> u32 {
+    use rust_decimal::prelude::ToPrimitive;
+    let dec = |x: tong_funding_core::types::Decimal| x.to_u32().unwrap();
+    match f {
+        Field::MaxLeverage => dec(e.max_leverage),
+        Field::MaxPriceDriftPct => dec(e.max_price_drift_pct),
+        Field::StaleDataThresholdMs => e.stale_data_threshold_ms as u32,
+        Field::OrderTimeoutSeconds => e.order_timeout_seconds,
+        Field::MaxLegImbalancePct => dec(e.max_leg_imbalance_pct),
+        Field::Min24hVolumeUsdt => dec(e.min_24h_volume_usdt),
+        Field::NetEdgeThresholdPct => dec(e.net_edge_threshold_pct.unwrap()),
+        Field::EstSlippagePct => dec(e.est_slippage_pct.unwrap()),
+        Field::SafetyMarginPct => dec(e.safety_margin_pct),
+        _ => panic!("not overridable"),
+    }
+}
+
+#[test]
+fn every_field_has_non_empty_help_with_affected_checks() {
+    for f in GLOBAL_FIELDS {
+        let h = f.help();
+        assert!(!h.meaning.trim().is_empty(), "{} meaning", f.key());
+        assert!(!h.affects.is_empty(), "{} affects", f.key());
+    }
+}
+
+#[test]
+fn help_mentions_the_formula_the_field_belongs_to() {
+    for f in [Field::NetEdgeThresholdPct, Field::EstSlippagePct, Field::SafetyMarginPct, Field::TakerFee(Exchange::Okx)] {
+        let formula = f.help().formula.unwrap_or_else(|| panic!("{} has no formula", f.key()));
+        assert!(formula.contains("net_edge_pct") || formula.contains("所需費率價差"), "{}: {formula}", f.key());
+    }
+    assert!(Field::EstSlippagePct.help().meaning.contains("越不容易達標"));
+    assert!(Field::MinExpectedNetPnlPct.help().formula.is_some());
+}
+
+#[test]
+fn guidance_texts_carry_the_spec_formulas_and_note() {
+    assert_eq!(NET_EDGE_FORMULA, "net_edge_pct = 費率價差 − 2 × (taker_fee_L + taker_fee_S) − 4 × est_slippage − safety_margin");
+    assert_eq!(REQUIRED_SPREAD_FORMULA, "所需費率價差 = 門檻 + 2 × (taker_fee_L + taker_fee_S) + 4 × est_slippage + safety_margin");
+    assert_eq!(QUALIFY_CONDITIONS.len(), 4);
+    assert!(OVERRIDE_RULE.contains("較嚴"));
+    assert!(STALE_NOTE.starts_with("建議 3000 ms：送單前檢查用的是送單前剛抓的價格與費率"));
+    assert!(STALE_NOTE.ends_with("另有 max_price_drift_pct 把關價格變動）。"));
 }
