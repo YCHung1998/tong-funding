@@ -54,9 +54,9 @@ pub struct Shell {
     only_qualified: bool,
     /// Scanner table controls (shown columns, sort). Lives here, not in the page, so it survives
     /// page switches; never persisted (spec scanner-table-controls).
-    view: ScanViewState,
+    pub(crate) view: ScanViewState,
     scan_events: std::rc::Rc<std::cell::RefCell<Vec<ScanEvent>>>,
-    table: Entity<TableState<ScannerTable>>,
+    pub(crate) table: Entity<TableState<ScannerTable>>,
     log_filter: LogFilter,
     log_vm: Option<SystemLogVm>,
     log_error: Option<LoadView>,
@@ -492,6 +492,7 @@ impl Shell {
             let shown = self.view.visibility.is_visible(col);
             let chip = div()
                 .id(("col-chip", i))
+                .test_support()
                 .px_2()
                 .py_1()
                 .rounded_sm()
@@ -511,7 +512,7 @@ impl Shell {
             });
         }
         let all = self.view.visibility.is_all_visible();
-        let reset = div().id("col-reset").px_2().py_1().rounded_sm().border_1().border_color(rgb(theme::BORDER)).child(small("重設欄位", if all { theme::TEXT_MUTED } else { theme::ACCENT }));
+        let reset = div().id("col-reset").test_support().px_2().py_1().rounded_sm().border_1().border_color(rgb(theme::BORDER)).child(small("重設欄位", if all { theme::TEXT_MUTED } else { theme::ACCENT }));
         row.child(if all {
             reset
         } else {

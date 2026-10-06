@@ -57,6 +57,8 @@ pub mod system_log;
 mod testkit;
 
 #[cfg(test)]
+mod scan_table_ui_tests;
+#[cfg(test)]
 mod shell_tests;
 #[cfg(test)]
 mod theme_tests;

@@ -504,7 +504,7 @@ impl TableDelegate for ScannerTable {
     /// The header title is clickable too (the library only reacts to its small sort icon).
     fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
         let c = self.visible.get(col_ix).copied().unwrap_or(ScanColumn::Symbol);
-        let mut title = div().id(("scan-th", col_ix)).size_full().child(c.title());
+        let mut title = div().id(("scan-th", col_ix)).test_support().size_full().child(c.title());
         if c.sortable() {
             let events = self.events.clone();
             title = title.cursor_pointer().on_click(move |_, _, _| events.borrow_mut().push(ScanEvent::CycleSort(c)));
@@ -554,6 +554,7 @@ impl TableDelegate for ScannerTable {
                 div().child(
                     div()
                         .id(("cand", row))
+                        .test_support()
                         .cursor_pointer()
                         .on_click(move |_, _, _| toggles.borrow_mut().push(symbol.clone()))
                         .child(small(mark, color)),
