@@ -33,6 +33,11 @@ pub const WARNING: u32 = 0xE9BE67;
 pub const NEGATIVE: u32 = 0xF18B91;
 pub const INFO: u32 = 0x789BDE;
 
+// Risk-settings direction badges (spec design-tokens). Box fills only, text on them is TEXT_PRIMARY;
+// deliberately not POSITIVE/NEGATIVE so they are not read as profit or funding sign.
+pub const STRICT_HIGH: u32 = 0x1F5A3A;
+pub const STRICT_LOW: u32 = 0x7A2D33;
+
 // Font: Plex Mono for numbers/Latin, bundled. Chinese uses the macOS system CJK font (see design.md).
 pub const FONT_MONO: &str = "IBM Plex Mono";
 

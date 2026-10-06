@@ -111,7 +111,7 @@ impl Default for RiskConfig {
             max_leverage: Decimal::from(5),
             max_concurrent_pairs: 3,
             max_price_drift_pct: Decimal::new(5, 2),
-            stale_data_threshold_ms: 1000,
+            stale_data_threshold_ms: 3000,
             safety_margin_pct: Decimal::new(1, 2),
             order_timeout_seconds: 15,
             max_leg_imbalance_pct: Decimal::new(10, 1),

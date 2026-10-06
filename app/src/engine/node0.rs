@@ -504,11 +504,11 @@ mod tests {
     }
 
     #[test]
-    fn price_1001_ms_old_with_threshold_1000_fails_data_fresh() {
+    fn price_3001_ms_old_with_default_threshold_3000_fails_data_fresh() {
         let mut fx = Fx::new();
-        fx.now = 6_000 + 1_000;
+        fx.now = 6_000 + 3_000;
         assert_eq!(fx.verdict(), Node0Verdict::Pass, "exactly the threshold is still fresh");
-        fx.now = 6_000 + 1_001;
+        fx.now = 6_000 + 3_001;
         assert_eq!(fx.failed(), vec![Check::DataFresh]);
     }
 

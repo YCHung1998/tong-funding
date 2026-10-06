@@ -172,9 +172,9 @@ mod contract_quote {
 
     #[test]
     fn contract_quote_a_stale_price_gives_no_quantity() {
-        let s = snap_with(Exchange::Binance, "60200", NOW - 1_001, Some(Ok(lot("0.001", "0.001"))));
-        assert_eq!(cell(&s, Exchange::Binance, "1200"), QuoteCell::Stale { age_ms: 1_001 });
-        assert_eq!(QuoteCell::Stale { age_ms: 1_001 }.text(), "價格已過期");
+        let s = snap_with(Exchange::Binance, "60200", NOW - 3_001, Some(Ok(lot("0.001", "0.001"))));
+        assert_eq!(cell(&s, Exchange::Binance, "1200"), QuoteCell::Stale { age_ms: 3_001 });
+        assert_eq!(QuoteCell::Stale { age_ms: 3_001 }.text(), "價格已過期");
     }
 
     #[test]

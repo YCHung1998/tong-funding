@@ -105,3 +105,16 @@ fn text_has_at_least_4_5_contrast_on_every_table_background() {
         }
     }
 }
+
+// ---- risk-settings-guidance: strictness badge colours ----
+
+#[test]
+fn strictness_badges_are_legible_and_distinguishable() {
+    for bg in [STRICT_HIGH, STRICT_LOW] {
+        assert!(contrast(TEXT_PRIMARY, bg) >= 4.5, "{bg:06X} = {}", contrast(TEXT_PRIMARY, bg));
+    }
+    assert_ne!(STRICT_HIGH, STRICT_LOW);
+    let (hr, hg) = ((STRICT_HIGH >> 16) & 0xFF, (STRICT_HIGH >> 8) & 0xFF);
+    let (lr, lg) = ((STRICT_LOW >> 16) & 0xFF, (STRICT_LOW >> 8) & 0xFF);
+    assert!(hg > hr && lr > lg, "green-ish vs red-ish");
+}

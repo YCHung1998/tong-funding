@@ -23,3 +23,8 @@
 
 - [`open_dialog` 在本 app 從未用過，dialog layer 實際是否繪製未驗證] → 先做最小 spike；不行則改為頁內可收合說明區塊（同一份 `help()` 資料）。
 - [`est_slippage_pct`「越高越嚴」違反直覺（它是估計值）] → 說明文字明寫：估得越高，Net Edge 算得越低、越不容易達標，因此較保守。
+
+## 實作紀錄
+
+- **`open_dialog` spike 成功**：`window.open_dialog(cx, |dialog, window, _| ...)` 在本 app 的 Root 下實際繪製，內容可捲動；以點擊外側遮罩或 `close_dialog` 關閉。寬度 API 需要 `Pixels`，以 `rx(640.0).to_pixels(window.rem_size())` 取得，仍跟隨縮放。不需退回頁內可收合區塊。測試：`app/src/ui/risk_help_ui_tests.rs`。
+- 預設值改 3000 後，原本隱含 1000 的兩個測試（`node0` 過期邊界、合約試算過期報價）改用 3000 / 3001 ms；`core/tests/parity_fixtures.rs` 的 `1_000_000` 為 Python 來源資料，未動。

@@ -30,6 +30,65 @@ pub enum Field {
     TakerFee(Exchange),
 }
 
+/// Which way a field tightens the risk gate. The source of truth is the conservative merge in
+/// `core::risk::effective_for_pair` (max-merged = higher is stricter, min-merged = lower is
+/// stricter); a test locks the two together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strictness {
+    HigherStricter,
+    LowerStricter,
+    /// A fact to fill in truthfully, not a tightening knob (taker fee).
+    Fact,
+}
+
+impl Strictness {
+    /// Arrow text: shown next to the colour so the direction never relies on colour alone.
+    pub fn badge(self) -> &'static str {
+        match self {
+            Strictness::HigherStricter => "▲ 越高越嚴",
+            Strictness::LowerStricter => "▼ 越低越嚴",
+            Strictness::Fact => "● 事實值",
+        }
+    }
+}
+
+/// Which judgement a field feeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Affect {
+    Qualify,
+    Pretrade,
+    Execution,
+}
+
+impl Affect {
+    pub fn label(self) -> &'static str {
+        match self {
+            Affect::Qualify => "達標",
+            Affect::Pretrade => "送單前檢查",
+            Affect::Execution => "執行",
+        }
+    }
+}
+
+/// Plain data shared by the help dialog and its tests.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldHelp {
+    pub meaning: &'static str,
+    pub formula: Option<&'static str>,
+    pub affects: &'static [Affect],
+}
+
+pub const NET_EDGE_FORMULA: &str = "net_edge_pct = 費率價差 − 2 × (taker_fee_L + taker_fee_S) − 4 × est_slippage − safety_margin";
+pub const REQUIRED_SPREAD_FORMULA: &str = "所需費率價差 = 門檻 + 2 × (taker_fee_L + taker_fee_S) + 4 × est_slippage + safety_margin";
+pub const QUALIFY_CONDITIONS: [&str; 4] = [
+    "Net Edge ≥ net_edge_threshold_pct",
+    "扣安全邊際前淨利 ≥ min_expected_net_pnl_pct",
+    "兩腿 24h 成交量 ≥ min_24h_volume_usdt",
+    "交易所與幣種在允許清單（allowed_exchanges / allowed_coins）",
+];
+pub const OVERRIDE_RULE: &str = "每腿覆寫：配對時取該配對兩腿（覆寫或全域值）中較嚴者——「越高越嚴」的欄位取較大值，「越低越嚴」的欄位取較小值；taker_fee_pct 不可覆寫。";
+pub const STALE_NOTE: &str = "建議 3000 ms：送單前檢查用的是送單前剛抓的價格與費率，正常延遲約 0.1–0.5 秒、交易所慢時 1–2 秒；1000 容易因網路延遲誤擋，超過 5000 則送單時的價格可能已明顯偏離（另有 max_price_drift_pct 把關價格變動）。";
+
 /// Global Limits, Layer 1 and Net Edge fields, in page order. Funding Threshold, Max Concurrent
 /// Trades (legs), Hedge Threshold and a single Max Slippage do not exist.
 pub const GLOBAL_FIELDS: [Field; 14] = [
@@ -111,6 +170,41 @@ impl Field {
             | Field::EstSlippagePct
             | Field::SafetyMarginPct
             | Field::TakerFee(_) => "%",
+        }
+    }
+
+    pub fn strictness(self) -> Strictness {
+        match self {
+            Field::NetEdgeThresholdPct | Field::MinExpectedNetPnlPct | Field::SafetyMarginPct | Field::EstSlippagePct | Field::Min24hVolumeUsdt => Strictness::HigherStricter,
+            Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs => Strictness::LowerStricter,
+            Field::TakerFee(_) => Strictness::Fact,
+        }
+    }
+
+    pub fn help(self) -> FieldHelp {
+        use Affect::*;
+        const NE: Option<&str> = Some("net_edge_pct = 費率價差 − 2 × (taker_fee_L + taker_fee_S) − 4 × est_slippage − safety_margin；所需費率價差 = 門檻 + 2 × (taker_fee_L + taker_fee_S) + 4 × est_slippage + safety_margin");
+        match self {
+            Field::MaxLeverage => FieldHelp { meaning: "每腿允許的最大槓桿；合約設定的槓桿超過它，送單前檢查會擋下。", formula: None, affects: &[Pretrade, Execution] },
+            Field::MaxPriceDriftPct => FieldHelp { meaning: "送單時每腿成交價相對基準價允許偏離的百分比；超過就不送單。", formula: None, affects: &[Pretrade, Execution] },
+            Field::StaleDataThresholdMs => FieldHelp { meaning: "價格與費率資料的最大年齡（毫秒）；比它舊的資料視為過期，送單前檢查會擋下。", formula: None, affects: &[Pretrade] },
+            Field::MaxConcurrentPairs => FieldHelp { meaning: "同時持有的配對組數上限；達上限後不再開新配對。", formula: None, affects: &[Pretrade] },
+            Field::OrderTimeoutSeconds => FieldHelp { meaning: "單筆訂單等待成交的秒數；逾時視為未成交，由執行流程處理。", formula: None, affects: &[Execution] },
+            Field::MaxLegImbalancePct => FieldHelp { meaning: "兩腿成交量差距允許的百分比；超過視為兩腿失衡，由執行流程處理。", formula: None, affects: &[Execution] },
+            Field::Min24hVolumeUsdt => FieldHelp { meaning: "兩腿標的 24 小時成交額（USDT）的下限；流動性不足不達標。", formula: None, affects: &[Qualify, Pretrade] },
+            Field::MinExpectedNetPnlPct => FieldHelp {
+                meaning: "預期淨利（funding 收入 − 手續費 − 估計滑價，尚未扣安全邊際）占每腿名目本金的最低百分比；達標的第二道門檻。",
+                formula: Some("預期淨利 = 費率價差 − 2 × (taker_fee_L + taker_fee_S) − 4 × est_slippage ≥ min_expected_net_pnl_pct"),
+                affects: &[Qualify],
+            },
+            Field::NetEdgeThresholdPct => FieldHelp { meaning: "Net Edge（已扣手續費、滑價、安全邊際）至少要達到的百分比才算達標；沒有預設值，須自行填寫。", formula: NE, affects: &[Qualify, Pretrade] },
+            Field::EstSlippagePct => FieldHelp {
+                meaning: "每筆成交的估計滑價，四筆成交各估一次；這是估計值，估得越高，Net Edge 算得越低、越不容易達標，因此較保守。",
+                formula: NE,
+                affects: &[Qualify, Pretrade],
+            },
+            Field::SafetyMarginPct => FieldHelp { meaning: "從 Net Edge 額外扣掉的緩衝；越大越保守。", formula: NE, affects: &[Qualify, Pretrade] },
+            Field::TakerFee(_) => FieldHelp { meaning: "該交易所的 taker 手續費率；請依帳戶手續費等級實填，不是調嚴調鬆的旋鈕。", formula: NE, affects: &[Qualify, Pretrade] },
         }
     }
 
