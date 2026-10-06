@@ -186,3 +186,46 @@ fn disabled_exchanges_are_not_requested() {
     assert_eq!(out.results.iter().map(|(e, _)| *e).collect::<Vec<_>>(), [Binance, Bybit]);
     assert!(r.to.requests().is_empty());
 }
+
+// ---- trade-cost-estimate: top-of-book rides on the same refresh ----
+
+#[test]
+fn refresh_carries_best_bid_ask_for_every_source_and_adds_one_book_request_only_on_binance() {
+    let r = rig(false, false);
+    // Binance's bookTicker is scripted on top of the existing routes; unscripted = unavailable.
+    let tb = Arc::new(ClockedTransport::new(binance_fake().on("/fapi/v1/ticker/bookTicker", ok("binance/bookTicker.json")), r.clock.clone(), 0));
+    let b = BinanceAdapter::new(Arc::clone(&tb), Arc::new(r.clock.clone()));
+    let out = block_on(refresh_sources(&b, &r.y, &r.o, &enabled(), &r.clock));
+    assert_eq!(out.books.len(), 3);
+    assert!(out.books.iter().all(|(_, x)| x.is_ok()), "{:?}", out.books);
+    assert_eq!(tb.count("/fapi/v1/ticker/bookTicker"), 1);
+    assert_eq!(r.ty.count("/v5/market/tickers"), 1, "Bybit: still ONE tickers request");
+    assert_eq!(r.to.count("market/tickers?instType=SWAP"), 1, "OKX: still ONE tickers request");
+    let mut snap = UiSnapshot::default();
+    for u in out.updates() {
+        apply_update(&mut snap, u);
+    }
+    for e in Exchange::ALL {
+        let feed = &snap.books[&e];
+        assert!(feed.books.contains_key("BTCUSDT"), "{e:?}");
+        assert_eq!(feed.last_success_at, Some(out.finished_at));
+        assert!(feed.last_error.is_none());
+    }
+}
+
+#[test]
+fn binance_book_failure_leaves_funding_observations_updated_and_flags_only_the_quotes() {
+    let r = rig(false, false); // binance_fake() has no bookTicker route
+    let out = block_on(refresh_sources(&r.b, &r.y, &r.o, &enabled(), &r.clock));
+    assert!(out.results.iter().all(|(_, x)| x.is_ok()), "funding observations are fine");
+    let bin = out.books.iter().find(|(e, _)| *e == Binance).unwrap();
+    assert!(bin.1.is_err());
+    let mut snap = UiSnapshot::default();
+    for u in out.updates() {
+        apply_update(&mut snap, u);
+    }
+    assert!(!snap.market[&Binance].observations.is_empty());
+    assert!(snap.books[&Binance].books.is_empty());
+    assert!(snap.books[&Binance].last_error.is_some());
+    assert!(snap.books[&Bybit].books.contains_key("BTCUSDT"));
+}

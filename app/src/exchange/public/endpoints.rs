@@ -7,6 +7,7 @@ pub const BINANCE_PREMIUM_INDEX: &str = "/fapi/v1/premiumIndex";
 pub const BINANCE_FUNDING_INFO: &str = "/fapi/v1/fundingInfo";
 pub const BINANCE_EXCHANGE_INFO: &str = "/fapi/v1/exchangeInfo";
 pub const BINANCE_TICKER_24H: &str = "/fapi/v1/ticker/24hr";
+pub const BINANCE_BOOK_TICKER: &str = "/fapi/v1/ticker/bookTicker";
 
 pub const BYBIT_HOST: &str = "https://api.bybit.com";
 pub const BYBIT_TICKERS: &str = "/v5/market/tickers";

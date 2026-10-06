@@ -158,7 +158,14 @@ fn leverage_checks(risk_json: &serde_json::Value, overrides_json: &serde_json::V
     let entry = EntrySnapshot { long_scan_price: d("100"), short_scan_price: d("100"), notional_usdt: d("1000"), leverage: d("5") };
     let (bl, bs, pl, ps) = (quote(long, "-0.001", 1_000), quote(short, "0.001", 1_000), quote(long, "-0.001", 6_000), quote(short, "0.001", 6_000));
     let margin: Result<tong_funding_core::types::Decimal, String> = Ok(d("10000"));
-    let ctx = Node0Context { now_ms: 6_100, symbol: "BTCUSDT", entry: &entry, effective: &eff, max_concurrent_pairs: cfg.max_concurrent_pairs, allowed_exchanges: &cfg.allowed_exchanges, open_pair_count: 0 };
+    let rules_of = |ex: Exchange| -> Result<crate::engine::ports::OrderRules, String> {
+        Ok(crate::engine::ports::OrderRules {
+            lot: tong_funding_core::quantity::LotSize { step_size: d("0.001"), min_qty: d("0.001") },
+            okx_ct_val: (ex == Exchange::Okx).then(|| d("0.01")),
+        })
+    };
+    let (rules_l, rules_s) = (rules_of(long), rules_of(short));
+    let ctx = Node0Context { now_ms: 6_100, symbol: "BTCUSDT", entry: &entry, effective: &eff, max_concurrent_pairs: cfg.max_concurrent_pairs, allowed_exchanges: &cfg.allowed_exchanges, open_pair_count: 0, rules: [&rules_l, &rules_s] };
     let l = Node0Leg { exchange: long, baseline: Some(&bl), pretrade: &pl, available_margin: &margin, has_foreign_exposure: false };
     let s = Node0Leg { exchange: short, baseline: Some(&bs), pretrade: &ps, available_margin: &margin, has_foreign_exposure: false };
     match node0::run(&ctx, &l, &s) {
