@@ -22,6 +22,7 @@ use super::format;
 use super::nav::{Page, DEBUG_WARNING};
 use super::pages::{self, ClickFn, ScannerTable, small, text};
 use super::positions::{self, PositionsVm};
+use super::scan_view::{ScanColumn, ScanEvent, ScanViewState, table_rows};
 use super::scanner::{self, RowsView, ScannerVm, TableState as ScanState};
 use super::status::{Connection, StatusModel, ENVIRONMENT_LABEL};
 use super::system_log::{self, LogFilter, LogRow, SystemLogVm};
@@ -51,6 +52,10 @@ pub struct Shell {
     alerts: Vec<Alert>,
     dismissed: BTreeSet<AlertKey>,
     only_qualified: bool,
+    /// Scanner table controls (shown columns, sort). Lives here, not in the page, so it survives
+    /// page switches; never persisted (spec scanner-table-controls).
+    view: ScanViewState,
+    scan_events: std::rc::Rc<std::cell::RefCell<Vec<ScanEvent>>>,
     table: Entity<TableState<ScannerTable>>,
     log_filter: LogFilter,
     log_vm: Option<SystemLogVm>,
@@ -118,7 +123,8 @@ impl Shell {
         let now_ms = wall_ms();
         let snap = UiSnapshot::default();
         let trading = TradingState::new(window, cx);
-        let table = cx.new(|cx| TableState::new(ScannerTable { rows: Vec::new(), now_ms, clocks: Default::default(), candidates: Vec::new(), toggles: trading.toggles.clone() }, window, cx));
+        let scan_events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let table = cx.new(|cx| TableState::new(ScannerTable::new(now_ms, trading.toggles.clone(), scan_events.clone()), window, cx).col_movable(false).col_resizable(false).col_selectable(false));
         let mut shell = Shell {
             page: Page::default_page(),
             now_secs: now_unix_secs(),
@@ -136,6 +142,8 @@ impl Shell {
             pos_filter: positions::Filter::default(),
             dismissed: BTreeSet::new(),
             only_qualified: false,
+            view: ScanViewState::default(),
+            scan_events,
             table,
             log_filter: LogFilter::default(),
             log_vm: None,
@@ -166,7 +174,7 @@ impl Shell {
             }
             self.bridge.push(u);
         }
-        if self.drain_candidate_toggles() {
+        if self.drain_candidate_toggles() | self.drain_scan_events() {
             self.sync_table(cx);
             cx.notify();
         }
@@ -203,11 +211,16 @@ impl Shell {
         self.sync_table(cx);
     }
 
+    /// Header clicks queued by the table delegate; true when the sort changed.
+    fn drain_scan_events(&mut self) -> bool {
+        let events: Vec<ScanEvent> = self.scan_events.borrow_mut().drain(..).collect();
+        events.into_iter().fold(false, |changed, ev| self.view.apply(ev) | changed)
+    }
+
     pub(crate) fn sync_table(&mut self, cx: &mut Context<Self>) {
-        let rows: Vec<_> = match self.scanner.visible(self.only_qualified) {
-            RowsView::Rows(r) => r.into_iter().cloned().collect(),
-            RowsView::NoneQualified => Vec::new(),
-        };
+        // Filtered and ordered here, so the candidate cells below line up with the rows as drawn.
+        let rows = table_rows(&self.scanner, self.only_qualified, self.view.sort).unwrap_or_default();
+        let (visible, sort) = (self.view.visibility.visible(), self.view.sort);
         let (now, clocks) = (self.now_ms, self.snap.clocks.clone());
         let candidates = self.candidate_cells(&rows);
         self.table.update(cx, |t, cx| {
@@ -216,6 +229,8 @@ impl Shell {
             d.now_ms = now;
             d.clocks = clocks;
             d.candidates = candidates;
+            d.visible = visible;
+            d.sort = sort;
             t.refresh(cx);
             cx.notify();
         });
@@ -466,7 +481,46 @@ impl Shell {
         } else if !matches!(vm.state, ScanState::Loading) {
             body = body.child(div().h(px(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
         }
-        div().flex().flex_col().gap_3().child(header).child(cards).child(controls).child(body).child(candidate_list)
+        let chips = self.column_chips(cx);
+        div().flex().flex_col().gap_3().child(header).child(cards).child(controls).child(chips).child(body).child(candidate_list)
+    }
+
+    /// One button per column (show/hide) and a reset; Symbol is locked on.
+    fn column_chips(&self, cx: &mut Context<Self>) -> Div {
+        let mut row = div().flex().flex_wrap().gap_2().items_center().child(small("欄位", theme::TEXT_MUTED));
+        for (i, col) in ScanColumn::ALL.into_iter().enumerate() {
+            let shown = self.view.visibility.is_visible(col);
+            let chip = div()
+                .id(("col-chip", i))
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .border_1()
+                .border_color(rgb(if shown { theme::ACCENT } else { theme::BORDER }))
+                .bg(rgb(if shown { theme::BG_CARD } else { theme::BG_SURFACE }))
+                .child(small(col.title(), if shown { theme::TEXT_PRIMARY } else { theme::TEXT_MUTED }));
+            row = row.child(if col.hideable() {
+                chip.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                    if this.view.visibility.toggle(col) {
+                        this.sync_table(cx);
+                        cx.notify();
+                    }
+                }))
+            } else {
+                chip
+            });
+        }
+        let all = self.view.visibility.is_all_visible();
+        let reset = div().id("col-reset").px_2().py_1().rounded_sm().border_1().border_color(rgb(theme::BORDER)).child(small("重設欄位", if all { theme::TEXT_MUTED } else { theme::ACCENT }));
+        row.child(if all {
+            reset
+        } else {
+            reset.cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
+                this.view.visibility.reset();
+                this.sync_table(cx);
+                cx.notify();
+            }))
+        })
     }
 
     fn positions_page(&self, cx: &mut Context<Self>) -> Div {
