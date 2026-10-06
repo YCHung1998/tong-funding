@@ -8,6 +8,7 @@
 - 背景：2026-10-05 量測時機器為電池 + 低電量模式（`pmset -g` 顯示 `lowpowermode 1`），更新率被降到約 30Hz，數據不可靠；
   較早一組 60Hz 的量測（p95 約 17.2–17.7 ms、無掉幀、每幀 CPU 約 5 ms）狀態未記錄。
 - 真實資料與真實更新頻率的重量測另見 `ui-readonly-pages` task 4.2。
+- `scan-table-column-controls`（掃幣表欄位/排序）：同一條件下另量「依 Net Edge 排序、隱藏數欄後」的 `--bench-table` 幀時間，確認排序沒有拖慢（單元測試只證明 528 列排序中位數 < 5 ms；`app/src/ui/vm/scan_view_tests.rs` 的 `sorting_528_rows_takes_under_5_ms_for_every_sortable_column`）。
 
 ## 需要使用者在場的驗證（agent 不得代做，因為會動到真實 Keychain 或需要 demo 金鑰）
 - [ ] **真實 macOS Keychain**（store-sqlite task 4.1）：執行

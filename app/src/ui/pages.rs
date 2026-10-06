@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use gpui_kit::component::chart::PieChart;
-use gpui_kit::component::table::{Column, TableDelegate, TableState};
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::*;
 use tong_funding_core::types::{Decimal, Exchange};
 
@@ -14,6 +14,7 @@ use super::bridge::ClockState;
 use super::dashboard::{self, ConnectedCard, DashboardVm, ExchangeCard, MarginDistribution};
 use super::format::{self, DASH};
 use super::positions::{PairCard, PositionsVm, TableView};
+use super::scan_view::{ScanColumn, ScanEvent, SortDir, SortState};
 use super::scanner::{self, RateCell, ScanRow};
 use super::system_log::{SystemLogVm, Timeline};
 use super::theme::{self, Tone};
@@ -451,22 +452,13 @@ pub struct ScannerTable {
     pub candidates: Vec<super::trading_pages::CandidateCell>,
     /// Clicked symbols, drained by the shell (the table cannot reach the shell directly).
     pub toggles: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    /// The shown columns, in display order (`columns_count`/`column`/`render_td` index into this).
+    pub visible: Vec<ScanColumn>,
+    /// Current sort, only used to draw the header icon (the shell has already ordered `rows`).
+    pub sort: Option<SortState>,
+    /// Sort clicks, drained by the shell like `toggles`.
+    pub events: std::rc::Rc<std::cell::RefCell<Vec<ScanEvent>>>,
 }
-
-const SCAN_COLS: [(&str, &str, f32); 12] = [
-    ("rank", "Rank", 50.0),
-    ("symbol", "Symbol", 120.0),
-    ("cov", "覆蓋", 50.0),
-    ("cd", "結算倒數", 110.0),
-    ("binance", "Binance", 150.0),
-    ("bybit", "Bybit", 150.0),
-    ("okx", "OKX", 150.0),
-    ("dir", "最佳套利方向", 160.0),
-    ("gross", "Gross Spread %", 120.0),
-    ("net", "Net Edge %", 200.0),
-    ("ok", "達標", 60.0),
-    ("add", "加入交易單", 130.0),
-];
 
 fn rate_cell(c: &RateCell) -> Div {
     let mut d = div().flex().gap_1().items_center().child(small(c.text(), tone(c.tone())));
@@ -479,37 +471,79 @@ fn rate_cell(c: &RateCell) -> Div {
     d
 }
 
+impl ScannerTable {
+    /// Rows start with the default order and every column shown.
+    pub fn new(now_ms: i64, toggles: std::rc::Rc<std::cell::RefCell<Vec<String>>>, events: std::rc::Rc<std::cell::RefCell<Vec<ScanEvent>>>) -> Self {
+        ScannerTable { rows: Vec::new(), now_ms, clocks: Default::default(), candidates: Vec::new(), toggles, visible: ScanColumn::ALL.to_vec(), sort: None, events }
+    }
+}
+
 impl TableDelegate for ScannerTable {
     fn columns_count(&self, _: &App) -> usize {
-        SCAN_COLS.len()
+        self.visible.len()
     }
     fn rows_count(&self, _: &App) -> usize {
         self.rows.len()
     }
     fn column(&self, ix: usize, _: &App) -> Column {
-        Column::new(SCAN_COLS[ix].0, SCAN_COLS[ix].1).width(px(SCAN_COLS[ix].2))
+        let c = self.visible.get(ix).copied().unwrap_or(ScanColumn::Symbol);
+        // No dragging or resizing: the delegate maps shown columns itself, so the table must not reorder them.
+        let mut col = Column::new(c.key(), c.title()).width(px(c.width())).resizable(false).movable(false);
+        if c.sortable() {
+            col = match self.sort {
+                Some(s) if s.column == c && s.dir == SortDir::Asc => col.ascending(),
+                Some(s) if s.column == c => col.descending(),
+                _ => col.sortable(),
+            };
+        }
+        if c.fixed_left() {
+            col = col.fixed_left();
+        }
+        col
+    }
+    /// The header title is clickable too (the library only reacts to its small sort icon).
+    fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
+        let c = self.visible.get(col_ix).copied().unwrap_or(ScanColumn::Symbol);
+        let mut title = div().id(("scan-th", col_ix)).test_support().size_full().child(c.title());
+        if c.sortable() {
+            let events = self.events.clone();
+            title = title.cursor_pointer().on_click(move |_, _, _| events.borrow_mut().push(ScanEvent::CycleSort(c)));
+        }
+        title
+    }
+    /// The library's sort icon was clicked; it already cycled, so record the result it reports.
+    fn perform_sort(&mut self, col_ix: usize, sort: ColumnSort, _: &mut Window, _: &mut Context<TableState<Self>>) {
+        let Some(c) = self.visible.get(col_ix).copied() else { return };
+        let dir = match sort {
+            ColumnSort::Ascending => Some(SortDir::Asc),
+            ColumnSort::Descending => Some(SortDir::Desc),
+            ColumnSort::Default => None,
+        };
+        self.events.borrow_mut().push(ScanEvent::SetSort(c, dir));
     }
     fn render_td(&mut self, row: usize, col: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
-        let Some(r) = self.rows.get(row) else { return div() };
-        match col {
-            0 => small(format!("{:02}", r.rank), theme::TEXT_MUTED),
-            1 => small(r.symbol.clone(), theme::TEXT_PRIMARY),
-            2 => small(r.coverage_text(), theme::TEXT_SECONDARY),
-            3 => {
+        let (Some(r), Some(c)) = (self.rows.get(row), self.visible.get(col).copied()) else { return div() };
+        match c {
+            ScanColumn::Rank => small(format!("{:02}", r.rank), theme::TEXT_MUTED),
+            ScanColumn::Symbol => small(r.symbol.clone(), theme::TEXT_PRIMARY),
+            ScanColumn::Coverage => small(r.coverage_text(), theme::TEXT_SECONDARY),
+            ScanColumn::Countdown => {
                 let clock = r.countdown_target.map(|(_, e)| self.clocks.get(&e).copied().unwrap_or(ClockState::Unsynced)).unwrap_or(ClockState::Unsynced);
                 small(scanner::countdown(r.countdown_target, clock, self.now_ms).text(), theme::TEXT_SECONDARY)
             }
-            4..=6 => rate_cell(&r.cells[col - 4].1),
-            7 => small(r.direction_text(), theme::TEXT_SECONDARY),
-            8 => {
+            ScanColumn::Binance => rate_cell(&r.cells[0].1),
+            ScanColumn::Bybit => rate_cell(&r.cells[1].1),
+            ScanColumn::Okx => rate_cell(&r.cells[2].1),
+            ScanColumn::Direction => small(r.direction_text(), theme::TEXT_SECONDARY),
+            ScanColumn::Gross => {
                 let mut d = div().flex().gap_1().child(small(r.gross_text(), theme::TEXT_SECONDARY));
                 if r.intervals_differ {
                     d = d.child(small("週期不同", theme::WARNING));
                 }
                 d
             }
-            9 => small(r.net_edge.text(), tone(r.net_edge.tone())),
-            11 => {
+            ScanColumn::NetEdge => small(r.net_edge.text(), tone(r.net_edge.tone())),
+            ScanColumn::Add => {
                 let cell = self.candidates.get(row).cloned().unwrap_or_default();
                 let (mark, color) = match (&cell.blocked, cell.checked) {
                     (_, true) => ("☑ 已加入".to_string(), theme::ACCENT),
@@ -520,12 +554,13 @@ impl TableDelegate for ScannerTable {
                 div().child(
                     div()
                         .id(("cand", row))
+                        .test_support()
                         .cursor_pointer()
                         .on_click(move |_, _, _| toggles.borrow_mut().push(symbol.clone()))
                         .child(small(mark, color)),
                 )
             }
-            _ => small(r.qualified.text(), if r.qualified == scanner::Qualified::Yes { theme::POSITIVE } else { theme::TEXT_MUTED }),
+            ScanColumn::Qualified => small(r.qualified.text(), if r.qualified == scanner::Qualified::Yes { theme::POSITIVE } else { theme::TEXT_MUTED }),
         }
     }
 }

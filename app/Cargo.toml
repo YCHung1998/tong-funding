@@ -23,5 +23,7 @@ keyring = { version = "3", features = ["apple-native"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Headless UI tests (click/scroll by element id); only enabled for test builds.
+gpui-kit = { version = "=0.7.1", features = ["test-support"] }
 # Paused tokio time in engine actor tests (no real waiting).
 tokio = { version = "1.53.2", features = ["test-util"] }

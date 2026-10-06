@@ -44,6 +44,8 @@ pub mod format;
 pub mod funding;
 #[path = "vm/positions.rs"]
 pub mod positions;
+#[path = "vm/scan_view.rs"]
+pub mod scan_view;
 #[path = "vm/scanner.rs"]
 pub mod scanner;
 #[path = "vm/scanner_refresh.rs"]
@@ -54,6 +56,8 @@ pub mod system_log;
 #[path = "vm/testkit.rs"]
 mod testkit;
 
+#[cfg(test)]
+mod scan_table_ui_tests;
 #[cfg(test)]
 mod shell_tests;
 #[cfg(test)]
