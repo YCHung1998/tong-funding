@@ -669,7 +669,7 @@ impl Shell {
             .child(text(format!("計算與執行邊界 · execution_mode {}", vm.mode_label), theme::TEXT_PRIMARY))
             .child(small(format!("每腿：Notional {} · Initial Margin {}", opt_money(vm.notional), opt_money(vm.margin)), theme::TEXT_SECONDARY))
             .child(small(format!("雙腿合計：Notional {} · Initial Margin {}", opt_money(vm.pair_notional), opt_money(vm.pair_margin)), theme::TEXT_SECONDARY))
-            .child(small("預期數量：LONG / SHORT 各一腿（不跨所加總）", theme::TEXT_SECONDARY))
+            .child(small("預期數量：LONG / SHORT 兩腿同一幣數，名目本金為上限（不跨所加總）", theme::TEXT_SECONDARY))
             .child(small(contract_settings::QUOTE_NOTE, theme::TEXT_MUTED));
         let mut quote = card().child(pick_row("試算標的", self.trading.c_symbol.element("BTCUSDT"), self.trading.c_symbol.loaded(), "行情", self.trading.c_symbol.is_unlisted(cx).then(|| symbol.clone())));
         match vm.notional {
@@ -679,6 +679,8 @@ impl Shell {
                     let age = q.observed_at.map_or_else(|| DASH.into(), |t| format!("{} 秒前", format::secs(self.now_ms - t)));
                     quote = quote.child(small(format!("{} · 現價 {price} · {age} · 預期數量 {}", q.exchange.name(), q.cell.text()), theme::TEXT_SECONDARY));
                 }
+                // Pairs trade one shared quantity (matched-leg-quantity); the rows above are single-leg references.
+                quote = quote.child(small(contract_settings::pair_quote(&symbol, n, &self.snap, self.now_ms), theme::TEXT_PRIMARY));
             }
             None => quote = quote.child(small("Target Notional 無效，無法試算", theme::TEXT_MUTED)),
         }

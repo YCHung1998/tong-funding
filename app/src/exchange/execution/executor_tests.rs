@@ -453,10 +453,17 @@ async fn a_hedge_mode_position_makes_the_account_list_unusable() {
 async fn account_margin_is_the_available_usdt_and_missing_is_an_error() {
     let t = FakeTransport::new()
         .on("/fapi/v2/balance", Ok(HttpResponse::ok(r#"[{"asset":"USDT","balance":"1000","availableBalance":"750.5"},{"asset":"BNB","balance":"1","availableBalance":"1"}]"#)))
-        .on("/v5/account/wallet-balance", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[{"coin":[{"coin":"USDT","walletBalance":"500","availableToWithdraw":""}]}]}}"#)));
+        .on("/v5/account/wallet-balance", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[{"accountType":"UNIFIED","totalAvailableBalance":"480.25","coin":[{"coin":"USDT","walletBalance":"500","availableToWithdraw":""}]}]}}"#)));
     let a = account(t);
     assert_eq!(a.available_margin(Exchange::Binance).await, Ok(d("750.5")));
-    assert!(a.available_margin(Exchange::Bybit).await.is_err(), "not reported = not available (fail closed)");
+    // UNIFIED: `availableToWithdraw` is deprecated (""), the account's totalAvailableBalance is used.
+    assert_eq!(a.available_margin(Exchange::Bybit).await, Ok(d("480.25")));
+    let empty = account(FakeTransport::new().on(
+        "/v5/account/wallet-balance",
+        Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[{"accountType":"UNIFIED","totalAvailableBalance":"","coin":[{"coin":"USDT","walletBalance":"500","availableToWithdraw":""}]}]}}"#)),
+    ));
+    let e = empty.available_margin(Exchange::Bybit).await.unwrap_err();
+    assert!(e.starts_with("Bybit:") && e.contains("totalAvailableBalance"), "not reported = not available (fail closed): {e}");
 }
 
 #[tokio::test]

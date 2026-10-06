@@ -16,7 +16,7 @@ use tong_funding_core::risk::{ExecutionMode, TriggerMode};
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{CommandSink, LegAccount, UiSnapshot, ACCOUNT_EXCHANGES};
-use super::contract_settings::{leg_quantity, QuoteCell};
+use super::contract_settings::{pair_quantity, QuoteCell};
 use super::engine_view::{blocker_text, refusing_blockers};
 use super::risk_settings::missing_display;
 use crate::engine::command::{Blocker, Command, PairView};
@@ -247,12 +247,15 @@ fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms:
     let entry = snap.pair_entries.get(&p.internal_uuid).unwrap_or(&empty);
     let notional = dec_of(entry, "notional_usdt");
     let leverage = dec_of(entry, "leverage").filter(|l| *l > Decimal::ZERO);
-    let qty = |ex: Exchange| match (notional, price_of(snap, ex, &p.symbol)) {
-        (Some(n), Some(px)) => leg_quantity(ex, &p.symbol, n, px, snap.rules.get(&(ex, p.symbol.clone()))),
-        (None, _) => QuoteCell::NoRules("掃描快照缺少 notional".into()),
-        (_, None) => QuoteCell::NoPrice,
+    // matched-leg-quantity: both legs at one shared quantity, the notional being a cap.
+    let rules = |ex: Exchange| snap.rules.get(&(ex, p.symbol.clone()));
+    let (long_qty, short_qty) = match (notional, price_of(snap, p.long_exchange, &p.symbol), price_of(snap, p.short_exchange, &p.symbol)) {
+        (Some(n), Some(pl), Some(ps)) => {
+            pair_quantity(&p.symbol, n, (p.long_exchange, pl, rules(p.long_exchange)), (p.short_exchange, ps, rules(p.short_exchange)))
+        }
+        (None, _, _) => (QuoteCell::NoRules("掃描快照缺少 notional".into()), QuoteCell::NoRules("掃描快照缺少 notional".into())),
+        (_, _, _) => (QuoteCell::NoPrice, QuoteCell::NoPrice),
     };
-    let (long_qty, short_qty) = (qty(p.long_exchange), qty(p.short_exchange));
     let selectable = if p.state != PairState::Prepared {
         Err(format!("狀態 {}", p.state))
     } else if matches!(long_qty, QuoteCell::BelowMinimum) || matches!(short_qty, QuoteCell::BelowMinimum) {

@@ -80,13 +80,28 @@ fn sel(ids: &[&str]) -> BTreeSet<String> {
 }
 
 // ---- 1.1 list, selection, summary --------------------------------------------------------
+#[test]
+fn staged_orders_both_legs_show_one_shared_quantity_at_most_the_notional() {
+    // matched-leg-quantity: different prices and steps still give one quantity for both legs.
+    let mut s = snap();
+    for (ex, px, step) in [(Exchange::Binance, "60000", "0.001"), (Exchange::Bybit, "60100", "0.0001")] {
+        s.market.get_mut(&ex).unwrap().observations.iter_mut().find(|o| o.symbol == "BTCUSDT").unwrap().mark_price = d(px);
+        s.rules.insert((ex, "BTCUSDT".into()), lot(step, step));
+    }
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    let btc = vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap();
+    assert_eq!((btc.long_qty.order_qty(), btc.short_qty.order_qty()), (Some(d("0.019")), Some(d("0.019"))));
+    assert_eq!(btc.long_qty.text(), "0.019 BTC（≈ 1,140.00 USDT）");
+    assert_eq!(btc.short_qty.text(), "0.019 BTC（≈ 1,141.90 USDT）");
+}
+
 
 #[test]
 fn staged_orders_rows_show_floored_quantities_and_the_net_edge() {
     let vm = build(&snap(), &BTreeSet::new(), NOW);
     assert_eq!(vm.staged_count, 3);
     let btc = vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap();
-    assert_eq!(btc.long_qty.text(), "0.019 BTC", "never 0.019934");
+    assert_eq!(btc.long_qty.text(), "0.019 BTC（≈ 1,143.80 USDT）", "never 0.019934");
     assert_eq!(btc.net_edge_pct, Some(d("0.07")));
     assert_eq!((btc.notional, btc.leverage, btc.margin), (Some(d("1200")), Some(d("3")), Some(d("400"))));
     assert_eq!(btc.entry_in_ms, Some(T - 10_000 - NOW), "entry at T−10 s");
@@ -187,7 +202,7 @@ fn the_confirmation_lists_two_legs_per_pair_and_nothing_is_sent_before_confirmin
     let pending = open_confirm(&vm).expect("enabled");
     assert_eq!(pending.legs.len(), 2 * 2);
     let first = &pending.legs[0];
-    assert_eq!((first.exchange, first.side, first.qty_text.as_str()), (Exchange::Binance, OrderSide::Buy, "0.019 BTC"));
+    assert_eq!((first.exchange, first.side, first.qty_text.as_str()), (Exchange::Binance, OrderSide::Buy, "0.019 BTC（≈ 1,143.80 USDT）"));
     assert_eq!((first.notional, first.leverage, first.margin), (d("1200"), d("3"), d("400")));
     assert_eq!(pending.legs[1].side, OrderSide::Sell);
     assert_eq!(pending.env_text, "SIMULATION：由模擬器成交，不會送出真實訂單");

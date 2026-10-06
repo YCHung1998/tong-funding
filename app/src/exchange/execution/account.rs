@@ -101,7 +101,7 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
         Box::pin(async move {
             match exchange {
                 Exchange::Binance => to_margin(exchange, &self.binance.get_balances().await.map_err(|e| e.to_string())?),
-                Exchange::Bybit => to_margin(exchange, &self.bybit.get_balances().await.map_err(|e| e.to_string())?),
+                Exchange::Bybit => self.bybit.get_available_margin().await.map_err(|e| format!("Bybit: {e}")),
                 Exchange::Okx => Err(OKX_ACCOUNT_UNSUPPORTED.to_string()),
             }
         })

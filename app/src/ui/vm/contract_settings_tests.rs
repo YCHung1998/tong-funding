@@ -113,6 +113,29 @@ mod contract_quote {
     }
 
     #[test]
+    fn pair_quantity_is_one_shared_quantity_with_each_legs_value() {
+        // matched-leg-quantity: 1000 / max(60000, 60100) = 0.01663… → common step 0.001 → 0.016 on both legs.
+        let (l, s) = (Ok(lot("0.001", "0.001")), Ok(lot("0.0001", "0.0001")));
+        let (long, short) = pair_quantity("BTCUSDT", d("1000"), (Exchange::Binance, d("60000"), Some(&l)), (Exchange::Bybit, d("60100"), Some(&s)));
+        assert_eq!((long.order_qty(), short.order_qty()), (Some(d("0.016")), Some(d("0.016"))));
+        assert_eq!(long.text(), "0.016 BTC（≈ 960.00 USDT）");
+        assert_eq!(short.text(), "0.016 BTC（≈ 961.60 USDT）");
+        let pending = pair_quantity("BTCUSDT", d("1000"), (Exchange::Binance, d("60000"), None), (Exchange::Bybit, d("60100"), Some(&s)));
+        assert_eq!((pending.0, pending.1.order_qty()), (QuoteCell::RulesPending, None), "a leg without rules gives no quantity to either leg");
+    }
+
+    #[test]
+    fn pair_quote_line_for_binance_and_bybit() {
+        let mut s = snap_with(Exchange::Binance, "60000", NOW - 100, Some(Ok(lot("0.001", "0.001"))));
+        let b = snap_with(Exchange::Bybit, "60100", NOW - 100, Some(Ok(lot("0.0001", "0.0001"))));
+        s.market.extend(b.market);
+        s.rules.extend(b.rules);
+        assert_eq!(pair_quote("BTCUSDT", d("1000"), &s, NOW), "Binance↔Bybit 共同數量：0.016 BTC · Binance ≈ 960.00 USDT · Bybit ≈ 961.60 USDT");
+        let only = snap_with(Exchange::Binance, "60000", NOW - 100, Some(Ok(lot("0.001", "0.001"))));
+        assert_eq!(pair_quote("BTCUSDT", d("1000"), &only, NOW), "Binance↔Bybit 共同數量：無法計算（Bybit 無價格）");
+    }
+
+    #[test]
     fn contract_quote_floors_to_the_step_1200_at_60200_is_0_019() {
         let s = snap_with(Exchange::Binance, "60200", NOW - 100, Some(Ok(lot("0.001", "0.001"))));
         match cell(&s, Exchange::Binance, "1200") {

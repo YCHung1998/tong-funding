@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tong_funding_core::redact::redact_secrets;
-use tong_funding_core::types::{Exchange, Side};
+use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::endpoints::{
     BYBIT_BALANCE_PATH, BYBIT_OPEN_ORDERS_PATH, BYBIT_ORDERS_PAGE_LIMIT, BYBIT_POSITIONS_PAGE_LIMIT, BYBIT_POSITIONS_PATH, BybitHost, MAX_PAGES,
@@ -70,11 +70,7 @@ impl<T: HttpTransport> BybitSignedClient<T> {
 
     /// `GET /v5/account/wallet-balance`: every coin of every returned account.
     pub async fn get_balances(&self) -> Result<Vec<Balance>, AdapterError> {
-        let account_type = match self.account_type {
-            BybitAccountType::Unified => "UNIFIED",
-            BybitAccountType::Contract => "CONTRACT",
-        };
-        let (body, at) = self.signed_get(BYBIT_BALANCE_PATH, &encode_query(&[("accountType", account_type.to_string())])).await?;
+        let (body, at) = self.signed_get(BYBIT_BALANCE_PATH, &encode_query(&[("accountType", self.account_type_param().to_string())])).await?;
         let mut out = Vec::new();
         for account in result_list(&body)? {
             let coins = account.get("coin").and_then(Value::as_array).ok_or_else(|| AdapterError::parse("missing coin list"))?;
@@ -83,6 +79,19 @@ impl<T: HttpTransport> BybitSignedClient<T> {
             }
         }
         Ok(out)
+    }
+
+    /// Available margin (USDT) from the same `wallet-balance` request; see [`available_margin_from`].
+    pub async fn get_available_margin(&self) -> Result<Decimal, AdapterError> {
+        let (body, _) = self.signed_get(BYBIT_BALANCE_PATH, &encode_query(&[("accountType", self.account_type_param().to_string())])).await?;
+        available_margin_from(&body, self.account_type)
+    }
+
+    fn account_type_param(&self) -> &'static str {
+        match self.account_type {
+            BybitAccountType::Unified => "UNIFIED",
+            BybitAccountType::Contract => "CONTRACT",
+        }
     }
 
     /// `GET /v5/position/list` (linear, USDT-settled): non-zero positions across all pages.
@@ -267,6 +276,33 @@ fn parse_order(r: &Value, fetched_at: i64) -> Result<OpenOrder, AdapterError> {
         status: str_req(r, "orderStatus")?,
         fetched_at,
     })
+}
+
+/// Available margin from a `wallet-balance` body.
+/// UNIFIED: the account's `totalAvailableBalance` (Bybit's own figure for opening positions; "0" and
+/// negative values are taken as reported). `availableToWithdraw` is deprecated for UNIFIED since
+/// 2025-01-09 (always ""), and nothing is computed in its place: an empty value is an error.
+/// CONTRACT: USDT `availableToWithdraw`, as before.
+pub fn available_margin_from(body: &Value, account_type: BybitAccountType) -> Result<Decimal, AdapterError> {
+    let accounts = result_list(body)?;
+    match account_type {
+        BybitAccountType::Unified => {
+            let account = accounts
+                .iter()
+                .find(|a| a.get("accountType").and_then(Value::as_str) == Some("UNIFIED"))
+                .ok_or_else(|| AdapterError::parse("no UNIFIED account in wallet-balance"))?;
+            dec_opt(account, "totalAvailableBalance")?.ok_or_else(|| AdapterError::parse("totalAvailableBalance not reported (isolated margin is not supported)"))
+        }
+        BybitAccountType::Contract => {
+            let usdt = accounts
+                .iter()
+                .filter_map(|a| a.get("coin").and_then(Value::as_array))
+                .flatten()
+                .find(|c| c.get("coin").and_then(Value::as_str) == Some("USDT"))
+                .ok_or_else(|| AdapterError::parse("no USDT coin in wallet-balance"))?;
+            dec_opt(usdt, "availableToWithdraw")?.ok_or_else(|| AdapterError::parse("USDT availableToWithdraw not reported"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -515,6 +551,65 @@ mod tests {
         let c = BybitSignedClient::new(t.clone(), Arc::new(full_secrets()), Arc::new(ManualClock::new(NOW)), Arc::new(|| Some(0)), FakeResync::ok(), BybitHost::Demo).with_account_type(BybitAccountType::Contract);
         block_on(c.get_balances()).unwrap();
         assert!(t.requests()[0].url.ends_with("?accountType=CONTRACT"));
+    }
+
+    // ---- available margin (bybit-uta-available-margin) ----
+
+    fn wallet(total_available: &str, coins: Value) -> Value {
+        json!({"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"UNIFIED","totalAvailableBalance":total_available,"coin":coins}]}})
+    }
+
+    #[test]
+    fn unified_margin_is_the_account_total_available_balance() {
+        let body = wallet("8123.45", json!([{"coin":"USDT","walletBalance":"9000","availableToWithdraw":""}]));
+        assert_eq!(available_margin_from(&body, BybitAccountType::Unified).unwrap(), d("8123.45"));
+    }
+
+    #[test]
+    fn unified_margin_zero_and_negative_are_taken_as_reported() {
+        let coins = json!([{"coin":"USDT","walletBalance":"1000","availableToWithdraw":"500"}]);
+        assert_eq!(available_margin_from(&wallet("0", coins.clone()), BybitAccountType::Unified).unwrap(), d("0"));
+        assert_eq!(available_margin_from(&wallet("-12.5", coins), BybitAccountType::Unified).unwrap(), d("-12.5"));
+    }
+
+    #[test]
+    fn unified_margin_empty_is_an_error_naming_the_field_and_never_computed() {
+        let body = wallet("", json!([{"coin":"USDT","walletBalance":"1000","totalPositionIM":"200","totalOrderIM":"50","locked":""}]));
+        let e = available_margin_from(&body, BybitAccountType::Unified).unwrap_err().to_string();
+        assert!(e.contains("totalAvailableBalance"), "{e}");
+    }
+
+    #[test]
+    fn unified_margin_reads_only_the_unified_account() {
+        let body = json!({"retCode":0,"retMsg":"OK","result":{"list":[
+            {"accountType":"FUND","totalAvailableBalance":"5","coin":[]},
+            {"accountType":"UNIFIED","totalAvailableBalance":"7","coin":[]}
+        ]}});
+        assert_eq!(available_margin_from(&body, BybitAccountType::Unified).unwrap(), d("7"));
+        let none = json!({"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"FUND","totalAvailableBalance":"5","coin":[]}]}});
+        assert!(available_margin_from(&none, BybitAccountType::Unified).is_err());
+    }
+
+    #[test]
+    fn unified_margin_never_uses_the_deprecated_available_to_withdraw() {
+        let body = wallet("", json!([{"coin":"BTC","walletBalance":"1","availableToWithdraw":"999"}]));
+        assert!(available_margin_from(&body, BybitAccountType::Unified).is_err());
+    }
+
+    #[test]
+    fn contract_margin_is_still_usdt_available_to_withdraw() {
+        let body = json!({"retCode":0,"retMsg":"OK","result":{"list":[{"accountType":"CONTRACT","totalAvailableBalance":"","coin":[{"coin":"USDT","walletBalance":"100","availableToWithdraw":"90"}]}]}});
+        assert_eq!(available_margin_from(&body, BybitAccountType::Contract).unwrap(), d("90"));
+        let empty = json!({"retCode":0,"retMsg":"OK","result":{"list":[{"coin":[{"coin":"USDT","walletBalance":"100","availableToWithdraw":""}]}]}});
+        assert!(available_margin_from(&empty, BybitAccountType::Contract).is_err());
+    }
+
+    #[test]
+    fn get_available_margin_reads_the_unified_wallet_balance() {
+        let body = wallet("8123.45", json!([{"coin":"USDT","walletBalance":"9000","availableToWithdraw":""}]));
+        let (t, c) = client(FakeTransport::new().on("/v5/account/wallet-balance", Ok(HttpResponse::ok(body.to_string()))));
+        assert_eq!(block_on(c.get_available_margin()).unwrap(), d("8123.45"));
+        assert_eq!(t.requests()[0].url, "https://api-demo.bybit.com/v5/account/wallet-balance?accountType=UNIFIED");
     }
 
     // ---- normalisation ----
