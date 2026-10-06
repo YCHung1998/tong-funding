@@ -8,6 +8,9 @@
 //! tong-funding secrets delete <binance|bybit|okx> <api-key|api-secret|passphrase>
 //! ```
 //!
+//! Everything lives in one Keychain item (see `store::secrets::BundleSecrets`); each subcommand
+//! reads it once and writes it back at most once.
+//!
 //! The value is read from stdin (one line), never from the command line, and is never printed.
 //! Exit codes: 0 ok, 1 store error, 2 usage error.
 
@@ -17,7 +20,7 @@ use tong_funding_core::redact::redact_secrets;
 use tong_funding_core::types::Exchange;
 
 use crate::ports::{SecretName, SecretProvider};
-use crate::store::secrets::{KeyStore, KeychainSecrets};
+use crate::store::secrets::{BundleSecrets, KeyStore, needed};
 
 pub const SUBCOMMAND: &str = "secrets";
 
@@ -49,14 +52,6 @@ fn name_str(n: SecretName) -> &'static str {
     }
 }
 
-/// Which secrets each exchange needs (OKX also needs a passphrase).
-fn needed(exchange: Exchange) -> &'static [SecretName] {
-    match exchange {
-        Exchange::Okx => &[SecretName::ApiKey, SecretName::ApiSecret, SecretName::Passphrase],
-        Exchange::Binance | Exchange::Bybit => &[SecretName::ApiKey, SecretName::ApiSecret],
-    }
-}
-
 fn target(args: &[String]) -> Result<(Exchange, SecretName), String> {
     match args {
         [e, n] => {
@@ -73,10 +68,10 @@ fn target(args: &[String]) -> Result<(Exchange, SecretName), String> {
 
 /// Runs the subcommand on the real Keychain; returns the process exit code.
 pub fn run(args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    run_with(&KeychainSecrets::system(), args, stdin, out, err)
+    run_with(&BundleSecrets::system(), args, stdin, out, err)
 }
 
-fn run_with<S: KeyStore>(secrets: &KeychainSecrets<S>, args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn run_with<S: KeyStore>(secrets: &BundleSecrets<S>, args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let usage = |err: &mut dyn Write, msg: &str| {
         let _ = writeln!(err, "{msg}\n{USAGE}");
         2
@@ -103,7 +98,7 @@ fn run_with<S: KeyStore>(secrets: &KeychainSecrets<S>, args: &[String], stdin: &
             }
             match secrets.set_secret(ex, name, value) {
                 Ok(()) => {
-                    let _ = writeln!(out, "stored {} {}", ex.name(), name_str(name));
+                    let _ = writeln!(out, "stored {} {} (a running app picks it up after a restart)", ex.name(), name_str(name));
                     0
                 }
                 Err(e) => {
@@ -166,7 +161,7 @@ const ENV_KEYS: [(&str, Exchange, SecretName); 7] = [
 
 /// Stores every known credential of a Python-style `.env` file. Values are never printed: the
 /// report names only variables and secrets. Other variables (base URLs, account type) are ignored.
-fn import_env<S: KeyStore>(secrets: &KeychainSecrets<S>, path: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+fn import_env<S: KeyStore>(secrets: &BundleSecrets<S>, path: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -174,7 +169,7 @@ fn import_env<S: KeyStore>(secrets: &KeychainSecrets<S>, path: &str, out: &mut d
             return 1;
         }
     };
-    let mut code = 0;
+    let mut found: Vec<(Exchange, SecretName, &str)> = Vec::new();
     for line in text.lines() {
         let line = line.trim_end_matches('\r').trim();
         if line.is_empty() || line.starts_with('#') {
@@ -195,17 +190,21 @@ fn import_env<S: KeyStore>(secrets: &KeychainSecrets<S>, path: &str, out: &mut d
             let _ = writeln!(out, "skipped {} {} (empty)", ex.name(), name_str(secret));
             continue;
         }
-        match secrets.set_secret(ex, secret, value) {
-            Ok(()) => {
-                let _ = writeln!(out, "stored {} {}", ex.name(), name_str(secret));
+        found.push((ex, secret, value));
+    }
+    // one bundle write for everything
+    match secrets.set_many(&found) {
+        Ok(()) => {
+            for (ex, secret, _) in &found {
+                let _ = writeln!(out, "stored {} {}", ex.name(), name_str(*secret));
             }
-            Err(e) => {
-                code = 1;
-                let _ = writeln!(err, "{} {}: {e}", ex.name(), name_str(secret));
-            }
+            0
+        }
+        Err(e) => {
+            let _ = writeln!(err, "nothing stored: {e}");
+            1
         }
     }
-    code
 }
 
 #[cfg(test)]
@@ -232,7 +231,38 @@ mod tests {
         }
     }
 
-    fn call(s: &KeychainSecrets<Mem>, args: &[&str], stdin: &str) -> (i32, String, String) {
+    /// Counts bundle writes (every write is the one `credentials` item).
+    #[derive(Default)]
+    struct CountingMem(Mem, Mutex<u32>);
+
+    impl KeyStore for CountingMem {
+        fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+            self.0.get(account)
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+            *self.1.lock().unwrap() += 1;
+            self.0.set(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.0.delete(account)
+        }
+    }
+
+    struct Shared(std::sync::Arc<CountingMem>);
+
+    impl KeyStore for Shared {
+        fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+            self.0.get(account)
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+            self.0.set(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.0.delete(account)
+        }
+    }
+
+    fn call(s: &BundleSecrets<Mem>, args: &[&str], stdin: &str) -> (i32, String, String) {
         let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         let code = run_with(s, &args, &mut stdin.as_bytes(), &mut out, &mut err);
@@ -241,7 +271,7 @@ mod tests {
 
     #[test]
     fn set_reads_stdin_stores_and_never_prints_the_value() {
-        let s = KeychainSecrets::new(Mem::default());
+        let s = BundleSecrets::new(Mem::default());
         let (code, out, err) = call(&s, &["set", "binance", "api-secret"], "Sup3rSecretValue\n");
         assert_eq!(code, 0, "{err}");
         assert_eq!(s.get(Exchange::Binance, SecretName::ApiSecret).unwrap().as_deref(), Some("Sup3rSecretValue"));
@@ -254,7 +284,7 @@ mod tests {
 
     #[test]
     fn crlf_is_stripped_but_empty_or_padded_values_are_refused() {
-        let s = KeychainSecrets::new(Mem::default());
+        let s = BundleSecrets::new(Mem::default());
         assert_eq!(call(&s, &["set", "bybit", "api_key"], "abcd1234\r\n").0, 0);
         assert_eq!(s.get(Exchange::Bybit, SecretName::ApiKey).unwrap().as_deref(), Some("abcd1234"));
         for bad in ["\n", "", "   \n", " abcd1234\n", "abcd1234 \n"] {
@@ -266,7 +296,7 @@ mod tests {
 
     #[test]
     fn delete_and_usage_errors() {
-        let s = KeychainSecrets::new(Mem::default());
+        let s = BundleSecrets::new(Mem::default());
         call(&s, &["set", "okx", "api-key"], "k-123456\n");
         assert_eq!(call(&s, &["delete", "okx", "api-key"], "").0, 0);
         assert_eq!(s.get(Exchange::Okx, SecretName::ApiKey).unwrap(), None);
@@ -286,7 +316,7 @@ mod tests {
             "# comment\nBINANCE_API_KEY=bk-AAAA1111\nBINANCE_API_SECRET=\"bs-BBBB2222\"\nBINANCE_BASE_URL=https://testnet.binancefuture.com\n\nBYBIT_API_KEY=\nBYBIT_API_SECRET=ys-CCCC3333\r\nBYBIT_ACCOUNT_TYPE=UNIFIED\nOKX_DEMO_API_KEY='ok-DDDD4444'\nOKX_DEMO_API_SECRET=os-EEEE5555\nOKX_DEMO_PASSPHRASE=my pass phrase\nSOMETHING_ELSE=zzz\n",
         )
         .unwrap();
-        let s = KeychainSecrets::new(Mem::default());
+        let s = BundleSecrets::new(Mem::default());
         let (code, out, err) = call(&s, &["import-env", p.to_str().unwrap()], "");
         assert_eq!(code, 0, "{out}{err}");
         let got = |e, n| s.get(e, n).unwrap();
@@ -305,9 +335,29 @@ mod tests {
 
     #[test]
     fn import_env_with_a_missing_file_fails_without_echoing_anything() {
-        let s = KeychainSecrets::new(Mem::default());
+        let s = BundleSecrets::new(Mem::default());
         let (code, _, err) = call(&s, &["import-env", "/nonexistent/.env"], "");
         assert_eq!(code, 1, "{err}");
         assert_eq!(call(&s, &["import-env"], "").0, 2);
+    }
+
+    #[test]
+    fn import_env_writes_the_bundle_exactly_once_and_set_keeps_other_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".env");
+        std::fs::write(&p, "BINANCE_API_KEY=a1\nBINANCE_API_SECRET=a2\nBYBIT_API_KEY=a3\nBYBIT_API_SECRET=a4\nOKX_DEMO_API_KEY=a5\nOKX_DEMO_API_SECRET=a6\nOKX_DEMO_PASSPHRASE=a7\n").unwrap();
+        let raw = std::sync::Arc::new(CountingMem::default());
+        let s = BundleSecrets::new(Shared(raw.clone()));
+        let args = ["import-env".to_string(), p.to_str().unwrap().to_string()];
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(run_with(&s, &args, &mut "".as_bytes(), &mut out, &mut err), 0);
+        assert_eq!(*raw.1.lock().unwrap(), 1, "one keychain write for seven values");
+        let bundle: serde_json::Value = serde_json::from_str(&raw.0.get("credentials").unwrap().unwrap()).unwrap();
+        assert_eq!(bundle.as_object().unwrap().len(), 7);
+        let set = ["set".to_string(), "bybit".to_string(), "api-key".to_string()];
+        assert_eq!(run_with(&s, &set, &mut "new-key\n".as_bytes(), &mut out, &mut err), 0);
+        assert_eq!(s.get(Exchange::Bybit, SecretName::ApiKey).unwrap().as_deref(), Some("new-key"));
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap().as_deref(), Some("a1"));
+        assert_eq!(*raw.1.lock().unwrap(), 2);
     }
 }

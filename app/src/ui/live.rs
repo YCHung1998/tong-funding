@@ -73,7 +73,7 @@ use crate::store::db::Db;
 use crate::store::event_query::{EventPage, EventQuery};
 use crate::store::events::{EventStore, SCAN_RUN};
 use crate::store::scan_buffer::DEFAULT_CAPACITY;
-use crate::store::secrets::KeychainSecrets;
+use crate::store::secrets::BundleSecrets;
 use crate::store::state::PairRow;
 
 /// Market poll period (Python version: 10 s; unverified against the rate limits).
@@ -415,7 +415,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     }
 
     // Account polls (the same signed clients back the engine's demo account view).
-    let secrets: Arc<dyn SecretProvider> = Arc::new(KeychainSecrets::system());
+    let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
     let mut signed_clients = None;
     let mut ledger_sources = None;
     if let Some(t) = signed.clone() {

@@ -138,4 +138,4 @@ Python 版只在 MANUAL 顯示「立即執行」。Figma 的一鍵送出沒有�
 10. **確認視窗** 以頁面內的確認面板實作（GPUI dialog 元件未驗證，Risks 所述）。
 11. **候選清單只在記憶體**，重啟後清空；新配對的 `internal_uuid` 為 `ui-<ms>-<序號>-<symbol>`、`pair_id` 為 `<SYMBOL>-<ms>`（時間取自 UI 唯一允許讀牆鐘的地方，view-model 由參數注入）。
 12. **組裝根**：`main.rs` 只開一次 `Db`，交給 `LiveSource`；`LiveSource` 在同一個 runtime 上建 `EngineDeps`（`SimulatedExecutor` + `SimPriceBook` 由行情輪詢與 Binance WS 疊加持續餵價、`DemoExecutorFactory` 讀 Keychain、`DemoAccountView` 與模擬帳戶、`RecoveryReconciler`、`PublicMarketData`、`ClockOffsets`、`LogNotifier`）並啟動 engine。engine 運行時配對清單改以 engine snapshot 為準（store 輪詢不再推 Pairs）。沒有資料庫時 engine 不啟動，所有交易動作顯示「引擎未啟動」。headless 子命令仍在建立視窗前結束（source-check 測試）。
-13. **demo 金鑰檢查** 每 30 秒以 `load_credentials` 讀 Keychain（只保留原因字串，不保留或印出任何值）。
+13. **demo 金鑰檢查** 每 30 秒以 `load_credentials` 讀 Keychain（只保留原因字串，不保留或印出任何值）（keychain-single-item 之後讀的是行程內快取：憑證合併為單一鑰匙圈項目、每個程序只讀一次，失敗也快取，所以這個 30 秒檢查不再觸發鑰匙圈詢問；重新啟動才會重讀）。

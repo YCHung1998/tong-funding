@@ -1,10 +1,13 @@
-//! API-key storage in the macOS Keychain, plus redaction of event payloads
+//! API-key storage in the macOS Keychain (one bundle item, cached per process), plus redaction of event payloads
 //! (spec: secret-storage; tasks 4.1, 4.2).
 //!
 //! Calls into `keyring` sit behind the small [`KeyStore`] seam so unit tests never touch the real
 //! Keychain. Callers must treat any `Err` and any `Ok(None)` from [`SecretProvider::get`] as
 //! "not connected" and send no request.
 #![allow(dead_code)]
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use serde_json::Value;
 use tong_funding_core::redact::{PLACEHOLDER, is_sensitive_name, redact_secrets, register_secret};
@@ -89,49 +92,134 @@ impl KeyStore for KeychainStore {
     }
 }
 
-/// `SecretProvider` + store/delete on top of any [`KeyStore`].
-pub struct KeychainSecrets<S: KeyStore = KeychainStore> {
-    store: S,
-}
+/// Account of the single Keychain item that holds every credential (a JSON map
+/// `"<Exchange>:<name>" -> value`), so macOS asks for authorisation once, not once per secret.
+pub const BUNDLE_ACCOUNT: &str = "credentials";
 
-impl KeychainSecrets<KeychainStore> {
-    pub fn system() -> Self {
-        KeychainSecrets { store: KeychainStore::new() }
+type Bundle = BTreeMap<String, String>;
+
+/// Which secrets each exchange needs (OKX also needs a passphrase).
+pub fn needed(exchange: Exchange) -> &'static [SecretName] {
+    match exchange {
+        Exchange::Okx => &[SecretName::ApiKey, SecretName::ApiSecret, SecretName::Passphrase],
+        Exchange::Binance | Exchange::Bybit => &[SecretName::ApiKey, SecretName::ApiSecret],
     }
 }
 
-impl<S: KeyStore> KeychainSecrets<S> {
+/// `SecretProvider` + store/delete on top of any [`KeyStore`]. The bundle item is read once per
+/// process and cached, a failed read included (no retry, so a denied prompt does not come back
+/// every poll); writes go through [`BundleSecrets::update`] and refresh the cache.
+pub struct BundleSecrets<S: KeyStore = KeychainStore> {
+    store: S,
+    cache: Mutex<Option<Result<Bundle, SecretError>>>,
+}
+
+impl BundleSecrets<KeychainStore> {
+    pub fn system() -> Self {
+        BundleSecrets::new(KeychainStore::new())
+    }
+}
+
+impl<S: KeyStore> BundleSecrets<S> {
     pub fn new(store: S) -> Self {
-        KeychainSecrets { store }
+        BundleSecrets { store, cache: Mutex::new(None) }
+    }
+
+    /// Reads the bundle; when the item does not exist yet, migrates the legacy per-account items
+    /// (kept in place) into it. A corrupt bundle is a failure: falling back to legacy items could
+    /// silently use stale credentials.
+    fn load(&self) -> Result<Bundle, SecretError> {
+        match self.store.get(BUNDLE_ACCOUNT).map_err(scrub)? {
+            Some(json) => serde_json::from_str::<Bundle>(&json).map_err(|_| {
+                SecretError::Unavailable("credentials item is not valid JSON; rewrite it with `secrets import-env`".into())
+            }),
+            None => {
+                let mut bundle = Bundle::new();
+                for ex in Exchange::ALL {
+                    for &name in needed(ex) {
+                        let account = account_name(ex, name);
+                        if let Some(v) = self.store.get(&account).map_err(scrub)?.filter(|v| !v.is_empty()) {
+                            bundle.insert(account, v);
+                        }
+                    }
+                }
+                if !bundle.is_empty() {
+                    let json = serde_json::to_string(&bundle).expect("string map serialises");
+                    if let Err(e) = self.store.set(BUNDLE_ACCOUNT, &json) {
+                        eprintln!("credentials migration: bundle not written, will retry next start: {}", scrub(e));
+                    }
+                }
+                Ok(bundle)
+            }
+        }
+    }
+
+    /// Runs `f` on the cached bundle, loading it first if needed.
+    fn with_cache<R>(&self, f: impl FnOnce(&mut Option<Result<Bundle, SecretError>>) -> R) -> R {
+        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.is_none() {
+            let loaded = self.load();
+            if let Ok(b) = &loaded {
+                b.values().for_each(|v| register_secret(v));
+            }
+            *cache = Some(loaded);
+        }
+        f(&mut cache)
+    }
+
+    /// Read-modify-write of the bundle: one load (cached), one store write, only if `f` changed
+    /// something. Fails without writing when the bundle could not be read.
+    fn update(&self, f: impl FnOnce(&mut Bundle)) -> Result<(), SecretError> {
+        self.with_cache(|cache| {
+            let mut next = cache.clone().expect("loaded")?;
+            let before = next.clone();
+            f(&mut next);
+            if next == before {
+                return Ok(());
+            }
+            let json = serde_json::to_string(&next).expect("string map serialises");
+            // a store may echo the value it failed to write; drop every value verbatim
+            self.store.set(BUNDLE_ACCOUNT, &json).map_err(|e| match scrub(e) {
+                SecretError::Unavailable(m) => SecretError::Unavailable(next.values().fold(m, |m, v| m.replace(v.as_str(), PLACEHOLDER))),
+            })?;
+            *cache = Some(Ok(next));
+            Ok(())
+        })
     }
 
     /// Stores (or overwrites) a secret. Empty values are rejected.
     pub fn set_secret(&self, exchange: Exchange, name: SecretName, value: &str) -> Result<(), SecretError> {
-        if value.is_empty() {
+        self.set_many(&[(exchange, name, value)])
+    }
+
+    /// Stores several secrets with a single bundle write. Empty values are rejected.
+    pub fn set_many(&self, items: &[(Exchange, SecretName, &str)]) -> Result<(), SecretError> {
+        if items.iter().any(|(_, _, v)| v.is_empty()) {
             return Err(SecretError::Unavailable("refusing to store an empty secret".into()));
         }
-        register_secret(value);
-        self.store.set(&account_name(exchange, name), value).map_err(|e| match scrub(e) {
-            // a store may echo the value it failed to write; drop it verbatim too
-            SecretError::Unavailable(m) => SecretError::Unavailable(m.replace(value, PLACEHOLDER)),
+        items.iter().for_each(|(_, _, v)| register_secret(v));
+        self.update(|b| {
+            for (e, n, v) in items {
+                b.insert(account_name(*e, *n), v.to_string());
+            }
         })
     }
 
     /// Removes a secret; removing a missing one is not an error.
     pub fn delete_secret(&self, exchange: Exchange, name: SecretName) -> Result<(), SecretError> {
-        self.store.delete(&account_name(exchange, name)).map_err(scrub)
+        self.update(|b| {
+            b.remove(&account_name(exchange, name));
+        })
     }
 }
 
-impl<S: KeyStore> SecretProvider for KeychainSecrets<S> {
+impl<S: KeyStore> SecretProvider for BundleSecrets<S> {
     fn get(&self, exchange: Exchange, name: SecretName) -> Result<Option<String>, SecretError> {
         // An empty stored value is never usable: report it as missing, not as a credential.
-        let value = self.store.get(&account_name(exchange, name)).map_err(scrub)?.filter(|v| !v.is_empty());
-        if let Some(v) = &value {
-            // every secret that leaves the Keychain is tracked by exact value from now on
-            register_secret(v);
-        }
-        Ok(value)
+        self.with_cache(|cache| match cache.as_ref().expect("loaded") {
+            Ok(b) => Ok(b.get(&account_name(exchange, name)).filter(|v| !v.is_empty()).cloned()),
+            Err(e) => Err(e.clone()),
+        })
     }
 }
 
@@ -289,7 +377,7 @@ mod tests {
 
     #[test]
     fn set_then_get_round_trips_per_exchange_and_name() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         s.set_secret(Exchange::Binance, SecretName::ApiKey, "bk").unwrap();
         s.set_secret(Exchange::Bybit, SecretName::ApiKey, "yk").unwrap();
         assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap().as_deref(), Some("bk"));
@@ -299,7 +387,7 @@ mod tests {
 
     #[test]
     fn set_overwrites() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         s.set_secret(Exchange::Okx, SecretName::Passphrase, "old").unwrap();
         s.set_secret(Exchange::Okx, SecretName::Passphrase, "new").unwrap();
         assert_eq!(s.get(Exchange::Okx, SecretName::Passphrase).unwrap().as_deref(), Some("new"));
@@ -307,7 +395,7 @@ mod tests {
 
     #[test]
     fn delete_removes_and_is_idempotent() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         s.set_secret(Exchange::Binance, SecretName::ApiSecret, "x").unwrap();
         s.delete_secret(Exchange::Binance, SecretName::ApiSecret).unwrap();
         assert_eq!(s.get(Exchange::Binance, SecretName::ApiSecret).unwrap(), None);
@@ -316,26 +404,26 @@ mod tests {
 
     #[test]
     fn missing_item_is_none_not_error() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         assert_eq!(s.get(Exchange::Okx, SecretName::ApiKey).unwrap(), None);
     }
 
     #[test]
     fn read_failure_is_an_error_never_a_default() {
-        let s = KeychainSecrets::new(MemStore::failing());
+        let s = BundleSecrets::new(MemStore::failing());
         assert!(matches!(s.get(Exchange::Binance, SecretName::ApiKey), Err(SecretError::Unavailable(_))));
     }
 
     #[test]
     fn write_and_delete_failures_surface() {
-        let s = KeychainSecrets::new(MemStore::failing());
+        let s = BundleSecrets::new(MemStore::failing());
         assert!(s.set_secret(Exchange::Binance, SecretName::ApiKey, "k").is_err());
         assert!(s.delete_secret(Exchange::Binance, SecretName::ApiKey).is_err());
     }
 
     #[test]
     fn empty_value_is_rejected_on_set_and_treated_as_missing_on_get() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         assert!(s.set_secret(Exchange::Binance, SecretName::ApiKey, "").is_err());
         // an empty string already sitting in the store must not be returned as a usable secret
         s.store.set("Binance:api_key", "").unwrap();
@@ -344,7 +432,7 @@ mod tests {
 
     #[test]
     fn works_through_the_secret_provider_trait_object() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         s.set_secret(Exchange::Binance, SecretName::ApiKey, "k").unwrap();
         let p: &dyn SecretProvider = &s;
         assert_eq!(p.get(Exchange::Binance, SecretName::ApiKey).unwrap().as_deref(), Some("k"));
@@ -465,11 +553,11 @@ mod tests {
 
     #[test]
     fn get_contract_empty_missing_and_error() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         s.store.set("Binance:api_key", "").unwrap();
         assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey), Ok(None), "stored empty");
         assert_eq!(s.get(Exchange::Okx, SecretName::ApiKey), Ok(None), "missing");
-        let f = KeychainSecrets::new(MemStore::failing());
+        let f = BundleSecrets::new(MemStore::failing());
         assert!(matches!(f.get(Exchange::Binance, SecretName::ApiKey), Err(SecretError::Unavailable(_))), "error");
     }
 
@@ -488,7 +576,7 @@ mod tests {
 
     #[test]
     fn error_messages_from_any_store_are_redacted() {
-        let s = KeychainSecrets::new(LeakyStore);
+        let s = BundleSecrets::new(LeakyStore);
         let Err(SecretError::Unavailable(m)) = s.get(Exchange::Binance, SecretName::ApiKey) else { panic!() };
         assert!(!m.contains("S3CR3T") && !m.contains("SIG123"), "{m}");
         let Err(SecretError::Unavailable(m)) = s.set_secret(Exchange::Binance, SecretName::ApiKey, "VALUE-XYZ") else { panic!() };
@@ -509,7 +597,7 @@ mod tests {
 
     #[test]
     fn secrets_read_from_the_keychain_are_tracked_by_exact_value() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         s.store.set("Binance:api_secret", "kc-get-Zx81-unique").unwrap();
         assert_eq!(s.get(Exchange::Binance, SecretName::ApiSecret).unwrap().as_deref(), Some("kc-get-Zx81-unique"));
         for text in ["x kc-get-Zx81-unique y", "weird_field\t=kc-get-Zx81-unique", "kc%2Dget%2DZx81%2Dunique"] {
@@ -522,7 +610,7 @@ mod tests {
 
     #[test]
     fn secrets_written_to_the_keychain_are_tracked_too() {
-        let s = KeychainSecrets::new(MemStore::default());
+        let s = BundleSecrets::new(MemStore::default());
         s.set_secret(Exchange::Okx, SecretName::Passphrase, "kc-set-Qp44-unique pass").unwrap();
         assert!(!redact_secrets("a kc-set-Qp44-unique pass b").contains("Qp44"));
     }
@@ -648,6 +736,166 @@ mod tests {
         assert!(dump.contains(KEY) && dump.contains(SIG));
     }
 
+    // ---- keychain-single-item: one bundle item, one read per process ----
+
+    /// Counts every underlying store access, so tests can assert how many Keychain prompts a
+    /// process would trigger. `fail_account` makes only that account error (e.g. a denied bundle).
+    struct CountStore {
+        inner: MemStore,
+        gets: Mutex<Vec<String>>,
+        sets: Mutex<Vec<String>>,
+        fail_set: bool,
+    }
+
+    impl CountStore {
+        fn new() -> Self {
+            CountStore { inner: MemStore::default(), gets: Mutex::default(), sets: Mutex::default(), fail_set: false }
+        }
+        fn with(self, account: &str, value: &str) -> Self {
+            self.inner.set(account, value).unwrap();
+            self
+        }
+        fn gets(&self) -> Vec<String> {
+            self.gets.lock().unwrap().clone()
+        }
+        fn sets(&self) -> Vec<String> {
+            self.sets.lock().unwrap().clone()
+        }
+    }
+
+    impl KeyStore for CountStore {
+        fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+            self.gets.lock().unwrap().push(account.into());
+            self.inner.get(account)
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+            self.sets.lock().unwrap().push(account.into());
+            if self.fail_set {
+                return Err(MemStore::err());
+            }
+            self.inner.set(account, value)
+        }
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.inner.delete(account)
+        }
+    }
+
+    const BUNDLE: &str = "credentials";
+
+    fn bundle_json(s: &BundleSecrets<CountStore>) -> serde_json::Value {
+        serde_json::from_str(&s.store.inner.get(BUNDLE).unwrap().expect("bundle item")).unwrap()
+    }
+
+    #[test]
+    fn many_reads_touch_the_store_exactly_once() {
+        let s = BundleSecrets::new(CountStore::new().with(BUNDLE, r#"{"Binance:api_key":"bk","Binance:api_secret":"bs","Bybit:api_key":"yk","Bybit:api_secret":"ys"}"#));
+        for _ in 0..3 {
+            for (ex, nm) in [(Exchange::Binance, SecretName::ApiKey), (Exchange::Binance, SecretName::ApiSecret), (Exchange::Bybit, SecretName::ApiKey), (Exchange::Bybit, SecretName::ApiSecret), (Exchange::Okx, SecretName::Passphrase)] {
+                let _ = s.get(ex, nm);
+            }
+        }
+        assert_eq!(s.get(Exchange::Bybit, SecretName::ApiSecret).unwrap().as_deref(), Some("ys"));
+        assert_eq!(s.get(Exchange::Okx, SecretName::Passphrase).unwrap(), None);
+        assert_eq!(s.store.gets(), vec![BUNDLE.to_string()], "only the bundle, once");
+        assert!(s.store.sets().is_empty());
+    }
+
+    #[test]
+    fn a_failed_load_is_cached_and_never_retried() {
+        let s = BundleSecrets::new(MemStore::failing());
+        let counted = BundleSecrets::new(CountingFail::default());
+        for _ in 0..4 {
+            assert!(matches!(counted.get(Exchange::Binance, SecretName::ApiKey), Err(SecretError::Unavailable(_))));
+            assert!(matches!(counted.get(Exchange::Bybit, SecretName::ApiSecret), Err(SecretError::Unavailable(_))));
+        }
+        assert_eq!(*counted.store.0.lock().unwrap(), 1, "denied once, no re-prompt");
+        assert!(s.get(Exchange::Okx, SecretName::ApiKey).is_err());
+    }
+
+    #[derive(Default)]
+    struct CountingFail(Mutex<u32>);
+    impl KeyStore for CountingFail {
+        fn get(&self, _: &str) -> Result<Option<String>, SecretError> {
+            *self.0.lock().unwrap() += 1;
+            Err(MemStore::err())
+        }
+        fn set(&self, _: &str, _: &str) -> Result<(), SecretError> {
+            Err(MemStore::err())
+        }
+        fn delete(&self, _: &str) -> Result<(), SecretError> {
+            Err(MemStore::err())
+        }
+    }
+
+    #[test]
+    fn set_writes_into_the_bundle_and_keeps_other_values() {
+        let s = BundleSecrets::new(CountStore::new().with(BUNDLE, r#"{"Binance:api_key":"bk","Binance:api_secret":"bs"}"#));
+        s.set_secret(Exchange::Bybit, SecretName::ApiKey, "yk").unwrap();
+        assert_eq!(bundle_json(&s), json!({"Binance:api_key":"bk","Binance:api_secret":"bs","Bybit:api_key":"yk"}));
+        assert_eq!(s.get(Exchange::Bybit, SecretName::ApiKey).unwrap().as_deref(), Some("yk"), "cache updated");
+        assert_eq!(s.store.sets(), vec![BUNDLE.to_string()]);
+        s.delete_secret(Exchange::Binance, SecretName::ApiKey).unwrap();
+        assert_eq!(bundle_json(&s), json!({"Binance:api_secret":"bs","Bybit:api_key":"yk"}));
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap(), None);
+    }
+
+    #[test]
+    fn set_many_writes_the_bundle_once() {
+        let s = BundleSecrets::new(CountStore::new());
+        s.set_many(&[(Exchange::Binance, SecretName::ApiKey, "a"), (Exchange::Binance, SecretName::ApiSecret, "b"), (Exchange::Okx, SecretName::Passphrase, "c")]).unwrap();
+        assert_eq!(s.store.sets().len(), 1);
+        assert_eq!(bundle_json(&s), json!({"Binance:api_key":"a","Binance:api_secret":"b","OKX:passphrase":"c"}));
+    }
+
+    #[test]
+    fn empty_bundle_values_are_treated_as_unset() {
+        let s = BundleSecrets::new(CountStore::new().with(BUNDLE, r#"{"Binance:api_key":""}"#));
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap(), None);
+    }
+
+    #[test]
+    fn legacy_items_migrate_into_the_bundle_once_and_are_kept() {
+        let legacy = CountStore::new().with("Binance:api_key", "bk").with("Binance:api_secret", "bs").with("Bybit:api_key", "yk").with("Bybit:api_secret", "ys");
+        let s = BundleSecrets::new(legacy);
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap().as_deref(), Some("bk"));
+        assert_eq!(s.get(Exchange::Bybit, SecretName::ApiSecret).unwrap().as_deref(), Some("ys"));
+        assert_eq!(bundle_json(&s), json!({"Binance:api_key":"bk","Binance:api_secret":"bs","Bybit:api_key":"yk","Bybit:api_secret":"ys"}));
+        assert_eq!(s.store.inner.get("Binance:api_key").unwrap().as_deref(), Some("bk"), "legacy item kept");
+        assert_eq!(s.store.sets(), vec![BUNDLE.to_string()]);
+        // the next process sees the bundle and never reads a legacy account
+        let next = BundleSecrets::new(CountStore { inner: MemStore { map: Mutex::new(s.store.inner.map.lock().unwrap().clone()), fail: false }, ..CountStore::new() });
+        assert_eq!(next.get(Exchange::Bybit, SecretName::ApiKey).unwrap().as_deref(), Some("yk"));
+        assert_eq!(next.store.gets(), vec![BUNDLE.to_string()]);
+    }
+
+    #[test]
+    fn nothing_anywhere_means_unset_and_no_empty_bundle() {
+        let s = BundleSecrets::new(CountStore::new());
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap(), None);
+        assert!(s.store.sets().is_empty());
+        assert_eq!(s.store.inner.get(BUNDLE).unwrap(), None);
+    }
+
+    #[test]
+    fn migration_still_works_when_the_bundle_write_fails() {
+        let mut store = CountStore::new().with("Binance:api_key", "bk-migr-fail");
+        store.fail_set = true;
+        let s = BundleSecrets::new(store);
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap().as_deref(), Some("bk-migr-fail"));
+        assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap().as_deref(), Some("bk-migr-fail"));
+        assert_eq!(s.store.sets().len(), 1, "tried once; retried next process");
+    }
+
+    #[test]
+    fn corrupt_bundle_is_a_failure_without_legacy_fallback_or_leak() {
+        let s = BundleSecrets::new(CountStore::new().with(BUNDLE, "{not json S3CR3T-corrupt").with("Binance:api_key", "stale"));
+        let Err(SecretError::Unavailable(m)) = s.get(Exchange::Binance, SecretName::ApiKey) else { panic!("expected failure") };
+        assert!(!m.contains("S3CR3T-corrupt"), "{m}");
+        assert_eq!(s.store.gets(), vec![BUNDLE.to_string()], "no legacy fallback");
+        assert!(s.set_secret(Exchange::Binance, SecretName::ApiKey, "new").is_err(), "must not overwrite a bundle it cannot read");
+        assert!(s.store.sets().is_empty());
+    }
+
     /// Real Keychain round trip. Pops a macOS authorization dialog and writes to the user's real
     /// Keychain, so it is ignored by default. Run by hand:
     /// `cargo test -p tong-funding store::secrets::tests::real_keychain -- --ignored --nocapture`
@@ -655,7 +903,7 @@ mod tests {
     #[ignore = "touches the real macOS Keychain"]
     fn real_keychain_round_trip() {
         // dedicated service name: never touches the user's real tong-funding credentials
-        let s = KeychainSecrets::new(KeychainStore::with_service("tong-funding-test"));
+        let s = BundleSecrets::new(KeychainStore::with_service("tong-funding-test"));
         let (ex, nm) = (Exchange::Binance, SecretName::ApiKey);
         s.delete_secret(ex, nm).unwrap();
         assert_eq!(s.get(ex, nm).unwrap(), None);
