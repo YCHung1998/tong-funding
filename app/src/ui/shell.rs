@@ -479,7 +479,7 @@ impl Shell {
         if matches!(vm.visible(self.only_qualified), RowsView::NoneQualified) {
             body = body.child(text("目前沒有達標標的", theme::TEXT_MUTED));
         } else if !matches!(vm.state, ScanState::Loading) {
-            body = body.child(div().h(px(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
+            body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(px(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
         }
         let chips = self.column_chips(cx);
         div().flex().flex_col().gap_3().child(header).child(cards).child(controls).child(chips).child(body).child(candidate_list)
@@ -596,7 +596,9 @@ impl Shell {
             Page::ManualOrder => self.manual_order_page(cx),
         };
         let replies = self.replies_strip();
-        div().id("content").flex_1().p_6().overflow_y_scroll().child(replies).child(inner)
+        // `min_w_0`: a flex item never shrinks below its content, so without it a wide page (the scanner
+        // table) pushed the whole page past the window edge instead of letting the table scroll inside.
+        div().id("content").flex_1().min_w_0().p_6().overflow_y_scroll().child(replies).child(inner)
     }
 
     fn status_bar(&self) -> Div {

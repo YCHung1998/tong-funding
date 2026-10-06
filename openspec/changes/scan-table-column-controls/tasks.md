@@ -18,14 +18,14 @@
 
 ## 4. 橫向捲動與固定欄（含前置驗證）
 
-- [ ] 4.1 前置驗證：Rank、Symbol 設 `fixed_left()`，視窗縮窄時以 `tools/window_shot.sh` 擷取視窗截圖，確認橫向捲軸出現、固定欄不透出下方內容、標題與資料列對齊；不通過則降級為只做橫向捲動並修改 spec 與 design 的對應敘述
-- [ ] 4.2 隱藏欄位使總寬小於可視寬度時不出現橫向捲動（截圖或純函式「總寬」測試）
+- [x] 4.1 前置驗證（結果：固定左側欄可用，見下）：Rank、Symbol 設 `fixed_left()`，視窗縮窄時以 `tools/window_shot.sh` 擷取視窗截圖，確認橫向捲軸出現、固定欄不透出下方內容、標題與資料列對齊；不通過則降級為只做橫向捲動並修改 spec 與 design 的對應敘述
+- [x] 4.2 隱藏欄位使總寬小於可視寬度時不出現橫向捲動（純函式 `total_width_shrinks_when_columns_are_hidden_and_decides_horizontal_scroll`；UI 層的版面限制由 `the_table_stays_inside_the_window_and_the_overflow_scrolls_inside_it` 驗證）
 
 ## 5. 欄位按鈕列
 
-- [ ] 5.1 在 `controls` 與表格之間加入欄位按鈕列（每欄一顆，可換行）與「重設欄位」；顯示中／已隱藏樣式走 design-tokens，通過 `app/tests/no_color_literals.rs`
-- [ ] 5.2 以 `tools/window_shot.sh` 擷取掃幣頁截圖：預設、隱藏數欄、依 Net Edge 降冪、窄視窗橫向捲動（附於回報，供使用者重現）
+- [x] 5.1 在 `controls` 與表格之間加入欄位按鈕列（每欄一顆，可換行）與「重設欄位」；顯示中／已隱藏樣式走 design-tokens，通過 `app/tests/no_color_literals.rs`
+- [x] 5.2 實機截圖（視窗限定擷取，`HOME` 指向暫存目錄不碰真實資料庫）：預設狀態與版面修正前後各一張已取得；隱藏/排序/捲動後的截圖因為在使用中的桌面上以真實滑鼠點擊、滾輪不穩定（視窗常失焦、大小被改變）而沒有取得，改以無視窗的 `scan_table_ui_tests.rs`（真實 Shell、真實 hit-test 點擊）驗證，請 Eason 以 `cargo run -p tong-funding` 自行目視確認
 
 ## 6. 收尾
 
-- [ ] 6.1 `openspec validate scan-table-column-controls`、`cargo test --workspace`（私有 target）全綠；在 `TODO.md` 記錄「排序後 `--bench-table` 幀時間」的實機量測待辦；更新 `TASKS.md`
+- [x] 6.1 `openspec validate scan-table-column-controls`、`cargo test --workspace`（私有 target）全綠；在 `TODO.md` 記錄「排序後 `--bench-table` 幀時間」的實機量測待辦；更新 `TASKS.md`

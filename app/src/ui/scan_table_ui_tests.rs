@@ -283,3 +283,51 @@ fn the_table_scrolls_sideways_when_the_columns_are_wider_than_the_window(cx: &mu
     let moved = offset(&rig, cx);
     assert!(moved < start, "scrolled left by the wheel: {start:?} -> {moved:?}");
 }
+
+#[gpui_kit::test]
+fn the_table_stays_inside_the_window_and_the_overflow_scrolls_inside_it(cx: &mut TestAppContext) {
+    // Real-window finding: the page used to grow wider than the window and get clipped, so the
+    // columns on the right could not be reached and the table never scrolled.
+    let rig = open_sized(cx, NARROW);
+    let (table, last_header) = cx
+        .update_window(rig.window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            (window.find("scan-table").bounds(), window.try_find(("col-header", 11usize)).map(|e| e.bounds()))
+        })
+        .unwrap();
+    assert!(table.right() <= px(NARROW) + px(0.5), "the table container ends at {:?}, past the {NARROW} px window", table.right());
+    assert!(table.size.width > px(300.), "and it is not collapsed: {:?}", table.size.width);
+    let total = ScanColumn::ALL.iter().map(|c| c.width()).sum::<f32>();
+    assert!(total > NARROW, "the test only means something when the columns are wider than the window");
+    // The last column is outside the table's viewport: the library does not even draw it until scrolled.
+    assert!(last_header.is_none_or(|b| b.right() > px(NARROW)), "the last column header must not already be inside the window: {last_header:?}");
+}
+
+#[gpui_kit::test]
+fn scrolling_brings_the_last_column_into_view(cx: &mut TestAppContext) {
+    let rig = open_sized(cx, NARROW);
+    let last = |rig: &Rig, cx: &mut TestAppContext| {
+        cx.update_window(rig.window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.try_find(("col-header", 11usize)).map(|e| e.bounds().right())
+        })
+        .unwrap()
+    };
+    let before = last(&rig, cx);
+    assert!(before.is_none_or(|r| r > px(NARROW)), "not reachable before scrolling: {before:?}");
+    for _ in 0..4 {
+        cx.update_window(rig.window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // any header that is currently drawn inside the table's scrolling part
+            let drawn: Vec<usize> = (0..12usize).filter(|i| window.try_find(("scan-th", *i)).is_some()).collect();
+            // Rank and Symbol (0, 1) are fixed on the left: they stay drawn while the others scroll away.
+            assert!(drawn.contains(&0) && drawn.contains(&1), "fixed columns must stay drawn: {drawn:?}");
+            let target = *drawn.iter().find(|i| **i >= 2).expect("some scrolling header is drawn");
+            window.scroll(("scan-th", target), ScrollDelta::Pixels(point(px(-400.), px(0.))), cx);
+        })
+        .unwrap();
+        rig.settle(cx);
+    }
+    let after = last(&rig, cx).expect("after scrolling the last column is drawn");
+    assert!(after <= px(NARROW) + px(0.5), "and it is fully inside the window: {after:?}");
+}

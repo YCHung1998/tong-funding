@@ -51,6 +51,14 @@
 - **欄位重建時排序圖示**：`refresh` 會重新呼叫 `column(ix)`，若沒有把目前的 `SortState` 寫回 `Column.sort`，圖示會消失。緩解：D4 規定 `column()` 依 `SortState` 設定；測試純函式 `column_sort_of(state, col)`。
 - **字串排序**：Symbol 全是 ASCII（`BTCUSDT`、`1000PEPEUSDT`），不分大小寫比較足夠；不引入 Unicode 排序相依。
 
+## Implementation Notes
+
+- **版面問題（實機截圖發現，task 4.1）**：`content`（頁面容器）是 flex 子項目但沒有 `min_w_0`，內容比視窗寬時它不會縮小，整頁被撐寬後被視窗邊緣裁掉，表格自己的橫向捲動永遠不會啟動，右側欄位也點不到。修正：`content` 加 `min_w_0`、表格容器加 `w_full().min_w_0()`。測試：`the_table_stays_inside_the_window_and_the_overflow_scrolls_inside_it`（修正前表格容器延伸到 1688 px，視窗 1000 px）。
+- **標題文字可點**：gpui-component 只在點小圖示時排序；標題文字點擊由 `render_th` 另外處理（`CycleSort`），圖示點擊走 `perform_sort`（`SetSort`），兩者共用同一個 `ScanViewState`。
+- **固定左側欄的證據**：`scrolling_brings_the_last_column_into_view` 在每次捲動前斷言第 0、1 欄（Rank、Symbol）仍被繪製，中間欄被捲出。
+- **無視窗的 Shell 測試**：以 gpui-kit 的 `test-support`（只在 dev-dependency 啟用）依元素 id 模擬點擊與捲動；元素以 `.test_support()` 註冊（正式版為 no-op）。
+- **測試輔助函式的教訓**：只讀 delegate 狀態會看不出「Shell 狀態被重設但尚未同步到表格」；`Rig::view` 現在同時比對 `Shell.view` 與 delegate。
+
 ## Open Questions
 
 - 欄位與排序要不要在重啟後保留？v1 預設「不保留」，若之後需要，再用 store 的 config 鍵 `ui.scan_table`（需通過寫入端的秘密檢查，內容只是欄位名稱）另開 change。
