@@ -13,4 +13,4 @@
 ## 3. 驗證
 
 - [x] 3.1 `cargo test -p tong-funding ui::manual_order` 與全套 `cargo test` 綠燈
-- [ ] 3.2 實機（SIMULATION）：先手動開一筆倉 → 清單出現 → 帶入平倉 → 確認 → 持倉歸零；截圖
+- [x] 3.2 實機（SIMULATION）：先手動開一筆倉 → 清單出現 → 帶入平倉 → 確認 → 持倉歸零；截圖（使用者實機確認 2026-10-06）

@@ -2,7 +2,7 @@
 
 - [x] 1.1 `theme.rs` 新增 `TABLE_ROW` / `TABLE_STRIPE` / `TABLE_HOVER`，`theme_tests.rs` 加對比度與奇偶亮度比 ≥ 1.2 測試（先紅後綠）
 - [x] 1.2 `component_theme.rs` 改用 `Theme::update` 同步 colors → tokens，表底 / 斑馬 / hover 改用新配色；能的話加 `tokens.table_even == TABLE_STRIPE` 測試
-- [ ] 1.3 實機截圖確認掃幣表奇偶列底色不同，並逐頁檢查其他元件顏色未異常
+- [x] 1.3 實機截圖確認掃幣表奇偶列底色不同，並逐頁檢查其他元件顏色未異常（使用者實機確認 2026-10-06）
 
 ## 2. 達標公式
 
@@ -13,4 +13,4 @@
 ## 3. 驗證
 
 - [x] 3.1 `cargo test -p tong-funding ui::scanner` 與全套 `cargo test` 綠燈
-- [ ] 3.2 實機：改風控設定中的滑價，回掃幣頁確認公式數字與結果跟著改變；截圖
+- [x] 3.2 實機：改風控設定中的滑價，回掃幣頁確認公式數字與結果跟著改變；截圖（使用者實機確認 2026-10-06）
