@@ -52,6 +52,8 @@ pub struct Shell {
     alerts: Vec<Alert>,
     dismissed: BTreeSet<AlertKey>,
     only_qualified: bool,
+    /// The "達標計算" block on the scanner page is expanded (default).
+    breakdown_open: bool,
     /// Scanner table controls (shown columns, sort). Lives here, not in the page, so it survives
     /// page switches; never persisted (spec scanner-table-controls).
     pub(crate) view: ScanViewState,
@@ -142,6 +144,7 @@ impl Shell {
             pos_filter: positions::Filter::default(),
             dismissed: BTreeSet::new(),
             only_qualified: false,
+            breakdown_open: true,
             view: ScanViewState::default(),
             scan_events,
             table,
@@ -406,7 +409,6 @@ impl Shell {
                     .flex()
                     .gap_3()
                     .items_center()
-                    .child(small(vm.threshold_text.clone(), theme::TEXT_SECONDARY))
                     .child(
                         div()
                             .id("to-risk")
@@ -418,6 +420,30 @@ impl Shell {
                             .child(small("於風控設定修改 →", theme::ACCENT)),
                     ),
             );
+        let mut breakdown = pages::card().child(
+            div()
+                .id("breakdown-toggle")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.breakdown_open = !this.breakdown_open;
+                    cx.notify();
+                }))
+                .child(small(if self.breakdown_open { "▾ 達標計算" } else { "▸ 達標計算" }, theme::TEXT_PRIMARY)),
+        );
+        if self.breakdown_open {
+            if vm.breakdown.is_empty() {
+                breakdown = breakdown.child(small("需至少兩個啟用且可交易的交易所才能計算", theme::TEXT_MUTED));
+            }
+            for l in &vm.breakdown {
+                for line in l.lines() {
+                    breakdown = breakdown.child(small(line, if l.calc.is_ok() { theme::TEXT_SECONDARY } else { theme::WARNING }));
+                }
+            }
+            breakdown = breakdown.child(small(
+                "門檻 net_edge_threshold_pct · 手續費 taker_fee_pct · 滑價 est_slippage_pct · 安全邊際 safety_margin_pct · 最低淨利 min_expected_net_pnl_pct",
+                theme::TEXT_MUTED,
+            ));
+        }
         let summary = |label: &str, value: String| pages::card().child(small(label.to_string(), theme::TEXT_MUTED)).child(text(value, theme::TEXT_PRIMARY).text_size(px(14.0)));
         let cards = div()
             .flex()
@@ -482,7 +508,7 @@ impl Shell {
             body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(px(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
         }
         let chips = self.column_chips(cx);
-        div().flex().flex_col().gap_3().child(header).child(cards).child(controls).child(chips).child(body).child(candidate_list)
+        div().flex().flex_col().gap_3().child(header).child(breakdown).child(cards).child(controls).child(chips).child(body).child(candidate_list)
     }
 
     /// One button per column (show/hide) and a reset; Symbol is locked on.
