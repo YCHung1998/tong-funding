@@ -223,6 +223,7 @@ mod tests {
             side: OrderSide::Buy,
             quantity: d("0.019"),
             reduce_only: false,
+            intended_base_qty: None,
         }
     }
 

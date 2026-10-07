@@ -234,6 +234,37 @@ fn pnl_a_fill_without_its_contract_value_is_incomplete_with_a_named_reason_and_n
     assert_eq!(compute_pnl(&spec_case()), compute_pnl(&q));
 }
 
+#[test]
+fn pnl_an_okx_close_without_its_contract_value_is_incomplete_without_a_quantity_mismatch() {
+    // S1: open recorded with ct_val (10 coins); after a restart the close (1000 contracts) has none.
+    // The raw contract count must not be added to `closed`: no "open 10, closed 1000" text.
+    let mut p = spec_case();
+    p.legs[1].fills[0].quantity = d("10");
+    p.legs[1].fills[1].quantity = d("1000");
+    p.legs[1].fills[1].contract_value_missing = true;
+    let b = compute_pnl(&p);
+    match &b.status {
+        PnlStatus::Incomplete(r) => {
+            assert!(r.iter().any(|x| matches!(x, IncompleteReason::MissingContractValue { id, .. } if id == "s-close")), "{r:?}");
+            assert!(!r.iter().any(|x| matches!(x, IncompleteReason::OpenCloseQuantityMismatch { .. })), "no bogus quantity mismatch: {r:?}");
+            for x in r {
+                assert!(!x.label().contains("1000"), "{}", x.label());
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+    // and the symmetric case: the open lost its contract value
+    let mut q = spec_case();
+    q.legs[1].fills[0].quantity = d("1000");
+    q.legs[1].fills[0].contract_value_missing = true;
+    q.legs[1].fills[1].quantity = d("10");
+    let r = match compute_pnl(&q).status {
+        PnlStatus::Incomplete(r) => r,
+        other => panic!("{other:?}"),
+    };
+    assert!(!r.iter().any(|x| matches!(x, IncompleteReason::OpenCloseQuantityMismatch { .. })), "{r:?}");
+}
+
 fn window(exchange: Exchange, opened: i64, closed: Option<i64>) -> LegWindow {
     LegWindow { exchange, symbol: "BTCUSDT".into(), opened_at_ms: opened, closed_at_ms: closed }
 }

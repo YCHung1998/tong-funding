@@ -72,7 +72,7 @@ impl OrderHttpRequest {
     }
     /// Generic header. The OKX demo flag and `OK-ACCESS-*` are NOT settable here (see `okx_auth`).
     pub fn header(mut self, name: &str, value: &str) -> Self {
-        if is_protected_okx_header(name) {
+        if !crate::exchange::transport::is_valid_header_name(name) || is_protected_okx_header(name) {
             self.protected_header_misuse = true;
         } else {
             self.headers.push((name.to_string(), value.to_string()));
@@ -297,6 +297,16 @@ pub mod fake {
 
     impl OrderTransport for FakeOrderTransport {
         fn send(&self, req: OrderHttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {
+            // Every OKX request must pass the REAL admission rule, exactly like on the real transport,
+            // so executor-level tests cannot pass with a request the real transport would refuse.
+            if let Ok(url) = reqwest::Url::parse(req.full_url())
+                && url.host_str().is_some_and(crate::exchange::signed::endpoints::is_okx_host)
+            {
+                assert!(
+                    !req.misuses_protected_header() && HostPolicy::SignedDemo.allows(&url, req.headers()),
+                    "an OKX request the real admission rule would refuse: {req:?}"
+                );
+            }
             let reply = {
                 let mut script = self.inner.script.lock().unwrap();
                 // Longest matching key wins, so a specific script beats a generic one.
@@ -514,5 +524,46 @@ mod tests {
         let mut r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "/v5/order/create", Duration::from_millis(50));
         r.url = "https://example.invalid/v5/order/create".into();
         assert_eq!(t.send(r).await, Err(AdapterError::network("host not allowed")));
+    }
+
+    // ---- round 2: R7 (the fake runs the real admission rule), R8 (token-only names), S3 (real transport) ----
+
+    #[tokio::test]
+    #[should_panic(expected = "real admission rule")]
+    async fn the_fake_order_transport_panics_on_an_okx_request_the_real_rule_would_refuse() {
+        let fake = fake::FakeOrderTransport::new();
+        fake.on(Method::Get, "/x", fake::Reply::ok("{}"));
+        let mut r = OrderHttpRequest::to_demo(Method::Get, DemoEnv::Okx(OkxHost::Demo), "/x", Duration::from_secs(1));
+        r.headers.clear(); // an OKX request that lost its flag
+        let _ = fake.send(r).await;
+    }
+
+    #[test]
+    fn header_names_that_are_not_http_tokens_are_refused_and_mark_the_request() {
+        for name in ["x-simulated-trading ", " x-simulated-trading", "x-simulated-trading\n", "x\u{0445}-simulated-trading", "x simulated", "", "ok-access-key\r\nx: y", "na:me"] {
+            let r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/p", Duration::from_secs(1)).header(name, "1");
+            assert!(r.misuses_protected_header(), "{name:?} must be refused");
+            assert_eq!(r.headers().len(), 1, "{name:?}: only the constructor's flag is present");
+        }
+        let ok = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "/p", Duration::from_secs(1)).header("X-BAPI-API-KEY", "k");
+        assert!(!ok.misuses_protected_header() && ok.headers().len() == 1);
+    }
+
+    /// S3: the REAL order transport with the real `SignedDemo` policy refuses an OKX URL without the
+    /// flag before DNS or any connection. The error is the policy's refusal, not a network error, and
+    /// it comes back immediately. (A request that would pass is never sent here.)
+    #[tokio::test]
+    async fn the_real_order_transport_refuses_the_real_okx_host_without_the_flag_before_any_connection() {
+        let t = ReqwestOrderTransport::signed_demo().unwrap();
+        for method in [Method::Get, Method::Post, Method::Delete] {
+            let mut r = OrderHttpRequest::to_demo(method, DemoEnv::Okx(OkxHost::Demo), "/api/v5/trade/order", Duration::from_secs(30));
+            r.headers.clear();
+            let started = std::time::Instant::now();
+            assert_eq!(t.send(r).await, Err(AdapterError::network("host not allowed")), "{method:?}");
+            assert!(started.elapsed() < Duration::from_millis(500), "no DNS, no connection: {:?}", started.elapsed());
+        }
+        let mut dup = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/api/v5/trade/order", Duration::from_secs(30));
+        dup.headers.push(("X-Simulated-Trading".into(), "0".into()));
+        assert_eq!(t.send(dup).await, Err(AdapterError::network("host not allowed")), "a second, different flag");
     }
 }

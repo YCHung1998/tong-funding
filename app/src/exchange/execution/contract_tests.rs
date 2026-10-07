@@ -42,6 +42,7 @@ trait Harness {
     fn expire_unknown_submits(&self) -> bool {
         false
     }
+    fn pass_time_between_lookups(&self) {}
     fn executor(&self) -> Arc<dyn Executor>;
     fn simulated(&self) -> bool;
     fn id(&self, seq: u16) -> String;
@@ -105,8 +106,11 @@ impl Harness for OkxDemo {
         Exchange::Okx
     }
     fn expire_unknown_submits(&self) -> bool {
-        self.0.clock.advance(6_000);
+        self.0.clock.advance(8_000); // expTime + the 2 s margin
         true
+    }
+    fn pass_time_between_lookups(&self) {
+        self.0.clock.advance(1_500); // the second confirmation must be a second after the first
     }
     fn executor(&self) -> Arc<dyn Executor> {
         self.0.ex.clone()
@@ -201,7 +205,7 @@ impl Harness for Demo {
 }
 
 fn order(exchange: Exchange, id: &str) -> OrderRequest {
-    OrderRequest { client_order_id: id.into(), exchange, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d(QTY), reduce_only: false }
+    OrderRequest { client_order_id: id.into(), exchange, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d(QTY), reduce_only: false, intended_base_qty: (exchange == Exchange::Okx).then(|| d(QTY) * d("0.01")) }
 }
 
 fn found(o: QueryOutcome) -> crate::engine::ports::OrderStatus {
@@ -244,6 +248,7 @@ async fn contract(h: &dyn Harness) {
     assert!(matches!(ex.submit(order(h.exchange(), &id)).await, SubmitOutcome::Unknown { .. }));
     if h.expire_unknown_submits() {
         assert!(matches!(ex.query(h.exchange(), "BTCUSDT", &id).await, QueryOutcome::Failed { .. }), "one confirmation is not enough");
+        h.pass_time_between_lookups();
     }
     assert_eq!(ex.query(h.exchange(), "BTCUSDT", &id).await, QueryOutcome::NotFound);
 

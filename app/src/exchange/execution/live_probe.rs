@@ -153,6 +153,30 @@ fn filled(o: &QueryOutcome) -> Decimal {
     }
 }
 
+/// The quantity to close on one leg. A leg whose fill is known closes what was filled. A leg whose
+/// order ended without a known fill (lookup failed, or not found) is NEVER skipped silently: the
+/// account position is read and any non-zero position is closed; if even that fails a loud manual
+/// instruction is printed (a skipped close would leave an open demo position behind).
+async fn closing_quantity(account: &dyn AccountView, exchange: Exchange, symbol: &str, outcome: &QueryOutcome) -> Decimal {
+    if let QueryOutcome::Found(s) = outcome {
+        return s.filled_quantity;
+    }
+    match account.positions(exchange).await {
+        Ok(list) => {
+            let held = list.items.iter().filter(|p| p.symbol == symbol).map(|p| p.quantity.abs()).max().unwrap_or(Decimal::ZERO);
+            if held > Decimal::ZERO || !list.complete {
+                println!("  !!! {} leg ended with an unknown fill ({outcome:?}); position on the account: {held} (list complete: {}); closing that quantity", exchange.name(), list.complete);
+            }
+            held
+        }
+        Err(e) => {
+            println!("  !!! {} leg ended with an unknown fill ({outcome:?}) and its position could not be read ({e}).", exchange.name());
+            println!("  !!! MANUAL ACTION: check the {} demo account for an open {symbol} position and close it by hand; this probe sends no close for that leg.", exchange.name());
+            Decimal::ZERO
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "places real demo/testnet orders; run on the Mac with the user present (TODO.md)"]
 async fn live_demo_probe() {
@@ -232,7 +256,7 @@ async fn live_demo_probe() {
             symbol: symbol.clone(),
             side,
             quantity: q,
-            reduce_only: action == OrderAction::Close,
+            reduce_only: action == OrderAction::Close, intended_base_qty: None,
         };
         let trigger = clock.now_ms();
         let long = req(Leg::Long, OrderAction::Open, long_ex, OrderSide::Buy, leg_qty(long_ex));
@@ -247,7 +271,7 @@ async fn live_demo_probe() {
         let _ = events.append("PROBE_FILLS", Some(&pair), json!({ "long": format!("{lf:?}"), "short": format!("{sf:?}") }));
 
         let close_trigger = clock.now_ms();
-        let (lq, sq) = (filled(&lf), filled(&sf));
+        let (lq, sq) = (closing_quantity(&account, long_ex, &symbol, &lf).await, closing_quantity(&account, short_ex, &symbol, &sf).await);
         let lc = req(Leg::Long, OrderAction::Close, long_ex, OrderSide::Sell, lq);
         let sc = req(Leg::Short, OrderAction::Close, short_ex, OrderSide::Buy, sq);
         let (lcid, scid) = (lc.client_order_id.clone(), sc.client_order_id.clone());
@@ -281,7 +305,7 @@ async fn live_demo_probe() {
             symbol: symbol.clone(),
             side,
             quantity: leg_qty(exchange),
-            reduce_only: true,
+            reduce_only: true, intended_base_qty: None,
         };
         let out = submit_logged(&db, &events, &ex, clock.as_ref(), &pair, leg, OrderAction::Close, r, clock.now_ms()).await;
         println!("reduce-only without a position on {}: {out:?}", exchange.name());

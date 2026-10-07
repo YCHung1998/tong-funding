@@ -19,6 +19,7 @@ use super::okx::{OkxLimitsSource, OkxOrderClient};
 use crate::engine::ports::{Executor, ExecutorFactory, ServerOffsets};
 use crate::exchange::health::ratelimit::RateLimiter;
 use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost};
+use crate::exchange::signed::okx::OkxLatch;
 use crate::exchange::signed::signing::{Credentials, load_credentials};
 use crate::ports::{SecretProvider, TimeSource};
 
@@ -31,6 +32,9 @@ pub struct DemoExecutorFactory<T> {
     limiter: Arc<RateLimiter>,
     binance_env: BinanceHost,
     okx_limits: Option<Arc<dyn OkxLimitsSource>>,
+    /// The one OKX latch of the process: every executor this factory builds shares it, and the
+    /// read client gets the same `Arc` from `okx_latch()` (okx-trading-enablement 3.5).
+    okx_latch: Arc<OkxLatch>,
 }
 
 impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
@@ -45,7 +49,12 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
         limiter: Arc<RateLimiter>,
         binance_env: BinanceHost,
     ) -> Self {
-        DemoExecutorFactory { transport, secrets, clock, offsets, intents, limiter, binance_env, okx_limits: None }
+        DemoExecutorFactory { transport, secrets, clock, offsets, intents, limiter, binance_env, okx_limits: None, okx_latch: OkxLatch::new() }
+    }
+
+    /// The process-wide OKX latch (a `50101` anywhere disables OKX everywhere).
+    pub fn okx_latch(&self) -> Arc<OkxLatch> {
+        self.okx_latch.clone()
     }
 
     /// Where the OKX size guard gets `ctVal` / `lotSz` / mark price / the notional cap. Without it
@@ -72,7 +81,8 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
             self.offsets.clone(),
             self.intents.clone(),
             self.limiter.clone(),
-        );
+        )
+        .with_okx_latch(self.okx_latch.clone());
         // OKX is optional (design D5): key, secret and passphrase, else OKX orders are not sent.
         let executor = match &self.okx_limits {
             Some(l) => executor.with_okx_limits(l.clone()),

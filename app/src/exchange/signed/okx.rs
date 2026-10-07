@@ -20,7 +20,6 @@ use super::signing::{
     parse_json, require_offset, sanitize_error,
 };
 use crate::exchange::error::AdapterError;
-use crate::exchange::execution::executor::POSITION_MODE_TTL_MS;
 use crate::exchange::transport::{HttpRequest, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
@@ -30,28 +29,37 @@ const OKX_POSITIONS_PATH: &str = "/api/v5/account/positions";
 const OKX_PENDING_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
 /// Page size of `orders-pending` (documented maximum 100; UNVERIFIED against a real account).
 const OKX_ORDERS_PAGE_LIMIT: usize = 100;
-/// `code` values meaning "slow down" (rate limit; sub-account order rate limit).
-const RATE_LIMIT_CODES: [&str; 2] = ["50011", "50061"];
+/// OKX codes meaning "slow down" (request too frequent, sub-account rate limit). ONE list for the
+/// read and the order paths.
+pub const OKX_RATE_LIMIT_CODES: [i64; 2] = [50011, 50061];
+/// OKX codes meaning "the outcome is unknown" (service unavailable, endpoint timeout - "does not mean
+/// the request was successful or failed" -, system busy, system error). UNVERIFIED list.
+pub const OKX_UNKNOWN_CODES: [i64; 4] = [50001, 50004, 50013, 50026];
 /// Code of the `AdapterError::Exchange` that reports an unsupported account mode.
 pub const ACCOUNT_MODE_CODE: &str = "acct_mode_unsupported";
 
-/// Process-wide "OKX is disabled" latch: tripped by an environment mismatch (`50101`) on any OKX
-/// request. Once tripped it never resets; the order client and the read client can share one `Arc`.
+/// How long a confirmed account-mode reading is trusted (read gate and the executor's one-way gate).
+pub const POSITION_MODE_TTL_MS: i64 = 60_000;
+
+/// The one reason text of an environment mismatch (`50101`).
+pub const ENV_MISMATCH_REASON: &str = "OKX 50101: API key does not match the environment (demo flag sent); OKX disabled until restart";
+
+/// "OKX is disabled" latch, tripped by an environment mismatch (`50101`) on any OKX request. Once
+/// tripped (first reason wins) it never resets. Production owns ONE `Arc<OkxLatch>` (the executor
+/// factory, `okx_latch()`) and hands it to the order client and to the read client
+/// (`OkxSignedClient::with_latch`, wired in okx-trading-enablement 3.5).
 #[derive(Debug, Default)]
-pub struct OkxLatch(Mutex<Option<String>>);
+pub struct OkxLatch(std::sync::OnceLock<String>);
 
 impl OkxLatch {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
     pub fn trip(&self, reason: &str) {
-        let mut g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if g.is_none() {
-            *g = Some(reason.to_string());
-        }
+        let _ = self.0.set(reason.to_string());
     }
     pub fn reason(&self) -> Option<String> {
-        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        self.0.get().cloned()
     }
 }
 
@@ -108,7 +116,7 @@ impl<T: HttpTransport> OkxSignedClient<T> {
         OkxSignedClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None), mode: Mutex::new(None), latch: OkxLatch::new() }
     }
 
-    /// Shares an `OkxLatch` (with the order client): `50101` anywhere disables OKX everywhere.
+    /// Shares the production `OkxLatch` (owned by the executor factory) with the order client.
     pub fn with_latch(mut self, latch: Arc<OkxLatch>) -> Self {
         self.latch = latch;
         self
@@ -216,16 +224,10 @@ impl<T: HttpTransport> OkxSignedClient<T> {
         Ok(incomplete(items, format!("page cap of {MAX_PAGES} reached")))
     }
 
-    /// A signed GET of an OKX read endpoint for the sibling clients (ledger): the same request
-    /// construction, demo flag, `50102` retry and latch as every other read.
-    pub(in crate::exchange) async fn get_signed(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
-        self.signed_get(path, query).await
-    }
-
     /// One attempt; if the exchange rejects the timestamp (`50102`), re-sync the clock once and send
     /// exactly one more request, rebuilt from scratch (so it carries the same demo flag by the same
     /// constructor). A second rejection, or a failed re-sync, is returned as is.
-    async fn signed_get(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
+    pub(in crate::exchange) async fn signed_get(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
         match self.attempt(path, query).await {
             Err(e) if is_timestamp_rejected(&e) => {
                 self.resync.resync().await.map_err(sanitize_error)?;
@@ -251,7 +253,7 @@ impl<T: HttpTransport> OkxSignedClient<T> {
         if let Err(AdapterError::Exchange { code, .. }) = &result
             && code == ENV_MISMATCH_CODE
         {
-            self.latch.trip("OKX 50101: API key does not match the environment (demo flag sent); OKX disabled until restart");
+            self.latch.trip(ENV_MISMATCH_REASON);
         }
         result
     }
@@ -320,7 +322,7 @@ fn code_error(body: &Value) -> Option<AdapterError> {
     if code == "0" {
         return None;
     }
-    if RATE_LIMIT_CODES.contains(&code.as_str()) {
+    if code.parse::<i64>().is_ok_and(|n| OKX_RATE_LIMIT_CODES.contains(&n)) {
         return Some(AdapterError::RateLimited { retry_after_ms: None });
     }
     let msg = body.get("msg").and_then(Value::as_str).unwrap_or("");

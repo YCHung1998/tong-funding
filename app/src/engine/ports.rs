@@ -67,6 +67,10 @@ pub struct OrderRequest {
     pub side: OrderSide,
     pub quantity: Decimal,
     pub reduce_only: bool,
+    /// The base-coin amount this order is meant to trade (an opening leg: `SizedLeg::base_qty`);
+    /// `None` for closes and manual orders. OKX checks `sz x ctVal` against it (a coin amount
+    /// passed as contracts is refused).
+    pub intended_base_qty: Option<Decimal>,
 }
 
 /// What the exchange (or the simulation) says about one order.

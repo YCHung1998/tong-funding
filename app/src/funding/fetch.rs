@@ -19,7 +19,8 @@ use tong_funding_core::types::Exchange;
 use super::pnl_record::{assemble, latest_pnl, recompute_if_changed};
 use super::{FETCH_DELAY_MS, FETCH_ERROR, FUNDING_LEDGER_FETCHED, PNL_RETRY_WINDOW_MS};
 use crate::exchange::error::AdapterError;
-use crate::exchange::signed::ledger::{BINANCE_INCOME_LIMIT, BinanceLedgerClient, BybitLedgerClient, LedgerPage, OkxLedgerClient};
+use crate::exchange::signed::ledger::{BINANCE_INCOME_LIMIT, BinanceLedgerClient, BybitLedgerClient, LedgerPage};
+use crate::exchange::signed::okx::OkxSignedClient;
 use crate::exchange::transport::HttpTransport;
 use crate::store::db::Db;
 use crate::store::events::EventStore;
@@ -293,7 +294,7 @@ impl<T: HttpTransport + 'static> LedgerSource for BybitLedgerSource<T> {
 
 /// OKX `bills-archive` as a `LedgerSource`: per symbol, paged by the last `billId` (`after`,
 /// "older than"); the cursor is the page's `next_cursor` (a full page only).
-pub struct OkxLedgerSource<T>(pub Arc<OkxLedgerClient<T>>);
+pub struct OkxLedgerSource<T>(pub Arc<OkxSignedClient<T>>);
 
 impl<T: HttpTransport + 'static> LedgerSource for OkxLedgerSource<T> {
     fn exchange(&self) -> Exchange {

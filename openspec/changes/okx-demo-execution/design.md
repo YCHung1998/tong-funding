@@ -111,3 +111,8 @@
 - #8：clOrdId 的執行期 `not_sent` 分支改為單元測試 `engine_client_order_ids_always_fit_the_okx_clordid_rule`；spec 的「clOrdId 含底線」情境移除。
 - A/D：`OrderHttpRequest::header()` 拒絕 `x-simulated-trading` 與 `OK-ACCESS-*`（`okx_auth` 才能設 `OK-ACCESS-*`）；本機假伺服器測試證明 GET / POST / DELETE 缺標頭、重複、值 0、`header()` 嘗試皆零連線；`ReqwestOrderTransport` 亦 `.no_proxy()` 並有 `HTTP_PROXY` 測試。
 - E–J 另開 change `okx-execution-guards`（本 change 的 task 數已 ≤ 12，但守衛自成一組安全規則；依 coordinator 指示拆分）。
+
+## 抗辯修正（第二輪）
+
+- R7 / R8 / S3 同 `okx-signed-read` 第二輪：`FakeOrderTransport` 跑真實准入規則；`OrderHttpRequest::header()` 拒絕非 token 名稱；真實 `ReqwestOrderTransport` 對真實 OKX 主機缺旗標在連線前拒絕。
+- `OrderRequest` 新增 `intended_base_qty: Option<Decimal>`（engine 對開倉腿填 `SizedLeg::base_qty`，平倉與手動單為 `None`），供 `okx-execution-guards` 的 R2 比對。

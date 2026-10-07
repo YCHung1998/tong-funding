@@ -14,6 +14,7 @@ use tong_funding_core::redact::redact_secrets;
 
 use crate::engine::ports::{OrderState, OrderStatus, QueryOutcome, SubmitOutcome};
 use crate::exchange::error::AdapterError;
+use crate::exchange::signed::okx::{ENV_MISMATCH_CODE, OKX_RATE_LIMIT_CODES, OKX_UNKNOWN_CODES};
 use crate::exchange::health::ratelimit::parse_retry_after_ms;
 use crate::exchange::transport::HttpResponse;
 
@@ -32,11 +33,6 @@ pub const BYBIT_RATE_LIMIT_CODES: [i64; 2] = [10006, 10018];
 /// Bybit "order not exists or too late to cancel" (UNVERIFIED).
 pub const BYBIT_NOT_FOUND_CODES: [i64; 1] = [110001];
 
-/// OKX codes meaning "the outcome is unknown" (service unavailable, endpoint timeout - "does not
-/// mean the request was successful or failed" -, system busy, system error). UNVERIFIED list.
-pub const OKX_UNKNOWN_CODES: [i64; 4] = [50001, 50004, 50013, 50026];
-/// OKX rate-limit codes: request too frequent, sub-account rate limit.
-pub const OKX_RATE_LIMIT_CODES: [i64; 2] = [50011, 50061];
 /// The only OKX codes that make a reply "clearly refused" (documented; UNVERIFIED completeness):
 /// parameter / mode / lot / balance / market-order-size refusals, "order does not exist", cancel
 /// failure, and authentication failures (nothing was processed). Any other code is UNKNOWN, so the
@@ -215,7 +211,7 @@ pub fn okx_is_env_mismatch(result: &Result<HttpResponse, AdapterError>) -> bool 
     let Ok(body) = serde_json::from_str::<Value>(&resp.body) else { return false };
     let code = body.get("code").and_then(Value::as_str);
     let s_code = body.get("data").and_then(Value::as_array).and_then(|d| d.first()).and_then(|r| r.get("sCode")).and_then(Value::as_str);
-    code == Some("50101") || s_code == Some("50101")
+    code == Some(ENV_MISMATCH_CODE) || s_code == Some(ENV_MISMATCH_CODE)
 }
 
 /// A submit reply turned into a class; `parse_ack` reads the accepted body.

@@ -101,6 +101,7 @@ mod tests {
             side: OrderSide::Buy,
             quantity: qty.parse().unwrap(),
             reduce_only: false,
+            intended_base_qty: None,
         }
     }
 

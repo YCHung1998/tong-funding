@@ -1086,6 +1086,7 @@ impl Actor {
                 side: OrderSide::for_leg(side_of(leg), OrderAction::Open),
                 quantity: sized.order_qty.value(),
                 reduce_only: false,
+                intended_base_qty: Some(sized.base_qty),
             };
             legs[idx(leg)] = Some(LegOrder::new(req, unit(exchange, &r)));
         }
@@ -1435,7 +1436,7 @@ impl Actor {
                 symbol: view.symbol.clone(),
                 side: OrderSide::for_leg(side_of(leg), OrderAction::Close),
                 quantity: close_qty,
-                reduce_only: true,
+                reduce_only: true, intended_base_qty: None,
             };
             legs[idx(leg)] = Some(LegOrder::new(req, Decimal::ONE));
         }
@@ -1550,7 +1551,7 @@ impl Actor {
             symbol: o.symbol,
             side: o.side,
             quantity: o.quantity,
-            reduce_only: o.reduce_only,
+            reduce_only: o.reduce_only, intended_base_qty: None,
         };
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
         tokio::spawn(async move {
@@ -2797,7 +2798,7 @@ mod tests {
             symbol: "BTCUSDT".into(),
             side: OrderSide::Buy,
             quantity: Decimal::new(1, 3),
-            reduce_only: false,
+            reduce_only: false, intended_base_qty: None,
         };
         actor.spawn_submit("u-hang".into(), Leg::Long, OrderAction::Open, req, None);
         tokio::spawn(actor.run());
@@ -2873,7 +2874,7 @@ mod tests {
             symbol: "BTCUSDT".into(),
             side,
             quantity: Decimal::new(19, 3),
-            reduce_only: false,
+            reduce_only: false, intended_base_qty: None,
         };
         let triggered = T0 - 40;
         let start = tokio::time::Instant::now();

@@ -253,7 +253,7 @@ fn funding_fetch_plan_includes_okx_legs_with_their_symbol() {
 
 fn okx_source(script: Vec<Result<crate::exchange::transport::HttpResponse, AdapterError>>) -> (OkxLedgerSource<crate::exchange::transport::FakeTransport>, Arc<crate::exchange::transport::FakeTransport>) {
     use crate::exchange::signed::endpoints::OkxHost;
-    use crate::exchange::signed::ledger::{OKX_BILLS_ARCHIVE_PATH, OkxLedgerClient};
+    use crate::exchange::signed::ledger::OKX_BILLS_ARCHIVE_PATH;
     use crate::exchange::signed::okx::OkxSignedClient;
     use crate::exchange::transport::FakeTransport;
     use crate::ports::{MemorySecrets, SecretName};
@@ -272,7 +272,7 @@ fn okx_source(script: Vec<Result<crate::exchange::transport::HttpResponse, Adapt
         MemorySecrets::default().with(Exchange::Okx, SecretName::ApiKey, "K_NOT_REAL").with(Exchange::Okx, SecretName::ApiSecret, "S_NOT_REAL").with(Exchange::Okx, SecretName::Passphrase, "P_NOT_REAL"),
     );
     let signed = OkxSignedClient::new(t.clone(), secrets, Arc::new(ManualClock::new(NOW)), Arc::new(|| Some(0)), Arc::new(NoResync), OkxHost::Demo);
-    (OkxLedgerSource(Arc::new(OkxLedgerClient::new(Arc::new(signed)))), t)
+    (OkxLedgerSource(Arc::new(signed)), t)
 }
 
 fn okx_body(name: &str) -> Result<crate::exchange::transport::HttpResponse, AdapterError> {

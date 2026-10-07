@@ -46,6 +46,13 @@ impl std::fmt::Debug for HttpResponse {
     }
 }
 
+/// A name `http::HeaderName` accepts (a real HTTP token). Anything else (trailing space, newline,
+/// unicode look-alikes, ...) could be normalised into a protected name by a lower layer, so it is
+/// refused outright.
+pub fn is_valid_header_name(name: &str) -> bool {
+    http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+}
+
 impl HttpRequest {
     pub fn get(url: impl Into<String>, timeout: Duration) -> Self {
         HttpRequest { url: url.into(), headers: Vec::new(), timeout, protected_header_misuse: false }
@@ -53,7 +60,7 @@ impl HttpRequest {
     /// Generic header. The OKX demo flag and the `OK-ACCESS-*` family are NOT settable here: the
     /// header is dropped and the request is marked so that a transport refuses it.
     pub fn header(mut self, name: &str, value: &str) -> Self {
-        if is_protected_okx_header(name) {
+        if !is_valid_header_name(name) || is_protected_okx_header(name) {
             self.protected_header_misuse = true;
         } else {
             self.headers.push((name.to_string(), value.to_string()));
@@ -232,6 +239,18 @@ mod debug_tests {
         let ok = HttpRequest::get("https://h/x", Duration::from_secs(1)).header("X-MBX-APIKEY", "k");
         assert!(!ok.misuses_protected_header());
         assert_eq!(ok.headers.len(), 1);
+    }
+
+    #[test]
+    fn header_names_that_are_not_http_tokens_are_refused_and_mark_the_request() {
+        // R8: "x-simulated-trading " (trailing space) and a unicode look-alike must not slip past the name check
+        for name in ["x-simulated-trading ", " ok-access-key", "x-simulated-trading\n", "x\u{0445}-simulated-trading", "ok\u{2011}access-key", "a b", "", "a:b", "ok-access-key\r\nx: y"] {
+            let r = HttpRequest::get("https://h/x", Duration::from_secs(1)).header(name, "1");
+            assert!(r.headers.is_empty(), "{name:?} must not be added");
+            assert!(r.misuses_protected_header(), "{name:?} must mark the request so a transport refuses it");
+        }
+        let ok = HttpRequest::get("https://h/x", Duration::from_secs(1)).header("X-BAPI-API-KEY", "k").header("Content-Type", "application/json");
+        assert!(!ok.misuses_protected_header() && ok.headers.len() == 2);
     }
 
     #[test]

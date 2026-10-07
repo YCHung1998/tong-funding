@@ -38,3 +38,13 @@
 - 合約測試的 OKX 參數化（`contract_tests.rs`）需要 `expire_unknown_submits()`：OKX 的「從未到達」要等 `expTime` 過後兩次查無，與 Binance / Bybit 的立即查無不同，這是 D4 的刻意差異。
 - 讀取端 `OkxSignedClient` 的 latch 測試與實作同時寫（紅燈證據只涵蓋下單端與 executor）。
 - `clippy -D warnings` 在 baseline 的 `tong-funding-core` 即失敗（既有問題，與本計畫無關）。
+
+## 抗辯修正（第二輪）
+
+- R1：平倉（`reduce_only`）只檢查 `sz > 0` 與（lotSz 已知時的）整數倍，**永不**因名目上限或缺標記價 / limits 而被擋；`sz ≤ 已知持倉張數` 的檢查需要持倉資料，executor 沒有，未實作（列為後續）。
+- R2：開倉必須帶 `intended_base_qty`，且 `|sz × ctVal − intended| ≤ lotSz × ctVal`，否則 `not_sent`；缺 `intended_base_qty` 也不送（`0.01` BTC 當作 `sz` 的情境被擋）。
+- R3：`51603` 判為查無需 `now ≥ expTime + 2 s` 且兩次確認相隔 ≥ 1 s（以注入時間計）；**未持久化**：order intents 沒有 `expTime` 欄位，不為此改 schema。保守規則：重啟 / 工廠重建後沒有紀錄的 id，`51603` **永不**判為查無，維持「待確認」；只有本程序內被明確拒絕（Rejected）的送單才立即信 `51603`。這使恢復流程對 OKX 腿在重啟後無法以查無收斂（需人工 / 持倉比對），是刻意的 fail-closed。
+- R4：`50101` 出現在送單回應 = 閘道在處理前拒絕 → `Rejected{50101}`（並閂鎖）；閂鎖後送單與帳戶模式讀取被擋，**查單與撤單不被擋**（它們只收斂可能已掛上的單，不會增加曝險）。
+- R5：工廠擁有唯一的 `Arc<OkxLatch>`（`okx_latch()`），建出的每個 executor 與其 OKX 下單客戶端共用；讀取端的接線（`OkxSignedClient::with_latch(factory.okx_latch())`）屬 `okx-trading-enablement` 3.5。`OkxLatch` 改為 `OnceLock<String>`，原因文字為單一常數 `ENV_MISMATCH_REASON`。
+- R6：任何被拒絕的 OKX 平倉（含送出前的 `not_sent`）原因都帶「對側腿裸露」文字；開倉不帶。
+- R9：`live_probe` 對「成交未知」的腿讀帳戶持倉並平掉非零持倉；連持倉都讀不到時印出醒目的手動平倉指示，不再默默略過。

@@ -227,7 +227,7 @@ mod tests {
             symbol: "BTCUSDT".into(),
             side: if reduce_only { OrderSide::Sell } else { OrderSide::Buy },
             quantity: "0.019".parse().unwrap(),
-            reduce_only,
+            reduce_only, intended_base_qty: None,
         })
         .unwrap()
     }

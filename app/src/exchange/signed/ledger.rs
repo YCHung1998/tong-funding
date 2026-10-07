@@ -338,22 +338,12 @@ impl<T: HttpTransport> BybitLedgerClient<T> {
     }
 }
 
-// ---- OKX client ---------------------------------------------------------------------------------
+// ---- OKX bills --------------------------------------------------------------------------------------
 
-/// OKX funding bills per symbol and window, over the demo-flagged read client.
-pub struct OkxLedgerClient<T>(Arc<OkxSignedClient<T>>);
-
-impl<T: HttpTransport> OkxLedgerClient<T> {
-    pub fn new(client: Arc<OkxSignedClient<T>>) -> Self {
-        OkxLedgerClient(client)
-    }
-
-    pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {
-        self.0.last_not_connected_reason()
-    }
-
+impl<T: HttpTransport> OkxSignedClient<T> {
     /// One page of funding bills of `symbol` in `[begin_ms, end_ms]` (at most 7 days, our own
     /// window rule); `after` = the previous page's last `billId` (results are newest first).
+    /// Same request construction, demo flag, `50102` retry and latch as every other OKX read.
     pub async fn bills_page(&self, symbol: &str, begin_ms: i64, end_ms: i64, after: Option<&str>) -> Result<LedgerPage, AdapterError> {
         let inst_id = okx_inst_id(symbol).ok_or_else(|| AdapterError::parse("symbol is not a BASEUSDT symbol"))?;
         let mut params = vec![
@@ -367,7 +357,7 @@ impl<T: HttpTransport> OkxLedgerClient<T> {
         if let Some(a) = after {
             params.push(("after", a.to_string()));
         }
-        let (body, _) = self.0.get_signed(OKX_BILLS_ARCHIVE_PATH, &encode_query(&params)).await?;
+        let (body, _) = self.signed_get(OKX_BILLS_ARCHIVE_PATH, &encode_query(&params)).await?;
         parse_okx_bills(&body)
     }
 }
@@ -568,9 +558,8 @@ mod tests {
         assert!(matches!(parse_okx_bills(&json!({"code":"0"})), Err(AdapterError::Parse(_))));
     }
 
-    fn okx_client(t: &Arc<FakeTransport>, secrets: Arc<dyn SecretProvider>) -> OkxLedgerClient<FakeTransport> {
-        let signed = OkxSignedClient::new(t.clone(), secrets, Arc::new(ManualClock::new(1_607_418_537_000)), Arc::new(|| Some(715)), Arc::new(NoResync), OkxHost::Demo);
-        OkxLedgerClient::new(Arc::new(signed))
+    fn okx_client(t: &Arc<FakeTransport>, secrets: Arc<dyn SecretProvider>) -> OkxSignedClient<FakeTransport> {
+        OkxSignedClient::new(t.clone(), secrets, Arc::new(ManualClock::new(1_607_418_537_000)), Arc::new(|| Some(715)), Arc::new(NoResync), OkxHost::Demo)
     }
 
     fn okx_secrets() -> Arc<dyn SecretProvider> {
@@ -660,7 +649,7 @@ mod tests {
                 Arc::new(NoResync),
                 OkxHost::Demo,
             );
-            let client = OkxLedgerClient::new(Arc::new(signed));
+            let client = signed;
             let now = crate::ports::Clock::now_ms(clock.as_ref());
             let page = client.bills_page(&symbol, now - 7 * 24 * 3_600_000, now, None).await;
             match page {

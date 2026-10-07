@@ -151,3 +151,11 @@ A. `HttpRequest::header()` 拒絕 `x-simulated-trading` 與 `OK-ACCESS-*`（丟�
 B. 靜態規則（`static_checks.rs`，整個 `src/` 與 `tests/`）：`reqwest` 識別字只准在 `reqwest_transport.rs` 與 `execution/http.rs`；`x-simulated-trading` 字面只准 `signed/endpoints.rs`；`OK-ACCESS` 只准 `signed/endpoints.rs` 與 `signed/signing.rs`；`okx.com` 只准 `signed/endpoints.rs` 與 `public/endpoints.rs`；各有反例測試，且與 `host_fragments`（豁免白名單主機）分開。
 C. 兩個真實客戶端皆 `.no_proxy()`、無重導向、無自動重試；測試以 `HTTP_PROXY` 驗證（含對照組證明測試非空轉）。
 D. 以本機假伺服器 + `LocalOkxTest` 策略證明缺標頭 / 重複 / `header()` 嘗試皆零連線；POST 版本在 `okx-demo-execution`。
+
+## 抗辯修正（第二輪）
+
+- S2：`.no_proxy()` 是**刻意的行為變更，且同時影響 Binance / Bybit** 的簽名客戶端與下單客戶端：簽名與下單流量不得經過會攔截的環境代理（`HTTP(S)_PROXY`）。啟動時若設有代理變數，`ui/live.rs` 印一行警告（`proxy_env_warning`，只列變數名，不印值）說明簽名 / 下單流量會忽略它。以 `HTTP_PROXY` 測試鎖定（含對照組）。
+- S3：以**真實** `ReqwestTransport::get` 與 `ReqwestOrderTransport::send`（`signed_demo()` 策略）測試：真實 OKX 主機缺旗標、重複、值 0、`header()` 嘗試、只有 `OK-ACCESS-*` 皆在任何 DNS / 連線之前被拒絕（錯誤等於策略拒絕 `host not allowed`、耗時 < 500 ms）；測試從不送出會通過的請求。
+- R7：`FakeOrderTransport::send` 對每個 OKX 請求斷言真實的 `HostPolicy::SignedDemo.allows`（違規即 panic），executor 層測試因此跑真實的准入規則。
+- R8：`header()`（`HttpRequest` 與 `OrderHttpRequest`）拒絕不是合法 HTTP token 的名稱（`http::HeaderName::from_bytes`：尾端空白、換行、unicode 相似字…），標記 `protected_header_misuse`；新增直接依賴 `http`（已在 lockfile）。
+- 簡化：`POSITION_MODE_TTL_MS` 移到簽名層（`signed::okx`，executor 重新匯出）；OKX 速率 / 未知碼只有一份 `i64` 清單（`signed::okx`，下單路徑共用）；`bills_page` 直接是 `OkxSignedClient` 的方法，不再有 `OkxLedgerClient` / `get_signed`；`DemoAccountView` 一律用 `is_complete()`。未做（列為後續簡化，無行為影響）：body 只解析一次的 `EnvMismatch` 變體、executor 每次呼叫只綁定一次 OKX client（`Result<OkxOrderClient, String>`）、共用 `#[cfg(test)] test_support` 模組、少數重複測試合併。

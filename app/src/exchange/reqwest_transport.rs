@@ -428,6 +428,28 @@ mod tests {
         assert!(raw.contains("ok-access-key: k"));
     }
 
+    /// S3: the REAL `ReqwestTransport::get` with the real `SignedDemo` policy. The real OKX host
+    /// without the flag is refused by the policy itself (not by a failed connection) and immediately.
+    #[test]
+    fn the_real_get_transport_refuses_the_real_okx_host_without_the_flag_before_any_connection() {
+        let t = ReqwestTransport::signed_demo().unwrap();
+        let url = format!("https://{OKX_DEMO_HOST}/api/v5/account/balance");
+        let bare = || HttpRequest::get(url.clone(), Duration::from_secs(30));
+        let mut dup = bare();
+        dup.headers = hdrs(&[("x-simulated-trading", "1"), ("X-Simulated-Trading", "1")]);
+        let mut zero = bare();
+        zero.headers = hdrs(&[("x-simulated-trading", "0")]);
+        for (what, r) in [("no flag", bare()), ("duplicate", dup), ("flag 0", zero), ("header() attempt", bare().header("x-simulated-trading", "1")), ("auth only", {
+            let mut r = bare();
+            r.headers = hdrs(&[("OK-ACCESS-KEY", "k")]);
+            r
+        })] {
+            let started = Instant::now();
+            assert_eq!(block_on(t.get(r)), Err(AdapterError::network("host not allowed")), "{what}: the policy's refusal, not a network error");
+            assert!(started.elapsed() < Duration::from_millis(500), "{what}: refused before DNS / connection ({:?})", started.elapsed());
+        }
+    }
+
     // ------------------------------------------------ no proxy, no redirect, no retry
 
     #[test]

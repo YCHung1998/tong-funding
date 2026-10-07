@@ -83,3 +83,8 @@ engine 送 OKX 單時已持有 `ct_val`（`fill.rs` 的 `LegSizing.okx_ct_val`�
 - `FundingFetchState` 對 OKX 沿用 `fetch_state`（依 `FUNDING_LEDGER_FETCHED` 事件判定），不再固定 `NotFetched`。
 - `ui/live.rs` 的 OKX 流水來源接線屬 `okx-trading-enablement` 3.5：它同時建立 `OkxSignedClient`、校時與 `with_okx`，把兩處放在一起才不會各自建一份客戶端。
 - 流水客戶端 `OkxLedgerClient` 包 `OkxSignedClient`（`get_signed`）：簽名、模擬標頭、`50102` 重試、閂鎖與限流判讀與唯讀客戶端完全相同，沒有第三份 attempt 迴圈。
+
+## 抗辯修正（第二輪）
+
+- S1：`core` 的 `leg_pnl` 不再把 `contract_value_missing` 成交的原始張數加進 `opened` / `closed`，且該腿有未換算成交時不產生 `OpenCloseQuantityMismatch`（只留 `MissingContractValue`）；測試涵蓋「開倉有 `ct_val`、重啟後平倉沒有」（core 與 store 層）。
+- `OkxLedgerClient` 移除：`bills_page` 是 `OkxSignedClient` 的方法，`OkxLedgerSource<T>(Arc<OkxSignedClient<T>>)`。

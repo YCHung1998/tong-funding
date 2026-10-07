@@ -7375,6 +7375,7 @@ dependencies = [
  "gpui-kit",
  "hex",
  "hmac 0.13.0",
+ "http",
  "keyring",
  "reqwest",
  "rusqlite",

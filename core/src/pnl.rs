@@ -359,15 +359,23 @@ fn leg_pnl(leg: &LegInput, reasons: &mut Vec<IncompleteReason>) -> LegPnl {
         Side::Short => Decimal::NEGATIVE_ONE,
     };
     let (mut opened, mut closed) = (Decimal::ZERO, Decimal::ZERO);
+    let mut any_unconverted = false;
     for f in leg.fills.iter().filter(|f| !f.quantity.is_zero()) {
         // Price PnL of a long = Σ close (p × q) − Σ open (p × q); a short is the opposite.
+        // A fill whose quantity is in unconverted contracts (`contract_value_missing`) is not added to
+        // `opened` / `closed`: mixing contracts into coins would fake a quantity mismatch.
+        any_unconverted |= f.contract_value_missing;
         let dir = match f.action {
             FillAction::Open => {
-                opened += f.quantity;
+                if !f.contract_value_missing {
+                    opened += f.quantity;
+                }
                 -sign
             }
             FillAction::Close => {
-                closed += f.quantity;
+                if !f.contract_value_missing {
+                    closed += f.quantity;
+                }
                 sign
             }
         };
@@ -412,7 +420,8 @@ fn leg_pnl(leg: &LegInput, reasons: &mut Vec<IncompleteReason>) -> LegPnl {
             }
         }
     }
-    if opened != closed {
+    // (with an unconverted fill the totals are incomplete by construction; `MissingContractValue` already says so)
+    if opened != closed && !any_unconverted {
         reasons.push(IncompleteReason::OpenCloseQuantityMismatch { exchange: ex, opened, closed });
         missing.extend([Component::PriceRef, Component::PriceActual, Component::Slippage]);
     }

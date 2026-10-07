@@ -213,7 +213,7 @@ mod tests {
             symbol: "BTCUSDT".into(),
             side,
             quantity: "0.019".parse().unwrap(),
-            reduce_only,
+            reduce_only, intended_base_qty: None,
         })
         .unwrap()
     }

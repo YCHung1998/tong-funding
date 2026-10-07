@@ -16,16 +16,16 @@ OKX 客戶端 SHALL 在送出任何 OKX 訂單之前，以與下單相同的金�
 
 ### Requirement: 任一處收到 50101 即停用 OKX
 
-任何 OKX 請求（送單、查單、撤單、帳戶設定、唯讀查詢）收到 `50101` 時，系統 SHALL 閂鎖：本程序其後的 OKX 送單 SHALL 不送出、查單與撤單 SHALL 回報失敗、唯讀查詢 SHALL 回報錯誤，原因文字 SHALL 指出環境不符；閂鎖 SHALL NOT 被當成一般的已拒絕訂單，SHALL NOT 在程序內被解除。
+任何 OKX 請求（送單、查單、撤單、帳戶設定、唯讀查詢）收到 `50101` 時，系統 SHALL 閂鎖：送單回應的 `50101` SHALL 回報為已拒絕（閘道在處理前拒絕）；本程序其後的 OKX 送單與帳戶模式讀取 SHALL 不送出、唯讀查詢 SHALL 回報錯誤，但查單與撤單 SHALL 仍可送出以收斂可能已掛上的訂單，原因文字 SHALL 指出環境不符；閂鎖 SHALL NOT 被當成一般的已拒絕訂單，SHALL NOT 在程序內被解除。
 
 #### Scenario: 查單收到 50101
 
 - **WHEN** 一次 OKX 查單回應 `50101`
-- **THEN** 其後的 OKX 送單不送出請求，原因含 `50101`
+- **THEN** 其後的 OKX 送單不送出請求，原因含 `50101`；對已知訂單的查單與撤單仍會送出
 
 ### Requirement: OKX 數量守衛
 
-OKX 送單前 SHALL 取得該標的的 `ctVal`、`lotSz`、標記價與單腿名目上限；任一缺少、`sz` 不是 `lotSz` 的整數倍、或 `sz × ctVal × 標記價` 超過上限時 SHALL 不送出（`not_sent`）並指出原因。沒有任何限制來源時 SHALL 一律不送。
+OKX 送單前 SHALL 取得該標的的 `ctVal`、`lotSz`、標記價與單腿名目上限；任一缺少、`sz` 不是 `lotSz` 的整數倍、`sz × ctVal` 與訂單所帶的預期幣量相差超過一個 `lotSz × ctVal`（或訂單沒有預期幣量）、或 `sz × ctVal × 標記價` 超過上限時 SHALL 不送出（`not_sent`）並指出原因；沒有任何限制來源時開倉 SHALL 一律不送。`reduceOnly` 的平倉 SHALL 只檢查 `sz > 0` 與（已知時的）`lotSz` 整數倍，SHALL NOT 因名目上限、缺標記價或缺限制資料而被擋。
 
 #### Scenario: 幣量被當成張數
 
@@ -39,7 +39,7 @@ OKX 送單前 SHALL 取得該標的的 `ctVal`、`lotSz`、標記價與單腿名
 
 ### Requirement: 逾時單的查無判定
 
-OKX 送單 SHALL 帶 `expTime`。對結果為未知或被限流的送單，其 `51603` 查詢 SHALL 在伺服器時間超過 `expTime` 且已連續兩次 `51603` 之後才視為查無；在此之前 SHALL 回報待確認（失敗）。
+OKX 送單 SHALL 帶 `expTime`。對結果為未知或被限流的送單，其 `51603` 查詢 SHALL 在時間達 `expTime` 加 2 秒、且已有兩次相隔至少 1 秒的 `51603` 之後才視為查無；在此之前 SHALL 回報待確認（失敗）。對本程序沒有送單紀錄的 `clOrdId`（例如重啟或工廠重建後），`51603` SHALL NOT 被視為查無；只有被明確拒絕的送單的 `51603` 立即視為查無。
 
 #### Scenario: 逾時後立刻查無
 
@@ -48,7 +48,7 @@ OKX 送單 SHALL 帶 `expTime`。對結果為未知或被限流的送單，其 `
 
 #### Scenario: 過期且兩次查無
 
-- **WHEN** 伺服器時間已超過 `expTime`，連續兩次查單皆為 `51603`
+- **WHEN** 時間已達 `expTime` 加 2 秒，相隔至少 1 秒的兩次查單皆為 `51603`
 - **THEN** 第二次回報查無
 
 ### Requirement: 只有白名單中的代碼才是已拒絕
@@ -67,7 +67,7 @@ OKX 送單回應的 `code` / `sCode` 只有在文件列出的拒絕碼名單內�
 
 ### Requirement: 平倉守衛
 
-`reduceOnly` 的 OKX 單 SHALL 在送出前重新讀取帳戶模式（不使用快取）；被 `51000` 或 `51010` 拒絕時，拒絕原因 SHALL 指出對側腿裸露、需人工處理。
+`reduceOnly` 的 OKX 單 SHALL 在送出前重新讀取帳戶模式（不使用快取）；被拒絕（任何原因，含送出前的 `not_sent`）時，拒絕原因 SHALL 指出對側腿裸露、需人工處理。
 
 #### Scenario: 平倉不用快取
 

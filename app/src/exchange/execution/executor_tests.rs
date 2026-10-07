@@ -61,7 +61,14 @@ pub(super) fn demo_id(leg: Leg, action: OrderAction, seq: u16) -> String {
 }
 
 pub(super) fn req(exchange: Exchange, id: &str, side: OrderSide, qty: &str, reduce_only: bool) -> OrderRequest {
-    OrderRequest { client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only }
+    OrderRequest { client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None }
+}
+
+/// An OKX order: contracts `qty`; an opening one intends `qty x 0.01` coins (the test instrument's ctVal).
+pub(super) fn okx_req(id: &str, side: OrderSide, qty: &str, reduce_only: bool) -> OrderRequest {
+    let mut r = req(Exchange::Okx, id, side, qty, reduce_only);
+    r.intended_base_qty = (!reduce_only).then(|| d(qty) * d("0.01"));
+    r
 }
 
 pub(super) fn creds() -> Arc<Credentials> {
@@ -336,7 +343,7 @@ async fn an_existing_position_never_counts_as_a_fill_and_a_failed_lookup_is_not_
 }
 
 fn okx_open() -> OrderRequest {
-    req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, "3", false)
+    okx_req(&demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, "3", false)
 }
 
 /// Every request of the rig must pass the real admission rule (host + the flag exactly once).
@@ -380,7 +387,7 @@ async fn an_okx_order_checks_the_account_mode_once_then_posts_with_the_flag() {
     script_okx_mode(&r.t);
     r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
     assert!(matches!(r.ex.submit(okx_open()).await, SubmitOutcome::Accepted(_)));
-    assert!(matches!(r.ex.submit(req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 1), OrderSide::Sell, "3", false)).await, SubmitOutcome::Accepted(_)));
+    assert!(matches!(r.ex.submit(okx_req(&demo_id(Leg::Short, OrderAction::Open, 1), OrderSide::Sell, "3", false)).await, SubmitOutcome::Accepted(_)));
     assert_eq!(r.t.count(Method::Get, "/api/v5/account/config"), 1, "the one-way reading is reused for 60 s (key: account level)");
     assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 2);
     assert_okx_requests_admitted(&r.t);
@@ -425,7 +432,7 @@ async fn okx_cancel_only_touches_orders_in_order_intents() {
 }
 
 fn okx_close() -> OrderRequest {
-    req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Close, 0), OrderSide::Buy, "3", true)
+    okx_req(&demo_id(Leg::Short, OrderAction::Close, 0), OrderSide::Buy, "3", true)
 }
 
 #[tokio::test]
@@ -465,13 +472,17 @@ async fn a_coin_sized_quantity_on_a_ctval_1000_instrument_is_not_sent() {
     script_okx_mode(&r.t);
     r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
     for (qty, expect) in [("0.019", "lotSz"), ("3", "notional")] {
-        match ex.submit(req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, qty, false)).await {
+        let mut o = okx_req(&demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, qty, false);
+        o.intended_base_qty = Some(d(qty) * d("1000")); // this instrument's ctVal
+        match ex.submit(o).await {
             SubmitOutcome::Rejected { reason } => assert!(reason.contains(expect), "{qty}: {reason}"),
             other => panic!("{qty}: {other:?}"),
         }
     }
     assert!(r.t.requests().is_empty(), "refused before any request");
-    assert!(matches!(ex.submit(req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 1), OrderSide::Sell, "1", false)).await, SubmitOutcome::Accepted(_)), "1 contract = 1000 coins * 0.5 = 500 USDT is within the cap");
+    let mut one = okx_req(&demo_id(Leg::Short, OrderAction::Open, 1), OrderSide::Sell, "1", false);
+    one.intended_base_qty = Some(d("1000"));
+    assert!(matches!(ex.submit(one).await, SubmitOutcome::Accepted(_)), "1 contract = 1000 coins * 0.5 = 500 USDT is within the cap");
 }
 
 #[tokio::test]
@@ -479,8 +490,8 @@ async fn a_close_rereads_the_account_mode_every_time_while_an_open_uses_the_cach
     let r = rig();
     script_okx_mode(&r.t);
     r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
-    let open = |seq| req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, seq), OrderSide::Sell, "3", false);
-    let close = |seq| req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Close, seq), OrderSide::Buy, "3", true);
+    let open = |seq| okx_req(&demo_id(Leg::Short, OrderAction::Open, seq), OrderSide::Sell, "3", false);
+    let close = |seq| okx_req(&demo_id(Leg::Short, OrderAction::Close, seq), OrderSide::Buy, "3", true);
     r.ex.submit(open(0)).await;
     r.ex.submit(open(1)).await;
     assert_eq!(r.t.count(Method::Get, "/api/v5/account/config"), 1);
@@ -806,4 +817,96 @@ async fn an_unsupported_okx_account_mode_fails_the_engine_checks() {
     let a = okx_account(t, okx_keys());
     assert!(a.positions(Exchange::Okx).await.unwrap_err().contains("帳戶模式不支援"));
     assert!(a.available_margin(Exchange::Okx).await.is_err());
+}
+
+
+// ---- round 2 (adversarial review): R1, R2, R5, R6 ------------------------------------------------------
+
+#[tokio::test]
+async fn a_close_is_sent_above_the_notional_cap_and_when_the_limits_source_has_no_data() {
+    // R1: closing must never be blocked by the cap or by missing mark data
+    let capped = |limits: Arc<StubLimits>| {
+        let r = rig();
+        let ex = DemoExecutor::new(
+            BinanceOrderClient::new(Arc::new(r.t.clone()), creds(), BinanceHost::Testnet),
+            BybitOrderClient::new(Arc::new(r.t.clone()), creds(), BybitHost::Demo),
+            Arc::new(r.clock.clone()),
+            Arc::new(Offsets(Some(0))),
+            r.ledger.clone(),
+            Arc::new(RateLimiter::new(Arc::new(r.clock.clone()))),
+        )
+        .with_okx(OkxOrderClient::new(Arc::new(r.t.clone()), okx_creds(), OkxHost::Demo))
+        .with_okx_limits(limits);
+        script_okx_mode(&r.t);
+        r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+        (r, ex)
+    };
+    // a cap of 1 USDT: the close of 3 contracts (1800 USDT) is far above it
+    let (r, ex) = capped(limits_of("0.01", "0.001", "60000", "1"));
+    assert!(matches!(ex.submit(okx_close()).await, SubmitOutcome::Accepted(_)));
+    assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 1);
+    // the same close is refused only for what is really wrong with it: an open would be refused by the cap
+    assert!(matches!(ex.submit(okx_open()).await, SubmitOutcome::Rejected { reason } if reason.contains("notional")));
+    // a source without data for the symbol: the open is refused, the close still goes out
+    let (r, ex) = capped(Arc::new(StubLimits(Default::default())));
+    assert!(matches!(ex.submit(okx_open()).await, SubmitOutcome::Rejected { .. }));
+    assert!(matches!(ex.submit(okx_close()).await, SubmitOutcome::Accepted(_)));
+    assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 1, "only the close was posted");
+}
+
+#[tokio::test]
+async fn an_open_whose_contracts_do_not_match_its_intended_coin_amount_is_not_sent() {
+    // R2: 0.01 BTC passed as sz (ctVal 0.01, lotSz 0.001): a valid lot multiple, but 100 times too small
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+    let mut o = okx_req(&demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, "0.01", false);
+    o.intended_base_qty = Some(d("0.01"));
+    assert!(matches!(r.ex.submit(o).await, SubmitOutcome::Rejected { reason } if reason.contains("intended")));
+    let mut none = okx_open();
+    none.intended_base_qty = None;
+    assert!(matches!(r.ex.submit(none).await, SubmitOutcome::Rejected { reason } if reason.contains("intended")));
+    assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 0);
+}
+
+#[tokio::test]
+async fn any_rejected_okx_close_says_the_other_leg_is_naked_and_an_open_does_not() {
+    // R6: not only 51000 / 51010
+    for body in [okx_order_fx("place_rejected_51131"), okx_order_fx("place_code0_scode51121")] {
+        let r = rig();
+        script_okx_mode(&r.t);
+        r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&body));
+        match r.ex.submit(okx_close()).await {
+            SubmitOutcome::Rejected { reason } => assert!(reason.contains("naked"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        match r.ex.submit(okx_open()).await {
+            SubmitOutcome::Rejected { reason } => assert!(!reason.contains("naked"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    // a close refused before it is sent (guard) says it too
+    let r = rig();
+    r.t.on(Method::Get, "/api/v5/account/config", Reply::ok(&okx_signed_fx("account_config_long_short")));
+    assert!(matches!(r.ex.submit(okx_close()).await, SubmitOutcome::Rejected { reason } if reason.contains("naked")));
+}
+
+#[tokio::test]
+async fn the_factory_owns_one_latch_shared_with_the_executor_it_builds() {
+    // R5: one Arc<OkxLatch> for production wiring; the factory exposes it for the read client too
+    let t = FakeOrderTransport::new();
+    script_okx_mode(&t);
+    t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+    let full = all_keys().with(Exchange::Okx, SecretName::ApiKey, KEY).with(Exchange::Okx, SecretName::ApiSecret, SECRET).with(Exchange::Okx, SecretName::Passphrase, "TEST_PASS_NOT_REAL");
+    let f = factory(Arc::new(full), &t).with_okx_limits(btc_limits());
+    let latch = f.okx_latch();
+    let ex = f.build().unwrap();
+    assert!(Arc::ptr_eq(&latch, &f.okx_latch()), "the same latch every time");
+    assert!(matches!(ex.submit_classified(&okx_open()).await, SubmitClass::Accepted(_)));
+    latch.trip("tripped by the read client");
+    match ex.submit_classified(&okx_open()).await {
+        SubmitClass::Rejected { code, message } => assert_eq!((code.as_str(), message.contains("tripped by the read client")), ("not_sent", true), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(Arc::ptr_eq(&latch, ex.okx_latch()), "the executor reports the same latch");
 }

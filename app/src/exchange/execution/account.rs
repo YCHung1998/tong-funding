@@ -16,7 +16,7 @@ use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
 use crate::exchange::signed::okx::OkxSignedClient;
 use crate::exchange::error::AdapterError;
-use crate::exchange::signed::models::{Balance, Completeness, OpenOrder, Position, PositionMode};
+use crate::exchange::signed::models::{Balance, OpenOrder, Position, PositionMode};
 use crate::exchange::transport::HttpTransport;
 
 /// Reason when no OKX client was given to the view (not wired yet: UI wiring is okx-trading-enablement).
@@ -102,8 +102,9 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
                 Exchange::Okx => {
                     let okx = self.okx()?;
                     let l = okx.get_positions().await.map_err(|e| Self::okx_error(okx, e))?;
+                    let complete = l.is_complete();
                     let items = l.items.into_iter().map(|p| AccountPosition { exchange, symbol: p.symbol, quantity: p.contracts }).collect();
-                    Ok(Listed { items, complete: l.completeness == Completeness::Complete })
+                    Ok(Listed { items, complete })
                 }
             }
         })

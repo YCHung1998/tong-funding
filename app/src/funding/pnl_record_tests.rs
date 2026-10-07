@@ -296,6 +296,11 @@ fn pnl_record_a_missing_close_reference_keeps_the_result_incomplete_with_the_rea
 
 /// Bybit long + OKX short on BTCUSDT; the OKX orders are 3 contracts, `ct_val` (when given) on every event.
 pub(crate) fn okx_round(ct_val: Option<&str>, close_reference: &str) -> Fx {
+    okx_round_with(ct_val, ct_val, close_reference)
+}
+
+/// Like `okx_round`, with separate `ct_val`s for the open and the close events (a close after a restart has none).
+pub(crate) fn okx_round_with(open_ct: Option<&str>, close_ct: Option<&str>, close_reference: &str) -> Fx {
     let (dir, db, clock) = open_tmp();
     let fx = Fx { events: EventStore::new(db.clone()), _dir: dir, db, clock };
     add_pair_on(&fx.db, "p1", "BTCUSDT", false, Exchange::Bybit, Exchange::Okx);
@@ -314,6 +319,7 @@ pub(crate) fn okx_round(ct_val: Option<&str>, close_reference: &str) -> Fx {
                 "client_order_id": format!("demo-p1-{leg}-{action}"), "leg": leg, "action": action, "simulated": false,
                 "exchange": exchange.name(), "symbol": "BTCUSDT",
             });
+            let ct_val = if action == "open" { open_ct } else { close_ct };
             if exchange == Exchange::Okx && let Some(c) = ct_val {
                 p["ct_val"] = json!(c);
             }
@@ -391,4 +397,20 @@ fn okx_funding_entries_are_attributed_to_the_okx_leg() {
     fx.clock.set(T + 80_000);
     let r = settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
     assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "COMPLETE"), "{r:?}");
+}
+
+#[test]
+fn an_okx_close_after_a_restart_has_no_contract_value_and_the_pair_is_incomplete_without_a_quantity_mismatch() {
+    // S1 at the store level: the open event carries ct_val, the close (written after a restart) does not
+    let fx = okx_round_with(Some("0.01"), None, "60300");
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    let short = &a.input.legs[1];
+    assert!(!short.fills[0].contract_value_missing && short.fills[1].contract_value_missing);
+    both_okx_fetched(&fx);
+    fx.clock.set(T + 700_000);
+    let r = settle_pnl(&fx.db, "p1", T + 700_000, true).unwrap();
+    assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "INCOMPLETE"), "{r:?}");
+    let reasons = latest_pnl(&fx.db, "p1").unwrap().unwrap().payload["reasons"].to_string();
+    assert!(reasons.contains("OKX 成交缺合約面值"), "{reasons}");
+    assert!(!reasons.contains("開平倉數量不一致"), "{reasons}");
 }
