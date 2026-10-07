@@ -720,7 +720,8 @@ impl Run<'_> {
             Exchange::Okx => {
                 let market = self.market.ok_or_else(|| "OKX order rules unavailable (no market data)".to_string())?;
                 let rules = market.order_rules(leg.exchange, &leg.symbol).await.map_err(|e| format!("OKX order rules unavailable: {e}"))?;
-                Ok(rules.okx_ct_val.unwrap_or(Decimal::ONE))
+                // a missing contract value is an error: a contract is NOT one coin
+                rules.okx_ct_val.filter(|c| *c > Decimal::ZERO).ok_or_else(|| "OKX order rules unavailable: ctVal missing".to_string())
             }
         }
     }
@@ -1807,6 +1808,34 @@ mod tests {
         let known = LegFill::Known { requested: d("0.01"), filled: d("0.01") };
         assert_eq!(only_outcome(&r).verdict, Verdict::Normal { fills: Some((known, known)) });
         fx.assert_read_only();
+    }
+
+    /// Rules that exist but carry no OKX contract value (a catalog row without `ctVal`).
+    struct RulesWithoutCtVal;
+    impl MarketData for RulesWithoutCtVal {
+        fn refetch(&self, _: Exchange, _: &str) -> BoxFut<'_, Result<crate::engine::ports::FreshQuote, String>> {
+            Box::pin(std::future::ready(Err("not used".into())))
+        }
+        fn order_rules(&self, _: Exchange, _: &str) -> BoxFut<'_, Result<crate::engine::ports::OrderRules, String>> {
+            let r = crate::engine::ports::OrderRules { lot: tong_funding_core::quantity::LotSize { step_size: d("1"), min_qty: d("1") }, okx_ct_val: None };
+            Box::pin(std::future::ready(Ok(r)))
+        }
+    }
+
+    /// okx-trading-enablement 3.7 (2): a missing `ctVal` is an error, never "1 contract = 1 coin"
+    /// (that would compare 1 contract with 1 BTC and could settle an imbalanced pair as RECONCILED).
+    #[test]
+    fn an_okx_leg_without_a_contract_value_waits_instead_of_counting_a_contract_as_one_coin() {
+        let (_d, db, _) = open_tmp();
+        let (l, s) = okx_pair(&db);
+        let fx = FakeExchange::default();
+        fx.filled(&l, "1");
+        fx.filled(&s, "1");
+        fx.position(Exchange::Okx, "1");
+        fx.position(SHORT_EX, "-1");
+        let r = run_with(&db, &fx, Some(&RulesWithoutCtVal), None);
+        assert!(r.pending.as_deref().is_some_and(|p| p.contains("ctVal")), "{r:?}");
+        assert_eq!(pair_state(&db), "FILL_MONITOR", "1 contract vs 1 coin must not look balanced");
     }
 
     #[test]

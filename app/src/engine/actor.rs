@@ -1599,7 +1599,8 @@ impl Actor {
             side: o.side,
             quantity: o.quantity,
             reduce_only: o.reduce_only,
-            intended_base_qty: None,
+            // only an opening order is checked against the coin amount the user typed (a close is never blocked by it)
+            intended_base_qty: if o.reduce_only { None } else { o.intended_base_qty },
             leverage,
         };
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());

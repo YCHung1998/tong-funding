@@ -27,10 +27,11 @@ use crate::store::scan_buffer::ScanRecord;
 pub const MAX_RECOMPUTE_HZ: i64 = 2;
 /// Countdown cells update once per second, independently of data.
 pub const COUNTDOWN_TICK_MS: i64 = 1_000;
-/// Design D4: only these exchanges can take orders; OKX is price comparison only.
-pub const TRADABLE_EXCHANGES: [Exchange; 2] = [Exchange::Binance, Exchange::Bybit];
+/// Every exchange can take orders (okx-trading-enablement); which ones are actually traded is
+/// decided by the risk setting `allowed_exchanges`, not by this list.
+pub const TRADABLE_EXCHANGES: [Exchange; 3] = [Exchange::Binance, Exchange::Bybit, Exchange::Okx];
 /// Exchanges whose account (signed) data the pages show.
-pub const ACCOUNT_EXCHANGES: [Exchange; 2] = [Exchange::Binance, Exchange::Bybit];
+pub const ACCOUNT_EXCHANGES: [Exchange; 3] = [Exchange::Binance, Exchange::Bybit, Exchange::Okx];
 
 pub fn is_tradable(e: Exchange) -> bool {
     TRADABLE_EXCHANGES.contains(&e)
@@ -104,8 +105,6 @@ pub struct AccountData {
 /// Account data of one exchange as the pages see it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AccountState {
-    /// Public market data only (OKX).
-    Unsupported,
     /// Missing keys, unsynced clock, ... (shown with the reason, never as zero).
     NotConnected { reason: String },
     Loading,
@@ -340,13 +339,14 @@ pub struct UiSnapshot {
     pub replies: Vec<CommandOutcome>,
     /// funding-pnl: funding / PnL data per `pair_id` (positions page).
     pub funding: BTreeMap<String, crate::ui::funding::PairFunding>,
+    /// `OkxLatch::reason()` once an environment mismatch (`50101`) disabled OKX for the rest of the run.
+    pub okx_disabled: Option<String>,
 }
 
 impl UiSnapshot {
     pub fn account(&self, e: Exchange) -> AccountState {
         match self.accounts.get(&e) {
             Some(a) => a.clone(),
-            None if !ACCOUNT_EXCHANGES.contains(&e) => AccountState::Unsupported,
             None => AccountState::Loading,
         }
     }
@@ -389,6 +389,8 @@ pub enum SourceUpdate {
     CommandResult(CommandOutcome),
     /// funding-pnl: replaces the per-pair funding data.
     Funding(BTreeMap<String, crate::ui::funding::PairFunding>),
+    /// The OKX latch tripped (the one shared `OkxLatch`): why OKX is disabled until restart.
+    OkxDisabled(String),
 }
 
 impl SourceUpdate {
@@ -484,6 +486,7 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
             snap.replies.drain(..extra);
         }
         SourceUpdate::Funding(f) => snap.funding = f,
+        SourceUpdate::OkxDisabled(why) => snap.okx_disabled = Some(why),
     }
 }
 

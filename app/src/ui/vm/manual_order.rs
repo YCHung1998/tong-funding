@@ -56,12 +56,20 @@ pub struct ManualResult {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualVm {
-    /// Binance and Bybit only (OKX takes no orders); `Err` = disabled with the reason.
+    /// One panel per exchange; `Err` = disabled with the reason.
     pub panels: Vec<(Exchange, Result<(), String>)>,
     pub mode: Option<ExecutionMode>,
     pub env_text: String,
-    /// The floored quantity, or why there is none.
+    /// The floored order quantity in the exchange's unit (CONTRACTS on OKX, where the form takes
+    /// coins), or why there is none.
     pub rounded: Result<Decimal, String>,
+    /// OKX: `3 張（≈ 0.03 BTC，≈ 1,800.00 USDT）`, the conversion of the typed coin amount.
+    pub qty_note: Option<String>,
+    /// The quantity as the confirmation writes it (`0.001 BTC`, `3 張（≈ 0.03 BTC）`).
+    pub qty_text: Option<String>,
+    /// OKX opening order: the coin amount the user typed (the executor's size guard compares
+    /// `contracts x ctVal` with it). `None` otherwise.
+    pub intended_base_qty: Option<Decimal>,
     pub est_notional: Option<Decimal>,
     /// The validated leverage of an opening order; `None` for reduce-only (ignored) or while invalid.
     pub leverage: Option<Decimal>,
@@ -77,7 +85,9 @@ pub struct ManualConfirm {
     pub exchange: Exchange,
     pub symbol: String,
     pub side: OrderSide,
+    /// The order quantity in the exchange's unit (contracts on OKX).
     pub quantity: Decimal,
+    pub intended_base_qty: Option<Decimal>,
     pub qty_text: String,
     pub est_notional: Option<Decimal>,
     pub reduce_only: bool,
@@ -100,7 +110,21 @@ fn panel_state(snap: &UiSnapshot, ex: Exchange) -> Result<(), String> {
     if snap.settings.risk.allowed_exchanges.contains(&ex) { Ok(()) } else { Err("此交易所未在 allowed_exchanges 中".into()) }
 }
 
-fn rounded(form: &ManualForm, snap: &UiSnapshot) -> Result<(Decimal, String), String> {
+/// The order quantity of the form in the exchange's unit, with how to show it.
+struct Sized {
+    /// Contracts on OKX, base coin elsewhere.
+    order_qty: Decimal,
+    /// The coin amount the order stands for.
+    base_qty: Decimal,
+    /// The quantity as written in the confirmation.
+    text: String,
+    /// OKX: the conversion line (`N 張（≈ x BTC，≈ y USDT）`).
+    note: Option<String>,
+    /// OKX: what the user typed.
+    typed: Option<Decimal>,
+}
+
+fn sized(form: &ManualForm, snap: &UiSnapshot, price: Option<Decimal>) -> Result<Sized, String> {
     let symbol = form.symbol.trim().to_ascii_uppercase();
     if symbol.is_empty() {
         return Err("Symbol 為空".into());
@@ -114,11 +138,25 @@ fn rounded(form: &ManualForm, snap: &UiSnapshot) -> Result<(Decimal, String), St
         Some(Err(e)) => return Err(format!("無法取得合約規格（{e}）")),
         Some(Ok(r)) => r,
     };
-    match Quantity::round_down(raw, &rules.lot) {
-        Ok(q) => Ok((q.value(), format!("{} {}", q.to_order_string(&rules.lot), format::base_coin(&symbol)))),
-        Err(tong_funding_core::quantity::QuantityError::BelowMinimum { .. }) => Err("低於最小下單量".into()),
-        Err(e) => Err(e.to_string()),
+    let coin = format::base_coin(&symbol);
+    let below = |e: tong_funding_core::quantity::QuantityError| match e {
+        tong_funding_core::quantity::QuantityError::BelowMinimum { .. } => "低於最小下單量".to_string(),
+        other => other.to_string(),
+    };
+    if form.exchange == Exchange::Okx {
+        // OKX sizes in contracts: the form takes COINS, converted with ctVal and floored to lotSz.
+        let ct_val = rules.okx_ct_val.filter(|c| *c > Decimal::ZERO).ok_or_else(|| "無法取得合約規格（ctVal）".to_string())?;
+        let contracts = Quantity::okx_contracts(raw, ct_val, &rules.lot).map_err(below)?;
+        let n = contracts.value();
+        let base = (n * ct_val).normalize();
+        let note = match price {
+            Some(p) => format!("{} 張（≈ {base} {coin}，≈ {} USDT）", n.normalize(), format::money(n * ct_val * p, 2)),
+            None => format!("{} 張（≈ {base} {coin}）", n.normalize()),
+        };
+        return Ok(Sized { order_qty: n, base_qty: n * ct_val, text: format!("{} 張（≈ {base} {coin}）", n.normalize()), note: Some(note), typed: Some(raw) });
     }
+    let q = Quantity::round_down(raw, &rules.lot).map_err(below)?;
+    Ok(Sized { order_qty: q.value(), base_qty: q.value(), text: format!("{} {coin}", q.value().normalize()), note: None, typed: None })
 }
 
 /// A whole-number leverage from 1 to 125 (the range both exchanges take).
@@ -174,9 +212,9 @@ fn results(snap: &UiSnapshot) -> Vec<ManualResult> {
 pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> ManualVm {
     let mode = snap.engine.as_ref().map(|e| e.execution_mode);
     let panels: Vec<(Exchange, Result<(), String>)> = TRADABLE_EXCHANGES.iter().map(|ex| (*ex, panel_state(snap, *ex))).collect();
-    let r = rounded(form, snap);
     let price = snap.market.get(&form.exchange).and_then(|f| f.observations.iter().find(|o| o.symbol == form.symbol.trim().to_ascii_uppercase())).map(|o| o.mark_price);
-    let est_notional = r.as_ref().ok().zip(price).map(|((q, _), p)| *q * p);
+    let r = sized(form, snap, price);
+    let est_notional = r.as_ref().ok().zip(price).map(|(z, p)| z.base_qty * p);
 
     let mut submit_disabled = Vec::new();
     match &snap.engine {
@@ -187,9 +225,7 @@ pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> Manua
             }
         }
     }
-    if !TRADABLE_EXCHANGES.contains(&form.exchange) {
-        submit_disabled.push("OKX 不提供下單".into());
-    } else if let Err(why) = panel_state(snap, form.exchange) {
+    if let Err(why) = panel_state(snap, form.exchange) {
         submit_disabled.push(why);
     }
     if let Err(why) = &r {
@@ -224,7 +260,11 @@ pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> Manua
         cancel_disabled.push("Symbol 為空".into());
     }
 
-    ManualVm { panels, mode, env_text: env_text(mode), rounded: r.map(|(q, _)| q), est_notional, leverage, cap_text, submit_disabled, cancel_disabled, results: results(snap) }
+    let (qty_note, intended_base_qty, qty_text) = match &r {
+        Ok(z) => (z.note.clone(), if form.reduce_only { None } else { z.typed }, Some(z.text.clone())),
+        Err(_) => (None, None, None),
+    };
+    ManualVm { panels, mode, env_text: env_text(mode), rounded: r.map(|z| z.order_qty), qty_note, qty_text, intended_base_qty, est_notional, leverage, cap_text, submit_disabled, cancel_disabled, results: results(snap) }
 }
 
 /// Opens the confirmation; `None` while submit is disabled. Sends nothing.
@@ -235,12 +275,13 @@ pub fn open_confirm(vm: &ManualVm, form: &ManualForm) -> Option<ManualConfirm> {
     let mode = vm.mode?;
     let quantity = *vm.rounded.as_ref().ok()?;
     let symbol = form.symbol.trim().to_ascii_uppercase();
-    let qty_text = format!("{} {}", quantity.normalize(), format::base_coin(&symbol));
+    let qty_text = vm.qty_text.clone()?;
     Some(ManualConfirm {
         exchange: form.exchange,
         symbol,
         side: form.side,
         quantity,
+        intended_base_qty: vm.intended_base_qty,
         qty_text,
         est_notional: vm.est_notional,
         reduce_only: form.reduce_only,
@@ -256,7 +297,7 @@ pub fn open_confirm(vm: &ManualVm, form: &ManualForm) -> Option<ManualConfirm> {
 pub fn confirm(c: &ManualConfirm, sink: &dyn CommandSink) {
     sink.send(
         format!("手動下單 {} {} {:?} {}", c.exchange.name(), c.symbol, c.side, c.qty_text),
-        Command::ManualOrder(ManualOrder { exchange: c.exchange, symbol: c.symbol.clone(), side: c.side, quantity: c.quantity, reduce_only: c.reduce_only, leverage: if c.reduce_only { None } else { c.leverage } }),
+        Command::ManualOrder(ManualOrder { exchange: c.exchange, symbol: c.symbol.clone(), side: c.side, quantity: c.quantity, reduce_only: c.reduce_only, leverage: if c.reduce_only { None } else { c.leverage }, intended_base_qty: if c.reduce_only { None } else { c.intended_base_qty } }),
     );
 }
 
@@ -296,9 +337,30 @@ pub struct PickList<T> {
 pub struct PositionRow {
     pub exchange: Exchange,
     pub symbol: String,
-    /// Signed: long positive, short negative.
+    /// Signed COIN amount: long positive, short negative. OKX reports contracts; they are
+    /// multiplied by `ctVal` here (and `ZERO` while `unconvertible`: never contracts as coins).
     pub quantity: Decimal,
     pub is_long: bool,
+    /// OKX only: the signed contract count, when `ctVal` is known.
+    pub contracts: Option<Decimal>,
+    /// OKX position whose `ctVal` is unknown: it cannot be shown in coins or closed from here.
+    pub unconvertible: bool,
+    /// OKX only: the position as the exchange reported it (contracts), for the "無法換算" label.
+    pub raw_contracts: Option<Decimal>,
+}
+
+impl PositionRow {
+    /// Close = opposite side, the whole position in coins, reduce-only (the form converts OKX coins
+    /// back to contracts). `None` while the position cannot be converted.
+    pub fn close_prefill(&self) -> Option<ManualPrefill> {
+        (!self.unconvertible).then(|| ManualPrefill {
+            exchange: self.exchange,
+            symbol: self.symbol.clone(),
+            side: if self.is_long { OrderSide::Sell } else { OrderSide::Buy },
+            quantity: self.quantity.abs().normalize().to_string(),
+            reduce_only: true,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -306,7 +368,11 @@ pub struct OrderRow {
     pub exchange: Exchange,
     pub symbol: String,
     pub order_id: Option<String>,
+    /// Remaining COIN amount (OKX: contracts x `ctVal`; `ZERO` while `unconvertible`).
     pub remaining: Decimal,
+    /// OKX only: the remaining contracts as reported.
+    pub remaining_contracts: Option<Decimal>,
+    pub unconvertible: bool,
 }
 
 /// Values a "close this position" click writes into the order form.
@@ -358,28 +424,58 @@ fn pick_lists<A, T>(
 /// Non-zero positions per tradable exchange, from the account of the current execution mode.
 pub fn open_positions(snap: &UiSnapshot) -> Vec<PickList<PositionRow>> {
     pick_lists(snap, |a| &a.positions, |p| {
-        (!p.quantity.is_zero()).then(|| PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity, is_long: p.quantity > Decimal::ZERO })
+        if p.quantity.is_zero() {
+            return None;
+        }
+        let is_long = p.quantity > Decimal::ZERO;
+        Some(match ct_val_of(snap, p.exchange, &p.symbol) {
+            CtVal::NotOkx => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity, is_long, contracts: None, unconvertible: false, raw_contracts: None },
+            CtVal::Known(c) => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity * c, is_long, contracts: Some(p.quantity), unconvertible: false, raw_contracts: Some(p.quantity) },
+            CtVal::Unknown => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: Decimal::ZERO, is_long, contracts: None, unconvertible: true, raw_contracts: Some(p.quantity) },
+        })
     })
+}
+
+/// How the quantities of one (exchange, symbol) convert to coins.
+enum CtVal {
+    NotOkx,
+    Known(Decimal),
+    Unknown,
+}
+
+fn ct_val_of(snap: &UiSnapshot, exchange: Exchange, symbol: &str) -> CtVal {
+    if exchange != Exchange::Okx {
+        return CtVal::NotOkx;
+    }
+    match snap.rules.get(&(exchange, symbol.to_string())) {
+        Some(Ok(r)) => r.okx_ct_val.filter(|c| *c > Decimal::ZERO).map_or(CtVal::Unknown, CtVal::Known),
+        _ => CtVal::Unknown,
+    }
 }
 
 /// Open orders per tradable exchange; rows without an id are kept (shown, not pickable).
 pub fn open_orders(snap: &UiSnapshot) -> Vec<PickList<OrderRow>> {
     pick_lists(snap, |a| &a.open_orders, |o| {
         let order_id = o.client_order_id.as_ref().map(|i| i.trim().to_string()).filter(|i| !i.is_empty());
-        Some(OrderRow { exchange: o.exchange, symbol: o.symbol.clone(), order_id, remaining: o.remaining_quantity })
+        Some(match ct_val_of(snap, o.exchange, &o.symbol) {
+            CtVal::NotOkx => OrderRow { exchange: o.exchange, symbol: o.symbol.clone(), order_id, remaining: o.remaining_quantity, remaining_contracts: None, unconvertible: false },
+            CtVal::Known(c) => OrderRow { exchange: o.exchange, symbol: o.symbol.clone(), order_id, remaining: o.remaining_quantity * c, remaining_contracts: Some(o.remaining_quantity), unconvertible: false },
+            CtVal::Unknown => OrderRow { exchange: o.exchange, symbol: o.symbol.clone(), order_id, remaining: Decimal::ZERO, remaining_contracts: Some(o.remaining_quantity), unconvertible: true },
+        })
     })
 }
 
-/// Close = opposite side, the whole position, reduce-only. Quantity is passed unrounded; `build`
-/// floors it to the exchange step and the confirmation shows the result.
-pub fn close_prefill(p: &AccountPosition) -> ManualPrefill {
-    ManualPrefill {
+/// Close prefill of an engine position that is already in COINS (Binance / Bybit). OKX positions
+/// are contracts and are converted by `open_positions` first: this refuses them (`None`) so contracts
+/// can never be written into the coin form.
+pub fn close_prefill(p: &AccountPosition) -> Option<ManualPrefill> {
+    (p.exchange != Exchange::Okx).then(|| ManualPrefill {
         exchange: p.exchange,
         symbol: p.symbol.clone(),
         side: if p.quantity > Decimal::ZERO { OrderSide::Sell } else { OrderSide::Buy },
         quantity: p.quantity.abs().normalize().to_string(),
         reduce_only: true,
-    }
+    })
 }
 
 /// `None` for an order without an id (it cannot be cancelled from here).

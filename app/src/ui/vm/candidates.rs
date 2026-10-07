@@ -8,7 +8,7 @@ use serde_json::json;
 use tong_funding_core::pair::PairState;
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::bridge::{is_tradable, CommandSink, UiSnapshot};
+use super::bridge::{CommandSink, UiSnapshot};
 use super::leverage_cap::{self, CapCheck};
 use super::scanner::{Qualified, ScanRow, ScannerVm};
 use crate::engine::command::{Command, NewPreparedPair, PairView};
@@ -17,8 +17,6 @@ use crate::engine::command::{Command, NewPreparedPair, PairView};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CandidateBlock {
     NoDirection,
-    /// The best pair includes OKX (price comparison only).
-    CompareOnly,
     /// Settings incomplete: qualification cannot be decided.
     NotDecidable,
     NotQualified,
@@ -34,7 +32,6 @@ impl CandidateBlock {
     pub fn text(self) -> String {
         match self {
             CandidateBlock::NoDirection => "無可交易方向".into(),
-            CandidateBlock::CompareOnly => "OKX 僅比價".into(),
             CandidateBlock::NotDecidable => "設定不完整".into(),
             CandidateBlock::NotQualified => "未達標".into(),
             CandidateBlock::StaleData(e) => format!("{} 行情過期", e.name()),
@@ -84,9 +81,6 @@ fn staged(snap: &UiSnapshot, symbol: &str, now_ms: i64) -> bool {
 /// Whether the row may be ticked. Pure.
 pub fn eligibility(row: &ScanRow, snap: &UiSnapshot, now_ms: i64) -> Result<(), CandidateBlock> {
     let Some((long, short)) = row.direction else { return Err(CandidateBlock::NoDirection) };
-    if !is_tradable(long) || !is_tradable(short) {
-        return Err(CandidateBlock::CompareOnly);
-    }
     match row.qualified {
         Qualified::Yes => {}
         Qualified::NotConfigured => return Err(CandidateBlock::NotDecidable),

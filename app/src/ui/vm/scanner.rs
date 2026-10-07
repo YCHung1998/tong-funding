@@ -1,7 +1,7 @@
 //! Scanner view-model (task 2.4, spec scanner-page). Net Edge, qualification and the best pair
 //! always come from `core` (design D3); this module only selects rows, picks what to show and
-//! formats it. OKX is price comparison only (design D4): its rate is shown but never takes part
-//! in Gross Spread, Net Edge, direction or qualification.
+//! formats it. Every enabled exchange (`allowed_exchanges`), OKX included, takes part in Gross
+//! Spread, Net Edge, direction and qualification (okx-trading-enablement).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,8 +30,6 @@ pub enum RateCell {
         interval_secs: i64,
         /// 8h equivalent, display only, present when the interval is not 8h.
         eq_8h: Option<Decimal>,
-        /// OKX: shown for comparison only.
-        compare_only: bool,
         /// The source's latest fetch failed (or it is stale): this value is old.
         stale: bool,
     },
@@ -53,16 +51,13 @@ impl RateCell {
             RateCell::Rate { interval_secs, .. } => Some(format::interval_label(Some(*interval_secs))),
         }
     }
-    /// Secondary text: 8h equivalent (display only), "僅比價", stale marker.
+    /// Secondary text: 8h equivalent (display only), stale marker.
     pub fn notes(&self) -> Vec<String> {
         match self {
-            RateCell::Rate { eq_8h, compare_only, stale, .. } => {
+            RateCell::Rate { eq_8h, stale, .. } => {
                 let mut v = Vec::new();
                 if let Some(e) = eq_8h {
                     v.push(format!("8h 等效 {}（僅供顯示）", format::rate_pct(*e)));
-                }
-                if *compare_only {
-                    v.push("僅比價".into());
                 }
                 if *stale {
                     v.push("過期".into());
@@ -398,7 +393,7 @@ fn pairs_of(exchanges: &[Exchange]) -> Vec<(Exchange, Exchange)> {
     out
 }
 
-fn cell_for(o: Option<&FundingObservation>, e: Exchange, enabled: bool, feed_stale: bool) -> RateCell {
+fn cell_for(o: Option<&FundingObservation>, enabled: bool, feed_stale: bool) -> RateCell {
     let Some(o) = o.filter(|_| enabled) else { return RateCell::Empty };
     if is_consistent_listed(o) {
         let interval = o.funding_interval_secs.unwrap_or_default();
@@ -406,14 +401,13 @@ fn cell_for(o: Option<&FundingObservation>, e: Exchange, enabled: bool, feed_sta
             rate: o.funding_rate,
             interval_secs: interval,
             eq_8h: if interval != 28_800 { equivalent_8h_rate(o.funding_rate, o.funding_interval_secs) } else { None },
-            compare_only: !is_tradable(e),
             stale: feed_stale,
         };
     }
     match (o.data_status, o.funding_interval_secs) {
         (DataStatus::NotListed, _) => RateCell::Empty,
         // Too old to use: shown, marked, never used in a calculation.
-        (DataStatus::Stale, Some(interval)) => RateCell::Rate { rate: o.funding_rate, interval_secs: interval, eq_8h: None, compare_only: !is_tradable(e), stale: true },
+        (DataStatus::Stale, Some(interval)) => RateCell::Rate { rate: o.funding_rate, interval_secs: interval, eq_8h: None, stale: true },
         (_, interval) => RateCell::DataError { interval_unknown: interval.is_none() },
     }
 }
@@ -509,7 +503,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> ScannerVm {
         if listed.is_empty() || (!symbols_allowed.is_empty() && !symbols_allowed.contains(*symbol)) {
             continue;
         }
-        let cells = Exchange::ALL.map(|e| (e, cell_for(by_ex.get(&e).copied(), e, enabled.contains(&e), feed(e).failing())));
+        let cells = Exchange::ALL.map(|e| (e, cell_for(by_ex.get(&e).copied(), enabled.contains(&e), feed(e).failing())));
         let candidates: Vec<&FundingObservation> = listed.iter().copied().filter(|o| is_tradable(o.exchange)).collect();
         let mut row = ScanRow {
             rank: 0,

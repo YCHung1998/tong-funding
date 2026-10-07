@@ -94,9 +94,13 @@ fn a_failed_fetch_keeps_the_old_observations_and_marks_the_feed_failing() {
 }
 
 #[test]
-fn okx_account_is_unsupported_and_unknown_accounts_are_loading() {
+fn every_exchange_is_tradable_and_has_an_account_and_unknown_accounts_are_loading() {
+    // okx-trading-enablement: OKX is a tradable, account-backed exchange like the other two
+    assert_eq!(TRADABLE_EXCHANGES.to_vec(), vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx]);
+    assert_eq!(ACCOUNT_EXCHANGES.to_vec(), vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx]);
+    assert!(is_tradable(Exchange::Okx));
     let s = UiSnapshot::default();
-    assert_eq!(s.account(Exchange::Okx), AccountState::Unsupported);
+    assert_eq!(s.account(Exchange::Okx), AccountState::Loading, "not read yet is loading, never public-data-only");
     assert_eq!(s.account(Exchange::Binance), AccountState::Loading);
     assert_eq!(s.clock(Exchange::Bybit), ClockState::Unsynced);
 }
@@ -122,4 +126,12 @@ fn books_update_replaces_on_success_and_keeps_old_quotes_on_failure() {
     assert_eq!(f.books["BTCUSDT"].ask_price, "101".parse().unwrap());
     assert!(f.last_error.is_none());
     assert!(SourceUpdate::Books { exchange: Exchange::Okx, books: Err("x".into()), at: 0 }.is_market(), "quotes trigger the recompute too");
+}
+
+#[test]
+fn the_okx_disabled_reason_is_kept_until_it_changes() {
+    let mut s = UiSnapshot::default();
+    assert_eq!(s.okx_disabled, None);
+    apply_update(&mut s, SourceUpdate::OkxDisabled("OKX 50101: ...".into()));
+    assert_eq!(s.okx_disabled.as_deref(), Some("OKX 50101: ..."));
 }

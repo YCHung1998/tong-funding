@@ -83,23 +83,46 @@ fn missing_bybit_fee_shows_not_configured_with_the_missing_item_never_zero() {
 }
 
 #[test]
-fn okx_largest_spread_is_never_chosen_and_is_marked_compare_only() {
+fn okx_largest_spread_is_chosen_like_any_other_exchange() {
     let vm = build(&snap(complete_settings("0.01"), &[(Binance, "BTCUSDT", "0.0001"), (Bybit, "BTCUSDT", "0.0002"), (Okx, "BTCUSDT", "-0.0050")]), NOW);
     let r = row(&vm, "BTCUSDT");
-    let (l, s) = r.direction.unwrap();
-    assert!(l != Okx && s != Okx, "direction only between Binance and Bybit");
-    assert_eq!(r.gross_text(), "0.0100");
-    assert!(cell(r, Okx).notes().contains(&"僅比價".to_string()));
+    assert_eq!(r.direction, Some((Okx, Bybit)), "long the lowest rate (OKX), short the highest (Bybit)");
+    assert_eq!(r.gross_text(), "0.5200");
+    assert_eq!(r.qualified, Qualified::Yes);
+    assert!(cell(r, Okx).notes().iter().all(|n| !n.contains("僅比價")), "{:?}", cell(r, Okx).notes());
     assert_eq!(cell(r, Okx).text(), "−0.5000");
     assert_eq!(r.coverage_text(), "3/3");
 }
 
 #[test]
-fn one_tradable_exchange_gives_dashes_but_coverage_counts_okx() {
-    let vm = build(&snap(complete_settings("0.01"), &[(Binance, "BTCUSDT", "0.0001"), (Okx, "BTCUSDT", "0.0009")]), NOW);
+fn an_okx_binance_pair_is_a_direction_when_bybit_is_excluded() {
+    let mut settings = complete_settings("0.01");
+    settings.risk.allowed_exchanges = vec![Binance, Okx];
+    let vm = build(&snap(settings, &[(Binance, "BTCUSDT", "0.0003"), (Bybit, "BTCUSDT", "-0.0100"), (Okx, "BTCUSDT", "-0.0001")]), NOW);
+    let r = row(&vm, "BTCUSDT");
+    assert_eq!(r.direction, Some((Okx, Binance)));
+    assert_eq!(r.gross_text(), "0.0400");
+    assert_eq!(cell(r, Bybit).text(), "—", "an excluded exchange takes no part");
+    assert_eq!(r.net_edge.text(), "−0.0400");
+}
+
+#[test]
+fn excluding_okx_removes_it_from_direction_and_qualification() {
+    let mut settings = complete_settings("0.01");
+    settings.risk.allowed_exchanges = vec![Binance, Bybit];
+    let vm = build(&snap(settings, &[(Binance, "BTCUSDT", "0.0001"), (Bybit, "BTCUSDT", "0.0002"), (Okx, "BTCUSDT", "-0.0050")]), NOW);
+    let r = row(&vm, "BTCUSDT");
+    assert_eq!(r.direction, Some((Binance, Bybit)));
+    assert_eq!(r.gross_text(), "0.0100");
+    assert_eq!(cell(r, Okx).text(), "—");
+}
+
+#[test]
+fn a_single_listed_exchange_gives_dashes_and_coverage_counts_it() {
+    let vm = build(&snap(complete_settings("0.01"), &[(Binance, "BTCUSDT", "0.0001")]), NOW);
     let r = row(&vm, "BTCUSDT");
     assert_eq!((r.gross_text(), r.net_edge.text(), r.direction_text(), r.qualified.text()), ("—".into(), "—".into(), "—".into(), "—"));
-    assert_eq!(r.coverage_text(), "2/3");
+    assert_eq!(r.coverage_text(), "1/3");
 }
 
 #[test]

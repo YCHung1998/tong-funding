@@ -18,7 +18,6 @@ use crate::ui::theme::Tone;
 
 /// funding-pnl (settlement-timeline): replaces Figma's "PnL 未扣手續費與資金費".
 pub const PNL_NOTE: &str = fv::SPREAD_NOTE;
-pub const OKX_NOTE: &str = "OKX 僅比價，不顯示持倉";
 pub const MANUAL_NOTE: &str = "需人工處理";
 
 /// Every position of the connected account exchanges plus `core`'s grouping of them.
@@ -134,6 +133,9 @@ pub struct PosRow {
     /// funding-pnl: the "Funding 收到" cell ("—" plus a reason when unknown, never 0) and its tone.
     pub funding: String,
     pub funding_tone: Tone,
+    /// OKX only: the position in contracts (`quantity / ctVal`), when `ctVal` is known. Shown beside
+    /// the coin amount; never used as the coin amount.
+    pub contracts: Option<Decimal>,
 }
 
 impl PosRow {
@@ -147,7 +149,10 @@ impl PosRow {
                 Side::Long => "LONG".into(),
                 Side::Short => "SHORT".into(),
             },
-            format!("{} {}", format::size(self.quantity), format::base_coin(&self.symbol)),
+            match self.contracts {
+                Some(n) => format!("{} {}（{} 張）", format::size(self.quantity), format::base_coin(&self.symbol), n.abs().normalize()),
+                None => format!("{} {}", format::size(self.quantity), format::base_coin(&self.symbol)),
+            },
             opt(self.entry_price),
             opt(self.mark_price),
             self.leverage.map_or_else(|| DASH.to_string(), |l| format!("{}×", l.normalize())),
@@ -262,8 +267,18 @@ pub struct PositionsVm {
     /// `Binance +4.00 · Bybit −4.00`.
     pub pnl_breakdown: String,
     pub pair_cards: Vec<PairCard>,
-    /// Incomplete lists, unconnected exchanges, OKX note.
+    /// Incomplete lists (with the reason), unconnected exchanges.
     pub notices: Vec<String>,
+}
+
+/// An OKX position in contracts, from its coin amount and the instrument's `ctVal`; `None` for the
+/// other exchanges and while `ctVal` is unknown.
+fn contracts_of(snap: &UiSnapshot, p: &Position) -> Option<Decimal> {
+    if p.exchange != Exchange::Okx {
+        return None;
+    }
+    let ct_val = snap.rules.get(&(Exchange::Okx, p.symbol.clone()))?.as_ref().ok()?.okx_ct_val.filter(|c| *c > Decimal::ZERO)?;
+    Some((p.quantity / ct_val).normalize())
 }
 
 pub fn build(snap: &UiSnapshot, filter: &Filter) -> PositionsVm {
@@ -298,6 +313,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter) -> PositionsVm {
             unpaired: g.is_unpaired(i),
             funding,
             funding_tone,
+            contracts: contracts_of(snap, p),
         })
         .collect();
 
@@ -343,14 +359,18 @@ pub fn build(snap: &UiSnapshot, filter: &Filter) -> PositionsVm {
     let mut notices = Vec::new();
     for e in ACCOUNT_EXCHANGES {
         match snap.account(e) {
-            AccountState::Loaded { data, .. } if data.positions_incomplete.is_some() => notices.push(format!("{} 持倉列表可能不完整", e.name())),
+            AccountState::Loaded { data, .. } if data.positions_incomplete.is_some() => {
+                notices.push(format!("{} 持倉列表可能不完整", e.name()));
+                if let Some(why) = &data.positions_incomplete {
+                    notices.push(format!("{}：{why}", e.name()));
+                }
+            }
             AccountState::NotConnected { reason } => notices.push(format!("{} 未連線：{reason}", e.name())),
             AccountState::Failed { error, .. } => notices.push(format!("{} 持倉讀取失敗：{error}", e.name())),
             AccountState::Loading => notices.push(format!("{} 持倉載入中", e.name())),
             _ => {}
         }
     }
-    notices.push(OKX_NOTE.to_string());
 
     PositionsVm {
         title: format!("{} OPEN · {pairs} PAIRS", all.len()),

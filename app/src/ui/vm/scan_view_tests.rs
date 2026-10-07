@@ -9,7 +9,7 @@ use crate::ui::testkit::d;
 
 fn cell(rate: Option<&str>) -> RateCell {
     match rate {
-        Some(r) => RateCell::Rate { rate: d(r), interval_secs: 28_800, eq_8h: None, compare_only: false, stale: false },
+        Some(r) => RateCell::Rate { rate: d(r), interval_secs: 28_800, eq_8h: None, stale: false },
         None => RateCell::Empty,
     }
 }

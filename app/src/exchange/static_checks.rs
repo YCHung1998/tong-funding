@@ -1210,6 +1210,19 @@ const LATE: &str = "api.bybit.com";
         assert!(violations.is_empty(), "{violations:?}");
     }
 
+    /// okx-trading-enablement 3.5 / 3.6: the composition root gives the OKX read client the SAME latch the
+    /// executor factory owns (one `Arc`, no second latch), and the factory gets the limits source.
+    #[test]
+    fn live_rs_wires_the_okx_read_client_to_the_factorys_latch_and_the_factory_to_the_limits() {
+        let live = production_code(&std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/live.rs")).unwrap());
+        assert!(live.contains("let latch = f.okx_latch();"), "the latch comes from the factory");
+        assert!(live.contains(".with_latch(okx_latch.clone())"), "the OKX read client shares it");
+        assert!(live.contains(".with_okx_limits(okx_limits.clone())"), "the factory gets the size-guard limits");
+        assert_eq!(live.matches("OkxSignedClient::new(").count(), 1, "exactly one OKX read client");
+        // the only other `OkxLatch::new()` calls are the private latches of the no-factory fallbacks
+        assert_eq!(live.matches("OkxLatch::new()").count(), 2, "a new place creating a latch would split the shared one");
+    }
+
     #[test]
     fn ui_live_names_no_production_host_literal() {
         let live = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("ui").join("live.rs");

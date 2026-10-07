@@ -26,6 +26,8 @@ fn snap_with(binance: AccountState, bybit: AccountState) -> UiSnapshot {
     let mut s = UiSnapshot::default();
     s.accounts.insert(Binance, binance);
     s.accounts.insert(Bybit, bybit);
+    // OKX connected with nothing in it (so these two-exchange cases keep their numbers)
+    s.accounts.insert(Okx, loaded(vec![], vec![], NOW));
     s
 }
 
@@ -200,11 +202,48 @@ fn unconnected_exchange_is_excluded_and_named() {
     assert!(vm.cards.contains(&ExchangeCard::NotConnected { exchange: Bybit, reason: "金鑰不存在".into() }));
 }
 
+fn okx_connected() -> AccountState {
+    let mut a = loaded(vec![asset("USDT", "5000", Some("4999.8"), None), asset("BTC", "0.1", Some("6000"), None)], vec![position(Okx, "BTCUSDT", "-0.03", "60000", "60000", "5", "0", Some("360"))], NOW);
+    if let AccountState::Loaded { data, .. } = &mut a {
+        data.contract_equity = Some(ContractEquity { used_margin: d("360"), available_margin: d("4640") });
+    }
+    a
+}
+
 #[test]
-fn okx_is_a_compare_only_card_without_amounts() {
-    let vm = build(&snap_with(figma_binance(), loaded(vec![asset("USDT", "18000", None, None)], vec![], NOW)), NOW);
-    assert!(vm.cards.contains(&ExchangeCard::CompareOnly { exchange: Okx }));
-    assert_eq!(format::money(vm.total, 2), "40,000.00", "OKX not in the total");
+fn okx_is_a_real_account_card_counted_in_the_total_and_the_shares() {
+    let mut s = snap_with(figma_binance(), loaded(vec![asset("USDT", "18000", None, None)], vec![], NOW));
+    s.accounts.insert(Okx, okx_connected());
+    let vm = build(&s, NOW);
+    let o = connected(&vm, Okx);
+    assert_eq!(o.status_label, "● CONNECTED · DEMO");
+    // USDT 5,000 + BTC 6,000 (exchange valuation) + contract equity 360 + 4,640
+    assert_eq!(format::money(o.value, 2), "16,000.00");
+    assert_eq!(format::money(vm.total, 2), "56,000.00", "40,000 + OKX");
+    assert!(vm.excluded_note.is_none(), "{:?}", vm.excluded_note);
+    assert_eq!(o.assets.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["USDT", "BTC", CONTRACT_EQUITY_LABEL]);
+    assert!(matches!(&o.margin, MarginDistribution::Slices { used_total, .. } if *used_total == d("360")));
+    assert!(!vm.cards.iter().any(|c| format!("{c:?}").contains("CompareOnly")));
+    assert_eq!(vm.open_positions, 2, "Binance BTC + OKX BTC");
+}
+
+#[test]
+fn okx_not_connected_failed_and_loading_are_named_states_never_zero_and_not_in_the_total() {
+    let mut s = snap_with(figma_binance(), loaded(vec![asset("USDT", "18000", None, None)], vec![], NOW));
+    // nothing read yet
+    s.accounts.remove(&Okx);
+    let vm = build(&s, NOW);
+    assert!(vm.cards.contains(&ExchangeCard::Loading { exchange: Okx }));
+    assert_eq!(vm.excluded_note.as_deref(), Some("不含未連線的交易所：OKX"));
+    s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
+    let vm = build(&s, NOW);
+    assert!(vm.cards.contains(&ExchangeCard::NotConnected { exchange: Okx, reason: "Keychain 沒有 API key".into() }));
+    assert_eq!(format::money(vm.total, 2), "40,000.00");
+    s.accounts.insert(Okx, AccountState::Failed { error: "帳戶模式不支援 (acctLv 2, posMode long_short_mode)".into(), at: NOW });
+    let vm = build(&s, NOW);
+    assert!(matches!(vm.cards.last(), Some(ExchangeCard::Failed { exchange: Okx, error, .. }) if error.contains("long_short_mode")));
+    assert_eq!(format::money(vm.total, 2), "40,000.00");
+    assert_eq!(vm.excluded_note.as_deref(), Some("不含未連線的交易所：OKX"));
 }
 
 #[test]

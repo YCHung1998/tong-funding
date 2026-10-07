@@ -274,6 +274,7 @@ mod tests {
                 quantity: Decimal::ONE,
                 reduce_only: false,
                 leverage: None,
+            intended_base_qty: None,
             }),
             Command::ManualOrder(ManualOrder {
                 exchange: Exchange::Binance,
@@ -282,6 +283,7 @@ mod tests {
                 quantity: Decimal::ONE,
                 reduce_only: true,
                 leverage: None,
+            intended_base_qty: None,
             }),
             Command::AutoExit { pair: p() },
             Command::ManualExit { pair: p() },

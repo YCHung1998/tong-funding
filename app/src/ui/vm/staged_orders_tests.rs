@@ -571,3 +571,92 @@ fn staged_row_with_an_unknown_cap_is_selectable_in_simulation_but_not_in_exchang
     let vm = build(&s, &BTreeSet::new(), NOW);
     assert_eq!(vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap().selectable, Ok(()));
 }
+
+// ---- okx-trading-enablement: an OKX leg on the staged-orders page -----------------------------
+
+mod okx {
+    use super::*;
+    use crate::ui::bridge::BookFeed;
+    use tong_funding_core::trade_cost::TopOfBook;
+
+    /// BTC pair, long OKX (ctVal 0.001, lot 1 contract: 0.016 BTC = 16 contracts), short Bybit.
+    /// The OKX top of book is already in COINS (the adapter multiplies the contract sizes by ctVal).
+    fn okx_snap(ask_coins: &str) -> UiSnapshot {
+        let mut s = snap();
+        s.pair_entries.insert(
+            "u-BTCUSDT".into(),
+            json!({"long_scan_price": "60010", "short_scan_price": "60010", "notional_usdt": "1000", "leverage": "5", "net_edge_pct": "0.07", "gross_spread": "0.0012"}),
+        );
+        for ex in [Exchange::Binance, Exchange::Bybit] {
+            s.market.get_mut(&ex).unwrap().observations.iter_mut().find(|o| o.symbol == "BTCUSDT").unwrap().mark_price = d("60010");
+        }
+        let mut o = obs(Exchange::Okx, "BTCUSDT", "0.0001", 28_800, T, NOW - 500);
+        o.mark_price = d("60010");
+        s.market.insert(Exchange::Okx, MarketFeed { observations: vec![o], last_success_at: Some(NOW - 500), last_error: None });
+        s.rules.insert((Exchange::Okx, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("1"), min_qty: d("1") }, okx_ct_val: Some(d("0.001")) }));
+        eng(&mut s).pairs.iter_mut().find(|p| p.symbol == "BTCUSDT").unwrap().long_exchange = Exchange::Okx;
+        let at = NOW - 4_000;
+        let book = |bid: &str, ask: &str, ask_qty: &str| TopOfBook { bid_price: d(bid), bid_qty: d("5"), ask_price: d(ask), ask_qty: d(ask_qty), observed_at: at };
+        let mut okx: BookFeed = BookFeed::default();
+        okx.books.insert("BTCUSDT".into(), book("60000", "60010", ask_coins));
+        okx.last_success_at = Some(at);
+        s.books.insert(Exchange::Okx, okx);
+        let mut bybit: BookFeed = BookFeed::default();
+        bybit.books.insert("BTCUSDT".into(), book("60090", "60100", "5"));
+        bybit.last_success_at = Some(at);
+        s.books.insert(Exchange::Bybit, bybit);
+        s
+    }
+
+    fn btc(s: &UiSnapshot) -> StagedRow {
+        build(s, &BTreeSet::new(), NOW).rows.into_iter().find(|r| r.symbol == "BTCUSDT").unwrap()
+    }
+
+    #[test]
+    fn the_okx_leg_is_sized_in_contracts_and_priced_in_coins() {
+        let r = btc(&okx_snap("5"));
+        assert_eq!(r.long_qty.order_qty(), Some(d("16")), "the OKX leg sends contracts");
+        assert!(r.long_qty.text().starts_with("16 張（≈ 0.016 BTC"), "{}", r.long_qty.text());
+        assert_eq!(r.short_qty.order_qty(), Some(d("0.016")), "the other leg the same coin amount");
+        match &r.cost {
+            CostView::Estimate(c) => {
+                assert_eq!(c.qty, d("0.016"), "the shared quantity is in coins");
+                assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(r.selectable.is_ok(), "{:?}", r.selectable);
+    }
+
+    #[test]
+    fn the_top_level_is_compared_in_coins_one_contract_size_below_the_shared_quantity_warns() {
+        // OKX ask size 10 contracts = 0.010 BTC < 0.016 BTC
+        let r = btc(&okx_snap("0.010"));
+        match &r.cost {
+            CostView::Estimate(c) => assert!(c.warnings.iter().any(|w| w.contains("OKX") && w.contains("第二檔") && w.contains("0.01")), "{:?}", c.warnings),
+            other => panic!("{other:?}"),
+        }
+        assert!(r.selectable.is_ok(), "a hint only");
+    }
+
+    #[test]
+    fn without_ct_val_there_is_no_quantity_and_no_estimate_and_the_reason_names_it() {
+        let mut s = okx_snap("5");
+        s.rules.insert((Exchange::Okx, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("1"), min_qty: d("1") }, okx_ct_val: None }));
+        let r = btc(&s);
+        assert!(matches!(&r.cost, CostView::Unavailable(w) if w.contains("ctVal")), "{:?}", r.cost);
+        assert!(r.selectable.is_err());
+    }
+
+    #[test]
+    fn the_margin_row_covers_okx_and_unknown_is_never_zero() {
+        use crate::ui::bridge::LegAccount;
+        let mut s = okx_snap("5");
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!(vm.margins.iter().map(|m| m.0).collect::<Vec<_>>(), vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx]);
+        assert_eq!(vm.margins.iter().find(|m| m.0 == Exchange::Okx).unwrap().1, "未知（尚未查詢）");
+        s.leg_accounts.insert((false, Exchange::Okx), LegAccount { positions: Err("x".into()), open_orders: Err("x".into()), available_margin: Ok(d("4640.5")), fetched_at: NOW });
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!(vm.margins.iter().find(|m| m.0 == Exchange::Okx).unwrap().1, "4,640.50 USDT");
+    }
+}

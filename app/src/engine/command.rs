@@ -42,6 +42,9 @@ pub struct ManualOrder {
     /// Leverage to set on the exchange before an opening order (manual-order-leverage); ignored on
     /// reduce-only orders, `None` leaves the account's leverage alone. Must be > 0 when present.
     pub leverage: Option<Decimal>,
+    /// The coin amount the caller intended (OKX: the executor's size guard checks
+    /// `quantity x ctVal` against it; `None` on closes and on exchanges that size in coins).
+    pub intended_base_qty: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +264,7 @@ mod tests {
             quantity: Decimal::new(1, 3),
             reduce_only,
             leverage: None,
+            intended_base_qty: None,
         })
     }
 

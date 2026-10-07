@@ -62,13 +62,7 @@ fn a_row_that_does_not_qualify_cannot_be_added() {
 }
 
 #[test]
-fn an_okx_leg_stale_data_and_an_incomplete_config_are_reasons() {
-    let s = snap();
-    let mut r = row(&scanner::build(&s, NOW), "BTCUSDT").clone();
-    r.direction = Some((Exchange::Okx, Exchange::Bybit));
-    assert_eq!(eligibility(&r, &s, NOW), Err(CandidateBlock::CompareOnly));
-    assert_eq!(CandidateBlock::CompareOnly.text(), "OKX 僅比價");
-
+fn stale_data_an_incomplete_config_and_a_passed_settlement_are_reasons() {
     let mut stale = snap();
     stale.market.get_mut(&Exchange::Bybit).unwrap().last_error = Some(("timeout".into(), NOW));
     let vm = scanner::build(&stale, NOW);
@@ -315,4 +309,27 @@ fn caps_that_fit_or_are_unknown_do_not_refuse_the_add() {
     let (sent, v) = add_one(&unknown);
     assert_eq!(sent, 1);
     assert!(v[0].cap.text().contains("未知"), "{}", v[0].cap.text());
+}
+
+#[test]
+fn an_okx_pair_is_an_ordinary_candidate_under_the_general_rules() {
+    // SOL: OKX is the cheapest leg, Bybit the dearest; everything else is as for any other pair.
+    let mut s = snap();
+    let mk = |ex: Exchange, rate: &str| {
+        let mut o = obs(ex, "SOLUSDT", rate, 28_800, T, NOW - 100);
+        o.mark_price = d("150");
+        o
+    };
+    s.market.insert(Exchange::Okx, MarketFeed { observations: vec![mk(Exchange::Okx, "-0.002")], last_success_at: Some(NOW - 100), last_error: None });
+    s.market.get_mut(&Exchange::Bybit).unwrap().observations.push(mk(Exchange::Bybit, "0.002"));
+    let vm = scanner::build(&s, NOW);
+    let sol = row(&vm, "SOLUSDT");
+    assert_eq!(sol.direction, Some((Exchange::Okx, Exchange::Bybit)));
+    assert_eq!(eligibility(sol, &s, NOW), Ok(()));
+    let mut list = CandidateList::default();
+    assert!(list.toggle(sol, &s, NOW));
+    // the OKX leg is judged like any other: its failing feed blocks the row
+    s.market.get_mut(&Exchange::Okx).unwrap().last_error = Some(("timeout".into(), NOW));
+    let vm = scanner::build(&s, NOW);
+    assert_eq!(eligibility(row(&vm, "SOLUSDT"), &s, NOW), Err(CandidateBlock::StaleData(Exchange::Okx)));
 }

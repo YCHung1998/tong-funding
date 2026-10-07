@@ -979,6 +979,7 @@ async fn a_manual_order_goes_through_the_simulator_with_an_intent() {
             quantity: dec("2"),
             reduce_only,
             leverage: None,
+            intended_base_qty: None,
         })
     };
     assert_eq!(ask(&h, order(false, OrderSide::Sell)).await, CommandReply::Accepted);
@@ -2241,7 +2242,7 @@ async fn caps_at_or_above_the_leverage_let_the_pair_proceed() {
 // ---- manual-order-leverage: engine --------------------------------------------------------
 
 fn manual_cmd(reduce_only: bool, side: OrderSide, leverage: Option<Decimal>) -> Command {
-    Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side, quantity: dec("2"), reduce_only, leverage })
+    Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side, quantity: dec("2"), reduce_only, leverage, intended_base_qty: None })
 }
 
 #[tokio::test(start_paused = true)]
@@ -2265,4 +2266,76 @@ async fn a_manual_opening_order_with_a_non_positive_leverage_is_refused_and_noth
     }
     sleep(Duration::from_millis(50)).await;
     assert!(rig.demo.requests.lock().unwrap().iter().all(|r| r.symbol != "ETHUSDT"));
+}
+
+// ---- okx-trading-enablement: an OKX leg end to end through Node 0 / 1 in EXCHANGE_DEMO ----------
+
+fn okx_rules(ct_val: &str) -> OrderRules {
+    OrderRules { lot: LotSize { step_size: dec("1"), min_qty: dec("1") }, okx_ct_val: Some(dec(ct_val)) }
+}
+
+/// Binance long / OKX short, 1000 USDT notional at 5x on price 100: 10 BTC = 1000 contracts of 0.01.
+async fn okx_pair_demo(okx_cap: Option<Result<Decimal, String>>) -> (Rig, EngineHandle) {
+    let (rig, deps) = rig(Opts { trigger: "AUTO", demo: true, ..Opts::default() });
+    rig.market.rules.lock().unwrap().insert(Exchange::Okx, okx_rules("0.01"));
+    if let Some(c) = okx_cap {
+        rig.demo.caps.lock().unwrap().insert(Exchange::Okx, c);
+    }
+    let h = start(deps);
+    let mut p = pair_at(UUID, SYM, T);
+    p.short_exchange = Exchange::Okx;
+    assert_eq!(ask(&h, Command::AddPrepared(p)).await, CommandReply::Accepted);
+    (rig, h)
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_okx_binance_pair_opens_in_demo_with_contracts_the_intended_coin_amount_and_the_leverage_on_both_legs() {
+    let (rig, _h) = okx_pair_demo(Some(Ok(dec("20")))).await;
+    run_until(&rig.clock, T - 9_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED", "{:?}", labels(&rig.db));
+    let sent = rig.demo.requests.lock().unwrap().clone();
+    let (bin, okx) = (sent.iter().find(|r| r.exchange == Exchange::Binance).unwrap(), sent.iter().find(|r| r.exchange == Exchange::Okx).unwrap());
+    assert_eq!((bin.quantity, bin.leverage, bin.reduce_only), (dec("10"), Some(dec("5")), false));
+    assert_eq!((okx.quantity, okx.leverage, okx.reduce_only), (dec("1000"), Some(dec("5")), false), "OKX: contracts, and the contract leverage to apply first");
+    assert_eq!(okx.intended_base_qty, Some(dec("10")), "the executor's size guard needs the coin amount");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_okx_leverage_cap_below_the_pair_leverage_blocks_before_any_order() {
+    let (rig, _h) = okx_pair_demo(Some(Ok(dec("3")))).await;
+    run_until(&rig.clock, T - 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "BLOCKED", "{:?}", labels(&rig.db));
+    let blocked = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
+    assert!(blocked.to_string().contains("OKX cap 3x"), "{blocked}");
+    assert!(rig.demo.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_okx_cap_blocks_the_pair_fail_closed() {
+    let (rig, _h) = okx_pair_demo(Some(Err("OKX: not connected (NoKey)".into()))).await;
+    run_until(&rig.clock, T - 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "BLOCKED", "{:?}", labels(&rig.db));
+    assert!(rig.demo.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_okx_opening_order_passes_the_intended_coin_amount_to_the_executor_and_a_close_does_not() {
+    let (rig, h) = started(Opts { demo: true, ..Opts::default() }).await;
+    let cmd = |reduce_only: bool, intended: Option<Decimal>| {
+        Command::ManualOrder(crate::engine::command::ManualOrder {
+            exchange: Exchange::Okx,
+            symbol: "ETHUSDT".into(),
+            side: if reduce_only { OrderSide::Buy } else { OrderSide::Sell },
+            quantity: dec("3"),
+            reduce_only,
+            leverage: if reduce_only { None } else { Some(dec("5")) },
+            intended_base_qty: intended,
+        })
+    };
+    assert_eq!(ask(&h, cmd(false, Some(dec("0.037")))).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(ask(&h, cmd(true, Some(dec("0.037")))).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(50)).await;
+    let sent: Vec<_> = rig.demo.requests.lock().unwrap().iter().filter(|r| r.exchange == Exchange::Okx).cloned().collect();
+    assert_eq!(sent.iter().map(|r| (r.quantity, r.reduce_only, r.intended_base_qty)).collect::<Vec<_>>(), vec![(dec("3"), false, Some(dec("0.037"))), (dec("3"), true, None)]);
 }

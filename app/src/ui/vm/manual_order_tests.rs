@@ -45,11 +45,11 @@ fn form(qty: &str) -> ManualForm {
 }
 
 #[test]
-fn only_binance_and_bybit_panels_and_a_disallowed_exchange_is_disabled() {
+fn one_panel_per_exchange_and_a_disallowed_exchange_is_disabled() {
     let mut s = snap(ExecutionMode::ExchangeDemo);
     s.settings.risk.allowed_exchanges = vec![Exchange::Binance];
     let vm = build(&form("0.001"), &CancelForm::default(), &s);
-    assert_eq!(vm.panels.iter().map(|p| p.0).collect::<Vec<_>>(), vec![Exchange::Binance, Exchange::Bybit]);
+    assert_eq!(vm.panels.iter().map(|p| p.0).collect::<Vec<_>>(), vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx]);
     assert_eq!(vm.panels[1].1, Err("此交易所未在 allowed_exchanges 中".to_string()));
     let mut f = form("0.001");
     f.exchange = Exchange::Bybit;
@@ -94,7 +94,7 @@ fn nothing_is_sent_before_confirming_and_exactly_one_command_after_in_exchange_d
     confirm(&c, &sink);
     assert_eq!(
         *sink.0.borrow(),
-        vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: false, leverage: Some(d("5")) })]
+        vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: false, leverage: Some(d("5")), intended_base_qty: None })]
     );
 }
 
@@ -228,7 +228,7 @@ mod picker {
         s.leg_accounts.insert((true, Exchange::Binance), acct(ok(vec![pos(Exchange::Binance, "SIMUSDT", "1")]), ok(vec![])));
         s.leg_accounts.insert((false, Exchange::Binance), acct(ok(vec![pos(Exchange::Binance, "BTCUSDT", "0.5"), pos(Exchange::Binance, "ZEROUSDT", "0")]), ok(vec![])));
         let l = open_positions(&s);
-        assert_eq!(l.iter().map(|x| x.exchange).collect::<Vec<_>>(), vec![Exchange::Binance, Exchange::Bybit]);
+        assert_eq!(l.iter().map(|x| x.exchange).collect::<Vec<_>>(), vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx]);
         let r = rows(&l[0]);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].symbol, "BTCUSDT");
@@ -264,9 +264,10 @@ mod picker {
 
     #[test]
     fn close_prefill_takes_the_opposite_side_the_absolute_quantity_and_reduce_only() {
-        let long = close_prefill(&pos(Exchange::Binance, "BTCUSDT", "0.50"));
+        let long = close_prefill(&pos(Exchange::Binance, "BTCUSDT", "0.50")).unwrap();
         assert_eq!(long, ManualPrefill { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Sell, quantity: "0.5".into(), reduce_only: true });
-        let short = close_prefill(&pos(Exchange::Bybit, "ETHUSDT", "-0.5"));
+        let short = close_prefill(&pos(Exchange::Bybit, "ETHUSDT", "-0.5")).unwrap();
+        assert_eq!(close_prefill(&pos(Exchange::Okx, "BTCUSDT", "-3")), None, "OKX contracts are never written into the coin form");
         assert_eq!(short, ManualPrefill { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side: OrderSide::Buy, quantity: "0.5".into(), reduce_only: true });
     }
 
@@ -274,14 +275,14 @@ mod picker {
     fn a_prefilled_close_form_sends_nothing_and_goes_through_the_confirmation() {
         let sink = Sink::default();
         let s = snap(ExecutionMode::Simulation);
-        let p = close_prefill(&pos(Exchange::Bybit, "BTCUSDT", "-0.0014"));
+        let p = close_prefill(&pos(Exchange::Bybit, "BTCUSDT", "-0.0014")).unwrap();
         let f = ManualForm { exchange: p.exchange, symbol: p.symbol, side: p.side, quantity: p.quantity, reduce_only: p.reduce_only, leverage: "5".into() };
         let vm = build(&f, &CancelForm::default(), &s);
         assert!(sink.0.borrow().is_empty());
         let c = open_confirm(&vm, &f).unwrap();
         assert_eq!(c.qty_text, "0.001 BTC");
         confirm(&c, &sink);
-        assert_eq!(*sink.0.borrow(), vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Bybit, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: true, leverage: None })]);
+        assert_eq!(*sink.0.borrow(), vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Bybit, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: true, leverage: None, intended_base_qty: None })]);
     }
 
     #[test]
@@ -387,4 +388,110 @@ fn the_cap_is_requested_for_the_estimate_rounded_up_to_the_next_thousand() {
     assert_eq!(cap_request_notional(d("1000")), d("1000"));
     assert_eq!(cap_request_notional(d("1000.01")), d("2000"));
     assert_eq!(cap_request_notional(d("0")), d("1000"));
+}
+
+// ---- okx-trading-enablement: the OKX panel takes coins and sends contracts --------------------
+
+mod okx {
+    use super::*;
+
+    /// BTCUSDT on OKX: ctVal 0.01 BTC per contract, lot 1 contract, mark 60,000.
+    fn okx_snap(mode: ExecutionMode) -> UiSnapshot {
+        let mut s = snap(mode);
+        let mut o = obs(Exchange::Okx, "BTCUSDT", "0.0001", 28_800, NOW + 3_600_000, NOW - 100);
+        o.mark_price = d("60000");
+        s.market.insert(Exchange::Okx, MarketFeed { observations: vec![o], last_success_at: Some(NOW - 100), last_error: None });
+        s.rules.insert((Exchange::Okx, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("1"), min_qty: d("1") }, okx_ct_val: Some(d("0.01")) }));
+        s.leverage_caps.insert((Exchange::Okx, "BTCUSDT".into()), crate::ui::bridge::CapReading { notional: d("100000"), cap: Ok(d("20")), fetched_at: NOW - 1_000 });
+        s
+    }
+
+    fn okx_form(qty: &str) -> ManualForm {
+        ManualForm { exchange: Exchange::Okx, ..form(qty) }
+    }
+
+    #[test]
+    fn coins_are_converted_to_whole_contracts_and_shown_with_coins_and_value() {
+        let vm = build(&okx_form("0.037"), &CancelForm::default(), &okx_snap(ExecutionMode::ExchangeDemo));
+        assert_eq!(vm.rounded, Ok(d("3")), "0.037 BTC / 0.01 = 3.7 -> 3 contracts");
+        assert_eq!(vm.qty_note.as_deref(), Some("3 張（≈ 0.03 BTC，≈ 1,800.00 USDT）"));
+        assert_eq!(vm.est_notional, Some(d("1800")));
+        assert!(vm.submit_disabled.is_empty(), "{:?}", vm.submit_disabled);
+    }
+
+    #[test]
+    fn the_confirmation_and_the_command_carry_contracts_and_the_typed_coin_amount() {
+        let sink = Sink::default();
+        let s = okx_snap(ExecutionMode::ExchangeDemo);
+        let vm = build(&okx_form("0.037"), &CancelForm::default(), &s);
+        let c = open_confirm(&vm, &okx_form("0.037")).unwrap();
+        assert_eq!(c.qty_text, "3 張（≈ 0.03 BTC）");
+        assert_eq!(c.quantity, d("3"));
+        assert!(sink.0.borrow().is_empty());
+        confirm(&c, &sink);
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![Command::ManualOrder(ManualOrder {
+                exchange: Exchange::Okx,
+                symbol: "BTCUSDT".into(),
+                side: OrderSide::Buy,
+                quantity: d("3"),
+                reduce_only: false,
+                leverage: Some(d("5")),
+                // the typed coin amount: the executor's size guard compares it with contracts x ctVal
+                intended_base_qty: Some(d("0.037")),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_reduce_only_close_is_converted_too_and_asks_for_no_leverage_or_intended_amount() {
+        let sink = Sink::default();
+        let mut f = okx_form("0.03");
+        f.reduce_only = true;
+        let vm = build(&f, &CancelForm::default(), &okx_snap(ExecutionMode::ExchangeDemo));
+        assert_eq!(vm.rounded, Ok(d("3")));
+        confirm(&open_confirm(&vm, &f).unwrap(), &sink);
+        assert!(matches!(&sink.0.borrow()[0], Command::ManualOrder(ManualOrder { quantity, reduce_only: true, leverage: None, intended_base_qty: None, .. }) if *quantity == d("3")));
+    }
+
+    #[test]
+    fn a_missing_ct_val_disables_submit_with_the_reason() {
+        let mut s = okx_snap(ExecutionMode::ExchangeDemo);
+        s.rules.insert((Exchange::Okx, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("1"), min_qty: d("1") }, okx_ct_val: None }));
+        let vm = build(&okx_form("0.037"), &CancelForm::default(), &s);
+        assert!(vm.submit_disabled.contains(&"無法取得合約規格（ctVal）".to_string()), "{:?}", vm.submit_disabled);
+        assert!(vm.rounded.is_err());
+        assert!(open_confirm(&vm, &okx_form("0.037")).is_none());
+    }
+
+    #[test]
+    fn below_one_contract_is_below_the_minimum() {
+        let vm = build(&okx_form("0.005"), &CancelForm::default(), &okx_snap(ExecutionMode::ExchangeDemo));
+        assert_eq!(vm.rounded, Err("低於最小下單量".to_string()));
+        assert!(vm.submit_disabled.contains(&"低於最小下單量".to_string()));
+    }
+
+    #[test]
+    fn the_position_picker_shows_okx_in_coins_and_a_close_is_prefilled_in_coins() {
+        use crate::engine::ports::{AccountPosition, Listed};
+        use crate::ui::bridge::LegAccount;
+        let mut s = okx_snap(ExecutionMode::ExchangeDemo);
+        let acct = |q: &str| LegAccount { positions: Ok(Listed { items: vec![AccountPosition { exchange: Exchange::Okx, symbol: "BTCUSDT".into(), quantity: d(q) }], complete: true }), open_orders: Ok(Listed { items: vec![], complete: true }), available_margin: Ok(d("1")), fetched_at: NOW - 5 };
+        s.leg_accounts.insert((false, Exchange::Okx), acct("-3"));
+        let lists = open_positions(&s);
+        let okx = lists.iter().find(|l| l.exchange == Exchange::Okx).expect("an OKX list");
+        let PickState::Rows { rows, .. } = &okx.state else { panic!("{:?}", okx.state) };
+        assert_eq!((rows[0].quantity, rows[0].contracts, rows[0].is_long, rows[0].unconvertible), (d("-0.03"), Some(d("-3")), false, false));
+        assert_eq!(
+            rows[0].close_prefill(),
+            Some(ManualPrefill { exchange: Exchange::Okx, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: "0.03".into(), reduce_only: true })
+        );
+        // without ctVal the row is shown as not convertible and cannot be prefilled (contracts are never coins)
+        s.rules.remove(&(Exchange::Okx, "BTCUSDT".into()));
+        let lists = open_positions(&s);
+        let PickState::Rows { rows, .. } = &lists.iter().find(|l| l.exchange == Exchange::Okx).unwrap().state else { panic!() };
+        assert!(rows[0].unconvertible);
+        assert_eq!(rows[0].close_prefill(), None);
+    }
 }

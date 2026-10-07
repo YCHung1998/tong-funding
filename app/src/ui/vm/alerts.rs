@@ -5,10 +5,14 @@
 
 use tong_funding_core::types::Exchange;
 
-use super::bridge::{AccountState, ClockState, KillSwitchState, SourceHealth, SourceId, UiSnapshot, ACCOUNT_EXCHANGES};
+use super::bridge::{AccountState, ClockState, KillSwitchState, SourceHealth, SourceId, UiSnapshot};
 use super::format;
 use crate::exchange::signed::signing::RECV_WINDOW_MS;
 use crate::ui::nav::Page;
+
+/// The accounts whose keys are required: an unconnected one is an alert. OKX keys are optional (no
+/// keys = OKX is simply not connected, shown on its dashboard card), so OKX raises no account alert.
+const ALERT_ACCOUNT_EXCHANGES: [Exchange; 2] = [Exchange::Binance, Exchange::Bybit];
 
 pub const MANUAL_TEXT: &str = "需人工處理，系統不會自動補單或平倉";
 
@@ -137,8 +141,13 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
         KillSwitchState::Off => {}
     }
 
+    // The OKX latch (an environment mismatch, 50101): OKX stays disabled until restart.
+    if let Some(reason) = &snap.okx_disabled {
+        push(Category::Halted, "OKX".into(), format!("OKX 已停用：{reason}（重新啟動前不會恢復）"), None, None);
+    }
+
     // 3. Disconnected / not connected accounts.
-    for e in ACCOUNT_EXCHANGES {
+    for e in ALERT_ACCOUNT_EXCHANGES {
         let source = SourceId::Account(e).label();
         match snap.account(e) {
             AccountState::NotConnected { reason } => push(Category::Disconnected, source, format!("{} 帳戶未連線：{reason}", e.name()), None, None),
@@ -154,7 +163,7 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
         expected.push(SourceId::BinanceWs);
     }
     expected.extend(Exchange::ALL.into_iter().filter(|e| enabled.contains(e)).map(SourceId::MarketPoll));
-    for e in ACCOUNT_EXCHANGES {
+    for e in ALERT_ACCOUNT_EXCHANGES {
         if matches!(snap.account(e), AccountState::Loaded { .. } | AccountState::Loading) {
             expected.push(SourceId::Account(e));
         }
@@ -193,7 +202,7 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
     }
 
     // 5. Clocks of the exchanges that sign requests.
-    for e in ACCOUNT_EXCHANGES {
+    for e in ALERT_ACCOUNT_EXCHANGES {
         let source = format!("{} 時鐘", e.name());
         match snap.clock(e) {
             ClockState::Unsynced => push(Category::RateLimitOrClock, source, format!("{} 時鐘未校時", e.name()), None, None),

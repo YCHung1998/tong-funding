@@ -38,17 +38,18 @@ use super::wiring::{self, ClockOffsets, NoAccount, PublicMarketData};
 use crate::engine::actor::{self as engine_actor, CommandMsg, EngineDeps, MarketPrices};
 use crate::engine::alert::LogNotifier;
 use crate::engine::command::{Command, CommandReply};
-use crate::engine::ports::{AccountView, ExecutorFactory, StartupReconciler};
+use crate::engine::ports::{AccountView, ExecutorFactory, ServerOffsets, StartupReconciler};
 use crate::engine::recovery::RecoveryReconciler;
 use crate::engine::sim::{MarginFromAccount, SimPriceBook, SimulatedExecutor};
 use crate::engine::timings::EngineTimings;
 use crate::exchange::execution::account::DemoAccountView;
 use crate::exchange::execution::factory::DemoExecutorFactory;
 use crate::exchange::execution::http::ReqwestOrderTransport;
+use crate::exchange::execution::okx::{OkxLimits, OkxLimitsSource};
 use crate::exchange::public::adapter::ExchangeAdapter;
 use crate::exchange::signed::signing::load_credentials;
 use crate::exchange::signed::ledger::{BinanceLedgerClient, BybitLedgerClient};
-use crate::funding::fetch::{BinanceLedgerSource, BybitLedgerSource, TokioPause};
+use crate::funding::fetch::{BinanceLedgerSource, BybitLedgerSource, OkxLedgerSource, TokioPause};
 use crate::funding::rate_source::DemoRateSource;
 use crate::funding::runner::{self as funding_runner, FundingLoop};
 use crate::funding::slot_runner;
@@ -67,8 +68,9 @@ use crate::exchange::public::okx::OkxAdapter;
 use crate::exchange::reqwest_transport::ReqwestTransport;
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
-use crate::exchange::signed::endpoints::{BinanceHost, BybitHost};
-use crate::exchange::signed::models::{Balance, Completeness, Position};
+use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost};
+use crate::exchange::signed::okx::{OkxLatch, OkxPosition, OkxSignedClient};
+use crate::exchange::signed::models::{Balance, Completeness, Position, PositionMode};
 use crate::exchange::signed::signing::{NotConnectedReason, Resync};
 use crate::ports::{EventSink, SecretProvider, SystemClock, TimeSource};
 use crate::store::db::Db;
@@ -114,6 +116,108 @@ pub fn account_data(balances: &[Balance], positions: Vec<Position>, incomplete: 
         .map(|b| AssetInput { asset: b.asset.clone(), quantity: b.amount, usdt_value: b.usdt_value, mark_price: marks.get(&format!("{}USDT", b.asset)).copied() })
         .collect();
     AccountData { assets, contract_equity: None, positions, positions_incomplete: incomplete, environment }
+}
+
+/// An OKX position in coins: the exchange reports CONTRACTS, so the coin amount is `contracts x ctVal`
+/// (signed: long positive, short negative). Without a usable `ctVal` there is no coin amount and the
+/// error says so with the contracts as reported: a contract is never shown as a coin.
+pub fn okx_to_position(p: &OkxPosition, ct_val: Option<Decimal>) -> Result<Position, String> {
+    let Some(ct) = ct_val.filter(|c| *c > Decimal::ZERO) else {
+        let side = if p.contracts.is_sign_negative() { "空" } else { "多" };
+        return Err(format!("{} {side} {} 張（無法換算：ctVal 未知）", p.symbol, p.contracts.abs().normalize()));
+    };
+    let quantity = p.contracts * ct;
+    Ok(Position {
+        exchange: Exchange::Okx,
+        symbol: p.symbol.clone(),
+        side: if quantity.is_sign_negative() { tong_funding_core::types::Side::Short } else { tong_funding_core::types::Side::Long },
+        quantity,
+        entry_price: p.avg_px,
+        mark_price: p.mark_px,
+        leverage: p.lever,
+        unrealized_pnl: p.upl,
+        margin: p.imr,
+        notional: p.notional_usd,
+        mode: PositionMode::OneWay,
+        fetched_at: p.fetched_at,
+    })
+}
+
+/// OKX balances and positions → the dashboard's account data. Positions are converted to coins;
+/// one that cannot be (no `ctVal`) is left out of `positions` AND named in `positions_incomplete`,
+/// so the list is never read as complete. Contract equity stays unset, like the other exchanges: the
+/// wallet rows already include the margin in use, so adding used + available margin would count it twice
+/// (the field mapping is unverified, design D9).
+pub fn okx_account_data(balances: &[Balance], positions: Vec<OkxPosition>, ct_val: &dyn Fn(&str) -> Option<Decimal>, marks: &HashMap<String, Decimal>) -> AccountData {
+    let mut data = account_data(balances, vec![], None, marks, "DEMO");
+    let mut skipped = Vec::new();
+    for p in &positions {
+        match okx_to_position(p, ct_val(&p.symbol)) {
+            Ok(pos) => data.positions.push(pos),
+            Err(why) => skipped.push(why),
+        }
+    }
+    data.positions_incomplete = (!skipped.is_empty()).then(|| skipped.join("；"));
+    data
+}
+
+/// A mark price older than this is not evidence for the OKX notional cap (a missing mark refuses opens).
+pub const MARK_MAX_AGE_MS: i64 = 60_000;
+/// The OKX per-leg notional cap is this multiple of the contract template's notional (open question 1
+/// of okx-execution-guards, decided in okx-trading-enablement): room for lot rounding and a manual order
+/// somewhat above the template, never an unbounded one.
+pub const OKX_LEG_CAP_FACTOR: i64 = 2;
+
+/// The per-leg cap for OKX orders; `None` (unknown: opens are refused) when the template is unreadable.
+pub fn okx_leg_cap(settings: &Settings) -> Option<Decimal> {
+    settings.contract_error.is_none().then(|| settings.contract.notional_usdt * Decimal::from(OKX_LEG_CAP_FACTOR))
+}
+
+/// What the OKX size guard may know about `symbol`: `(ctVal, lotSz)` from the catalog, a fresh mark
+/// price and the cap. Anything missing is `None` (an opening order is then not sent).
+pub fn okx_limits_from(table: &HashMap<String, (Decimal, Decimal)>, marks: &HashMap<String, (Decimal, i64)>, cap: Option<Decimal>, symbol: &str, now_ms: i64) -> Option<OkxLimits> {
+    let (ct_val, lot_sz) = *table.get(symbol)?;
+    let (mark_px, at) = *marks.get(symbol)?;
+    if now_ms.saturating_sub(at) > MARK_MAX_AGE_MS {
+        return None;
+    }
+    Some(OkxLimits { ct_val, lot_sz, mark_px, max_leg_notional: cap? })
+}
+
+/// The live [`OkxLimitsSource`]: filled by the market poll (catalog and marks) and the settings
+/// reader (cap); read by the executor, synchronously, before every OKX order.
+#[derive(Default)]
+pub struct LiveOkxLimits {
+    state: Mutex<LimitsState>,
+}
+
+#[derive(Default)]
+struct LimitsState {
+    table: HashMap<String, (Decimal, Decimal)>,
+    marks: HashMap<String, (Decimal, i64)>,
+    cap: Option<Decimal>,
+}
+
+impl LiveOkxLimits {
+    fn state(&self) -> std::sync::MutexGuard<'_, LimitsState> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    pub fn set_table(&self, table: HashMap<String, (Decimal, Decimal)>) {
+        self.state().table = table;
+    }
+    pub fn set_marks(&self, marks: &HashMap<String, Decimal>, at: i64) {
+        self.state().marks = marks.iter().map(|(k, v)| (k.clone(), (*v, at))).collect();
+    }
+    pub fn set_cap(&self, cap: Option<Decimal>) {
+        self.state().cap = cap;
+    }
+}
+
+impl OkxLimitsSource for LiveOkxLimits {
+    fn limits(&self, symbol: &str) -> Option<OkxLimits> {
+        let st = self.state();
+        okx_limits_from(&st.table, &st.marks, st.cap, symbol, clock_now(&SystemClock))
+    }
 }
 
 /// Stored pair rows → UI pairs. An unreadable state or entry becomes an anomaly, never dropped.
@@ -382,7 +486,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         events,
         limiter: Arc::new(RateLimiter::new(time.clone())),
         market_health: Exchange::ALL.into_iter().map(|e| (e, mk_health(&format!("{}_rest", e.name().to_lowercase()), MARKET_POLL_MS))).collect(),
-        account_health: [Exchange::Binance, Exchange::Bybit].into_iter().map(|e| (e, mk_health(&format!("{}_account", e.name().to_lowercase()), ACCOUNT_POLL_MS))).collect(),
+        account_health: [Exchange::Binance, Exchange::Bybit, Exchange::Okx].into_iter().map(|e| (e, mk_health(&format!("{}_account", e.name().to_lowercase()), ACCOUNT_POLL_MS))).collect(),
         clocks: Exchange::ALL.into_iter().map(|e| (e, Arc::new(ClockSync::new(time.clone())))).collect(),
         next_market_poll: Mutex::new(0),
         next_account_poll: Mutex::new(0),
@@ -433,10 +537,12 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         });
     }
 
-    // Clock sync (signing hosts for Binance / Bybit, the public host for OKX countdowns).
+    // Clock sync (signing hosts for Binance / Bybit, the public host for OKX: countdowns and, since
+    // okx-trading-enablement, the OKX signing offset).
     let bhost = binance_host();
+    let public = Arc::new(public);
     {
-        let (ctx, signed, public) = (ctx.clone(), signed.clone(), Arc::new(public));
+        let (ctx, signed, public) = (ctx.clone(), signed.clone(), public.clone());
         tokio::spawn(async move {
             loop {
                 for (ex, base) in [(Exchange::Binance, bhost.base_url()), (Exchange::Bybit, BybitHost::Demo.base_url())] {
@@ -461,8 +567,15 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         });
     }
 
-    // Account polls (the same signed clients back the engine's demo account view).
+    // The executor factory (EXCHANGE_DEMO orders) owns the ONE OKX latch of the process; the OKX read
+    // client below gets the same `Arc`, so a `50101` on any OKX request disables OKX everywhere.
     let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
+    let offsets: Arc<dyn ServerOffsets> = Arc::new(ClockOffsets { clocks: ctx.clocks.clone() });
+    let okx_limits = Arc::new(LiveOkxLimits::default());
+    okx_limits.set_cap(okx_leg_cap(&settings));
+    let (factory, okx_latch) = build_factory(db.as_ref(), &secrets, &time, &offsets, &ctx.limiter, bhost, &okx_limits);
+
+    // Account polls (the same signed clients back the engine's demo account view).
     let mut signed_clients = None;
     let mut ledger_sources = None;
     let mut rate_clients = None;
@@ -477,14 +590,25 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         };
         let resync = |ex: Exchange, base: &'static str| Arc::new(ClockResync { sync: ctx.clocks[&ex].clone(), transport: t.clone(), exchange: ex, base_url: base });
         let binance = Arc::new(BinanceSignedClient::new(t.clone(), secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost));
-        let bybit = Arc::new(BybitSignedClient::new(t.clone(), secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo));
-        signed_clients = Some((binance.clone(), bybit.clone()));
+        let bybit = Arc::new(BybitSignedClient::new(t.clone(), secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo));
+        let okx = Arc::new(
+            OkxSignedClient::new(
+                t.clone(),
+                secrets.clone(),
+                dyn_clock.clone(),
+                Arc::new(offset(ctx.clocks[&Exchange::Okx].clone())),
+                Arc::new(ClockResync { sync: ctx.clocks[&Exchange::Okx].clone(), transport: public.clone(), exchange: Exchange::Okx, base_url: OKX_HOST }),
+                OkxHost::Demo,
+            )
+            .with_latch(okx_latch.clone()),
+        );
+        signed_clients = Some((binance.clone(), bybit.clone(), okx.clone()));
         rate_clients = Some(DemoRateSource { binance: binance.clone(), bybit: bybit.clone() });
         // funding-pnl: the signed ledger clients (same transport, Keychain keys, clock offsets).
         let ledger_binance = BinanceLedgerClient::new(t.clone(), ledger_secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost);
         let ledger_bybit = BybitLedgerClient::new(t.clone(), ledger_secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo);
-        ledger_sources = Some((BinanceLedgerSource(Arc::new(ledger_binance)), BybitLedgerSource(Arc::new(ledger_bybit))));
-        let ctx = ctx.clone();
+        ledger_sources = Some((BinanceLedgerSource(Arc::new(ledger_binance)), BybitLedgerSource(Arc::new(ledger_bybit)), OkxLedgerSource(okx.clone())));
+        let (ctx, adapters) = (ctx.clone(), adapters.clone());
         tokio::spawn(async move {
             // Give clock sync a moment so the first poll is not refused as "unsynced".
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -492,18 +616,19 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                 *ctx.next_account_poll.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = clock_now(&ctx.clock) + ACCOUNT_POLL_MS;
                 poll_binance_account(&ctx, &binance, env_label(bhost)).await;
                 poll_bybit_account(&ctx, &bybit).await;
+                poll_okx_account(&ctx, &okx, &adapters.2).await;
                 tokio::time::sleep(Duration::from_millis(ACCOUNT_POLL_MS as u64)).await;
             }
         });
     } else {
-        for ex in [Exchange::Binance, Exchange::Bybit] {
+        for ex in super::bridge::ACCOUNT_EXCHANGES {
             shared.push(SourceUpdate::Account { exchange: ex, state: AccountState::NotConnected { reason: "簽名傳輸層無法建立".into() } });
         }
     }
 
     // The engine (composition root): same runtime, same store, real ports.
     let engine_running = match &db {
-        Some(db) => start_engine(&ctx, db, adapters.clone(), signed_clients, secrets.clone(), dyn_clock.clone(), time.clone(), bhost),
+        Some(db) => start_engine(&ctx, db, adapters.clone(), signed_clients, factory, offsets.clone(), dyn_clock.clone()),
         None => {
             shared.push(SourceUpdate::EngineUnavailable("資料庫不可用，引擎未啟動".into()));
             false
@@ -543,11 +668,14 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     {
         let (ctx, db, feed_health) = (ctx.clone(), db.clone(), feed.health());
         let secrets = secrets.clone();
+        let (okx_limits, okx_latch) = (okx_limits.clone(), okx_latch.clone());
         tokio::spawn(async move {
             let mut ticks: u64 = 0;
+            let mut latch_reported = false;
             loop {
                 if let Some(db) = &db {
                     let settings = load_settings(db);
+                    okx_limits.set_cap(okx_leg_cap(&settings));
                     *ctx.enabled.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = settings.risk.allowed_exchanges.iter().copied().collect();
                     ctx.shared.push(SourceUpdate::Settings(settings));
                     ctx.shared.push(SourceUpdate::System(read_system_flags(db, clock_now(&ctx.clock))));
@@ -575,6 +703,10 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                     ctx.shared.push(SourceUpdate::DemoKeys(demo_keys(secrets.as_ref())));
                 }
                 ticks += 1;
+                if !latch_reported && let Some(reason) = okx_latch.reason() {
+                    latch_reported = true;
+                    ctx.shared.push(SourceUpdate::OkxDisabled(reason));
+                }
                 push_health(&ctx, &feed_health);
                 tokio::time::sleep(Duration::from_millis(STORE_POLL_MS)).await;
             }
@@ -602,6 +734,14 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         let enabled = ctx.enabled.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let out = refresh_sources(&adapters.0, &adapters.1, &adapters.2, &enabled, ctx.clock.as_ref()).await;
         apply_outcome(&ctx, &out, trigger);
+        // the OKX size guard's data: catalog (cached) and the marks of this poll
+        // (only when OKX answered this round: an old mark must keep its old time)
+        if out.results.iter().any(|(ex, r)| *ex == Exchange::Okx && r.is_ok()) {
+            okx_limits.set_marks(&marks_of(&ctx, Exchange::Okx), clock_now(&ctx.clock));
+        }
+        if let Ok(table) = adapters.2.limit_table().await {
+            okx_limits.set_table(table);
+        }
         drop(guard);
         *ctx.next_market_poll.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = clock_now(&ctx.clock) + MARKET_POLL_MS;
         next = tokio::time::Instant::now() + Duration::from_millis(MARKET_POLL_MS as u64);
@@ -635,17 +775,42 @@ fn demo_keys(secrets: &dyn SecretProvider) -> Result<(), String> {
     Ok(())
 }
 
+/// The three signed read clients (they back the account polls and the engine's demo account view).
+type SignedClients = (Arc<BinanceSignedClient<ReqwestTransport>>, Arc<BybitSignedClient<ReqwestTransport>>, Arc<OkxSignedClient<ReqwestTransport>>);
+
+/// The EXCHANGE_DEMO executor factory and the one OKX latch it owns (the read client shares it). The
+/// order transport is the plain (never gated) one. Without a store or an order transport the factory
+/// refuses EXCHANGE_DEMO and the latch is a private one (no order client exists to trip it).
+fn build_factory(
+    db: Option<&Db>,
+    secrets: &Arc<dyn SecretProvider>,
+    time: &Arc<dyn TimeSource>,
+    offsets: &Arc<dyn ServerOffsets>,
+    limiter: &Arc<RateLimiter>,
+    bhost: BinanceHost,
+    okx_limits: &Arc<LiveOkxLimits>,
+) -> (Arc<dyn ExecutorFactory>, Arc<OkxLatch>) {
+    let Some(db) = db else { return (Arc::new(NoFactory("資料庫不可用".into())), OkxLatch::new()) };
+    match ReqwestOrderTransport::signed_demo() {
+        Ok(t) => {
+            let f = DemoExecutorFactory::new(Arc::new(t), secrets.clone(), time.clone(), offsets.clone(), Arc::new(db.clone()), limiter.clone(), bhost).with_okx_limits(okx_limits.clone());
+            let latch = f.okx_latch();
+            (Arc::new(f), latch)
+        }
+        Err(e) => (Arc::new(NoFactory(format!("order transport unavailable: {e}"))), OkxLatch::new()),
+    }
+}
+
 /// Builds the real `EngineDeps` and starts the engine on this runtime. Returns whether it runs.
 #[allow(clippy::too_many_arguments)]
 fn start_engine<B, Y, O>(
     ctx: &Arc<Ctx>,
     db: &Db,
     adapters: Arc<(B, Y, O)>,
-    signed_clients: Option<(Arc<BinanceSignedClient<ReqwestTransport>>, Arc<BybitSignedClient<ReqwestTransport>>)>,
-    secrets: Arc<dyn SecretProvider>,
+    signed_clients: Option<SignedClients>,
+    factory: Arc<dyn ExecutorFactory>,
+    offsets: Arc<dyn ServerOffsets>,
     clock: Arc<dyn crate::ports::Clock>,
-    time: Arc<dyn TimeSource>,
-    bhost: BinanceHost,
 ) -> bool
 where
     B: ExchangeAdapter + 'static,
@@ -655,7 +820,7 @@ where
     let prices = Arc::new(SimPriceBook::default());
     let simulator = Arc::new(SimulatedExecutor::new(prices.clone()));
     let account: Arc<dyn AccountView> = match signed_clients {
-        Some((b, y)) => Arc::new(DemoAccountView::new(b, y)),
+        Some((b, y, o)) => Arc::new(DemoAccountView::new(b, y).with_okx(o)),
         None => Arc::new(NoAccount("簽名傳輸層無法建立".into())),
     };
     // Leverage-cap reads for the pages (symbol-leverage-cap): fresh signed reads on the demo account.
@@ -674,11 +839,6 @@ where
     // SIMULATION positions from the simulated ledger; margin from the demo account (decision 6).
     let sim_account: Arc<dyn AccountView> = Arc::new(simulator.account_view(Arc::new(MarginFromAccount(account.clone()))));
     let market: Arc<dyn crate::engine::ports::MarketData> = Arc::new(PublicMarketData { adapters });
-    let offsets: Arc<dyn crate::engine::ports::ServerOffsets> = Arc::new(ClockOffsets { clocks: ctx.clocks.clone() });
-    let factory: Arc<dyn ExecutorFactory> = match ReqwestOrderTransport::signed_demo() {
-        Ok(t) => Arc::new(DemoExecutorFactory::new(Arc::new(t), secrets, time, offsets.clone(), Arc::new(db.clone()), ctx.limiter.clone(), bhost)),
-        Err(e) => Arc::new(NoFactory(format!("order transport unavailable: {e}"))),
-    };
     let reconciler: Arc<dyn StartupReconciler> = Arc::new(RecoveryReconciler::new(market.clone(), clock.clone()));
     let deps = EngineDeps {
         db: db.clone(),
@@ -716,7 +876,7 @@ where
         tokio::spawn(async move {
             loop {
                 for (simulated, view) in [(true, &sim_account), (false, &account)] {
-                    for ex in [Exchange::Binance, Exchange::Bybit] {
+                    for ex in super::bridge::TRADABLE_EXCHANGES {
                         let (positions, open_orders, available_margin) = tokio::join!(view.positions(ex), view.open_orders(ex), view.available_margin(ex));
                         let acc = LegAccount { positions, open_orders, available_margin, fetched_at: clock_now(&ctx.clock) };
                         ctx.shared.push(SourceUpdate::LegAccount { simulated, exchange: ex, account: acc });
@@ -738,7 +898,7 @@ where
 fn start_funding_loop(
     ctx: &Arc<Ctx>,
     db: Db,
-    sources: (BinanceLedgerSource<ReqwestTransport>, BybitLedgerSource<ReqwestTransport>),
+    sources: (BinanceLedgerSource<ReqwestTransport>, BybitLedgerSource<ReqwestTransport>, OkxLedgerSource<ReqwestTransport>),
     rates: Option<DemoRateSource<ReqwestTransport>>,
     secrets: Arc<dyn SecretProvider>,
 ) {
@@ -747,10 +907,11 @@ fn start_funding_loop(
         // Let clock sync run first so the first signed request is not refused as "unsynced".
         tokio::time::sleep(Duration::from_secs(5)).await;
         let mut state = FundingLoop::default();
-        let ready = move |ex: Exchange| load_credentials(secrets.as_ref(), ex, false).map(|_| ()).map_err(|reason| format!("{} keys unavailable ({reason:?})", ex.name()));
+        // OKX also needs its passphrase (the other two do not have one)
+        let ready = move |ex: Exchange| load_credentials(secrets.as_ref(), ex, ex == Exchange::Okx).map(|_| ()).map_err(|reason| format!("{} keys unavailable ({reason:?})", ex.name()));
         loop {
             let now = clock_now(&ctx.clock);
-            let report = funding_runner::tick(&db, &[&sources.0, &sources.1], &ready, &TokioPause, &mut state, now).await;
+            let report = funding_runner::tick(&db, &[&sources.0, &sources.1, &sources.2], &ready, &TokioPause, &mut state, now).await;
             for e in &report.errors {
                 eprintln!("funding ledger loop: {e}");
             }
@@ -928,6 +1089,36 @@ async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<ReqwestTransport>) 
     }
 }
 
+/// OKX account poll: balances and positions (converted to coins with the catalog's `ctVal`), shown as
+/// the dashboard's OKX card. A position whose `ctVal` is unknown is named in the incomplete reason
+/// instead of being dropped; the rules of the positions' symbols are requested for the pages.
+async fn poll_okx_account(ctx: &Ctx, c: &OkxSignedClient<ReqwestTransport>, adapter: &OkxAdapter<PublicT>) {
+    let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
+    match res {
+        Ok((balances, listing)) => {
+            let table = adapter.limit_table().await.unwrap_or_default();
+            let incomplete = match &listing.completeness {
+                Completeness::Complete => None,
+                Completeness::Incomplete { reason } => Some(reason.clone()),
+            };
+            if let Some(tx) = ctx.shared.rules_tx.get() {
+                for p in &listing.items {
+                    let _ = tx.send((Exchange::Okx, p.symbol.clone()));
+                }
+            }
+            let mut data = okx_account_data(&balances, listing.items, &|s: &str| table.get(s).map(|(ct, _)| *ct), &marks_of(ctx, Exchange::Okx));
+            if let Some(reason) = incomplete {
+                data.positions_incomplete = Some(match data.positions_incomplete.take() {
+                    Some(own) => format!("{reason}；{own}"),
+                    None => reason,
+                });
+            }
+            account_loaded(ctx, Exchange::Okx, data);
+        }
+        Err(e) => account_failed(ctx, Exchange::Okx, &e, c.last_not_connected_reason()),
+    }
+}
+
 /// One line for the operator when a proxy variable is set: the signed and order clients never use
 /// an environment proxy (an intercepting proxy would see keys and signatures), unlike curl-style tools.
 fn proxy_env_warning(get: impl Fn(&str) -> Option<String>) -> Option<String> {
@@ -964,6 +1155,89 @@ mod tests {
         assert_eq!(data.contract_equity, None, "mapping unverified (design D9)");
         assert_eq!(data.environment, "TESTNET");
         let _ = position(Exchange::Binance, "BTCUSDT", "1", "1", "1", "1", "0", None);
+    }
+
+    // ---- okx-trading-enablement 3.4: OKX positions in coins ----
+
+    fn okx_pos(symbol: &str, contracts: &str) -> OkxPosition {
+        OkxPosition {
+            symbol: symbol.into(),
+            contracts: d(contracts),
+            pos_side: "net".into(),
+            mgn_mode: "cross".into(),
+            avg_px: Some(d("60000")),
+            mark_px: Some(d("60100")),
+            upl: Some(d("-3")),
+            lever: Some(d("5")),
+            imr: Some(d("360")),
+            notional_usd: Some(d("1803")),
+            fetched_at: 7,
+        }
+    }
+
+    #[test]
+    fn an_okx_position_becomes_a_coin_position_with_contracts_times_ct_val() {
+        let p = okx_to_position(&okx_pos("BTCUSDT", "-3"), Some(d("0.01"))).unwrap();
+        assert_eq!((p.exchange, p.symbol.as_str(), p.side, p.quantity), (Exchange::Okx, "BTCUSDT", tong_funding_core::types::Side::Short, d("-0.03")));
+        assert_eq!((p.entry_price, p.mark_price, p.leverage), (Some(d("60000")), Some(d("60100")), Some(d("5"))));
+        assert_eq!((p.unrealized_pnl, p.margin, p.notional, p.fetched_at), (Some(d("-3")), Some(d("360")), Some(d("1803")), 7));
+        assert_eq!(p.mode, crate::exchange::signed::models::PositionMode::OneWay);
+        let long = okx_to_position(&okx_pos("ETHUSDT", "12.5"), Some(d("0.1"))).unwrap();
+        assert_eq!((long.side, long.quantity), (tong_funding_core::types::Side::Long, d("1.25")));
+    }
+
+    #[test]
+    fn an_okx_position_without_a_usable_ct_val_is_not_converted_and_says_so_with_its_contracts() {
+        for ct in [None, Some(Decimal::ZERO), Some(d("-0.01"))] {
+            let e = okx_to_position(&okx_pos("BTCUSDT", "-3"), ct).unwrap_err();
+            assert!(e.contains("BTCUSDT") && e.contains("3 張") && e.contains("無法換算"), "{e}");
+        }
+    }
+
+    #[test]
+    fn okx_account_data_keeps_the_assets_converts_the_positions_and_never_drops_one_silently() {
+        let bals = [Balance { exchange: Exchange::Okx, asset: "USDT".into(), amount: d("5000"), available: Some(d("4600")), usdt_value: Some(d("4999.8")), fetched_at: 1 }];
+        let ct = |s: &str| (s == "BTCUSDT").then(|| d("0.01"));
+        let data = okx_account_data(&bals, vec![okx_pos("BTCUSDT", "-3"), okx_pos("ETHUSDT", "7")], &ct, &HashMap::new());
+        assert_eq!(data.assets.len(), 1);
+        assert_eq!((data.assets[0].asset.as_str(), data.assets[0].quantity, data.assets[0].usdt_value), ("USDT", d("5000"), Some(d("4999.8"))));
+        assert_eq!(data.positions.len(), 1, "only the convertible one is a position");
+        assert_eq!(data.positions[0].quantity, d("-0.03"));
+        let why = data.positions_incomplete.expect("the unconverted position makes the list incomplete");
+        assert!(why.contains("ETHUSDT") && why.contains("7 張") && why.contains("無法換算"), "{why}");
+        assert_eq!(data.environment, "DEMO");
+        assert_eq!(data.contract_equity, None, "the wallet rows already include the margin: not counted twice (unverified mapping, like the other exchanges)");
+        let all_ok = okx_account_data(&bals, vec![okx_pos("BTCUSDT", "-3")], &ct, &HashMap::new());
+        assert_eq!(all_ok.positions_incomplete, None);
+    }
+
+    // ---- okx-trading-enablement 3.6: the size guard's limits ----
+
+    fn tbl() -> HashMap<String, (Decimal, Decimal)> {
+        [("BTCUSDT".to_string(), (d("0.01"), d("1")))].into()
+    }
+
+    #[test]
+    fn limits_need_the_instrument_a_fresh_mark_and_a_known_cap() {
+        let now = 1_000_000;
+        let marks: HashMap<String, (Decimal, i64)> = [("BTCUSDT".to_string(), (d("60000"), now - 5_000))].into();
+        let l = okx_limits_from(&tbl(), &marks, Some(d("2000")), "BTCUSDT", now).unwrap();
+        assert_eq!((l.ct_val, l.lot_sz, l.mark_px, l.max_leg_notional), (d("0.01"), d("1"), d("60000"), d("2000")));
+        assert_eq!(okx_limits_from(&tbl(), &marks, Some(d("2000")), "ETHUSDT", now), None, "unknown instrument");
+        assert_eq!(okx_limits_from(&tbl(), &marks, None, "BTCUSDT", now), None, "unknown cap");
+        assert_eq!(okx_limits_from(&tbl(), &HashMap::new(), Some(d("2000")), "BTCUSDT", now), None, "no mark");
+        let old: HashMap<String, (Decimal, i64)> = [("BTCUSDT".to_string(), (d("60000"), now - MARK_MAX_AGE_MS - 1))].into();
+        assert_eq!(okx_limits_from(&tbl(), &old, Some(d("2000")), "BTCUSDT", now), None, "a stale mark is not evidence");
+    }
+
+    #[test]
+    fn the_leg_cap_is_twice_the_contract_template_notional_and_unknown_when_the_template_is_unreadable() {
+        let s = Settings::default();
+        assert_eq!(okx_leg_cap(&s), Some(d("2000")), "default template 1000 USDT");
+        let s = Settings { contract: ContractTemplate { notional_usdt: d("300"), leverage: d("5") }, ..Settings::default() };
+        assert_eq!(okx_leg_cap(&s), Some(d("600")));
+        let bad = Settings { contract_error: Some("contract_template.notional_usdt must be > 0".into()), ..Settings::default() };
+        assert_eq!(okx_leg_cap(&bad), None, "an unreadable template means an unknown cap: fail closed");
     }
 
     fn row(status: &str, entry: serde_json::Value) -> PairRow {

@@ -1,6 +1,6 @@
 //! Dashboard (總覽) view-model (task 2.1, spec dashboard-page). Valuation rule (design D9): an
 //! exchange's Value is wallet assets (in USDT) + contract equity; position notional is never
-//! counted. Unconnected exchanges and OKX are never treated as zero.
+//! counted. Unconnected exchanges (OKX included) are never treated as zero.
 
 use std::collections::BTreeMap;
 
@@ -14,7 +14,6 @@ use crate::ui::theme::Tone;
 
 pub const CONTRACT_EQUITY_LABEL: &str = "合約";
 pub const EQUITY_FOOTNOTE: &str = "合約權益含已用與可用保證金，未重複計入合約名目本金";
-pub const OKX_NOTE: &str = "僅比價，不提供帳戶資料";
 
 /// One row of an exchange's asset table.
 #[derive(Debug, Clone, PartialEq)]
@@ -86,8 +85,6 @@ pub enum ExchangeCard {
     NotConnected { exchange: Exchange, reason: String },
     Loading { exchange: Exchange },
     Failed { exchange: Exchange, error: String, at: i64 },
-    /// OKX: price comparison only, no amounts.
-    CompareOnly { exchange: Exchange },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,10 +236,8 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
                 excluded.push(e.name());
                 cards.push(ExchangeCard::Loading { exchange: e });
             }
-            AccountState::Unsupported => cards.push(ExchangeCard::CompareOnly { exchange: e }),
         }
     }
-    cards.push(ExchangeCard::CompareOnly { exchange: Exchange::Okx });
 
     let total: Decimal = cards.iter().filter_map(|c| if let ExchangeCard::Connected(c) = c { Some(c.value) } else { None }).sum();
     for c in &mut cards {

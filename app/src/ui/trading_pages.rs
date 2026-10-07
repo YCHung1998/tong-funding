@@ -30,7 +30,7 @@ use super::symbol_select::{CoinPicker, SymbolPicker};
 use super::theme;
 use super::units::rx;
 use crate::engine::command::{Command, CommandReply};
-use crate::engine::ports::{AccountPosition, OrderSide};
+use crate::engine::ports::OrderSide;
 
 /// The "加入交易單" cell of one scanner row.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -945,13 +945,23 @@ impl Shell {
                         d = d.child(small(format!("{name} 目前沒有持倉{age}"), theme::TEXT_SECONDARY));
                     }
                     for r in rows {
-                        let pos = AccountPosition { exchange: r.exchange, symbol: r.symbol.clone(), quantity: r.quantity };
-                        let label = format!("{name} · {} · {} {}{age}", r.symbol, if r.is_long { "多" } else { "空" }, r.quantity.abs().normalize());
+                        let side = if r.is_long { "多" } else { "空" };
+                        let size = match (r.unconvertible, r.contracts, r.raw_contracts) {
+                            (true, _, Some(n)) => format!("{} 張（無法換算：ctVal 未知）", n.abs().normalize()),
+                            (false, Some(n), _) => format!("{} {}（{} 張）", r.quantity.abs().normalize(), format::base_coin(&r.symbol), n.abs().normalize()),
+                            _ => format!("{} {}", r.quantity.abs().normalize(), format::base_coin(&r.symbol)),
+                        };
+                        let label = format!("{name} · {} · {side} {size}{age}", r.symbol);
+                        let prefill = r.close_prefill();
                         d = d.child(div().flex().gap_2().items_center().child(small(label, theme::TEXT_PRIMARY)).child(btn(
                             SharedString::from(format!("m-pick-{name}-{}", r.symbol)),
                             "帶入平倉",
-                            true,
-                            self.click(cx, move |this, _| this.trading.pending_manual = Some(manual_order::close_prefill(&pos))),
+                            prefill.is_some(),
+                            self.click(cx, move |this, _| {
+                                if let Some(p) = prefill.clone() {
+                                    this.trading.pending_manual = Some(p);
+                                }
+                            }),
                         )));
                     }
                 }
@@ -976,7 +986,12 @@ impl Shell {
                         d = d.child(small(format!("{name} 目前沒有掛單"), theme::TEXT_SECONDARY));
                     }
                     for (i, r) in rows.into_iter().enumerate() {
-                        let label = format!("{name} · {} · 剩餘 {} · {}", r.symbol, r.remaining.normalize(), r.order_id.as_deref().unwrap_or("無 Order ID，無法由此撤單"));
+                        let remaining = match (r.unconvertible, r.remaining_contracts) {
+                            (true, Some(n)) => format!("{} 張（無法換算：ctVal 未知）", n.normalize()),
+                            (false, Some(n)) => format!("{} {}（{} 張）", r.remaining.normalize(), format::base_coin(&r.symbol), n.normalize()),
+                            _ => r.remaining.normalize().to_string(),
+                        };
+                        let label = format!("{name} · {} · 剩餘 {remaining} · {}", r.symbol, r.order_id.as_deref().unwrap_or("無 Order ID，無法由此撤單"));
                         let row = div().flex().gap_2().items_center().child(small(label, if r.order_id.is_some() { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY }));
                         d = d.child(match manual_order::cancel_prefill(&r) {
                             Some(p) => row.child(btn(SharedString::from(format!("x-pick-{name}-{i}")), "帶入撤單", true, self.click(cx, move |this, _| this.trading.pending_cancel = Some(p.clone())))),
@@ -994,7 +1009,7 @@ impl Shell {
         let cancel_form = self.trading.cancel_form(cx);
         let sym = form.symbol.trim().to_ascii_uppercase();
         if sym != self.trading.m_requested {
-            for ex in [Exchange::Binance, Exchange::Bybit] {
+            for ex in Exchange::ALL {
                 self.source.request_rules(ex, &sym);
             }
             self.trading.m_requested = sym;
@@ -1032,16 +1047,17 @@ impl Shell {
             .child(panels)
             .child(pick_row("Symbol", self.trading.m_symbol.element("BTCUSDT"), self.trading.m_symbol.loaded(), "行情", self.trading.m_symbol.is_unlisted(cx).then(|| self.trading.m_symbol.value(cx))))
             .child(div().flex().gap_2().child(side(self, cx, OrderSide::Buy)).child(side(self, cx, OrderSide::Sell)).child(reduce))
-            .child(field_row("Quantity", "", &self.trading.m_qty, None))
+            .child(field_row("Quantity", if form.exchange == Exchange::Okx { "幣量（系統依 ctVal 換算為張數）" } else { "" }, &self.trading.m_qty, None))
             .child(field_row("Leverage", "×（開倉單必填；reduce_only 不使用）", &self.trading.m_lev, None))
             .child(small(
                 vm.cap_text.clone().unwrap_or_else(|| if form.reduce_only { "reduce_only：不設定槓桿".to_string() } else { "槓桿上限：—".to_string() }),
                 theme::TEXT_SECONDARY,
             ))
             .child(small(
-                match &vm.rounded {
-                    Ok(q) => format!("取整後數量 {} · 估計 Notional {}", q.normalize(), opt_money(vm.est_notional)),
-                    Err(e) => e.clone(),
+                match (&vm.rounded, &vm.qty_note) {
+                    (Ok(_), Some(note)) => format!("換算後 {note} · 估計 Notional {}", opt_money(vm.est_notional)),
+                    (Ok(q), None) => format!("取整後數量 {} · 估計 Notional {}", q.normalize(), opt_money(vm.est_notional)),
+                    (Err(e), _) => e.clone(),
                 },
                 if vm.rounded.is_ok() { theme::TEXT_PRIMARY } else { theme::WARNING },
             ));

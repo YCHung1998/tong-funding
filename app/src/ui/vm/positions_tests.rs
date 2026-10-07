@@ -1,8 +1,10 @@
 //! Task 2.2: positions view-model (spec positions-page); pairs are test fakes (design D12).
 use tong_funding_core::pair::PairState;
-use tong_funding_core::types::Exchange::{Binance, Bybit};
+use tong_funding_core::types::Exchange::{Binance, Bybit, Okx};
 
 use super::*;
+use crate::engine::ports::OrderRules;
+use tong_funding_core::quantity::LotSize;
 use crate::ui::bridge::{AccountData, AccountState, UiSnapshot};
 use crate::ui::testkit::{d, loaded, pair, position};
 
@@ -95,7 +97,7 @@ fn a_row_renders_like_the_spec() {
 #[test]
 fn tiny_size_is_not_shown_as_zero() {
     let p = position(Binance, "BTCUSDT", "0.0000004", "60000", "60000", "3", "0", None);
-    let row = PosRow { exchange: p.exchange, symbol: p.symbol, side: p.side, quantity: p.quantity, entry_price: None, mark_price: None, leverage: None, unrealized_pnl: None, unpaired: true, funding: "—".into(), funding_tone: Tone::Muted };
+    let row = PosRow { exchange: p.exchange, symbol: p.symbol, side: p.side, quantity: p.quantity, entry_price: None, mark_price: None, leverage: None, unrealized_pnl: None, unpaired: true, funding: "—".into(), funding_tone: Tone::Muted, contracts: None };
     assert_eq!(row.cells()[3], "0.0000004 BTC");
 }
 
@@ -165,7 +167,8 @@ fn incomplete_lists_unconnected_exchanges_and_okx_are_announced() {
     let vm = build(&s, &Filter::default());
     assert!(vm.notices.contains(&"Bybit 持倉列表可能不完整".to_string()), "{:?}", vm.notices);
     assert_eq!(rows(&vm).len(), 4, "the rows already fetched are still shown");
-    assert!(vm.notices.contains(&OKX_NOTE.to_string()));
+    assert!(vm.notices.iter().all(|n| !n.contains("僅比價")), "OKX is no longer compare-only: {:?}", vm.notices);
+    assert!(vm.notices.contains(&"OKX 持倉載入中".to_string()), "OKX not read yet: {:?}", vm.notices);
 
     s.accounts.insert(Binance, AccountState::NotConnected { reason: "金鑰不存在".into() });
     let vm = build(&s, &Filter::default());
@@ -181,4 +184,64 @@ fn grouping_is_shared_and_uses_only_reconciled_pairs() {
     assert_eq!(g.pairs.len(), 2);
     assert_eq!(g.grouping.groups.len(), 2);
     let _ = AccountData { assets: vec![], contract_equity: None, positions: vec![], positions_incomplete: None, environment: "DEMO" };
+}
+
+// ---- okx-trading-enablement: OKX rows (positions arrive in coins, contracts shown beside them) ----
+
+fn with_okx_short() -> UiSnapshot {
+    let mut s = four();
+    // OKX short 3 contracts of BTCUSDT (ctVal 0.01) = -0.03 BTC; Binance long 0.03 BTC
+    s.accounts.insert(Okx, loaded(vec![], vec![position(Okx, "BTCUSDT", "-0.03", "60000", "60100", "5", "-3", Some("360"))], NOW));
+    if let Some(AccountState::Loaded { data, .. }) = s.accounts.get_mut(&Binance) {
+        data.positions = vec![position(Binance, "BTCUSDT", "0.03", "60000", "60200", "5", "6", Some("360"))];
+    }
+    s.accounts.remove(&Bybit);
+    s.accounts.insert(Bybit, loaded(vec![], vec![], NOW));
+    s.pairs = vec![pair("p1", "BTCUSDT", Binance, Okx, PairState::Reconciled)];
+    s.rules.insert((Okx, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("1"), min_qty: d("1") }, okx_ct_val: Some(d("0.01")) }));
+    s
+}
+
+#[test]
+fn an_okx_row_shows_coins_with_the_contracts_and_groups_with_the_other_exchanges_leg() {
+    let vm = build(&with_okx_short(), &Filter::default());
+    let okx = rows(&vm).iter().find(|r| r.exchange == Okx).expect("OKX row");
+    assert_eq!(okx.cells()[3], "0.030000 BTC（3 張）");
+    assert_eq!(okx.side, Side::Short);
+    assert!(!okx.unpaired, "grouped with Binance's long");
+    assert_eq!(vm.pair_cards.len(), 1);
+    let c = &vm.pair_cards[0];
+    assert_eq!((c.long.as_ref().unwrap().exchange, c.short.as_ref().unwrap().exchange), (Binance, Okx));
+    assert_eq!(c.label.as_deref(), Some("HEDGED · 0.00% IMBALANCE"));
+    assert_eq!(vm.exchange_options, [Binance, Okx]);
+    // the Binance row says nothing about contracts
+    assert_eq!(rows(&vm).iter().find(|r| r.exchange == Binance).unwrap().cells()[3], "0.030000 BTC");
+}
+
+#[test]
+fn an_okx_row_without_a_known_ct_val_shows_coins_only_never_contracts_as_coins() {
+    let mut s = with_okx_short();
+    s.rules.remove(&(Okx, "BTCUSDT".into()));
+    let vm = build(&s, &Filter::default());
+    assert_eq!(rows(&vm).iter().find(|r| r.exchange == Okx).unwrap().cells()[3], "0.030000 BTC");
+}
+
+#[test]
+fn okx_states_are_announced_like_the_other_exchanges_with_the_reason() {
+    let mut s = with_okx_short();
+    s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
+    let vm = build(&s, &Filter::default());
+    assert!(vm.notices.contains(&"OKX 未連線：Keychain 沒有 API key".to_string()), "{:?}", vm.notices);
+    assert!(vm.notices.iter().all(|n| !n.contains("僅比價")));
+    s.accounts.insert(Okx, AccountState::Failed { error: "帳戶模式不支援 (acctLv 2, posMode long_short_mode)".into(), at: NOW });
+    let vm = build(&s, &Filter::default());
+    assert!(vm.notices.iter().any(|n| n.starts_with("OKX 持倉讀取失敗：") && n.contains("long_short_mode")), "{:?}", vm.notices);
+    // an incomplete list names its reason (a position that could not be converted is never silently dropped)
+    let mut s = with_okx_short();
+    if let Some(AccountState::Loaded { data, .. }) = s.accounts.get_mut(&Okx) {
+        data.positions_incomplete = Some("ETHUSDT 空 7 張（無法換算：ctVal 未知）".into());
+    }
+    let vm = build(&s, &Filter::default());
+    assert!(vm.notices.contains(&"OKX 持倉列表可能不完整".to_string()), "{:?}", vm.notices);
+    assert!(vm.notices.iter().any(|n| n.contains("7 張") && n.contains("無法換算")), "{:?}", vm.notices);
 }

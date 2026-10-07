@@ -216,3 +216,16 @@ fn freshness_verdict_matches_the_banner() {
     assert_eq!(source_status(&unknown, NOW), FreshStatus::Unknown);
     let _: Exchange = Okx;
 }
+
+#[test]
+fn a_tripped_okx_latch_is_a_severe_banner_that_cannot_be_dismissed() {
+    // okx-trading-enablement 3.6: `OkxLatch::reason()` reaches the screen
+    let mut s = healthy();
+    assert!(alerts(&s, NOW).iter().all(|a| !a.message.contains("OKX 已停用")));
+    s.okx_disabled = Some("OKX 50101: API key does not match the environment (demo flag sent); OKX disabled until restart".into());
+    let a = alerts(&s, NOW);
+    let okx = a.iter().find(|a| a.message.contains("OKX 已停用")).expect("an OKX banner");
+    assert_eq!(okx.category, Category::Halted);
+    assert!(!okx.dismissible());
+    assert!(okx.message.contains("50101") && okx.message.contains("重新啟動"), "{}", okx.message);
+}

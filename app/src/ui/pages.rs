@@ -197,7 +197,7 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
     let mut total = card()
         .child(small("Total Portfolio Value", theme::TEXT_MUTED))
         .child(text(format!("{} USDT", format::money(vm.total, 2)), theme::TEXT_PRIMARY).text_size(fs(21.0)))
-        .child(small("Binance + Bybit · OKX 僅比價", theme::TEXT_SECONDARY));
+        .child(small("Binance + Bybit + OKX", theme::TEXT_SECONDARY));
     for n in [&vm.excluded_note, &vm.unvalued_note].into_iter().flatten() {
         total = total.child(small(n.clone(), theme::WARNING));
     }
@@ -227,7 +227,6 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
             ExchangeCard::Failed { exchange, error, at } => card()
                 .child(text(exchange.name(), theme::TEXT_PRIMARY))
                 .child(small(format!("載入失敗：{error}（{} UTC）", format::utc_hms(*at)), theme::NEGATIVE)),
-            ExchangeCard::CompareOnly { exchange } => card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small(dashboard::OKX_NOTE, theme::TEXT_MUTED)),
         });
     }
     let mut header = div().flex().justify_between().child(title("總覽", "Dashboard"));

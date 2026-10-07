@@ -144,6 +144,21 @@ impl<T: HttpTransport> OkxAdapter<T> {
         Ok(self.catalog.store(self.clock.now_ms(), catalog))
     }
 
+    /// `(ctVal, lotSz)` of every tradable linear instrument whose rules are usable, by system symbol,
+    /// from the cached catalog (a request only when the cache has expired). Feeds the OKX size guard.
+    pub async fn limit_table(&self) -> Result<HashMap<String, (Decimal, Decimal)>, AdapterError> {
+        let catalog = self.catalog().await?;
+        Ok(catalog
+            .0
+            .iter()
+            .filter(|(_, i)| i.tradable)
+            .filter_map(|(symbol, i)| {
+                let r = i.rules.as_ref().ok()?;
+                Some((symbol.clone(), (r.ct_val?, r.market_lot_size().step_size)))
+            })
+            .collect())
+    }
+
     async fn snapshot(&self) -> Result<(Vec<FundingObservation>, Books), AdapterError> {
         let funding_q = format!("{OKX_FUNDING_RATE}?instId=ANY");
         let mark_q = format!("{OKX_MARK_PRICE}?instType=SWAP");
@@ -578,6 +593,20 @@ mod tests {
         assert_eq!((r.ct_val, r.ct_mult), (Some(d("0.01")), Some(d("1"))));
         let RulesLookup::Available(chip) = block_on(adapter.instrument_rules("CHIPUSDT")).unwrap() else { panic!("rules expected") };
         assert_eq!((chip.step_size, chip.min_qty, chip.ct_val), (d("1"), d("1"), Some(d("100"))));
+    }
+
+    #[test]
+    fn the_limit_table_has_ct_val_and_lot_of_every_tradable_linear_instrument_only() {
+        let (t, adapter, _) = setup(happy_fake(), 0);
+        let table = block_on(adapter.limit_table()).unwrap();
+        assert_eq!(table.get("BTCUSDT"), Some(&(d("0.01"), d("0.01"))), "lotSz in contracts, ctVal in coins per contract");
+        assert_eq!(table.get("CHIPUSDT"), Some(&(d("100"), d("1"))));
+        assert!(!table.contains_key("BTCUSD"), "the inverse contract is not a USDT symbol");
+        block_on(adapter.limit_table()).unwrap();
+        assert_eq!(t.count(INSTRUMENTS), 1, "served from the catalog cache");
+        let fake = FakeTransport::new().on(INSTRUMENTS, Err(AdapterError::Timeout));
+        let (_, adapter, _) = setup(fake, 0);
+        assert_eq!(block_on(adapter.limit_table()), Err(AdapterError::Timeout));
     }
 
     #[test]
