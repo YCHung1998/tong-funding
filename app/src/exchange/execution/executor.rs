@@ -15,7 +15,7 @@ use tong_funding_core::types::Exchange;
 
 use super::binance::{BinanceOrderClient, ModeReading};
 use super::bybit::BybitOrderClient;
-use super::classify::SubmitClass;
+use super::classify::{LeverageOutcome, SubmitClass};
 use super::http::OrderTransport;
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{BoxFut, Executor, OrderRequest, QueryOutcome, ServerOffsets, SubmitOutcome};
@@ -144,6 +144,24 @@ impl<T: OrderTransport> DemoExecutor<T> {
         }
         if let Err(e) = self.ensure_one_way(req.exchange, order.symbol(), ts).await {
             return not_sent(e);
+        }
+        // order-leverage-sync: an opening order leaves only after both exchanges hold the same
+        // leverage; a failure here means nothing was sent (a certain rejection).
+        if let Some(leverage) = order.leverage() {
+            let ts = self.timestamp(req.exchange).unwrap_or(ts);
+            let outcome = match req.exchange {
+                Exchange::Binance => self.binance.set_leverage(order.symbol(), leverage, ts).await,
+                Exchange::Bybit => self.bybit.set_leverage(order.symbol(), leverage, ts).await,
+                Exchange::Okx => return not_sent(OKX_UNSUPPORTED.into()),
+            };
+            match outcome {
+                LeverageOutcome::Set => self.limiter.on_success(req.exchange, RequestClass::Signed),
+                LeverageOutcome::RateLimited { retry_after_ms } => {
+                    self.note_rate_limit(req.exchange, Some(retry_after_ms));
+                    return not_sent(format!("leverage not set (rate limited, retry after {retry_after_ms:?} ms)"));
+                }
+                LeverageOutcome::Failed { reason } => return not_sent(format!("leverage {leverage}x not set on {}: {reason}", req.exchange.name())),
+            }
         }
         let ts = self.timestamp(req.exchange).unwrap_or(ts);
         let class = match req.exchange {

@@ -8,3 +8,6 @@ pub mod endpoints;
 pub mod ledger;
 pub mod models;
 pub mod signing;
+
+#[cfg(test)]
+mod leverage_cap_tests;

@@ -245,6 +245,14 @@ pub struct LegAccount {
     pub fetched_at: i64,
 }
 
+/// One leverage-cap read: the cap an exchange allows for a position of `notional` USDT, or why it is unknown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapReading {
+    pub notional: Decimal,
+    pub cap: Result<Decimal, String>,
+    pub fetched_at: i64,
+}
+
 /// The reply to a command a page sent, for the page to show (latest last).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOutcome {
@@ -324,6 +332,8 @@ pub struct UiSnapshot {
     pub rules: BTreeMap<(Exchange, String), Result<OrderRules, String>>,
     /// Account reads by (simulated ledger?, exchange).
     pub leg_accounts: BTreeMap<(bool, Exchange), LegAccount>,
+    /// Latest per-symbol leverage cap reads by (exchange, symbol) (symbol-leverage-cap).
+    pub leverage_caps: BTreeMap<(Exchange, String), CapReading>,
     /// Demo keys for Binance AND Bybit readable from the Keychain; `None` = not checked yet.
     pub demo_keys: Option<Result<(), String>>,
     /// Latest command replies (at most [`MAX_REPLIES`], oldest first).
@@ -373,6 +383,7 @@ pub enum SourceUpdate {
     PairEntries(BTreeMap<String, Value>),
     TradeEvents(Vec<StoredEvent>),
     Rules { exchange: Exchange, symbol: String, rules: Result<OrderRules, String> },
+    LeverageCap { exchange: Exchange, symbol: String, reading: CapReading },
     LegAccount { simulated: bool, exchange: Exchange, account: LegAccount },
     DemoKeys(Result<(), String>),
     CommandResult(CommandOutcome),
@@ -459,6 +470,9 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         SourceUpdate::TradeEvents(ev) => snap.trade_events = ev,
         SourceUpdate::Rules { exchange, symbol, rules } => {
             snap.rules.insert((exchange, symbol), rules);
+        }
+        SourceUpdate::LeverageCap { exchange, symbol, reading } => {
+            snap.leverage_caps.insert((exchange, symbol), reading);
         }
         SourceUpdate::LegAccount { simulated, exchange, account } => {
             snap.leg_accounts.insert((simulated, exchange), account);
@@ -582,6 +596,8 @@ pub trait ReadOnlyDataSource: Send + Sync {
     fn load_events(&self, query: &crate::store::event_query::EventQuery) -> Result<crate::store::event_query::EventPage, String>;
     /// Ask for the market-order lot rules of `symbol` (answered with [`SourceUpdate::Rules`]).
     fn request_rules(&self, _exchange: Exchange, _symbol: &str) {}
+    /// Ask for the leverage cap of `symbol` at `notional` (answered with [`SourceUpdate::LeverageCap`]).
+    fn request_leverage_cap(&self, _exchange: Exchange, _symbol: &str, _notional: Decimal) {}
     /// `config.ui_prefs` (ui-font-zoom); `Ok(None)` = never saved.
     fn load_ui_prefs(&self) -> Result<Option<Value>, String> {
         Ok(None)

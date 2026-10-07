@@ -71,6 +71,9 @@ pub struct TradingState {
     pub mode_error: Option<String>,
     m_symbol: SymbolPicker,
     m_qty: In,
+    /// Leverage of a manual opening order; filled once from the contract settings, then editable.
+    m_lev: In,
+    m_lev_loaded: bool,
     x_symbol: SymbolPicker,
     x_id: In,
     pub m_exchange: Exchange,
@@ -134,6 +137,8 @@ impl TradingState {
             mode_error: None,
             m_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             m_qty: new_input(window, cx, ""),
+            m_lev: new_input(window, cx, "5"),
+            m_lev_loaded: false,
             x_symbol: SymbolPicker::new("BTCUSDT", window, cx),
             x_id: new_input(window, cx, ""),
             m_exchange: Exchange::Binance,
@@ -199,6 +204,11 @@ impl TradingState {
         if !self.settings_seen {
             return;
         }
+        if !self.m_lev_loaded {
+            // The manual order's leverage starts at the contract settings leverage (then user-editable).
+            set_val(&self.m_lev, snap.settings.contract.leverage.normalize().to_string(), window, cx);
+            self.m_lev_loaded = true;
+        }
         if !self.contract_loaded {
             let f = ContractForm::from_template(&snap.settings.contract);
             set_val(&self.c_notional, f.notional, window, cx);
@@ -251,7 +261,7 @@ impl TradingState {
     }
 
     fn manual_form(&self, cx: &App) -> ManualForm {
-        ManualForm { exchange: self.m_exchange, symbol: self.m_symbol.value(cx), side: self.m_side, quantity: val(&self.m_qty, cx), reduce_only: self.m_reduce }
+        ManualForm { exchange: self.m_exchange, symbol: self.m_symbol.value(cx), side: self.m_side, quantity: val(&self.m_qty, cx), reduce_only: self.m_reduce, leverage: val(&self.m_lev, cx) }
     }
 
     fn cancel_form(&self, cx: &App) -> CancelForm {
@@ -436,6 +446,9 @@ impl Shell {
             return panel.child(small("尚未勾選任何候選", theme::TEXT_MUTED));
         }
         for v in &views {
+            for ex in [v.long, v.short] {
+                self.source.request_leverage_cap(ex, &v.symbol, v.notional);
+            }
             let countdown = v.settlement_ms.map(|t| format!("{} UTC · 倒數 {}", format::utc_hms(t), format::hms(t - self.now_ms))).unwrap_or_else(|| DASH.into());
             let sym = v.symbol.clone();
             let mut line = div()
@@ -448,6 +461,7 @@ impl Shell {
                 .child(small(format!("Net Edge {}", v.net_edge_pct.map_or_else(|| DASH.into(), |n| format::fixed(n, 4))), theme::TEXT_SECONDARY))
                 .child(small(countdown, theme::TEXT_SECONDARY))
                 .child(small(format!("每腿 {} USDT · {}× · Margin {}", format::money(v.notional, 2), v.leverage.normalize(), format::money(v.margin, 2)), theme::TEXT_SECONDARY));
+            line = line.child(small(v.cap.text(), theme::TEXT_SECONDARY));
             line = match &v.valid {
                 Ok(()) => line.child(small("可加入", theme::POSITIVE)),
                 Err(why) => line.child(small(why.clone(), theme::WARNING)),
@@ -546,6 +560,11 @@ impl Shell {
             table = table.child(small("沒有暫存配對（於掃幣頁加入）", theme::TEXT_MUTED));
         }
         for r in &vm.rows {
+            if let Some(n) = r.notional {
+                for ex in [r.long, r.short] {
+                    self.source.request_leverage_cap(ex, &r.symbol, n);
+                }
+            }
             let uuid = r.uuid.clone();
             let mark = match (&r.selectable, r.selected) {
                 (Err(_), _) => "☐",
@@ -574,6 +593,9 @@ impl Shell {
                 .child(small(opt_money(r.margin), theme::TEXT_SECONDARY))
                 .child(small(r.leverage.map_or_else(|| DASH.into(), |l| format!("{}×", l.normalize())), theme::TEXT_SECONDARY))
                 .child(small(r.entry_in_ms.map_or_else(|| DASH.into(), format::hms), theme::TEXT_SECONDARY));
+            if let Some(cap) = &r.cap {
+                line = line.child(small(cap.text(), theme::TEXT_SECONDARY));
+            }
             if let Err(why) = &r.selectable {
                 line = line.child(small(why.clone(), theme::WARNING));
             }
@@ -978,6 +1000,11 @@ impl Shell {
             self.trading.m_requested = sym;
         }
         let vm = manual_order::build(&form, &cancel_form, &self.snap);
+        if !form.reduce_only
+            && let Some(n) = vm.est_notional
+        {
+            self.source.request_leverage_cap(form.exchange, &form.symbol.trim().to_ascii_uppercase(), manual_order::cap_request_notional(n));
+        }
         let warning = warn_box(vec![
             format!("⚠ {DEBUG_WARNING}：單腿下單會造成未避險曝險；標準流程為「掃幣 → 交易單」。"),
             vm.env_text.clone(),
@@ -1006,6 +1033,11 @@ impl Shell {
             .child(pick_row("Symbol", self.trading.m_symbol.element("BTCUSDT"), self.trading.m_symbol.loaded(), "行情", self.trading.m_symbol.is_unlisted(cx).then(|| self.trading.m_symbol.value(cx))))
             .child(div().flex().gap_2().child(side(self, cx, OrderSide::Buy)).child(side(self, cx, OrderSide::Sell)).child(reduce))
             .child(field_row("Quantity", "", &self.trading.m_qty, None))
+            .child(field_row("Leverage", "×（開倉單必填；reduce_only 不使用）", &self.trading.m_lev, None))
+            .child(small(
+                vm.cap_text.clone().unwrap_or_else(|| if form.reduce_only { "reduce_only：不設定槓桿".to_string() } else { "槓桿上限：—".to_string() }),
+                theme::TEXT_SECONDARY,
+            ))
             .child(small(
                 match &vm.rounded {
                     Ok(q) => format!("取整後數量 {} · 估計 Notional {}", q.normalize(), opt_money(vm.est_notional)),
@@ -1027,6 +1059,13 @@ impl Shell {
                 card()
                     .border_color(rgb(theme::WARNING))
                     .child(small(format!("確認：{} · {} · {} · {} · 估計 Notional {}{}", c.exchange.name(), c.symbol, side_text(c.side), c.qty_text, opt_money(c.est_notional), if c.reduce_only { " · reduce_only" } else { "" }), theme::TEXT_PRIMARY))
+                    .child(small(
+                        match (c.reduce_only, c.leverage) {
+                            (false, Some(l)) => format!("槓桿 {}×（送單前先設定到交易所）· {}", l.normalize(), c.cap_text.clone().unwrap_or_default()),
+                            _ => "不設定槓桿".to_string(),
+                        },
+                        theme::TEXT_PRIMARY,
+                    ))
                     .child(small(c.env_text.clone(), theme::WARNING))
                     .child(small(c.warning, theme::WARNING))
                     .child(

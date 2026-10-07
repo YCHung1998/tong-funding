@@ -27,6 +27,8 @@ mod contract_tests;
 #[cfg(test)]
 mod executor_tests;
 #[cfg(test)]
+mod leverage_tests;
+#[cfg(test)]
 mod live_probe;
 #[cfg(test)]
 mod replay_tests;

@@ -96,6 +96,9 @@ fn keys() -> MemorySecrets {
 fn empty_account() -> FakeTransport {
     FakeTransport::new()
         .on("/fapi/v2/positionRisk", Ok(HttpResponse::ok("[]")))
+        // symbol-leverage-cap: the engine reads both legs' caps before it enters (5x fits easily).
+        .on("/fapi/v1/leverageBracket", Ok(HttpResponse::ok(r#"[{"symbol":"BTCUSDT","brackets":[{"bracket":1,"initialLeverage":125,"notionalCap":50000000,"notionalFloor":0}]}]"#)))
+        .on("/v5/market/instruments-info", Ok(HttpResponse::ok(r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"BTCUSDT","status":"Trading","leverageFilter":{"minLeverage":"1","maxLeverage":"100.00","leverageStep":"0.01"}}]}}"#)))
         .on("/fapi/v1/openOrders", Ok(HttpResponse::ok("[]")))
         .on("/fapi/v2/balance", Ok(HttpResponse::ok(r#"[{"asset":"USDT","balance":"10000","availableBalance":"10000"}]"#)))
         .on("/v5/position/list", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[],"nextPageCursor":""}}"#)))
@@ -133,6 +136,9 @@ async fn replay(orders: FakeOrderTransport) -> Replay {
     db.flag_set(FLAG_EXECUTION_MODE, "EXCHANGE_DEMO").unwrap();
 
     script_one_way(&orders);
+    // order-leverage-sync: every opening order is preceded by a leverage request on its exchange.
+    orders.on(Method::Post, BINANCE_LEVERAGE_PATH, Reply::ok(r#"{"symbol":"BTCUSDT","leverage":5,"maxNotionalValue":"1000000"}"#));
+    orders.on(Method::Post, BYBIT_SET_LEVERAGE_PATH, Reply::ok(r#"{"retCode":0,"retMsg":"OK","result":{}}"#));
     let secrets: Arc<dyn SecretProvider> = Arc::new(keys());
     let limiter = Arc::new(RateLimiter::new(clock.clone()));
     let factory = DemoExecutorFactory::new(

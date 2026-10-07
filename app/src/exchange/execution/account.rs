@@ -106,4 +106,15 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
             }
         })
     }
+
+    fn max_leverage(&self, exchange: Exchange, symbol: &str, notional: Decimal) -> BoxFut<'_, Result<Decimal, String>> {
+        let symbol = symbol.to_string();
+        Box::pin(async move {
+            match exchange {
+                Exchange::Binance => self.binance.get_max_leverage(&symbol, notional).await.map_err(|e| format!("Binance: {e}")),
+                Exchange::Bybit => self.bybit.get_max_leverage(&symbol).await.map_err(|e| format!("Bybit: {e}")),
+                Exchange::Okx => Err(OKX_ACCOUNT_UNSUPPORTED.to_string()),
+            }
+        })
+    }
 }

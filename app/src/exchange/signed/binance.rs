@@ -4,9 +4,9 @@
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
-use tong_funding_core::types::{Exchange, Side};
+use tong_funding_core::types::{Decimal, Exchange, Side};
 
-use super::endpoints::{BINANCE_BALANCE_PATH, BINANCE_OPEN_ORDERS_PATH, BINANCE_POSITIONS_PATH, BinanceHost};
+use super::endpoints::{BINANCE_BALANCE_PATH, BINANCE_LEVERAGE_BRACKET_PATH, BINANCE_OPEN_ORDERS_PATH, BINANCE_POSITIONS_PATH, BinanceHost};
 use super::models::{Balance, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
     ClockOffsetSource, NotConnectedReason, RECV_WINDOW_MS, Resync, SIGNED_TIMEOUT, binance_signature, check_status, encode_query, load_credentials, parse_json, sanitize_error,
@@ -75,13 +75,25 @@ impl<T: HttpTransport> BinanceSignedClient<T> {
     /// One attempt; if the exchange rejects the timestamp, re-sync the clock once and send exactly
     /// one more request (a second rejection, or a failed re-sync, is returned as is).
     async fn signed_get(&self, path: &str) -> Result<(Value, i64), AdapterError> {
-        match self.attempt(path).await {
+        self.signed_get_with(path, &[]).await
+    }
+
+    /// Same as [`Self::signed_get`] with extra query parameters (signed together with the timestamp).
+    async fn signed_get_with(&self, path: &str, params: &[(&str, String)]) -> Result<(Value, i64), AdapterError> {
+        match self.attempt(path, params).await {
             Err(e) if is_timestamp_rejected(&e) => {
                 self.resync.resync().await.map_err(sanitize_error)?;
-                self.attempt(path).await
+                self.attempt(path, params).await
             }
             other => other,
         }
+    }
+
+    /// `GET /fapi/v1/leverageBracket` of one symbol: the maximum leverage for a position of
+    /// `notional` USDT (the bracket that contains it).
+    pub async fn get_max_leverage(&self, symbol: &str, notional: Decimal) -> Result<Decimal, AdapterError> {
+        let (body, _) = self.signed_get_with(BINANCE_LEVERAGE_BRACKET_PATH, &[("symbol", symbol.to_string())]).await?;
+        leverage_cap_from_brackets(&body, symbol, notional)
     }
 
     fn set_reason(&self, reason: Option<NotConnectedReason>) {
@@ -93,7 +105,7 @@ impl<T: HttpTransport> BinanceSignedClient<T> {
     /// Order of checks matters: secrets, then calibrated time, and only then a request is built.
     /// Returns the parsed body and the exchange time (local clock + offset) at which the response
     /// arrived, using the same offset as the signature.
-    async fn attempt(&self, path: &str) -> Result<(Value, i64), AdapterError> {
+    async fn attempt(&self, path: &str, params: &[(&str, String)]) -> Result<(Value, i64), AdapterError> {
         let prepared = load_credentials(self.secrets.as_ref(), Self::EXCHANGE, false).and_then(|c| require_offset(self.offset.as_ref()).map(|o| (c, o)));
         let (creds, offset_ms) = match prepared {
             Ok(v) => v,
@@ -104,7 +116,10 @@ impl<T: HttpTransport> BinanceSignedClient<T> {
         };
         self.set_reason(None);
         let timestamp = self.clock.now_ms().saturating_add(offset_ms);
-        let query = encode_query(&[("timestamp", timestamp.to_string()), ("recvWindow", RECV_WINDOW_MS.to_string())]);
+        let mut all: Vec<(&str, String)> = params.to_vec();
+        all.push(("timestamp", timestamp.to_string()));
+        all.push(("recvWindow", RECV_WINDOW_MS.to_string()));
+        let query = encode_query(&all);
         let signature = binance_signature(&creds.api_secret, &query)?;
         let url = format!("{}{}?{}&signature={}", self.host.base_url(), path, query, signature);
         let request = HttpRequest::get(url, SIGNED_TIMEOUT).header("X-MBX-APIKEY", &creds.api_key);
@@ -112,6 +127,26 @@ impl<T: HttpTransport> BinanceSignedClient<T> {
         let fetched_at = self.clock.now_ms().saturating_add(offset_ms);
         Ok((interpret(response)?, fetched_at))
     }
+}
+
+/// The leverage cap for `notional` from a `leverageBracket` body (an array of `{symbol, brackets}`
+/// or one such object): the `initialLeverage` of the bracket with `notionalFloor <= notional <=
+/// notionalCap`. A notional above every bracket, or a missing field, is an error (never a default).
+pub fn leverage_cap_from_brackets(body: &Value, symbol: &str, notional: Decimal) -> Result<Decimal, AdapterError> {
+    let entry = match body {
+        Value::Array(a) => a.iter().find(|e| e.get("symbol").and_then(Value::as_str) == Some(symbol)),
+        o @ Value::Object(_) if o.get("symbol").and_then(Value::as_str) == Some(symbol) => Some(o),
+        _ => None,
+    }
+    .ok_or_else(|| AdapterError::parse(format!("no leverage brackets for {symbol}")))?;
+    let brackets = entry.get("brackets").and_then(Value::as_array).ok_or_else(|| AdapterError::parse("missing brackets"))?;
+    for b in brackets {
+        let (floor, cap) = (dec_req(b, "notionalFloor")?, dec_req(b, "notionalCap")?);
+        if notional >= floor && notional <= cap {
+            return dec_req(b, "initialLeverage");
+        }
+    }
+    Err(AdapterError::parse(format!("notional {notional} is above every leverage bracket of {symbol}")))
 }
 
 /// Binance reports failures as `{"code": -1021, "msg": "..."}`, with HTTP 4xx or occasionally 200.

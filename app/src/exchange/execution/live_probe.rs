@@ -181,6 +181,7 @@ async fn live_demo_probe() {
             side,
             quantity: q,
             reduce_only: action == OrderAction::Close,
+            leverage: None,
         };
         let trigger = clock.now_ms();
         let long = req(Leg::Long, OrderAction::Open, Exchange::Binance, OrderSide::Buy, qty);
@@ -230,6 +231,7 @@ async fn live_demo_probe() {
             side,
             quantity: qty,
             reduce_only: true,
+            leverage: None,
         };
         let out = submit_logged(&db, &events, &ex, clock.as_ref(), &pair, leg, OrderAction::Close, r, clock.now_ms()).await;
         println!("reduce-only without a position on {}: {out:?}", exchange.name());
@@ -248,4 +250,112 @@ async fn live_demo_probe() {
     println!("open trigger -> both legs accepted:      {:?}", report.entry_to_both_accepted);
     println!("excluded entries: {}", report.entries_excluded);
     println!("T-5 criterion (p99 < 2500 ms, submit part only): {:?}", report.t5_criterion_met());
+}
+
+/// symbol-leverage-cap / order-leverage-sync: the real demo hosts answer the leverage-cap reads and
+/// the leverage-set request, and the opened positions really carry the requested leverage.
+///
+/// Opens ONE long Binance + ONE short Bybit market order with `leverage = L` through the real
+/// `DemoExecutor` (the same path as the engine), reads both positions back (`leverage` field), closes
+/// both reduce-only, and finally asks for `cap + 1` on Binance to see the refusal. Uses a tiny quantity.
+/// Environment: `TONG_DEMO_SYMBOL`, `TONG_DEMO_QTY` (both required), `TONG_DEMO_LEVERAGE` (default 5),
+/// `TONG_DEMO_NOTIONAL` (default 1000, only for the Binance bracket lookup), `TONG_BINANCE_HOST`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "places real demo/testnet orders; run on the Mac with the user present"]
+async fn live_leverage_probe() {
+    if std::env::var("TONG_DEMO_LIVE").as_deref() != Ok(CONFIRM) {
+        println!("skipped: set TONG_DEMO_LIVE={CONFIRM}");
+        return;
+    }
+    let symbol = std::env::var("TONG_DEMO_SYMBOL").expect("TONG_DEMO_SYMBOL is required");
+    let qty: Decimal = std::env::var("TONG_DEMO_QTY").expect("TONG_DEMO_QTY is required").parse().expect("decimal");
+    let want: Decimal = std::env::var("TONG_DEMO_LEVERAGE").ok().and_then(|v| v.parse().ok()).unwrap_or(Decimal::from(5));
+    let notional: Decimal = std::env::var("TONG_DEMO_NOTIONAL").ok().and_then(|v| v.parse().ok()).unwrap_or(Decimal::from(1000));
+    let binance_host = match std::env::var("TONG_BINANCE_HOST").as_deref() {
+        Ok("demo") => BinanceHost::Demo,
+        _ => BinanceHost::Testnet,
+    };
+    let clock = Arc::new(SystemClock);
+    let db = Db::open(std::path::Path::new("/tmp/tong-leverage-probe.db"), clock.clone());
+    let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
+    let reads = Arc::new(ReqwestTransport::signed_demo().expect("transport"));
+    let b = ClockSync::new(clock.clone()).sync_once(reads.as_ref(), Exchange::Binance, binance_host.base_url()).await.expect("Binance serverTime");
+    let y = ClockSync::new(clock.clone()).sync_once(reads.as_ref(), Exchange::Bybit, BybitHost::Demo.base_url()).await.expect("Bybit time");
+    let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms });
+    let factory = DemoExecutorFactory::new(
+        Arc::new(ReqwestOrderTransport::signed_demo().expect("order transport")),
+        secrets.clone(),
+        clock.clone(),
+        offsets,
+        Arc::new(db.clone()),
+        Arc::new(RateLimiter::new(clock.clone())),
+        binance_host,
+    );
+    let ex = factory.build().expect("demo executor (keys in the Keychain?)");
+    let (ob, oy) = (b.offset_ms, y.offset_ms);
+    let bin = Arc::new(BinanceSignedClient::new(reads.clone(), secrets.clone(), clock.clone(), Arc::new(move || Some(ob)), Arc::new(NoResync), binance_host));
+    let byb = Arc::new(BybitSignedClient::new(reads, secrets, clock.clone(), Arc::new(move || Some(oy)), Arc::new(NoResync), BybitHost::Demo));
+    let account = DemoAccountView::new(bin.clone(), byb.clone());
+
+    // 1. caps
+    let caps = [account.max_leverage(Exchange::Binance, &symbol, notional).await, account.max_leverage(Exchange::Bybit, &symbol, notional).await];
+    println!("leverage caps for {symbol} at notional {notional}: Binance {:?}, Bybit {:?}", caps[0], caps[1]);
+    for (ex, c) in [Exchange::Binance, Exchange::Bybit].into_iter().zip(&caps) {
+        let cap = c.as_ref().unwrap_or_else(|e| panic!("{} cap read failed: {e}", ex.name()));
+        assert!(*cap >= Decimal::ONE, "{} cap {cap}", ex.name());
+    }
+
+    // 2. open both legs at `want`, read the leverage back
+    let pair = format!("levprobe-{}", clock.now_ms());
+    let mk = |leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, leverage: Option<Decimal>, seq: u16| OrderRequest {
+        client_order_id: client_order_id(IdPrefix::Demo, &pair, leg, action, seq),
+        exchange,
+        symbol: symbol.clone(),
+        side,
+        quantity: qty,
+        reduce_only: action == OrderAction::Close,
+        leverage,
+    };
+    let open_l = mk(Leg::Long, OrderAction::Open, Exchange::Binance, OrderSide::Buy, Some(want), 0);
+    let open_s = mk(Leg::Short, OrderAction::Open, Exchange::Bybit, OrderSide::Sell, Some(want), 0);
+    let (rl, rs) = tokio::join!(ex.submit(open_l.clone()), ex.submit(open_s.clone()));
+    println!("open long Binance: {rl:?}\nopen short Bybit:  {rs:?}");
+    let (lid, sid) = (open_l.client_order_id.clone(), open_s.client_order_id.clone());
+    let _ = tokio::join!(wait_final(&ex, Exchange::Binance, &symbol, &lid), wait_final(&ex, Exchange::Bybit, &symbol, &sid));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let bl = bin.get_positions().await.expect("Binance positions").into_iter().find(|p| p.symbol == symbol);
+    let sl = byb.get_positions().await.expect("Bybit positions").items.into_iter().find(|p| p.symbol == symbol);
+    println!("Binance position: {bl:?}\nBybit position:   {sl:?}");
+    let leverage_of = |p: &Option<crate::exchange::signed::models::Position>| p.as_ref().and_then(|p| p.leverage);
+    let (lb, ly) = (leverage_of(&bl), leverage_of(&sl));
+
+    // 3. close both (reduce-only), whatever the assertions will say
+    let close_l = mk(Leg::Long, OrderAction::Close, Exchange::Binance, OrderSide::Sell, None, 0);
+    let close_s = mk(Leg::Short, OrderAction::Close, Exchange::Bybit, OrderSide::Buy, None, 0);
+    let (cl, cs) = tokio::join!(ex.submit(close_l.clone()), ex.submit(close_s.clone()));
+    println!("close long Binance: {cl:?}\nclose short Bybit:  {cs:?}");
+    let _ = tokio::join!(wait_final(&ex, Exchange::Binance, &symbol, &close_l.client_order_id), wait_final(&ex, Exchange::Bybit, &symbol, &close_s.client_order_id));
+    for exchange in [Exchange::Binance, Exchange::Bybit] {
+        println!("after close {}: positions {:?}", exchange.name(), account.positions(exchange).await);
+    }
+    assert_eq!((lb, ly), (Some(want), Some(want)), "both positions must carry the requested leverage {want}");
+
+    // 4. a leverage above Binance's cap must be refused by the exchange and send no order
+    if let Ok(cap) = &caps[0] {
+        let over = *cap + Decimal::ONE;
+        if over <= Decimal::from(125) {
+            let r = ex.submit(mk(Leg::Long, OrderAction::Open, Exchange::Binance, OrderSide::Buy, Some(over), 1)).await;
+            println!("open with leverage {over} (cap {cap}): {r:?}");
+            if !matches!(r, SubmitOutcome::Rejected { .. }) {
+                // The exchange allowed more than the cap we read: never leave that position open.
+                let c = ex.submit(mk(Leg::Long, OrderAction::Close, Exchange::Binance, OrderSide::Sell, None, 1)).await;
+                println!("closed the unexpected position: {c:?}");
+            }
+            assert!(matches!(r, SubmitOutcome::Rejected { .. }), "{r:?}");
+            let pos = account.positions(Exchange::Binance).await.expect("positions");
+            assert!(!pos.items.iter().any(|p| p.symbol == symbol), "no position may exist after the refused order: {pos:?}");
+        } else {
+            println!("Binance cap {cap}: no higher leverage to try");
+        }
+    }
 }

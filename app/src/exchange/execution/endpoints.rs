@@ -6,6 +6,8 @@
 pub const BINANCE_ORDER_PATH: &str = "/fapi/v1/order";
 /// Binance: `{"dualSidePosition": false}` = one-way mode.
 pub const BINANCE_POSITION_MODE_PATH: &str = "/fapi/v1/positionSide/dual";
+/// Binance: set the initial leverage of one symbol (POST, `symbol` + integer `leverage`).
+pub const BINANCE_LEVERAGE_PATH: &str = "/fapi/v1/leverage";
 /// Binance: fills of one order (commission per trade), for the fee of a filled order.
 pub const BINANCE_USER_TRADES_PATH: &str = "/fapi/v1/userTrades";
 
@@ -17,6 +19,8 @@ pub const BYBIT_CANCEL_PATH: &str = "/v5/order/cancel";
 pub const BYBIT_REALTIME_PATH: &str = "/v5/order/realtime";
 /// Bybit v5: order history (fallback when an order is no longer in `realtime`).
 pub const BYBIT_HISTORY_PATH: &str = "/v5/order/history";
+/// Bybit v5: set the leverage of one linear symbol (POST, JSON body, `buyLeverage` = `sellLeverage`).
+pub const BYBIT_SET_LEVERAGE_PATH: &str = "/v5/position/set-leverage";
 /// Bybit v5: position list of one symbol (`positionIdx` 0 = one-way).
 pub const BYBIT_POSITION_PATH: &str = "/v5/position/list";
 

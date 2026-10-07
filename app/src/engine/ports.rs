@@ -67,6 +67,10 @@ pub struct OrderRequest {
     pub side: OrderSide,
     pub quantity: Decimal,
     pub reduce_only: bool,
+    /// Leverage the exchange account must have on `symbol` before this order is sent. `Some` only
+    /// on the opening legs of a pair (both legs carry the entry snapshot's value); close, reduce-only
+    /// and manual orders carry `None` and leave the leverage alone.
+    pub leverage: Option<Decimal>,
 }
 
 /// What the exchange (or the simulation) says about one order.
@@ -158,6 +162,12 @@ pub trait AccountView: Send + Sync {
     fn positions(&self, exchange: Exchange) -> BoxFut<'_, Result<Listed<AccountPosition>, String>>;
     fn open_orders(&self, exchange: Exchange) -> BoxFut<'_, Result<Listed<AccountOrder>, String>>;
     fn available_margin(&self, exchange: Exchange) -> BoxFut<'_, Result<Decimal, String>>;
+    /// Maximum leverage the exchange allows on `symbol` for a position of `notional` USDT, read
+    /// fresh (symbol-leverage-cap). `Err` = unknown; callers fail closed. Views that cannot ask an
+    /// exchange (the simulated ledger, test fakes) keep this default.
+    fn max_leverage(&self, _exchange: Exchange, _symbol: &str, _notional: Decimal) -> BoxFut<'_, Result<Decimal, String>> {
+        Box::pin(std::future::ready(Err("leverage cap lookup is not available on this account view".to_string())))
+    }
 }
 
 /// A freshly fetched (never cached) market snapshot of one leg.

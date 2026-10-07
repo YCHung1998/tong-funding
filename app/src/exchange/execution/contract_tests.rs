@@ -125,7 +125,7 @@ impl Harness for Demo {
 }
 
 fn order(id: &str) -> OrderRequest {
-    OrderRequest { client_order_id: id.into(), exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d(QTY), reduce_only: false }
+    OrderRequest { client_order_id: id.into(), exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d(QTY), reduce_only: false, leverage: None }
 }
 
 fn found(o: QueryOutcome) -> crate::engine::ports::OrderStatus {

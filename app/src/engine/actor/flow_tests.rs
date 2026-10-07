@@ -145,6 +145,8 @@ struct FakeDemo {
     requests: Mutex<Vec<OrderRequest>>,
     positions: Mutex<HashMap<(Exchange, String), Decimal>>,
     orders: Mutex<HashMap<String, OrderStatus>>,
+    /// Scripted leverage caps per exchange (symbol-leverage-cap); unscripted = a permissive 125.
+    caps: Mutex<HashMap<Exchange, Result<Decimal, String>>>,
 }
 impl Executor for FakeDemo {
     fn is_simulated(&self) -> bool {
@@ -192,6 +194,10 @@ impl AccountView for DemoAccount {
     }
     fn available_margin(&self, _exchange: Exchange) -> BoxFut<'_, Result<Decimal, String>> {
         Box::pin(std::future::ready(Ok(dec("10000"))))
+    }
+    fn max_leverage(&self, exchange: Exchange, _symbol: &str, _notional: Decimal) -> BoxFut<'_, Result<Decimal, String>> {
+        let cap = self.0.caps.lock().unwrap().get(&exchange).cloned().unwrap_or_else(|| Ok(dec("125")));
+        Box::pin(std::future::ready(cap))
     }
 }
 
@@ -513,6 +519,8 @@ async fn a_full_simulation_round_from_t_minus_20_to_t_plus_20() {
     assert!(ids.iter().all(|i| i.starts_with("sim")));
     assert_eq!(sent.iter().map(|r| r.reduce_only).collect::<Vec<_>>(), vec![false, false, true, true]);
     assert_eq!(sent[0].quantity, dec("10"), "1000 USDT at 100");
+    // order-leverage-sync: both opening legs carry the entry snapshot's leverage (5), closes none.
+    assert_eq!(sent.iter().map(|r| r.leverage).collect::<Vec<_>>(), vec![Some(dec("5")), Some(dec("5")), None, None]);
     assert_eq!((sent[0].side, sent[1].side, sent[2].side, sent[3].side), (OrderSide::Buy, OrderSide::Sell, OrderSide::Sell, OrderSide::Buy));
     assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO);
     assert_eq!(rig.sim.position(Exchange::Bybit, SYM), Decimal::ZERO);
@@ -943,6 +951,7 @@ async fn a_manual_order_goes_through_the_simulator_with_an_intent() {
             side,
             quantity: dec("2"),
             reduce_only,
+            leverage: None,
         })
     };
     assert_eq!(ask(&h, order(false, OrderSide::Sell)).await, CommandReply::Accepted);
@@ -978,6 +987,7 @@ async fn user_order(rig: &Rig, side: OrderSide, qty: &str, reduce_only: bool) {
         side,
         quantity: dec(qty),
         reduce_only,
+        leverage: None,
     };
     let out = rig.sim.submit(req).await;
     assert!(matches!(out, SubmitOutcome::Accepted(_)), "{out:?}");
@@ -1511,6 +1521,9 @@ impl AccountView for CrashExchange {
     }
     fn available_margin(&self, _exchange: Exchange) -> BoxFut<'_, Result<Decimal, String>> {
         Box::pin(std::future::ready(Ok(dec("10000"))))
+    }
+    fn max_leverage(&self, _exchange: Exchange, _symbol: &str, _notional: Decimal) -> BoxFut<'_, Result<Decimal, String>> {
+        Box::pin(std::future::ready(Ok(dec("125"))))
     }
 }
 
@@ -2134,3 +2147,94 @@ async fn a_failed_close_reference_fetch_never_holds_the_close_back_and_is_record
 // cancel, settings saves).
 #[path = "ui_command_tests.rs"]
 mod ui_command_tests;
+
+// ---- candidate-readd-after-close: engine side ---------------------------------------------
+
+/// Recorded case NMRUSDT: flat confirmed, CLOSING while the funding PnL waits. The snapshot says so
+/// (`flat_confirmed`) and the pair no longer takes a `max_concurrent_pairs` slot, so the symbol can
+/// be traded again (a second pair passes Node 0 with `max_concurrent_pairs = 1`).
+#[tokio::test(start_paused = true)]
+async fn a_closing_pair_waiting_for_pnl_is_flat_confirmed_and_frees_its_concurrent_slot() {
+    let (rig, h) = started(Opts { trigger: "AUTO", demo: true, ..Opts::default() }).await;
+    store_risk(&rig.db, &RiskConfig { max_concurrent_pairs: 1, ..risk() });
+    let flat = |h: &EngineHandle| h.snapshots.borrow().pairs.iter().find(|p| p.internal_uuid == UUID).map(|p| p.flat_confirmed);
+    assert_ne!(flat(&h), Some(true), "not flat-confirmed before any close (the first snapshot may not be published yet)");
+    run_until(&rig.clock, T + 16_000).await;
+    assert_eq!(status(&rig.db, UUID), "CLOSING", "waiting for the PnL");
+    assert_eq!(flat(&h), Some(true), "CLOSE_CONFIRMED recorded, PnL pending");
+
+    // The same symbol again, settling a minute later; the first pair is still CLOSING at its check.
+    assert_eq!(ask(&h, Command::AddPrepared(pair_at("pair-0002", SYM, T + 60_000))).await, CommandReply::Accepted);
+    run_until(&rig.clock, T + 55_000).await;
+    assert_eq!(status(&rig.db, UUID), "CLOSING", "still waiting while the second pair is checked");
+    assert_ne!(status(&rig.db, "pair-0002"), "BLOCKED", "{:?}", labels(&rig.db));
+    assert_eq!(status(&rig.db, "pair-0002"), "RECONCILED", "{:?}", labels(&rig.db));
+}
+
+// ---- symbol-leverage-cap: engine gate -------------------------------------------------------
+
+async fn cap_case(caps: &[(Exchange, Result<Decimal, String>)]) -> (Rig, String) {
+    let (rig, h) = started(Opts { trigger: "AUTO", demo: true, ..Opts::default() }).await;
+    for (ex, c) in caps {
+        rig.demo.caps.lock().unwrap().insert(*ex, c.clone());
+    }
+    run_until(&rig.clock, T - 5_000).await;
+    let st = status(&rig.db, UUID);
+    drop(h);
+    (rig, st)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_leverage_above_a_legs_cap_blocks_the_pair_and_nothing_is_sent() {
+    // The pair's leverage is 5 (pair_at); Bybit's fresh cap is 3.
+    let (rig, st) = cap_case(&[(Exchange::Bybit, Ok(dec("3")))]).await;
+    assert_eq!(st, "BLOCKED", "{:?}", labels(&rig.db));
+    let blocked = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
+    assert!(blocked.to_string().contains("LeverageCap") && blocked.to_string().contains("Bybit cap 3x"), "{blocked}");
+    assert!(rig.demo.requests.lock().unwrap().is_empty(), "no order and so no leverage request either");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreadable_cap_blocks_the_pair_fail_closed() {
+    let (rig, st) = cap_case(&[(Exchange::Binance, Err("timeout".into()))]).await;
+    assert_eq!(st, "BLOCKED", "{:?}", labels(&rig.db));
+    let blocked = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
+    assert!(blocked.to_string().contains("LeverageCap") && blocked.to_string().contains("Binance cap unreadable"), "{blocked}");
+    assert!(rig.demo.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn caps_at_or_above_the_leverage_let_the_pair_proceed() {
+    let (rig, st) = cap_case(&[(Exchange::Binance, Ok(dec("5"))), (Exchange::Bybit, Ok(dec("50")))]).await;
+    assert_eq!(st, "RECONCILED", "{:?}", labels(&rig.db));
+    assert_eq!(rig.demo.requests.lock().unwrap().len(), 2);
+}
+
+// ---- manual-order-leverage: engine --------------------------------------------------------
+
+fn manual_cmd(reduce_only: bool, side: OrderSide, leverage: Option<Decimal>) -> Command {
+    Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side, quantity: dec("2"), reduce_only, leverage })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_opening_order_carries_its_leverage_and_a_reduce_only_one_none() {
+    let (rig, h) = started(Opts { demo: true, ..Opts::default() }).await;
+    assert_eq!(ask(&h, manual_cmd(false, OrderSide::Sell, Some(dec("5")))).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(50)).await;
+    // Even if the caller sends a leverage with a reduce-only order, it is not applied.
+    assert_eq!(ask(&h, manual_cmd(true, OrderSide::Buy, Some(dec("5")))).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(50)).await;
+    let sent = rig.demo.requests.lock().unwrap().clone();
+    let manual: Vec<_> = sent.iter().filter(|r| r.symbol == "ETHUSDT").collect();
+    assert_eq!(manual.iter().map(|r| (r.reduce_only, r.leverage)).collect::<Vec<_>>(), vec![(false, Some(dec("5"))), (true, None)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_opening_order_with_a_non_positive_leverage_is_refused_and_nothing_is_sent() {
+    let (rig, h) = started(Opts { demo: true, ..Opts::default() }).await;
+    for bad in [dec("0"), dec("-3")] {
+        assert!(matches!(ask(&h, manual_cmd(false, OrderSide::Sell, Some(bad))).await, CommandReply::Rejected(_)), "{bad}");
+    }
+    sleep(Duration::from_millis(50)).await;
+    assert!(rig.demo.requests.lock().unwrap().iter().all(|r| r.symbol != "ETHUSDT"));
+}

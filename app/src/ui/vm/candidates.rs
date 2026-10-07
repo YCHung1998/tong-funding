@@ -9,8 +9,9 @@ use tong_funding_core::pair::PairState;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{is_tradable, CommandSink, UiSnapshot};
+use super::leverage_cap::{self, CapCheck};
 use super::scanner::{Qualified, ScanRow, ScannerVm};
-use crate::engine::command::{Command, NewPreparedPair};
+use crate::engine::command::{Command, NewPreparedPair, PairView};
 
 /// Why a row cannot be ticked (first failing rule, in this order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,7 +26,7 @@ pub enum CandidateBlock {
     StaleData(Exchange),
     SettlementUnknown,
     SettlementPassed,
-    /// The symbol already has a PREPARED or running pair.
+    /// The symbol already has a PREPARED or running pair (one that still holds exposure).
     AlreadyStaged,
 }
 
@@ -44,21 +45,37 @@ impl CandidateBlock {
     }
 }
 
-fn staged(snap: &UiSnapshot, symbol: &str) -> bool {
+/// An account read older than this is not evidence of "flat" (the pages poll every 15 s).
+const ACCOUNT_FRESH_MS: i64 = 45_000;
+
+/// Both legs' accounts were read completely and recently and show no position and no open order
+/// on the pair's symbol. Anything unknown (error, incomplete list, stale, never read) is `false`.
+fn legs_flat(snap: &UiSnapshot, p: &PairView, now_ms: i64) -> bool {
+    [p.long_exchange, p.short_exchange].into_iter().all(|ex| {
+        let Some(acc) = snap.leg_accounts.get(&(p.simulated, ex)) else { return false };
+        if now_ms.saturating_sub(acc.fetched_at) > ACCOUNT_FRESH_MS {
+            return false;
+        }
+        let (Ok(positions), Ok(orders)) = (&acc.positions, &acc.open_orders) else { return false };
+        positions.complete
+            && orders.complete
+            && !positions.items.iter().any(|x| x.symbol == p.symbol && !x.quantity.is_zero())
+            && !orders.items.iter().any(|x| x.symbol == p.symbol)
+    })
+}
+
+/// Whether `symbol` still has a pair that holds it. A pair with no exposure left does not (re-adding
+/// a closed symbol, candidate-readd-after-close): `CLOSING` after the flat confirmation, and a locked
+/// state whose legs are verifiably flat on the accounts. Such a pair itself is left as it is.
+fn staged(snap: &UiSnapshot, symbol: &str, now_ms: i64) -> bool {
     snap.engine.as_ref().is_some_and(|e| {
         e.pairs.iter().any(|p| {
             p.symbol == symbol
                 && match p.state {
                     PairState::Finalized | PairState::Cancelled | PairState::Blocked => false,
-                    PairState::Prepared
-                    | PairState::PreTradeCheck
-                    | PairState::OrderSubmit
-                    | PairState::FillMonitor
-                    | PairState::Reconciled
-                    | PairState::Imbalanced
-                    | PairState::Closing
-                    | PairState::PartialFailure
-                    | PairState::Unresolved => true,
+                    PairState::Closing => !p.flat_confirmed,
+                    PairState::PartialFailure | PairState::Imbalanced | PairState::Unresolved => !legs_flat(snap, p, now_ms),
+                    PairState::Prepared | PairState::PreTradeCheck | PairState::OrderSubmit | PairState::FillMonitor | PairState::Reconciled => true,
                 }
         })
     })
@@ -85,7 +102,7 @@ pub fn eligibility(row: &ScanRow, snap: &UiSnapshot, now_ms: i64) -> Result<(), 
         Some((t, _)) if t <= now_ms => return Err(CandidateBlock::SettlementPassed),
         Some(_) => {}
     }
-    if staged(snap, &row.symbol) {
+    if staged(snap, &row.symbol, now_ms) {
         return Err(CandidateBlock::AlreadyStaged);
     }
     Ok(())
@@ -141,6 +158,9 @@ pub struct CandidateView {
     pub margin: Decimal,
     pub long_price: Option<Decimal>,
     pub short_price: Option<Decimal>,
+    /// symbol-leverage-cap: both legs' caps against the contract leverage (shown; a known cap
+    /// below the leverage also makes the candidate invalid, an unknown one does not).
+    pub cap: CapCheck,
     /// Re-checked on every data update; `Err` = shown with the reason, never added.
     pub valid: Result<(), String>,
 }
@@ -164,6 +184,13 @@ pub fn views(list: &CandidateList, scanner: &ScannerVm, snap: &UiSnapshot, now_m
             };
             let (long_price, short_price) = (price(snap, long, symbol), price(snap, short, symbol));
             let valid = valid.and_then(|()| if long_price.is_some() && short_price.is_some() { Ok(()) } else { Err("無掃描價格".into()) });
+            let cap = leverage_cap::check(snap, long, short, symbol, t.notional_usdt, t.leverage, now_ms);
+            // Only a KNOWN cap below the leverage refuses the add; unknown stays informational here
+            // (the engine's pre-trade gate fails closed in EXCHANGE_DEMO).
+            let valid = valid.and_then(|()| match cap.blocked_reason(Some(tong_funding_core::risk::ExecutionMode::Simulation)) {
+                Some(why) => Err(why),
+                None => Ok(()),
+            });
             CandidateView {
                 symbol: symbol.clone(),
                 long,
@@ -176,6 +203,7 @@ pub fn views(list: &CandidateList, scanner: &ScannerVm, snap: &UiSnapshot, now_m
                 margin: t.margin(),
                 long_price,
                 short_price,
+                cap,
                 valid,
             }
         })

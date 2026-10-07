@@ -28,12 +28,20 @@ fn snap(mode: ExecutionMode) -> UiSnapshot {
         s.market.insert(ex, MarketFeed { observations: vec![o], last_success_at: Some(NOW - 100), last_error: None });
         s.rules.insert((ex, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("0.001"), min_qty: d("0.001") }, okx_ct_val: None }));
     }
+    // symbol-leverage-cap: fresh caps (read for a large notional) so EXCHANGE_DEMO can select.
+    put_caps(&mut s, "BTCUSDT", "20", "20");
     s.engine = Some(EngineState { now_ms: NOW, trigger_mode: TriggerMode::Manual, execution_mode: mode, pairs: vec![], blockers: vec![], notices: vec![], alerts: vec![] });
     s
 }
 
+fn put_caps(s: &mut UiSnapshot, sym: &str, bin: &str, byb: &str) {
+    for (ex, c) in [(Exchange::Binance, bin), (Exchange::Bybit, byb)] {
+        s.leverage_caps.insert((ex, sym.into()), crate::ui::bridge::CapReading { notional: d("100000"), cap: Ok(d(c)), fetched_at: NOW - 1_000 });
+    }
+}
+
 fn form(qty: &str) -> ManualForm {
-    ManualForm { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: qty.into(), reduce_only: false }
+    ManualForm { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: qty.into(), reduce_only: false, leverage: "5".into() }
 }
 
 #[test]
@@ -86,7 +94,7 @@ fn nothing_is_sent_before_confirming_and_exactly_one_command_after_in_exchange_d
     confirm(&c, &sink);
     assert_eq!(
         *sink.0.borrow(),
-        vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: false })]
+        vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: false, leverage: Some(d("5")) })]
     );
 }
 
@@ -267,13 +275,13 @@ mod picker {
         let sink = Sink::default();
         let s = snap(ExecutionMode::Simulation);
         let p = close_prefill(&pos(Exchange::Bybit, "BTCUSDT", "-0.0014"));
-        let f = ManualForm { exchange: p.exchange, symbol: p.symbol, side: p.side, quantity: p.quantity, reduce_only: p.reduce_only };
+        let f = ManualForm { exchange: p.exchange, symbol: p.symbol, side: p.side, quantity: p.quantity, reduce_only: p.reduce_only, leverage: "5".into() };
         let vm = build(&f, &CancelForm::default(), &s);
         assert!(sink.0.borrow().is_empty());
         let c = open_confirm(&vm, &f).unwrap();
         assert_eq!(c.qty_text, "0.001 BTC");
         confirm(&c, &sink);
-        assert_eq!(*sink.0.borrow(), vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Bybit, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: true })]);
+        assert_eq!(*sink.0.borrow(), vec![Command::ManualOrder(ManualOrder { exchange: Exchange::Bybit, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("0.001"), reduce_only: true, leverage: None })]);
     }
 
     #[test]
@@ -296,4 +304,87 @@ mod picker {
         s2.leg_accounts.insert((true, Exchange::Bybit), acct(ok(vec![]), Err("boom".into())));
         assert_eq!(open_orders(&s2)[1].state, PickState::Failed("boom".into()));
     }
+}
+
+// ---- manual-order-leverage ----------------------------------------------------------------------
+
+fn demo() -> UiSnapshot {
+    snap(ExecutionMode::ExchangeDemo)
+}
+
+#[test]
+fn an_opening_order_needs_a_whole_number_leverage_from_1_to_125() {
+    for bad in ["", "abc", "2.5", "0", "126", "-3"] {
+        let mut f = form("0.001");
+        f.leverage = bad.into();
+        let vm = build(&f, &CancelForm::default(), &demo());
+        assert!(vm.submit_disabled.contains(&"Leverage 必須是 1–125 的整數".to_string()), "{bad:?}: {:?}", vm.submit_disabled);
+        assert!(open_confirm(&vm, &f).is_none());
+    }
+    for good in ["1", "5", " 125 "] {
+        let mut f = form("0.001");
+        f.leverage = good.into();
+        let mut s = snap(ExecutionMode::Simulation);
+        put_caps(&mut s, "BTCUSDT", "125", "125"); // the format is valid; the cap rule is tested separately
+        let vm = build(&f, &CancelForm::default(), &s);
+        assert!(vm.submit_disabled.is_empty(), "{good:?}: {:?}", vm.submit_disabled);
+    }
+}
+
+#[test]
+fn reduce_only_ignores_the_leverage_field_and_sends_none() {
+    let sink = Sink::default();
+    let mut f = form("0.001");
+    f.reduce_only = true;
+    f.leverage = "garbage".into();
+    let vm = build(&f, &CancelForm::default(), &demo());
+    assert!(vm.submit_disabled.is_empty(), "{:?}", vm.submit_disabled);
+    assert_eq!((vm.leverage, vm.cap_text.clone()), (None, None));
+    let c = open_confirm(&vm, &f).unwrap();
+    confirm(&c, &sink);
+    assert!(matches!(&sink.0.borrow()[0], Command::ManualOrder(ManualOrder { reduce_only: true, leverage: None, .. })));
+}
+
+#[test]
+fn a_known_cap_below_the_leverage_disables_submit_with_the_reason() {
+    let mut s = demo();
+    put_caps(&mut s, "BTCUSDT", "20", "3");
+    let mut f = form("0.001");
+    f.exchange = Exchange::Bybit;
+    let vm = build(&f, &CancelForm::default(), &s);
+    assert!(vm.submit_disabled.contains(&"槓桿 5× 超過 Bybit 上限 3×".to_string()), "{:?}", vm.submit_disabled);
+    assert!(vm.cap_text.unwrap().contains('✗'));
+    // The same leverage on Binance (cap 20) is fine.
+    assert!(build(&form("0.001"), &CancelForm::default(), &s).submit_disabled.is_empty());
+}
+
+#[test]
+fn an_unknown_cap_blocks_in_exchange_demo_only() {
+    let mut s = demo();
+    s.leverage_caps.clear();
+    let vm = build(&form("0.001"), &CancelForm::default(), &s);
+    assert!(vm.submit_disabled.iter().any(|w| w.contains("槓桿上限未知")), "{:?}", vm.submit_disabled);
+    let mut sim = snap(ExecutionMode::Simulation);
+    sim.leverage_caps.clear();
+    assert!(build(&form("0.001"), &CancelForm::default(), &sim).submit_disabled.is_empty());
+}
+
+#[test]
+fn the_confirmation_shows_the_leverage_and_the_cap_and_the_command_carries_it() {
+    let sink = Sink::default();
+    let f = form("0.0014");
+    let vm = build(&f, &CancelForm::default(), &demo());
+    let c = open_confirm(&vm, &f).unwrap();
+    assert_eq!(c.leverage, Some(d("5")));
+    assert!(c.cap_text.as_deref().unwrap().contains("Binance 上限 20×"), "{:?}", c.cap_text);
+    confirm(&c, &sink);
+    assert!(matches!(&sink.0.borrow()[0], Command::ManualOrder(ManualOrder { leverage: Some(l), .. }) if *l == d("5")));
+}
+
+#[test]
+fn the_cap_is_requested_for_the_estimate_rounded_up_to_the_next_thousand() {
+    assert_eq!(cap_request_notional(d("60")), d("1000"));
+    assert_eq!(cap_request_notional(d("1000")), d("1000"));
+    assert_eq!(cap_request_notional(d("1000.01")), d("2000"));
+    assert_eq!(cap_request_notional(d("0")), d("1000"));
 }

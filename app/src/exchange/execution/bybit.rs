@@ -13,8 +13,8 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use super::binance::ModeReading;
-use super::classify::{BYBIT_NOT_FOUND_CODES, Reply, SubmitClass, bybit_reply, bybit_state, query_outcome, submit_class};
-use super::endpoints::{BYBIT_CANCEL_PATH, BYBIT_CREATE_PATH, BYBIT_HISTORY_PATH, BYBIT_POSITION_PATH, BYBIT_REALTIME_PATH};
+use super::classify::{BYBIT_LEVERAGE_UNCHANGED_CODES, BYBIT_NOT_FOUND_CODES, LeverageOutcome, Reply, SubmitClass, bybit_reply, bybit_state, leverage_outcome, query_outcome, submit_class};
+use super::endpoints::{BYBIT_CANCEL_PATH, BYBIT_CREATE_PATH, BYBIT_HISTORY_PATH, BYBIT_POSITION_PATH, BYBIT_REALTIME_PATH, BYBIT_SET_LEVERAGE_PATH};
 use super::http::{DemoEnv, Method, OrderHttpRequest, OrderTransport};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderState, OrderStatus, QueryOutcome};
@@ -99,6 +99,12 @@ impl<T: OrderTransport> BybitOrderClient<T> {
         self.post(BYBIT_CANCEL_PATH, &json!({ "category": "linear", "symbol": symbol, "orderLinkId": id.as_str() }), timestamp)
     }
 
+    /// `POST /v5/position/set-leverage`: one leverage for both sides of a linear symbol.
+    pub fn leverage_request(&self, symbol: &str, leverage: u32, timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {
+        let l = leverage.to_string();
+        self.post(BYBIT_SET_LEVERAGE_PATH, &json!({ "category": "linear", "symbol": symbol, "buyLeverage": l, "sellLeverage": l }), timestamp)
+    }
+
     /// `GET /v5/position/list` of one symbol.
     pub fn position_mode_request(&self, symbol: &str, timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {
         self.get(BYBIT_POSITION_PATH, &[("category", "linear".to_string()), ("symbol", symbol.to_string())], timestamp)
@@ -109,6 +115,11 @@ impl<T: OrderTransport> BybitOrderClient<T> {
             Ok(r) => bybit_reply(self.transport.send(r).await),
             Err(e) => Reply::Unknown { reason: format!("request not built: {e}") },
         }
+    }
+
+    /// Set the symbol's leverage; "leverage not modified" (110043) counts as set.
+    pub async fn set_leverage(&self, symbol: &str, leverage: u32, timestamp: i64) -> LeverageOutcome {
+        leverage_outcome(self.send(self.leverage_request(symbol, leverage, timestamp)).await, &BYBIT_LEVERAGE_UNCHANGED_CODES)
     }
 
     pub async fn submit(&self, order: &ValidOrder, timestamp: i64) -> SubmitClass {
@@ -214,6 +225,7 @@ mod tests {
             side,
             quantity: "0.019".parse().unwrap(),
             reduce_only,
+            leverage: None,
         })
         .unwrap()
     }

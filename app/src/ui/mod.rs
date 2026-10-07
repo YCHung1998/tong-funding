@@ -31,6 +31,8 @@ pub mod bridge;
 pub mod candidates;
 #[path = "vm/contract_settings.rs"]
 pub mod contract_settings;
+#[path = "vm/leverage_cap.rs"]
+pub mod leverage_cap;
 #[path = "vm/manual_order.rs"]
 pub mod manual_order;
 #[path = "vm/symbol_options.rs"]
