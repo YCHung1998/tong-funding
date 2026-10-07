@@ -61,7 +61,7 @@ pub(super) fn demo_id(leg: Leg, action: OrderAction, seq: u16) -> String {
 }
 
 pub(super) fn req(exchange: Exchange, id: &str, side: OrderSide, qty: &str, reduce_only: bool) -> OrderRequest {
-    OrderRequest { client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None }
+    OrderRequest { client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None, leverage: None }
 }
 
 /// An OKX order: contracts `qty`; an opening one intends `qty x 0.01` coins (the test instrument's ctVal).
@@ -676,7 +676,10 @@ impl Resync for NoResync {
 }
 
 fn account(t: FakeTransport) -> DemoAccountView<FakeTransport> {
-    let t = Arc::new(t);
+    account_shared(Arc::new(t))
+}
+
+fn account_shared(t: Arc<FakeTransport>) -> DemoAccountView<FakeTransport> {
     let clock = Arc::new(ManualClock::new(NOW));
     let secrets: Arc<dyn SecretProvider> = Arc::new(all_keys());
     let offset = Arc::new(|| Some(0i64));
@@ -907,4 +910,48 @@ async fn the_factory_owns_one_latch_shared_with_the_executor_it_builds() {
         SubmitClass::Rejected { code, message } => assert_eq!((code.as_str(), message.contains("tripped by the read client")), ("not_sent", true), "{message}"),
         other => panic!("{other:?}"),
     }
+}
+
+#[tokio::test]
+async fn account_max_leverage_is_read_per_symbol_and_notional_on_both_exchanges() {
+    let bracket = r#"[{"symbol":"BTCUSDT","brackets":[{"bracket":1,"initialLeverage":20,"notionalCap":10000,"notionalFloor":0},{"bracket":2,"initialLeverage":10,"notionalCap":50000,"notionalFloor":10000}]}]"#;
+    let bybit = r#"{"retCode":0,"retMsg":"OK","result":{"category":"linear","list":[{"symbol":"BTCUSDT","status":"Trading","leverageFilter":{"minLeverage":"1","maxLeverage":"12.50","leverageStep":"0.01"}}]}}"#;
+    let t = FakeTransport::new().on("/fapi/v1/leverageBracket", Ok(HttpResponse::ok(bracket))).on("/v5/market/instruments-info", Ok(HttpResponse::ok(bybit)));
+    let t = Arc::new(t);
+    let a = account_shared(t.clone());
+    assert_eq!(a.max_leverage(Exchange::Binance, "BTCUSDT", d("1000")).await, Ok(d("20")));
+    assert_eq!(a.max_leverage(Exchange::Binance, "BTCUSDT", d("20000")).await, Ok(d("10")), "a larger position gets the smaller cap");
+    assert_eq!(a.max_leverage(Exchange::Bybit, "BTCUSDT", d("1000")).await, Ok(d("12.5")));
+    assert!(a.max_leverage(Exchange::Okx, "BTCUSDT", d("1000")).await.is_err());
+    let urls: Vec<String> = t.requests().iter().map(|r| r.url.clone()).collect();
+    assert!(urls[0].contains("/fapi/v1/leverageBracket?symbol=BTCUSDT&timestamp=") && urls[0].contains("&signature="), "{}", urls[0]);
+    assert!(urls.iter().any(|u| u.contains("/v5/market/instruments-info?category=linear&symbol=BTCUSDT")), "{urls:?}");
+}
+
+#[tokio::test]
+async fn account_max_leverage_failures_are_errors_never_a_default() {
+    let t = FakeTransport::new()
+        .on("/fapi/v1/leverageBracket", Ok(HttpResponse::with_status(400, r#"{"code":-1121,"msg":"Invalid symbol."}"#)))
+        .on("/v5/market/instruments-info", Ok(HttpResponse::ok(r#"{"retCode":0,"result":{"list":[]}}"#)));
+    let a = account(t);
+    assert!(a.max_leverage(Exchange::Binance, "NOPEUSDT", d("1000")).await.unwrap_err().starts_with("Binance:"));
+    assert!(a.max_leverage(Exchange::Bybit, "NOPEUSDT", d("1000")).await.unwrap_err().starts_with("Bybit:"));
+}
+
+// ---- order-leverage-sync x OKX: OKX set-leverage is not implemented ---------------------------------------
+
+#[tokio::test]
+async fn an_okx_open_that_carries_a_leverage_is_not_sent_and_nothing_at_all_is_requested() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+    let mut o = okx_open();
+    o.leverage = Some(d("5"));
+    match r.ex.submit(o).await {
+        SubmitOutcome::Rejected { reason } => assert!(reason.contains("OKX leverage sync not implemented yet"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(r.t.requests().is_empty(), "no order, no mode read, and never a set-leverage call: {:?}", r.t.requests().iter().map(|q| q.full_url().to_string()).collect::<Vec<_>>());
+    // the same order without a leverage (the probe / manual path) is unaffected
+    assert!(matches!(r.ex.submit(okx_open()).await, SubmitOutcome::Accepted(_)));
 }

@@ -100,3 +100,26 @@ fn okx_account_is_unsupported_and_unknown_accounts_are_loading() {
     assert_eq!(s.account(Exchange::Binance), AccountState::Loading);
     assert_eq!(s.clock(Exchange::Bybit), ClockState::Unsynced);
 }
+
+fn book(bid: &str, ask: &str, at: i64) -> tong_funding_core::trade_cost::TopOfBook {
+    let d = |s: &str| s.parse().unwrap();
+    tong_funding_core::trade_cost::TopOfBook { bid_price: d(bid), bid_qty: d("1"), ask_price: d(ask), ask_qty: d("1"), observed_at: at }
+}
+
+#[test]
+fn books_update_replaces_on_success_and_keeps_old_quotes_on_failure() {
+    let mut s = UiSnapshot::default();
+    let ok = |at: i64, ask: &str| SourceUpdate::Books { exchange: Exchange::Bybit, books: Ok([("BTCUSDT".to_string(), book("99", ask, at))].into()), at };
+    apply_update(&mut s, ok(1_000, "100"));
+    assert_eq!(s.books[&Exchange::Bybit].books["BTCUSDT"].ask_price, "100".parse().unwrap());
+    apply_update(&mut s, SourceUpdate::Books { exchange: Exchange::Bybit, books: Err("429".into()), at: 2_000 });
+    let f = &s.books[&Exchange::Bybit];
+    assert_eq!(f.books["BTCUSDT"].ask_price, "100".parse().unwrap(), "old quote kept, with its own observed_at");
+    assert_eq!(f.books["BTCUSDT"].observed_at, 1_000);
+    assert_eq!(f.last_error, Some(("429".to_string(), 2_000)));
+    apply_update(&mut s, ok(3_000, "101"));
+    let f = &s.books[&Exchange::Bybit];
+    assert_eq!(f.books["BTCUSDT"].ask_price, "101".parse().unwrap());
+    assert!(f.last_error.is_none());
+    assert!(SourceUpdate::Books { exchange: Exchange::Okx, books: Err("x".into()), at: 0 }.is_market(), "quotes trigger the recompute too");
+}

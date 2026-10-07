@@ -78,3 +78,7 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 ## 實作時發現
 
 - 來自 `okx-execution-guards` 第三輪審查，列入 tasks 3.7：(a) 手動 OKX 單（含 reduce-only）須先換張數；(b) `recovery.rs` 對 OKX 的 `ctVal` 缺失不得退回 1；(c) `lotSz` 於持倉期間變大時的平倉檢查（僅文件化）；(d) 平倉因「無持倉」被拒時的警示文字需與「裸腿」區分。
+
+## 實作時發現（合併 main 的 order-leverage-sync 之後）
+
+- engine 的開倉單現在帶 `leverage`（`order-leverage-sync`），Binance / Bybit 的 executor 在送單前先設槓桿。OKX 的 set-leverage **尚未實作**：executor 對帶 `leverage` 的 OKX 開倉在任何請求之前回 `not_sent`（「OKX leverage sync not implemented yet」，測試涵蓋且斷言零請求），絕不呼叫任何 OKX set-leverage 端點，也絕不在槓桿未套用時送出 OKX 開倉。因此在 task 3.8 完成前，engine 自動進場含 OKX 腿的配對都會在送單階段失敗；手動單與實機探針的 OKX 腿不帶 `leverage`（探針已註明），不受影響。

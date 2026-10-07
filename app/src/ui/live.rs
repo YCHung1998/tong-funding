@@ -30,7 +30,7 @@ use tong_funding_core::risk::{RiskConfig, RiskOverrides, parse_overrides};
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::banner::read_system_flags;
-use super::bridge::{
+use super::bridge::{CapReading, 
     AccountData, AccountState, AssetInput, ClockState, CommandOutcome, CommandSink, ContractTemplate, LegAccount, PairInfo, ReadOnlyDataSource, RefreshRequest, Settings,
     SourceHealth, SourceId, SourceUpdate,
 };
@@ -182,7 +182,14 @@ struct Shared {
     engine: std::sync::OnceLock<(mpsc::Sender<CommandMsg>, tokio::runtime::Handle)>,
     /// "Fetch the lot rules of this symbol" requests from the pages.
     rules_tx: std::sync::OnceLock<mpsc::UnboundedSender<(Exchange, String)>>,
+    /// "Read the leverage cap of this symbol at this notional" requests from the pages (symbol-leverage-cap).
+    cap_tx: std::sync::OnceLock<mpsc::UnboundedSender<(Exchange, String, Decimal)>>,
+    /// Last time a cap request was queued per key: the pages ask on every render, this keeps it to one per interval.
+    cap_asked: Mutex<HashMap<(Exchange, String, Decimal), std::time::Instant>>,
 }
+
+/// A leverage cap is re-read at most this often per (exchange, symbol, notional).
+const CAP_REFRESH: Duration = Duration::from_secs(20);
 
 impl Shared {
     fn push(&self, u: SourceUpdate) {
@@ -226,6 +233,18 @@ impl ReadOnlyDataSource for LiveSource {
         if let Some(tx) = self.shared.rules_tx.get() {
             let _ = tx.send((exchange, symbol.trim().to_ascii_uppercase()));
         }
+    }
+
+    fn request_leverage_cap(&self, exchange: Exchange, symbol: &str, notional: Decimal) {
+        let Some(tx) = self.shared.cap_tx.get() else { return };
+        let key = (exchange, symbol.trim().to_ascii_uppercase(), notional);
+        let now = std::time::Instant::now();
+        let mut asked = self.shared.cap_asked.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if asked.get(&key).is_some_and(|t| now.duration_since(*t) < CAP_REFRESH) {
+            return;
+        }
+        asked.insert(key.clone(), now);
+        let _ = tx.send(key);
     }
 
     fn load_ui_prefs(&self) -> Result<Option<serde_json::Value>, String> {
@@ -289,7 +308,7 @@ impl LiveSource {
     /// composition root opened (`None` = no store: the engine does not start). Never blocks the UI.
     pub fn start(db: Option<Db>) -> Arc<LiveSource> {
         let clock: Arc<SystemClock> = Arc::new(SystemClock);
-        let shared = Arc::new(Shared { updates: Mutex::new(Vec::new()), engine: std::sync::OnceLock::new(), rules_tx: std::sync::OnceLock::new() });
+        let shared = Arc::new(Shared { updates: Mutex::new(Vec::new()), engine: std::sync::OnceLock::new(), rules_tx: std::sync::OnceLock::new(), cap_tx: std::sync::OnceLock::new(), cap_asked: Mutex::new(HashMap::new()) });
         let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
         let gate = RefreshGate::default();
         let source = Arc::new(LiveSource { shared: shared.clone(), gate: gate.clone(), refresh_tx, db: db.clone() });
@@ -630,6 +649,19 @@ where
         Some((b, y)) => Arc::new(DemoAccountView::new(b, y)),
         None => Arc::new(NoAccount("簽名傳輸層無法建立".into())),
     };
+    // Leverage-cap reads for the pages (symbol-leverage-cap): fresh signed reads on the demo account.
+    {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(Exchange, String, Decimal)>();
+        let _ = ctx.shared.cap_tx.set(tx);
+        let (ctx, account) = (ctx.clone(), account.clone());
+        tokio::spawn(async move {
+            while let Some((exchange, symbol, notional)) = rx.recv().await {
+                let cap = account.max_leverage(exchange, &symbol, notional).await;
+                let reading = CapReading { notional, cap, fetched_at: clock_now(&ctx.clock) };
+                ctx.shared.push(SourceUpdate::LeverageCap { exchange, symbol, reading });
+            }
+        });
+    }
     // SIMULATION positions from the simulated ledger; margin from the demo account (decision 6).
     let sim_account: Arc<dyn AccountView> = Arc::new(simulator.account_view(Arc::new(MarginFromAccount(account.clone()))));
     let market: Arc<dyn crate::engine::ports::MarketData> = Arc::new(PublicMarketData { adapters });

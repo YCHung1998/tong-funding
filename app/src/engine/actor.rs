@@ -214,6 +214,20 @@ const fn side_of(leg: Leg) -> Side {
     }
 }
 
+/// symbol-leverage-cap gate: `Some(reason)` when the pair's leverage is above a leg's fresh cap or
+/// a cap could not be read (fail closed). `None` caps = SIMULATION pair, nothing to check.
+fn leverage_cap_block(view: &PairView, leverage: Decimal, caps: Option<&[Result<Decimal, String>; 2]>) -> Option<String> {
+    let caps = caps?;
+    for (exchange, cap) in [view.long_exchange, view.short_exchange].into_iter().zip(caps) {
+        match cap {
+            Err(e) => return Some(format!("{} cap unreadable ({e})", exchange.name())),
+            Ok(c) if leverage > *c => return Some(format!("leverage {}x exceeds the {} cap {}x", leverage.normalize(), exchange.name(), c.normalize())),
+            Ok(_) => {}
+        }
+    }
+    None
+}
+
 fn dstr(d: Decimal) -> String {
     d.normalize().to_string()
 }
@@ -338,6 +352,7 @@ impl OrderSet {
 struct EntryContext {
     rules: [Result<OrderRules, String>; 2],
     foreign: [Result<bool, String>; 2],
+    leverage_caps: Option<[Result<Decimal, String>; 2]>,
 }
 
 type QuotePair = (Result<FreshQuote, String>, Result<FreshQuote, String>);
@@ -905,6 +920,11 @@ impl Actor {
         flow.margins = None;
         flow.context = None;
         let (market, account, tx) = (self.market.clone(), self.account_for(view.simulated), self.event_tx.clone());
+        // Exchange pairs only: the cap depends on the position notional of the entry snapshot.
+        let cap_notional = (!view.simulated).then(|| {
+            let scan = self.flows.get(pair).map(|f| f.scan.clone()).unwrap_or(Value::Null);
+            EntrySnapshot::from_json(&scan).map(|e| e.notional_usdt).map_err(|e| format!("entry snapshot unreadable: {e}"))
+        });
         let (le, se, sym, pair) = (view.long_exchange, view.short_exchange, view.symbol.clone(), pair.to_string());
         tokio::spawn(async move {
             let (long, short) = tokio::join!(market.refetch(le, &sym), market.refetch(se, &sym));
@@ -914,7 +934,15 @@ impl Actor {
             let (long_rules, short_rules) = tokio::join!(market.order_rules(le, &sym), market.order_rules(se, &sym));
             let (long_foreign, short_foreign) =
                 tokio::join!(foreign_exposure(account.as_ref(), le, &sym), foreign_exposure(account.as_ref(), se, &sym));
-            let _ = tx.send(Event::EntryContextFetched { pair, long_rules, short_rules, long_foreign, short_foreign }).await;
+            let leverage_caps = match cap_notional {
+                None => None,
+                Some(Err(e)) => Some([Err(e.clone()), Err(e)]),
+                Some(Ok(n)) => {
+                    let (l, s) = tokio::join!(account.max_leverage(le, &sym, n), account.max_leverage(se, &sym, n));
+                    Some([l, s])
+                }
+            };
+            let _ = tx.send(Event::EntryContextFetched { pair, long_rules, short_rules, long_foreign, short_foreign, leverage_caps }).await;
         });
         CommandReply::Accepted
     }
@@ -979,7 +1007,13 @@ impl Actor {
         };
         let long_foreign = foreign(&context.foreign[0], Leg::Long, &mut notes);
         let short_foreign = foreign(&context.foreign[1], Leg::Short, &mut notes);
-        let others = self.pairs.iter().filter(|(k, _)| k.as_str() != pair).map(|(_, v)| v.state);
+        // A CLOSING pair that is flat-confirmed and only waits for its funding PnL holds no exposure,
+        // so it does not take a slot (candidate-readd-after-close).
+        let others = self
+            .pairs
+            .iter()
+            .filter(|(k, v)| k.as_str() != pair && !(v.state == PairState::Closing && self.awaiting_pnl(k)))
+            .map(|(_, v)| v.state);
         let open_pair_count = node0::count_open_pairs(others);
         let ctx = Node0Context {
             now_ms: self.clock.now_ms(),
@@ -989,6 +1023,7 @@ impl Actor {
             max_concurrent_pairs: risk.max_concurrent_pairs,
             allowed_exchanges: &risk.allowed_exchanges,
             open_pair_count,
+            rules: [&context.rules[0], &context.rules[1]],
         };
         let long = Node0Leg {
             exchange: view.long_exchange,
@@ -1012,6 +1047,9 @@ impl Actor {
                     node0::Node0Block::ConfigIncomplete { .. } | node0::Node0Block::InvalidEntry { .. } | node0::Node0Block::DataMismatch { .. } => Vec::new(),
                 };
                 fail(self, json!({ "block": format!("{block:?}"), "notes": notes, "failed_checks": failed_checks }))
+            }
+            Node0Verdict::Pass if let Some(why) = leverage_cap_block(&view, entry.leverage, context.leverage_caps.as_ref()) => {
+                fail(self, json!({ "block": format!("LeverageCap: {why}"), "notes": notes, "failed_checks": ["LeverageCap"] }))
             }
             Node0Verdict::Pass => {
                 // Lands in the same transaction as ORDER_SUBMIT (funding-pnl's entry record).
@@ -1087,6 +1125,8 @@ impl Actor {
                 quantity: sized.order_qty.value(),
                 reduce_only: false,
                 intended_base_qty: Some(sized.base_qty),
+                // Both legs open at the entry snapshot's leverage (order-leverage-sync).
+                leverage: Some(entry.leverage),
             };
             legs[idx(leg)] = Some(LegOrder::new(req, unit(exchange, &r)));
         }
@@ -1436,7 +1476,9 @@ impl Actor {
                 symbol: view.symbol.clone(),
                 side: OrderSide::for_leg(side_of(leg), OrderAction::Close),
                 quantity: close_qty,
-                reduce_only: true, intended_base_qty: None,
+                reduce_only: true,
+                intended_base_qty: None,
+                leverage: None,
             };
             legs[idx(leg)] = Some(LegOrder::new(req, Decimal::ONE));
         }
@@ -1528,6 +1570,11 @@ impl Actor {
     // ---- manual orders: same executor, same intent path, not part of a pair ----
 
     fn manual_order(&mut self, o: ManualOrder) -> CommandReply {
+        // manual-order-leverage: only an opening order applies a leverage; a non-positive one is refused.
+        let leverage = if o.reduce_only { None } else { o.leverage };
+        if leverage.is_some_and(|l| l <= Decimal::ZERO) {
+            return CommandReply::Rejected("leverage must be > 0".into());
+        }
         let prefix = self.id_prefix();
         let leg = match o.side {
             OrderSide::Buy => Leg::Long,
@@ -1551,7 +1598,9 @@ impl Actor {
             symbol: o.symbol,
             side: o.side,
             quantity: o.quantity,
-            reduce_only: o.reduce_only, intended_base_qty: None,
+            reduce_only: o.reduce_only,
+            intended_base_qty: None,
+            leverage,
         };
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
         tokio::spawn(async move {
@@ -1639,8 +1688,8 @@ impl Actor {
                 self.flows.entry(pair.clone()).or_default().margins = Some((long, short));
                 self.maybe_run_node0(&pair);
             }
-            Event::EntryContextFetched { pair, long_rules, short_rules, long_foreign, short_foreign } => {
-                let ctx = EntryContext { rules: [long_rules, short_rules], foreign: [long_foreign, short_foreign] };
+            Event::EntryContextFetched { pair, long_rules, short_rules, long_foreign, short_foreign, leverage_caps } => {
+                let ctx = EntryContext { rules: [long_rules, short_rules], foreign: [long_foreign, short_foreign], leverage_caps };
                 self.flows.entry(pair.clone()).or_default().context = Some(ctx);
                 self.maybe_run_node0(&pair);
             }
@@ -1827,6 +1876,7 @@ impl Actor {
                     state: PairState::Prepared,
                     settlement_ms: env.settlement_ms,
                     simulated,
+                    flat_confirmed: false,
                 };
                 self.flows.insert(p.internal_uuid.clone(), Flow::new(env.scan, false));
                 self.pairs.insert(p.internal_uuid, view);
@@ -2112,7 +2162,7 @@ impl Actor {
             now_ms: self.clock.now_ms(),
             trigger_mode: self.trigger_mode,
             execution_mode: self.execution_mode,
-            pairs: self.pairs.values().cloned().collect(),
+            pairs: self.pairs.values().map(|v| PairView { flat_confirmed: v.state == PairState::Closing && self.awaiting_pnl(&v.internal_uuid), ..v.clone() }).collect(),
             blockers: gate::current_blockers(&self.db, self.reconciliation_pending.as_deref()),
             prices: self.market_rx.borrow().iter().map(|((e, s), p)| (*e, s.clone(), *p)).collect(),
             notices: self.notices.clone(),
@@ -2580,6 +2630,7 @@ fn view_of_row(db: &Db, row: crate::store::state::PairRow) -> Option<(PairView, 
                 state,
                 settlement_ms: env.settlement_ms,
                 simulated: env.simulated,
+                flat_confirmed: false,
             },
             env.scan,
         )),
@@ -2798,7 +2849,9 @@ mod tests {
             symbol: "BTCUSDT".into(),
             side: OrderSide::Buy,
             quantity: Decimal::new(1, 3),
-            reduce_only: false, intended_base_qty: None,
+            reduce_only: false,
+            intended_base_qty: None,
+            leverage: None,
         };
         actor.spawn_submit("u-hang".into(), Leg::Long, OrderAction::Open, req, None);
         tokio::spawn(actor.run());
@@ -2874,7 +2927,9 @@ mod tests {
             symbol: "BTCUSDT".into(),
             side,
             quantity: Decimal::new(19, 3),
-            reduce_only: false, intended_base_qty: None,
+            reduce_only: false,
+            intended_base_qty: None,
+            leverage: None,
         };
         let triggered = T0 - 40;
         let start = tokio::time::Instant::now();

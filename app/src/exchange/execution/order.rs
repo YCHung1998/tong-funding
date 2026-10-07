@@ -51,7 +51,12 @@ pub struct ValidOrder {
     side: OrderSide,
     quantity: Decimal,
     reduce_only: bool,
+    /// Whole-number leverage to set before an opening order; always `None` on reduce-only orders.
+    leverage: Option<u32>,
 }
+
+/// Leverage range both exchanges accept as a whole number (the per-symbol maximum is the exchange's call).
+pub const LEVERAGE_RANGE: std::ops::RangeInclusive<u32> = 1..=125;
 
 impl ValidOrder {
     pub fn from_request(req: &OrderRequest) -> Result<ValidOrder, String> {
@@ -62,7 +67,18 @@ impl ValidOrder {
         if req.quantity <= Decimal::ZERO {
             return Err("quantity must be positive".into());
         }
-        Ok(ValidOrder { id, symbol: req.symbol.clone(), side: req.side, quantity: req.quantity, reduce_only: req.reduce_only })
+        let leverage = match req.leverage {
+            Some(l) if !req.reduce_only => {
+                let whole = l.fract().is_zero().then(|| u32::try_from(l.trunc()).ok()).flatten().filter(|n| LEVERAGE_RANGE.contains(n));
+                Some(whole.ok_or_else(|| format!("leverage {l} must be a whole number in {}..={}", LEVERAGE_RANGE.start(), LEVERAGE_RANGE.end()))?)
+            }
+            _ => None,
+        };
+        Ok(ValidOrder { id, symbol: req.symbol.clone(), side: req.side, quantity: req.quantity, reduce_only: req.reduce_only, leverage })
+    }
+    /// Leverage to align on the exchange before sending (opening orders only).
+    pub fn leverage(&self) -> Option<u32> {
+        self.leverage
     }
     pub fn id(&self) -> &ClientOrderId {
         &self.id
@@ -102,6 +118,7 @@ mod tests {
             quantity: qty.parse().unwrap(),
             reduce_only: false,
             intended_base_qty: None,
+            leverage: None,
         }
     }
 

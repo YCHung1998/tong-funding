@@ -135,7 +135,7 @@ fn okx_contract_conversion_matches_python() {
     println!("quantity_okx.json: compared {checked} cases");
 }
 
-fn leg(ex: Exchange, baseline: Option<Decimal>, scan: Decimal, latest: Decimal, margin: Decimal) -> LegInput {
+fn leg(ex: Exchange, baseline: Option<Decimal>, scan: Decimal, latest: Decimal, margin: Decimal, needed: Decimal) -> LegInput {
     LegInput {
         exchange: ex,
         baseline_price: baseline,
@@ -144,6 +144,7 @@ fn leg(ex: Exchange, baseline: Option<Decimal>, scan: Decimal, latest: Decimal, 
         price_observed_at_ms: 0,
         funding_observed_at_ms: 0,
         available_margin: margin,
+        margin_needed: needed,
         listed: true,
         exchange_allowed: true,
         volume_24h_quote: Some(Decimal::from(1_000_000_000u64)),
@@ -160,12 +161,13 @@ fn pretrade_drift_margin_leverage_match_python() {
         let x = &c["input"];
         let (lb, sb) = (dec(&x["long_baseline"]), dec(&x["short_baseline"]));
         let from_pretrade = x["baseline_source"].as_str().unwrap() == "pretrade";
+        let needed = dec(&x["margin_needed"]);
         let mk = |ex, base: Decimal, latest: &Value, margin: &Value| {
             if from_pretrade {
                 // Python also had a stale scan-time price on the entry; it must be ignored.
-                leg(ex, Some(base), base * Decimal::from_str("1.5").unwrap(), dec(latest), dec(margin))
+                leg(ex, Some(base), base * Decimal::from_str("1.5").unwrap(), dec(latest), dec(margin), needed)
             } else {
-                leg(ex, None, base, dec(latest), dec(margin))
+                leg(ex, None, base, dec(latest), dec(margin), needed)
             }
         };
         let input = PretradeInput {
@@ -173,7 +175,6 @@ fn pretrade_drift_margin_leverage_match_python() {
             net_edge_qualified: true,
             long: mk(Exchange::Binance, lb, &x["long_latest"], &x["available_margin_long"]),
             short: mk(Exchange::Bybit, sb, &x["short_latest"], &x["available_margin_short"]),
-            margin_needed: dec(&x["margin_needed"]),
             leverage: dec(&x["leverage"]),
             open_pair_count: 0,
         };

@@ -142,10 +142,14 @@ impl BybitHost {
 pub const BINANCE_BALANCE_PATH: &str = "/fapi/v2/balance";
 pub const BINANCE_POSITIONS_PATH: &str = "/fapi/v2/positionRisk";
 pub const BINANCE_OPEN_ORDERS_PATH: &str = "/fapi/v1/openOrders";
+/// Binance: leverage brackets of one symbol (signed GET, `symbol` parameter).
+pub const BINANCE_LEVERAGE_BRACKET_PATH: &str = "/fapi/v1/leverageBracket";
 
 pub const BYBIT_BALANCE_PATH: &str = "/v5/account/wallet-balance";
 pub const BYBIT_POSITIONS_PATH: &str = "/v5/position/list";
 pub const BYBIT_OPEN_ORDERS_PATH: &str = "/v5/order/realtime";
+/// Bybit v5: instrument catalog entry of one linear symbol (`leverageFilter.maxLeverage`).
+pub const BYBIT_INSTRUMENTS_PATH: &str = "/v5/market/instruments-info";
 
 /// Page size requested from Bybit (documented maxima: position list 200, realtime orders 50;
 /// UNVERIFIED against a real account, design Open Question #4).

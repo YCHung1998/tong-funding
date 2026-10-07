@@ -9,3 +9,6 @@ pub mod ledger;
 pub mod okx;
 pub mod models;
 pub mod signing;
+
+#[cfg(test)]
+mod leverage_cap_tests;

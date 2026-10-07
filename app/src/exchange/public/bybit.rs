@@ -13,12 +13,13 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tong_funding_core::funding::{DataStatus, FundingObservation, bybit_interval_secs};
+use tong_funding_core::trade_cost::TopOfBook;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::adapter::{
-    BATCH_TIMEOUT, ExchangeAdapter, InstrumentRules, ListingStatus, MAX_PAGES, META_TTL_MS, RawObservation,
-    RulesLookup, SINGLE_TIMEOUT, TtlCell, assemble, classify_exchange_body, dec_field, http_get, int, parse_json,
-    percent_encode_value, str_field, validate_symbol,
+    BATCH_TIMEOUT, Books, ExchangeAdapter, InstrumentRules, ListingStatus, MAX_PAGES, MarketSnapshot, META_TTL_MS,
+    RawObservation, RulesLookup, SINGLE_TIMEOUT, TtlCell, assemble, classify_exchange_body, dec_field, http_get, int, parse_json,
+    percent_encode_value, str_field, top_of_book, validate_symbol,
 };
 use super::endpoints::{BYBIT_INSTRUMENTS_INFO, BYBIT_TICKERS, bybit_url};
 use super::refetch::earliest_observed_at;
@@ -115,6 +116,18 @@ fn parse_instruments_page(body: &str) -> Result<(Vec<(String, Instrument)>, Opti
     Ok((rows, cursor))
 }
 
+/// Best bid / ask of one `tickers` row (`bid1Price`, `bid1Size`, `ask1Price`, `ask1Size`, base
+/// coin). An empty or missing field gives `None` (no quote); a JSON number is a `Parse` error.
+fn book_of(row: &Value, observed_at: i64) -> Result<Option<TopOfBook>, AdapterError> {
+    Ok(top_of_book(
+        dec_field(row, "bid1Price")?,
+        dec_field(row, "bid1Size")?,
+        dec_field(row, "ask1Price")?,
+        dec_field(row, "ask1Size")?,
+        observed_at,
+    ))
+}
+
 impl<T: HttpTransport> BybitAdapter<T> {
     pub fn new(transport: Arc<T>, clock: Arc<dyn Clock>) -> Self {
         BybitAdapter { transport, clock, catalog: TtlCell::new() }
@@ -178,6 +191,30 @@ impl<T: HttpTransport> BybitAdapter<T> {
         (r, self.clock.now_ms())
     }
 
+    async fn snapshot(&self) -> Result<(Vec<FundingObservation>, Books), AdapterError> {
+        let tickers_q = format!("{BYBIT_TICKERS}?category=linear");
+        let ((tickers, tickers_at), catalog) = tokio::join!(self.timed_get(&tickers_q, BATCH_TIMEOUT), self.catalog());
+        let body = parse_bybit_body(&tickers?)?;
+        let observed_at = earliest_observed_at(&[tickers_at]).unwrap_or(tickers_at);
+        let time = body.get("time").and_then(int);
+        let rows = body
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| AdapterError::parse("tickers has no result.list"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        let mut books = Books::new();
+        for row in rows {
+            if let Some(obs) = self.observation(row, time, &catalog, observed_at, false)? {
+                if let Some(book) = book_of(row, observed_at)? {
+                    books.insert(obs.symbol.clone(), book);
+                }
+                out.push(obs);
+            }
+        }
+        Ok((out, books))
+    }
+
     fn incomplete_error(c: &PagedCatalog) -> AdapterError {
         c.incomplete.clone().unwrap_or_else(|| AdapterError::incomplete("catalog incomplete"))
     }
@@ -234,23 +271,13 @@ impl<T: HttpTransport> ExchangeAdapter for BybitAdapter<T> {
     }
 
     async fn fetch_snapshot(&self) -> Result<Vec<FundingObservation>, AdapterError> {
-        let tickers_q = format!("{BYBIT_TICKERS}?category=linear");
-        let ((tickers, tickers_at), catalog) = tokio::join!(self.timed_get(&tickers_q, BATCH_TIMEOUT), self.catalog());
-        let body = parse_bybit_body(&tickers?)?;
-        let observed_at = earliest_observed_at(&[tickers_at]).unwrap_or(tickers_at);
-        let time = body.get("time").and_then(int);
-        let rows = body
-            .get("result")
-            .and_then(|r| r.get("list"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| AdapterError::parse("tickers has no result.list"))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            if let Some(obs) = self.observation(row, time, &catalog, observed_at, false)? {
-                out.push(obs);
-            }
-        }
-        Ok(out)
+        Ok(self.snapshot().await?.0)
+    }
+
+    /// Same single tickers request as `fetch_snapshot`: the quotes cost no extra request.
+    async fn fetch_market(&self) -> Result<MarketSnapshot, AdapterError> {
+        let (observations, books) = self.snapshot().await?;
+        Ok(MarketSnapshot { observations, books: Ok(books) })
     }
 
     async fn refetch_symbol(&self, symbol: &str) -> Result<FundingObservation, AdapterError> {
@@ -831,5 +858,43 @@ mod tests {
     fn bybit_adapter_reports_its_exchange() {
         let (_, adapter, _) = setup(happy_fake(), 0);
         assert_eq!(adapter.exchange(), Exchange::Bybit);
+    }
+
+    // ----- trade-cost-estimate: best bid / ask from the SAME tickers response -----
+
+    #[test]
+    fn tickers_give_the_best_bid_and_ask_with_no_extra_request() {
+        let (t, adapter, _) = setup(happy_fake(), 0);
+        let m = block_on(adapter.fetch_market()).unwrap();
+        let books = m.books.expect("books available");
+        let b = books["BTCUSDT"];
+        assert_eq!((b.bid_price, b.bid_qty, b.ask_price, b.ask_qty), (d("86000.40"), d("1.123"), d("86000.50"), d("4.926")));
+        assert_eq!(b.observed_at, NOW);
+        assert_eq!(books["ETHUSDT"].ask_price, d("2713.64"));
+        assert_eq!(t.count("/v5/market/tickers"), 1, "one tickers request, same as fetch_snapshot");
+        let before = t.requests().len();
+        block_on(adapter.fetch_snapshot()).unwrap();
+        assert_eq!(t.requests().len() - before, 1, "fetch_snapshot still sends exactly one request (catalog cached)");
+        assert_eq!(m.observations.len(), books.len() + m.observations.iter().filter(|o| !books.contains_key(&o.symbol)).count());
+    }
+
+    #[test]
+    fn empty_bid_price_makes_that_symbol_unavailable_never_mark_or_zero() {
+        let body = mutated("bybit/tickers.json", |v| {
+            for r in v["result"]["list"].as_array_mut().unwrap() {
+                if r["symbol"] == "BTCUSDT" {
+                    r["bid1Price"] = Value::from("");
+                }
+            }
+        });
+        let fake = FakeTransport::new()
+            .on("/v5/market/tickers", Ok(HttpResponse::ok(body.to_string())))
+            .on("/v5/market/instruments-info", ok("bybit/instruments_complete.json"));
+        let (_, adapter, _) = setup(fake, 0);
+        let m = block_on(adapter.fetch_market()).unwrap();
+        let books = m.books.unwrap();
+        assert!(!books.contains_key("BTCUSDT"));
+        assert!(books.contains_key("ETHUSDT"), "other symbols keep their quotes");
+        assert!(m.observations.iter().any(|o| o.symbol == "BTCUSDT"), "the funding observation is unaffected");
     }
 }

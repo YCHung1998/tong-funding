@@ -9,7 +9,7 @@ use tong_funding_core::redact::redact_secrets;
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::endpoints::{
-    BYBIT_BALANCE_PATH, BYBIT_OPEN_ORDERS_PATH, BYBIT_ORDERS_PAGE_LIMIT, BYBIT_POSITIONS_PAGE_LIMIT, BYBIT_POSITIONS_PATH, BybitHost, MAX_PAGES,
+    BYBIT_BALANCE_PATH, BYBIT_INSTRUMENTS_PATH, BYBIT_OPEN_ORDERS_PATH, BYBIT_ORDERS_PAGE_LIMIT, BYBIT_POSITIONS_PAGE_LIMIT, BYBIT_POSITIONS_PATH, BybitHost, MAX_PAGES,
 };
 use super::models::{Balance, Completeness, Listing, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
@@ -85,6 +85,14 @@ impl<T: HttpTransport> BybitSignedClient<T> {
     pub async fn get_available_margin(&self) -> Result<Decimal, AdapterError> {
         let (body, _) = self.signed_get(BYBIT_BALANCE_PATH, &encode_query(&[("accountType", self.account_type_param().to_string())])).await?;
         available_margin_from(&body, self.account_type)
+    }
+
+    /// `GET /v5/market/instruments-info` (linear) of one symbol: its maximum leverage. The endpoint
+    /// is public; it goes through the same request path (signing is harmless).
+    pub async fn get_max_leverage(&self, symbol: &str) -> Result<Decimal, AdapterError> {
+        let query = encode_query(&[("category", "linear".to_string()), ("symbol", symbol.to_string())]);
+        let (body, _) = self.signed_get(BYBIT_INSTRUMENTS_PATH, &query).await?;
+        max_leverage_from_instruments(&body, symbol)
     }
 
     fn account_type_param(&self) -> &'static str {
@@ -199,6 +207,17 @@ impl<T: HttpTransport> BybitSignedClient<T> {
         }
         Ok((body, fetched_at))
     }
+}
+
+/// `leverageFilter.maxLeverage` of `symbol` from an `instruments-info` body; a symbol that is not
+/// `Trading`, or a missing field, is an error.
+pub fn max_leverage_from_instruments(body: &Value, symbol: &str) -> Result<Decimal, AdapterError> {
+    let row = result_list(body)?.iter().find(|r| r.get("symbol").and_then(Value::as_str) == Some(symbol)).ok_or_else(|| AdapterError::parse(format!("{symbol} not in instruments-info")))?;
+    let status = row.get("status").and_then(Value::as_str).unwrap_or("");
+    if status != "Trading" {
+        return Err(AdapterError::parse(format!("{symbol} status is {status:?}, not Trading")));
+    }
+    dec_req(row.get("leverageFilter").ok_or_else(|| AdapterError::parse("missing leverageFilter"))?, "maxLeverage")
 }
 
 fn incomplete<R>(items: Vec<R>, reason: String) -> Listing<R> {

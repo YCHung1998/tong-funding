@@ -31,6 +31,10 @@ pub struct LegInput {
     pub price_observed_at_ms: i64,
     pub funding_observed_at_ms: i64,
     pub available_margin: Decimal,
+    /// Margin this leg needs: `qty × latest price ÷ leverage + opening fee`
+    /// (`trade_cost::leg_cost(..).margin`). A leg whose need cannot be computed carries a value no
+    /// balance reaches, so `Margin` fails (fail closed).
+    pub margin_needed: Decimal,
     pub listed: bool,
     pub exchange_allowed: bool,
     /// 24h quote (USDT) volume for this leg; `None` (missing data) fails the liquidity check.
@@ -46,7 +50,6 @@ pub struct PretradeInput {
     pub net_edge_qualified: bool,
     pub long: LegInput,
     pub short: LegInput,
-    pub margin_needed: Decimal,
     pub leverage: Decimal,
     pub open_pair_count: u32,
 }
@@ -103,7 +106,7 @@ pub fn evaluate_pretrade(input: &PretradeInput, limits: &PretradeLimits) -> Pret
         Check::Liquidity,
         legs.iter().any(|l| l.volume_24h_quote.is_none_or(|v| v < limits.min_24h_volume_usdt)),
     );
-    flag(Check::Margin, legs.iter().any(|l| l.available_margin < input.margin_needed));
+    flag(Check::Margin, legs.iter().any(|l| l.available_margin < l.margin_needed));
     flag(Check::Leverage, input.leverage > limits.max_leverage);
     flag(Check::ExistingExposure, legs.iter().any(|l| l.has_foreign_exposure));
     flag(

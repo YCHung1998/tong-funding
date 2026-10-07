@@ -13,6 +13,7 @@ use serde_json::Value;
 use tong_funding_core::funding::FundingObservation;
 use tong_funding_core::pair::PairState;
 use tong_funding_core::risk::{ExecutionMode, RiskConfig, RiskOverrides, TriggerMode};
+use tong_funding_core::trade_cost::TopOfBook;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use crate::engine::command::{Alert as EngineAlert, Blocker, Command, CommandReply, Notice, PairView};
@@ -45,6 +46,18 @@ pub struct MarketFeed {
     /// Local time of the last successful fetch (`None` = never).
     pub last_success_at: Option<i64>,
     /// Message and local time of the latest failure, if it is newer than the last success.
+    pub last_error: Option<(String, i64)>,
+}
+
+/// Latest best bid / ask of one exchange (trade-cost-estimate). Kept apart from [`MarketFeed`]:
+/// a failed quote fetch must not touch the funding observations, and the other way round.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BookFeed {
+    pub books: BTreeMap<String, TopOfBook>,
+    /// Local time of the last successful quote fetch (`None` = never).
+    pub last_success_at: Option<i64>,
+    /// Why the latest quote fetch failed; cleared by the next success. The old quotes are KEPT (they
+    /// carry their own `observed_at`, so the page shows their age).
     pub last_error: Option<(String, i64)>,
 }
 
@@ -232,6 +245,14 @@ pub struct LegAccount {
     pub fetched_at: i64,
 }
 
+/// One leverage-cap read: the cap an exchange allows for a position of `notional` USDT, or why it is unknown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapReading {
+    pub notional: Decimal,
+    pub cap: Result<Decimal, String>,
+    pub fetched_at: i64,
+}
+
 /// The reply to a command a page sent, for the page to show (latest last).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandOutcome {
@@ -286,6 +307,8 @@ impl Default for SystemFlags {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UiSnapshot {
     pub market: BTreeMap<Exchange, MarketFeed>,
+    /// Best bid / ask per exchange (trade-cost-estimate), refreshed with each market poll.
+    pub books: BTreeMap<Exchange, BookFeed>,
     pub accounts: BTreeMap<Exchange, AccountState>,
     pub health: Vec<SourceHealth>,
     pub clocks: BTreeMap<Exchange, ClockState>,
@@ -309,6 +332,8 @@ pub struct UiSnapshot {
     pub rules: BTreeMap<(Exchange, String), Result<OrderRules, String>>,
     /// Account reads by (simulated ledger?, exchange).
     pub leg_accounts: BTreeMap<(bool, Exchange), LegAccount>,
+    /// Latest per-symbol leverage cap reads by (exchange, symbol) (symbol-leverage-cap).
+    pub leverage_caps: BTreeMap<(Exchange, String), CapReading>,
     /// Demo keys for Binance AND Bybit readable from the Keychain; `None` = not checked yet.
     pub demo_keys: Option<Result<(), String>>,
     /// Latest command replies (at most [`MAX_REPLIES`], oldest first).
@@ -343,6 +368,9 @@ pub enum SourceUpdate {
     /// Partial update (e.g. a WebSocket frame): replaces only the given symbols.
     MarketPartial { exchange: Exchange, observations: Vec<FundingObservation>, at: i64 },
     MarketError { exchange: Exchange, error: String, at: i64 },
+    /// Best bid / ask of one poll: a success replaces that exchange's quotes, a failure keeps the
+    /// old ones and records why (never presented as new data).
+    Books { exchange: Exchange, books: Result<BTreeMap<String, TopOfBook>, String>, at: i64 },
     Account { exchange: Exchange, state: AccountState },
     Health(Vec<SourceHealth>),
     Clock { exchange: Exchange, state: ClockState },
@@ -355,6 +383,7 @@ pub enum SourceUpdate {
     PairEntries(BTreeMap<String, Value>),
     TradeEvents(Vec<StoredEvent>),
     Rules { exchange: Exchange, symbol: String, rules: Result<OrderRules, String> },
+    LeverageCap { exchange: Exchange, symbol: String, reading: CapReading },
     LegAccount { simulated: bool, exchange: Exchange, account: LegAccount },
     DemoKeys(Result<(), String>),
     CommandResult(CommandOutcome),
@@ -365,7 +394,7 @@ pub enum SourceUpdate {
 impl SourceUpdate {
     /// Market data changes feed the rate-limited recompute; everything else is applied the same way.
     pub fn is_market(&self) -> bool {
-        matches!(self, SourceUpdate::Market { .. } | SourceUpdate::MarketPartial { .. } | SourceUpdate::MarketError { .. })
+        matches!(self, SourceUpdate::Market { .. } | SourceUpdate::MarketPartial { .. } | SourceUpdate::MarketError { .. } | SourceUpdate::Books { .. })
     }
 }
 
@@ -392,6 +421,18 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         }
         SourceUpdate::MarketError { exchange, error, at } => {
             snap.market.entry(exchange).or_default().last_error = Some((error, at));
+            snap.market_updates += 1;
+        }
+        SourceUpdate::Books { exchange, books, at } => {
+            let feed = snap.books.entry(exchange).or_default();
+            match books {
+                Ok(b) => {
+                    feed.books = b;
+                    feed.last_success_at = Some(at);
+                    feed.last_error = None;
+                }
+                Err(e) => feed.last_error = Some((e, at)),
+            }
             snap.market_updates += 1;
         }
         SourceUpdate::Account { exchange, state } => {
@@ -429,6 +470,9 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         SourceUpdate::TradeEvents(ev) => snap.trade_events = ev,
         SourceUpdate::Rules { exchange, symbol, rules } => {
             snap.rules.insert((exchange, symbol), rules);
+        }
+        SourceUpdate::LeverageCap { exchange, symbol, reading } => {
+            snap.leverage_caps.insert((exchange, symbol), reading);
         }
         SourceUpdate::LegAccount { simulated, exchange, account } => {
             snap.leg_accounts.insert((simulated, exchange), account);
@@ -552,6 +596,8 @@ pub trait ReadOnlyDataSource: Send + Sync {
     fn load_events(&self, query: &crate::store::event_query::EventQuery) -> Result<crate::store::event_query::EventPage, String>;
     /// Ask for the market-order lot rules of `symbol` (answered with [`SourceUpdate::Rules`]).
     fn request_rules(&self, _exchange: Exchange, _symbol: &str) {}
+    /// Ask for the leverage cap of `symbol` at `notional` (answered with [`SourceUpdate::LeverageCap`]).
+    fn request_leverage_cap(&self, _exchange: Exchange, _symbol: &str, _notional: Decimal) {}
     /// `config.ui_prefs` (ui-font-zoom); `Ok(None)` = never saved.
     fn load_ui_prefs(&self) -> Result<Option<Value>, String> {
         Ok(None)

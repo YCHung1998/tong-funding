@@ -11,7 +11,7 @@ use tong_funding_core::types::Exchange;
 
 use super::bridge::SourceUpdate;
 use crate::exchange::error::AdapterError;
-use crate::exchange::public::adapter::ExchangeAdapter;
+use crate::exchange::public::adapter::{Books, ExchangeAdapter, MarketSnapshot};
 use crate::ports::Clock;
 
 /// Allows one refresh at a time. Cheap to clone; clones share the state.
@@ -49,6 +49,9 @@ pub struct RefreshOutcome {
     pub started_at: i64,
     pub finished_at: i64,
     pub results: Vec<(Exchange, Result<Vec<FundingObservation>, AdapterError>)>,
+    /// Best bid / ask of the same round, per source whose market request succeeded. `Err` = the
+    /// quotes are unavailable (e.g. Binance `bookTicker` rate limited); observations are unaffected.
+    pub books: Vec<(Exchange, Result<Books, String>)>,
 }
 
 impl RefreshOutcome {
@@ -59,19 +62,20 @@ impl RefreshOutcome {
     /// Snapshot updates: successes replace that exchange's observations, failures only record the
     /// error (old values stay, marked stale; never presented as new data).
     pub fn updates(&self) -> Vec<SourceUpdate> {
-        self.results
-            .iter()
-            .map(|(exchange, r)| match r {
-                Ok(observations) => SourceUpdate::Market { exchange: *exchange, observations: observations.clone(), at: self.finished_at },
-                Err(e) => SourceUpdate::MarketError { exchange: *exchange, error: e.to_string(), at: self.finished_at },
-            })
-            .collect()
+        let market = self.results.iter().map(|(exchange, r)| match r {
+            Ok(observations) => SourceUpdate::Market { exchange: *exchange, observations: observations.clone(), at: self.finished_at },
+            Err(e) => SourceUpdate::MarketError { exchange: *exchange, error: e.to_string(), at: self.finished_at },
+        });
+        let books = self.books.iter().map(|(exchange, b)| SourceUpdate::Books { exchange: *exchange, books: b.clone(), at: self.finished_at });
+        market.chain(books).collect()
     }
 }
 
-async fn fetch_if<A: ExchangeAdapter>(adapter: &A, enabled: &BTreeSet<Exchange>) -> Option<(Exchange, Result<Vec<FundingObservation>, AdapterError>)> {
+type Fetched = (Exchange, Result<MarketSnapshot, AdapterError>);
+
+async fn fetch_if<A: ExchangeAdapter>(adapter: &A, enabled: &BTreeSet<Exchange>) -> Option<Fetched> {
     let ex = adapter.exchange();
-    if enabled.contains(&ex) { Some((ex, adapter.fetch_snapshot().await)) } else { None }
+    if enabled.contains(&ex) { Some((ex, adapter.fetch_market().await)) } else { None }
 }
 
 /// Re-fetches every enabled market source concurrently. Disabled exchanges get no request.
@@ -83,8 +87,18 @@ where
 {
     let started_at = clock.now_ms();
     let (a, b, c) = futures_util::join!(fetch_if(binance, enabled), fetch_if(bybit, enabled), fetch_if(okx, enabled));
-    let results = [a, b, c].into_iter().flatten().collect();
-    RefreshOutcome { started_at, finished_at: clock.now_ms(), results }
+    let mut results = Vec::new();
+    let mut books = Vec::new();
+    for (ex, r) in [a, b, c].into_iter().flatten() {
+        match r {
+            Ok(m) => {
+                books.push((ex, m.books));
+                results.push((ex, Ok(m.observations)));
+            }
+            Err(e) => results.push((ex, Err(e))),
+        }
+    }
+    RefreshOutcome { started_at, finished_at: clock.now_ms(), results, books }
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ fn leg(exchange: Exchange) -> LegInput {
         price_observed_at_ms: 99_500,
         funding_observed_at_ms: 99_500,
         available_margin: d("1000"),
+        margin_needed: d("500"),
         listed: true,
         exchange_allowed: true,
         volume_24h_quote: Some(d("1000000")),
@@ -29,7 +30,6 @@ fn input() -> PretradeInput {
         net_edge_qualified: true,
         long: leg(Exchange::Binance),
         short: leg(Exchange::Bybit),
-        margin_needed: d("500"),
         leverage: d("3"),
         open_pair_count: 0,
     }
@@ -176,6 +176,21 @@ fn margin_fails_alone_on_either_leg() {
     let mut i = input();
     i.short.available_margin = d("500");
     assert!(failed(&i).is_empty());
+}
+
+/// Each leg is checked against ITS OWN needed margin (spec: pretrade-validation, 所需保證金).
+#[test]
+fn margin_is_compared_with_each_legs_own_need() {
+    let mut i = input();
+    i.long.margin_needed = d("192.48");
+    i.long.available_margin = d("192.2");
+    i.short.margin_needed = d("192.82");
+    i.short.available_margin = d("192.82");
+    assert_eq!(failed(&i), [Check::Margin], "long: 192.2 < 192.48");
+    i.long.available_margin = d("192.48");
+    assert!(failed(&i).is_empty());
+    i.short.available_margin = d("192.81");
+    assert_eq!(failed(&i), [Check::Margin], "short: 192.81 < 192.82");
 }
 
 #[test]

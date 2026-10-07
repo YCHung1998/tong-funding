@@ -33,6 +33,7 @@ fn pv(uuid: &str, symbol: &str, state: PairState, simulated: bool) -> PairView {
         state,
         settlement_ms: T,
         simulated,
+        flat_confirmed: false,
     }
 }
 
@@ -220,6 +221,7 @@ fn the_confirmation_lists_two_legs_per_pair_and_nothing_is_sent_before_confirmin
 fn exchange_demo_confirmation_warns_about_real_demo_orders() {
     let mut s = snap();
     eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
+    put_caps(&mut s, "BTCUSDT", "20", "10"); // EXCHANGE_DEMO needs known caps to select
     let vm = build(&s, &sel(&["u-BTCUSDT"]), NOW);
     assert_eq!(open_confirm(&vm).unwrap().env_text, "EXCHANGE_DEMO：將對 demo / testnet 帳戶真實下單");
 }
@@ -388,4 +390,184 @@ fn reconciled_pairs_offer_close_now_only_in_manual_mode() {
     let r = vm.running.iter().find(|r| r.uuid == "u-BTCUSDT").unwrap();
     assert!(!r.close_now, "AUTO shows 自動");
     assert_eq!(r.action_text(), "自動");
+}
+
+// ---- trade-cost-estimate: per-row cost estimate at the shared quantity --------------------
+
+mod cost {
+    use super::*;
+    use crate::ui::bridge::BookFeed;
+    use tong_funding_core::trade_cost::TopOfBook;
+
+    const QUOTE_AT: i64 = NOW - 4_000;
+
+    fn book(bid: &str, bid_qty: &str, ask: &str, ask_qty: &str) -> TopOfBook {
+        TopOfBook { bid_price: d(bid), bid_qty: d(bid_qty), ask_price: d(ask), ask_qty: d(ask_qty), observed_at: QUOTE_AT }
+    }
+
+    fn put_book(s: &mut UiSnapshot, ex: Exchange, symbol: &str, b: TopOfBook) {
+        let feed: &mut BookFeed = s.books.entry(ex).or_default();
+        feed.books.insert(symbol.into(), b);
+        feed.last_success_at = Some(b.observed_at);
+    }
+
+    /// The spec scenario: BTC at 60,010 / 60,090 (marks 60,010), qty 0.016 (1,000 cap, step 0.001),
+    /// 5x, taker 0.05 (Binance, long) and 0.055 (Bybit, short).
+    fn spec_snap() -> UiSnapshot {
+        let mut s = snap();
+        s.pair_entries.insert(
+            "u-BTCUSDT".into(),
+            json!({"long_scan_price": "60010", "short_scan_price": "60010", "notional_usdt": "1000", "leverage": "5", "net_edge_pct": "0.07", "gross_spread": "0.0012"}),
+        );
+        for ex in [Exchange::Binance, Exchange::Bybit] {
+            s.market.get_mut(&ex).unwrap().observations.iter_mut().find(|o| o.symbol == "BTCUSDT").unwrap().mark_price = d("60010");
+        }
+        s.settings.risk.taker_fee_pct.insert(Exchange::Binance, d("0.05"));
+        s.settings.risk.taker_fee_pct.insert(Exchange::Bybit, d("0.055"));
+        put_book(&mut s, Exchange::Binance, "BTCUSDT", book("60000", "5", "60010", "5"));
+        put_book(&mut s, Exchange::Bybit, "BTCUSDT", book("60090", "5", "60100", "5"));
+        s
+    }
+
+    fn btc(s: &UiSnapshot) -> StagedRow {
+        build(s, &BTreeSet::new(), NOW).rows.into_iter().find(|r| r.symbol == "BTCUSDT").unwrap()
+    }
+
+    fn display(r: &StagedRow) -> &CostDisplay {
+        match &r.cost {
+            CostView::Estimate(c) => c,
+            other => panic!("expected an estimate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn long_pays_the_ask_short_receives_the_bid_at_the_shared_quantity_spec_numbers() {
+        let r = btc(&spec_snap());
+        assert_eq!(r.long_qty.order_qty(), Some(d("0.016")), "the shared quantity");
+        let c = display(&r);
+        assert_eq!((c.qty, c.long_ask, c.short_bid), (d("0.016"), d("60010"), d("60090")));
+        let e = &c.estimate;
+        assert_eq!((e.long.cost.value, e.short.cost.value), (d("960.16"), d("961.44")));
+        assert_eq!((e.long.cost.open_fee, e.short.cost.open_fee), (d("0.48008"), d("0.528792")));
+        assert_eq!((e.long.cost.margin, e.short.cost.margin), (d("192.51208"), d("192.816792")));
+        assert_eq!((c.quote_at, c.quote_age_ms), (QUOTE_AT, 4_000));
+        assert!(c.warnings.is_empty());
+        let lines = r.cost.lines();
+        assert_eq!(lines[0], "L Binance 賣一 60010 → 價值 960.16 · 開倉費 0.4801 · 保證金 192.51");
+        assert_eq!(lines[1], "S Bybit 買一 60090 → 價值 961.44 · 開倉費 0.5288 · 保證金 192.82");
+        assert!(lines[2].starts_with("合計保證金 385.33 USDT"), "{}", lines[2]);
+        assert!(lines[3].contains("4 秒前"), "{}", lines[3]);
+    }
+
+    #[test]
+    fn the_older_quote_sets_the_data_time() {
+        let mut s = spec_snap();
+        let mut old = book("60090", "5", "60100", "5");
+        old.observed_at = NOW - 9_000;
+        put_book(&mut s, Exchange::Bybit, "BTCUSDT", old);
+        let r = btc(&s);
+        assert_eq!((display(&r).quote_at, display(&r).quote_age_ms), (NOW - 9_000, 9_000));
+    }
+
+    #[test]
+    fn quantity_above_the_top_level_warns_about_the_second_level_but_does_not_block() {
+        let mut s = spec_snap();
+        put_book(&mut s, Exchange::Binance, "BTCUSDT", book("60000", "5", "60010", "0.010"));
+        let r = btc(&s);
+        let c = display(&r);
+        assert_eq!(c.estimate.long.cost.value, d("960.16"), "still priced at the best ask");
+        assert!(c.warnings.iter().any(|w| w.contains("Binance") && w.contains("第二檔") && w.contains("0.01")), "{:?}", c.warnings);
+        assert!(r.selectable.is_ok(), "a hint only; submit is not blocked");
+    }
+
+    #[test]
+    fn a_new_snapshot_quote_updates_the_row() {
+        let mut s = spec_snap();
+        assert_eq!(display(&btc(&s)).estimate.long.cost.value, d("960.16"));
+        put_book(&mut s, Exchange::Binance, "BTCUSDT", book("60000", "5", "60020", "5"));
+        let c = display(&btc(&s)).clone();
+        assert_eq!(c.estimate.long.cost.value, d("960.32"));
+        assert_eq!(c.estimate.long.cost.margin, d("960.32") / d("5") + d("0.48016"));
+    }
+
+    #[test]
+    fn missing_quote_shows_the_reason_and_no_numbers() {
+        let mut s = spec_snap();
+        s.books.get_mut(&Exchange::Bybit).unwrap().books.clear();
+        let r = btc(&s);
+        match &r.cost {
+            CostView::Unavailable(why) => assert!(why.contains("無報價") && why.contains("Bybit") && !why.contains("Binance"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(r.cost.lines(), vec![format!("預估成本：{}", match &r.cost { CostView::Unavailable(w) => w.clone(), _ => unreachable!() })]);
+        // No book feed at all (never fetched): same, never a mark price in its place.
+        s.books.clear();
+        assert!(matches!(&btc(&s).cost, CostView::Unavailable(w) if w.contains("無報價") && w.contains("Binance") && w.contains("Bybit")));
+    }
+
+    #[test]
+    fn unset_taker_fee_shows_the_reason_and_no_numbers() {
+        let mut s = spec_snap();
+        s.settings.risk.taker_fee_pct.remove(&Exchange::Bybit);
+        match &btc(&s).cost {
+            CostView::Unavailable(why) => assert!(why.contains("手續費率") && why.contains("Bybit"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_quantity_or_leverage_shows_the_reason() {
+        let mut s = spec_snap();
+        s.rules.remove(&(Exchange::Bybit, "BTCUSDT".into()));
+        assert!(matches!(&btc(&s).cost, CostView::Unavailable(w) if w.contains("共同數量")));
+        let mut s = spec_snap();
+        s.pair_entries.insert("u-BTCUSDT".into(), json!({"notional_usdt": "1000", "net_edge_pct": "0.07"}));
+        assert!(matches!(&btc(&s).cost, CostView::Unavailable(w) if w.contains("槓桿")));
+    }
+
+    #[test]
+    fn a_failed_quote_refresh_keeps_the_old_estimate_and_says_so() {
+        let mut s = spec_snap();
+        s.books.get_mut(&Exchange::Binance).unwrap().last_error = Some(("HTTP 429".into(), NOW - 100));
+        let r = btc(&s);
+        let c = display(&r);
+        assert!(c.warnings.iter().any(|w| w.contains("Binance") && w.contains("更新失敗")), "{:?}", c.warnings);
+        assert_eq!(c.quote_age_ms, 4_000, "the shown age is the quote's own age");
+    }
+}
+
+// ---- symbol-leverage-cap: staged rows --------------------------------------------------------
+
+fn put_caps(s: &mut UiSnapshot, sym: &str, bin: &str, byb: &str) {
+    for (ex, c) in [(Exchange::Binance, bin), (Exchange::Bybit, byb)] {
+        s.leverage_caps.insert((ex, sym.into()), crate::ui::bridge::CapReading { notional: d("1200"), cap: Ok(d(c)), fetched_at: NOW - 1_000 });
+    }
+}
+
+#[test]
+fn staged_row_shows_both_caps_and_a_leverage_above_a_cap_cannot_be_selected() {
+    let mut s = snap(); // every pair: leverage 3x
+    put_caps(&mut s, "BTCUSDT", "20", "10");
+    put_caps(&mut s, "ETHUSDT", "20", "2");
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    let btc = vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap();
+    let eth = vm.rows.iter().find(|r| r.symbol == "ETHUSDT").unwrap();
+    assert_eq!(btc.selectable, Ok(()));
+    assert!(btc.cap.as_ref().unwrap().text().contains("Binance 20×") && btc.cap.as_ref().unwrap().text().ends_with('✓'));
+    assert_eq!(eth.selectable, Err("槓桿 3× 超過 Bybit 上限 2×".to_string()));
+    assert!(eth.cap.as_ref().unwrap().text().contains("Bybit 2×"));
+    assert_eq!(select_all(&vm), sel(&["u-BTCUSDT"]), "select-all skips the pair above its cap");
+}
+
+#[test]
+fn staged_row_with_an_unknown_cap_is_selectable_in_simulation_but_not_in_exchange_demo() {
+    let mut s = snap();
+    assert_eq!(build(&s, &BTreeSet::new(), NOW).rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap().selectable, Ok(()), "SIMULATION: informational");
+    eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    let btc = vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap();
+    assert!(btc.selectable.clone().unwrap_err().contains("槓桿上限未知"), "{:?}", btc.selectable);
+    put_caps(&mut s, "BTCUSDT", "20", "10");
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    assert_eq!(vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap().selectable, Ok(()));
 }

@@ -14,6 +14,7 @@ fn view(uuid: &str, symbol: &str, state: PairState, simulated: bool) -> PairView
         state,
         settlement_ms: 9_000,
         simulated,
+        flat_confirmed: false,
     }
 }
 

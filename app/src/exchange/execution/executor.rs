@@ -15,7 +15,7 @@ use tong_funding_core::types::Exchange;
 
 use super::binance::{BinanceOrderClient, ModeReading};
 use super::bybit::BybitOrderClient;
-use super::classify::SubmitClass;
+use super::classify::{LeverageOutcome, SubmitClass};
 use super::http::OrderTransport;
 use super::okx::{OkxLimitsSource, OkxOrderClient, check_size};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
@@ -26,6 +26,10 @@ use crate::store::db::Db;
 
 /// How long a confirmed one-way reading is trusted (defined in the signed layer, shared with the OKX read gate).
 pub use crate::exchange::signed::okx::POSITION_MODE_TTL_MS;
+
+/// An OKX opening order that carries a leverage is never sent: OKX set-leverage is not implemented, so
+/// the leverage could not be applied first (order-leverage-sync). No OKX set-leverage endpoint is ever called.
+pub const OKX_LEVERAGE_UNSUPPORTED: &str = "OKX leverage sync not implemented yet; OKX order not sent";
 
 /// Reason of OKX order calls on an executor built without an OKX client and without a reason.
 pub const OKX_UNAVAILABLE: &str = "OKX order client not configured";
@@ -181,6 +185,10 @@ impl<T: OrderTransport> DemoExecutor<T> {
             Ok(o) => o,
             Err(e) => return not_sent(e),
         };
+        if req.exchange == Exchange::Okx && req.leverage.is_some() {
+            // before ANY request (not even the mode read): an open must not leave without its leverage applied
+            return not_sent(OKX_LEVERAGE_UNSUPPORTED.into());
+        }
         if req.exchange == Exchange::Okx {
             // size guard first: nothing is requested for an order that is not a sane number of contracts
             // (a close is only checked for sz > 0 and the lot rule: never blocked by the cap or by missing data)
@@ -204,6 +212,24 @@ impl<T: OrderTransport> DemoExecutor<T> {
         }
         if let Err(e) = self.ensure_one_way(req.exchange, order.symbol(), ts).await {
             return not_sent(e);
+        }
+        // order-leverage-sync: an opening order leaves only after both exchanges hold the same
+        // leverage; a failure here means nothing was sent (a certain rejection).
+        if let Some(leverage) = order.leverage() {
+            let ts = self.timestamp(req.exchange).unwrap_or(ts);
+            let outcome = match req.exchange {
+                Exchange::Binance => self.binance.set_leverage(order.symbol(), leverage, ts).await,
+                Exchange::Bybit => self.bybit.set_leverage(order.symbol(), leverage, ts).await,
+                Exchange::Okx => return not_sent(OKX_LEVERAGE_UNSUPPORTED.into()), // unreachable: refused before any request
+            };
+            match outcome {
+                LeverageOutcome::Set => self.limiter.on_success(req.exchange, RequestClass::Signed),
+                LeverageOutcome::RateLimited { retry_after_ms } => {
+                    self.note_rate_limit(req.exchange, Some(retry_after_ms));
+                    return not_sent(format!("leverage not set (rate limited, retry after {retry_after_ms:?} ms)"));
+                }
+                LeverageOutcome::Failed { reason } => return not_sent(format!("leverage {leverage}x not set on {}: {reason}", req.exchange.name())),
+            }
         }
         let ts = self.timestamp(req.exchange).unwrap_or(ts);
         let class = match req.exchange {

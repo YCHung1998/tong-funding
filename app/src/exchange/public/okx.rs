@@ -17,12 +17,13 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tong_funding_core::funding::{DataStatus, FundingObservation, okx_interval_secs};
+use tong_funding_core::trade_cost::TopOfBook;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::adapter::{
-    BATCH_TIMEOUT, ExchangeAdapter, InstrumentRules, ListingStatus, META_TTL_MS, RawObservation, RulesLookup,
-    SINGLE_TIMEOUT, TtlCell, assemble, classify_exchange_body, dec_field, http_get, int, parse_json,
-    percent_encode_value, str_field, validate_symbol,
+    BATCH_TIMEOUT, Books, ExchangeAdapter, InstrumentRules, ListingStatus, MarketSnapshot, META_TTL_MS, RawObservation,
+    RulesLookup, SINGLE_TIMEOUT, TtlCell, assemble, classify_exchange_body, dec_field, http_get, int, parse_json,
+    percent_encode_value, str_field, top_of_book, validate_symbol,
 };
 use super::endpoints::{
     OKX_FUNDING_RATE, OKX_INSTRUMENTS, OKX_MARK_PRICE, OKX_TICKER, OKX_TICKERS, okx_url,
@@ -109,6 +110,21 @@ fn quote_volume(ticker: Option<&Value>) -> Result<Option<Decimal>, AdapterError>
     Ok(coins.zip(last).and_then(|(c, l)| c.checked_mul(l)))
 }
 
+/// Best bid / ask of one `tickers` row (`bidPx`, `bidSz`, `askPx`, `askSz`). OKX sizes are in
+/// CONTRACTS, so they are multiplied by `ct_val` (base coin per contract) to be comparable with the
+/// base-coin quantity; without a contract value there is no quote. Empty / missing fields give
+/// `None`; a JSON number is a `Parse` error.
+fn book_of(row: &Value, ct_val: Option<Decimal>, observed_at: i64) -> Result<Option<TopOfBook>, AdapterError> {
+    let Some(ct) = ct_val.filter(|c| *c > Decimal::ZERO) else { return Ok(None) };
+    Ok(top_of_book(
+        dec_field(row, "bidPx")?,
+        dec_field(row, "bidSz")?.and_then(|q| q.checked_mul(ct)),
+        dec_field(row, "askPx")?,
+        dec_field(row, "askSz")?.and_then(|q| q.checked_mul(ct)),
+        observed_at,
+    ))
+}
+
 fn find_row<'a>(rows: &'a [Value], inst_id: &str) -> Option<&'a Value> {
     rows.iter().find(|r| str_field(r, "instId") == Some(inst_id))
 }
@@ -126,6 +142,46 @@ impl<T: HttpTransport> OkxAdapter<T> {
         let body = http_get(&*self.transport, url, BATCH_TIMEOUT).await?;
         let catalog = parse_catalog(&body)?;
         Ok(self.catalog.store(self.clock.now_ms(), catalog))
+    }
+
+    async fn snapshot(&self) -> Result<(Vec<FundingObservation>, Books), AdapterError> {
+        let funding_q = format!("{OKX_FUNDING_RATE}?instId=ANY");
+        let mark_q = format!("{OKX_MARK_PRICE}?instType=SWAP");
+        let tickers_q = format!("{OKX_TICKERS}?instType=SWAP");
+        let (funding, mark, tickers, catalog) = tokio::join!(
+            self.timed_get(&funding_q, BATCH_TIMEOUT),
+            self.timed_get(&mark_q, BATCH_TIMEOUT),
+            self.timed_get(&tickers_q, BATCH_TIMEOUT),
+            self.catalog(),
+        );
+        let ((funding, funding_at), (mark, mark_at), (tickers, tickers_at)) = (funding, mark, tickers);
+        let funding = parse_okx_body(&funding?)?;
+        let mark = parse_okx_body(&mark?)?;
+        let tickers = parse_okx_body(&tickers?)?;
+        let observed_at = earliest_observed_at(&[funding_at, mark_at, tickers_at]).unwrap_or(funding_at);
+
+        let by_id = |rows: &[Value]| -> HashMap<String, Value> {
+            rows.iter().filter_map(|r| Some((str_field(r, "instId")?.to_string(), r.clone()))).collect()
+        };
+        let (mark, tickers) = (by_id(&mark), by_id(&tickers));
+        let mut out = Vec::with_capacity(funding.len());
+        let mut books = Books::new();
+        for row in &funding {
+            let Some(id) = str_field(row, "instId") else { continue };
+            if let Some(obs) = Self::observation(row, mark.get(id), tickers.get(id), &catalog, observed_at)? {
+                let ct_val = catalog
+                    .as_ref()
+                    .ok()
+                    .and_then(|c| c.0.get(&obs.symbol))
+                    .and_then(|i| i.rules.as_ref().ok())
+                    .and_then(|r| r.ct_val);
+                if let Some(book) = tickers.get(id).map(|t| book_of(t, ct_val, observed_at)).transpose()?.flatten() {
+                    books.insert(obs.symbol.clone(), book);
+                }
+                out.push(obs);
+            }
+        }
+        Ok((out, books))
     }
 
     async fn timed_get(&self, path_and_query: &str, timeout: Duration) -> (Result<String, AdapterError>, i64) {
@@ -176,33 +232,13 @@ impl<T: HttpTransport> ExchangeAdapter for OkxAdapter<T> {
     }
 
     async fn fetch_snapshot(&self) -> Result<Vec<FundingObservation>, AdapterError> {
-        let funding_q = format!("{OKX_FUNDING_RATE}?instId=ANY");
-        let mark_q = format!("{OKX_MARK_PRICE}?instType=SWAP");
-        let tickers_q = format!("{OKX_TICKERS}?instType=SWAP");
-        let (funding, mark, tickers, catalog) = tokio::join!(
-            self.timed_get(&funding_q, BATCH_TIMEOUT),
-            self.timed_get(&mark_q, BATCH_TIMEOUT),
-            self.timed_get(&tickers_q, BATCH_TIMEOUT),
-            self.catalog(),
-        );
-        let ((funding, funding_at), (mark, mark_at), (tickers, tickers_at)) = (funding, mark, tickers);
-        let funding = parse_okx_body(&funding?)?;
-        let mark = parse_okx_body(&mark?)?;
-        let tickers = parse_okx_body(&tickers?)?;
-        let observed_at = earliest_observed_at(&[funding_at, mark_at, tickers_at]).unwrap_or(funding_at);
+        Ok(self.snapshot().await?.0)
+    }
 
-        let by_id = |rows: &[Value]| -> HashMap<String, Value> {
-            rows.iter().filter_map(|r| Some((str_field(r, "instId")?.to_string(), r.clone()))).collect()
-        };
-        let (mark, tickers) = (by_id(&mark), by_id(&tickers));
-        let mut out = Vec::with_capacity(funding.len());
-        for row in &funding {
-            let Some(id) = str_field(row, "instId") else { continue };
-            if let Some(obs) = Self::observation(row, mark.get(id), tickers.get(id), &catalog, observed_at)? {
-                out.push(obs);
-            }
-        }
-        Ok(out)
+    /// Same tickers request as `fetch_snapshot`: the quotes cost no extra request.
+    async fn fetch_market(&self) -> Result<MarketSnapshot, AdapterError> {
+        let (observations, books) = self.snapshot().await?;
+        Ok(MarketSnapshot { observations, books: Ok(books) })
     }
 
     async fn refetch_symbol(&self, symbol: &str) -> Result<FundingObservation, AdapterError> {
@@ -726,5 +762,41 @@ mod tests {
     fn okx_adapter_reports_its_exchange() {
         let (_, adapter, _) = setup(happy_fake(), 0);
         assert_eq!(adapter.exchange(), Exchange::Okx);
+    }
+
+    // ----- trade-cost-estimate: best bid / ask from the SAME tickers response -----
+
+    #[test]
+    fn tickers_give_the_best_bid_and_ask_in_base_coin_with_no_extra_request() {
+        let (t, adapter, _) = setup(happy_fake(), 0);
+        let m = block_on(adapter.fetch_market()).unwrap();
+        let books = m.books.expect("books available");
+        // BTC-USDT-SWAP: ctVal 0.01 BTC per contract; sizes are contracts in the response.
+        let b = books["BTCUSDT"];
+        assert_eq!((b.bid_price, b.ask_price), (d("86005.7"), d("86005.8")));
+        assert_eq!((b.bid_qty, b.ask_qty), (d("18.2343"), d("0.2053")));
+        assert_eq!(t.count("market/tickers?instType=SWAP"), 1);
+        assert_eq!(t.count("funding-rate?instId=ANY") + t.count("mark-price?instType=SWAP"), 2);
+        assert!(!books.contains_key("BTCUSD"), "only -USDT-SWAP instruments");
+    }
+
+    #[test]
+    fn empty_ask_price_makes_that_symbol_unavailable() {
+        let tickers = mutated("okx/tickers_swap.json", |v| {
+            for r in v["data"].as_array_mut().unwrap() {
+                if r["instId"] == "BTC-USDT-SWAP" {
+                    r["askPx"] = Value::from("");
+                }
+            }
+        });
+        let fake = FakeTransport::new()
+            .on("funding-rate?instId=ANY", ok("okx/funding_rate_any.json"))
+            .on("mark-price?instType=SWAP", ok("okx/mark_price_swap.json"))
+            .on("market/tickers?instType=SWAP", Ok(HttpResponse::ok(tickers.to_string())))
+            .on("public/instruments?instType=SWAP", ok("okx/instruments_swap.json"));
+        let (_, adapter, _) = setup(fake, 0);
+        let books = block_on(adapter.fetch_market()).unwrap().books.unwrap();
+        assert!(!books.contains_key("BTCUSDT"));
+        assert!(books.contains_key("ETHUSDT"));
     }
 }

@@ -9,4 +9,5 @@ pub mod pretrade;
 pub mod quantity;
 pub mod redact;
 pub mod risk;
+pub mod trade_cost;
 pub mod types;

@@ -13,8 +13,8 @@ use std::time::Duration;
 use serde_json::Value;
 use tong_funding_core::types::Decimal;
 
-use super::classify::{BINANCE_NOT_FOUND_CODES, Reply, SubmitClass, binance_reply, binance_state, query_outcome, submit_class};
-use super::endpoints::{BINANCE_ORDER_PATH, BINANCE_POSITION_MODE_PATH, BINANCE_RESP_TYPE, BINANCE_USER_TRADES_PATH};
+use super::classify::{BINANCE_NOT_FOUND_CODES, LeverageOutcome, Reply, SubmitClass, binance_reply, binance_state, leverage_outcome, query_outcome, submit_class};
+use super::endpoints::{BINANCE_LEVERAGE_PATH, BINANCE_ORDER_PATH, BINANCE_POSITION_MODE_PATH, BINANCE_RESP_TYPE, BINANCE_USER_TRADES_PATH};
 use super::http::{DemoEnv, Method, OrderHttpRequest, OrderTransport};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderStatus, QueryOutcome};
@@ -96,6 +96,11 @@ impl<T: OrderTransport> BinanceOrderClient<T> {
         self.signed(Method::Delete, BINANCE_ORDER_PATH, params, timestamp)
     }
 
+    /// `POST /fapi/v1/leverage`: initial leverage of one symbol (integer 1..=125).
+    pub fn leverage_request(&self, symbol: &str, leverage: u32, timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {
+        self.signed(Method::Post, BINANCE_LEVERAGE_PATH, vec![("symbol", symbol.to_string()), ("leverage", leverage.to_string())], timestamp)
+    }
+
     /// `GET /fapi/v1/positionSide/dual`.
     pub fn position_mode_request(&self, timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {
         self.signed(Method::Get, BINANCE_POSITION_MODE_PATH, vec![], timestamp)
@@ -149,6 +154,11 @@ impl<T: OrderTransport> BinanceOrderClient<T> {
     pub async fn cancel(&self, symbol: &str, id: &ClientOrderId, timestamp: i64) -> QueryOutcome {
         let reply = self.send(self.cancel_request(symbol, id, timestamp)).await;
         query_outcome(reply, &BINANCE_NOT_FOUND_CODES, |b| parse_order(b, id.as_str()).map(Some))
+    }
+
+    /// Set the symbol's leverage (idempotent: the same value answers 200).
+    pub async fn set_leverage(&self, symbol: &str, leverage: u32, timestamp: i64) -> LeverageOutcome {
+        leverage_outcome(self.send(self.leverage_request(symbol, leverage, timestamp)).await, &[])
     }
 
     pub async fn position_mode(&self, timestamp: i64) -> Result<ModeReading, String> {
@@ -227,7 +237,9 @@ mod tests {
             symbol: "BTCUSDT".into(),
             side: if reduce_only { OrderSide::Sell } else { OrderSide::Buy },
             quantity: "0.019".parse().unwrap(),
-            reduce_only, intended_base_qty: None,
+            reduce_only,
+            intended_base_qty: None,
+            leverage: None,
         })
         .unwrap()
     }
