@@ -32,6 +32,28 @@ pub const BYBIT_RATE_LIMIT_CODES: [i64; 2] = [10006, 10018];
 /// Bybit "order not exists or too late to cancel" (UNVERIFIED).
 pub const BYBIT_NOT_FOUND_CODES: [i64; 1] = [110001];
 
+/// Bybit "leverage not modified" (set-leverage to the value the symbol already has): success.
+pub const BYBIT_LEVERAGE_UNCHANGED_CODES: [i64; 1] = [110043];
+
+/// Result of a set-leverage request. Anything but `Set` means the order after it is NOT sent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LeverageOutcome {
+    Set,
+    Failed { reason: String },
+    RateLimited { retry_after_ms: Option<u64> },
+}
+
+/// A set-leverage reply; a refusal whose code is in `unchanged` ("already that leverage") is `Set`.
+pub fn leverage_outcome(reply: Reply, unchanged: &[i64]) -> LeverageOutcome {
+    match reply {
+        Reply::Ok(_) => LeverageOutcome::Set,
+        Reply::Refused { code, .. } if unchanged.contains(&code) => LeverageOutcome::Set,
+        Reply::Refused { code, message } => LeverageOutcome::Failed { reason: redact_secrets(&format!("{code}: {message}")) },
+        Reply::RateLimited { retry_after_ms } => LeverageOutcome::RateLimited { retry_after_ms },
+        Reply::Unknown { reason } => LeverageOutcome::Failed { reason },
+    }
+}
+
 /// The four submit classes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubmitClass {

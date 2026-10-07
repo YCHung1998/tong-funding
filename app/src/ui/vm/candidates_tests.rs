@@ -96,6 +96,7 @@ fn a_symbol_already_staged_cannot_be_added() {
         state: PairState::Prepared,
         settlement_ms: T,
         simulated: true,
+        flat_confirmed: false,
     });
     let vm = scanner::build(&s, NOW);
     assert_eq!(eligibility(row(&vm, "BTCUSDT"), &s, NOW), Err(CandidateBlock::AlreadyStaged));
@@ -165,4 +166,153 @@ fn an_invalid_contract_template_blocks_adding() {
     let mut list = CandidateList::default();
     list.toggle(row(&vm, "BTCUSDT"), &s, NOW);
     assert!(views(&list, &vm, &s, NOW)[0].valid.as_ref().unwrap_err().contains("合約模板"));
+}
+
+// ---- candidate-readd-after-close ------------------------------------------------------------
+
+use crate::engine::ports::{AccountOrder, AccountPosition, Listed};
+use crate::ui::bridge::LegAccount;
+
+fn pair_in(s: &mut UiSnapshot, uuid: &str, state: PairState, flat_confirmed: bool) {
+    s.engine.as_mut().unwrap().pairs.push(PairView {
+        internal_uuid: uuid.into(),
+        pair_id: format!("pid-{uuid}"),
+        symbol: "BTCUSDT".into(),
+        long_exchange: Exchange::Binance,
+        short_exchange: Exchange::Bybit,
+        state,
+        settlement_ms: T,
+        simulated: false,
+        flat_confirmed,
+    });
+}
+
+/// Both legs' (demo) accounts read at `fetched_at`; `positions` / `orders` as (exchange, symbol, qty).
+fn accounts(s: &mut UiSnapshot, positions: &[(Exchange, &str, &str)], orders: &[(Exchange, &str, &str)], complete: bool, fetched_at: i64) {
+    for ex in [Exchange::Binance, Exchange::Bybit] {
+        let pos = positions.iter().filter(|p| p.0 == ex).map(|p| AccountPosition { exchange: ex, symbol: p.1.into(), quantity: d(p.2) }).collect();
+        let ord = orders.iter().filter(|o| o.0 == ex).map(|o| AccountOrder { exchange: ex, symbol: o.1.into(), client_order_id: None, remaining_quantity: d(o.2) }).collect();
+        s.leg_accounts.insert(
+            (false, ex),
+            LegAccount { positions: Ok(Listed { items: pos, complete }), open_orders: Ok(Listed { items: ord, complete }), available_margin: Ok(d("1000")), fetched_at },
+        );
+    }
+}
+
+fn eligible_btc(s: &UiSnapshot) -> Result<(), CandidateBlock> {
+    eligibility(row(&scanner::build(s, NOW), "BTCUSDT"), s, NOW)
+}
+
+#[test]
+fn a_closing_pair_with_the_flat_confirmation_does_not_block_re_adding() {
+    // NMRUSDT in the recorded data: CLOSE_CONFIRMED verified_flat, then CLOSING until the PnL settles.
+    let mut s = snap();
+    pair_in(&mut s, "u1", PairState::Closing, true);
+    assert_eq!(eligible_btc(&s), Ok(()));
+}
+
+#[test]
+fn a_closing_pair_without_the_flat_confirmation_still_blocks() {
+    let mut s = snap();
+    pair_in(&mut s, "u1", PairState::Closing, false);
+    assert_eq!(eligible_btc(&s), Err(CandidateBlock::AlreadyStaged));
+}
+
+#[test]
+fn a_locked_pair_whose_legs_are_flat_does_not_block_re_adding() {
+    // OGNUSDT in the recorded data: both legs closed by manual orders, scheduled close then left PARTIAL_FAILURE.
+    for state in [PairState::PartialFailure, PairState::Imbalanced, PairState::Unresolved] {
+        let mut s = snap();
+        pair_in(&mut s, "u1", state, false);
+        // A position on ANOTHER symbol and a zero-size row on this one are not exposure of the pair.
+        accounts(&mut s, &[(Exchange::Binance, "ETHUSDT", "3"), (Exchange::Bybit, "BTCUSDT", "0")], &[], true, NOW - 1_000);
+        assert_eq!(eligible_btc(&s), Ok(()), "{state:?}");
+    }
+}
+
+#[test]
+fn a_locked_pair_with_a_position_or_an_open_order_on_the_symbol_still_blocks() {
+    for (positions, orders) in [
+        (vec![(Exchange::Binance, "BTCUSDT", "0.5")], vec![]),
+        (vec![(Exchange::Bybit, "BTCUSDT", "-0.5")], vec![]),
+        (vec![], vec![(Exchange::Bybit, "BTCUSDT", "0.5")]),
+    ] {
+        let mut s = snap();
+        pair_in(&mut s, "u1", PairState::PartialFailure, false);
+        accounts(&mut s, &positions, &orders, true, NOW - 1_000);
+        assert_eq!(eligible_btc(&s), Err(CandidateBlock::AlreadyStaged), "{positions:?} {orders:?}");
+    }
+}
+
+#[test]
+fn an_unknown_incomplete_failed_or_stale_account_read_is_never_treated_as_flat() {
+    let locked = || {
+        let mut s = snap();
+        pair_in(&mut s, "u1", PairState::Imbalanced, false);
+        s
+    };
+    let mut incomplete = locked();
+    accounts(&mut incomplete, &[], &[], false, NOW - 1_000);
+
+    let mut stale = locked();
+    accounts(&mut stale, &[], &[], true, NOW - 60_000);
+
+    let mut failed = locked();
+    accounts(&mut failed, &[], &[], true, NOW - 1_000);
+    failed.leg_accounts.get_mut(&(false, Exchange::Bybit)).unwrap().positions = Err("timeout".into());
+
+    let mut one_leg_missing = locked();
+    accounts(&mut one_leg_missing, &[], &[], true, NOW - 1_000);
+    one_leg_missing.leg_accounts.remove(&(false, Exchange::Binance));
+
+    for (name, s) in [("incomplete", incomplete), ("stale", stale), ("failed", failed), ("missing", one_leg_missing), ("never read", locked())] {
+        assert_eq!(eligible_btc(&s), Err(CandidateBlock::AlreadyStaged), "{name}");
+    }
+}
+
+#[test]
+fn a_flat_old_pair_does_not_hide_a_running_pair_on_the_same_symbol() {
+    let mut s = snap();
+    pair_in(&mut s, "old", PairState::Closing, true);
+    pair_in(&mut s, "new", PairState::Prepared, false);
+    assert_eq!(eligible_btc(&s), Err(CandidateBlock::AlreadyStaged));
+}
+
+// ---- symbol-leverage-cap: candidate list ------------------------------------------------------
+
+fn put_caps(s: &mut UiSnapshot, sym: &str, bin: &str, byb: &str) {
+    for (ex, c) in [(Exchange::Binance, bin), (Exchange::Bybit, byb)] {
+        s.leverage_caps.insert((ex, sym.into()), crate::ui::bridge::CapReading { notional: d("1200"), cap: Ok(d(c)), fetched_at: NOW - 1_000 });
+    }
+}
+
+fn add_one(s: &UiSnapshot) -> (usize, Vec<CandidateView>) {
+    let vm = scanner::build(s, NOW);
+    let mut list = CandidateList::default();
+    assert!(list.toggle(row(&vm, "BTCUSDT"), s, NOW));
+    let sink = Sink::default();
+    (add_to_staged(&list, &vm, s, NOW, &sink), views(&list, &vm, s, NOW))
+}
+
+#[test]
+fn a_known_cap_below_the_contract_leverage_refuses_the_add_and_says_why() {
+    let mut s = snap(); // contract leverage 3x
+    put_caps(&mut s, "BTCUSDT", "20", "2");
+    let (sent, v) = add_one(&s);
+    assert_eq!(sent, 0);
+    assert_eq!(v[0].valid, Err("槓桿 3× 超過 Bybit 上限 2×".to_string()));
+    assert!(v[0].cap.text().contains("Bybit 2×"));
+}
+
+#[test]
+fn caps_that_fit_or_are_unknown_do_not_refuse_the_add() {
+    let mut s = snap();
+    put_caps(&mut s, "BTCUSDT", "20", "10");
+    let (sent, v) = add_one(&s);
+    assert_eq!(sent, 1);
+    assert!(v[0].cap.text().ends_with('✓'));
+    let unknown = snap(); // never read: shown, not blocking
+    let (sent, v) = add_one(&unknown);
+    assert_eq!(sent, 1);
+    assert!(v[0].cap.text().contains("未知"), "{}", v[0].cap.text());
 }

@@ -22,11 +22,13 @@ pub struct ManualForm {
     pub side: OrderSide,
     pub quantity: String,
     pub reduce_only: bool,
+    /// Leverage text; required for opening orders, ignored for reduce-only ones.
+    pub leverage: String,
 }
 
 impl Default for ManualForm {
     fn default() -> Self {
-        ManualForm { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: String::new(), reduce_only: false }
+        ManualForm { exchange: Exchange::Binance, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: String::new(), reduce_only: false, leverage: "5".into() }
     }
 }
 
@@ -61,6 +63,10 @@ pub struct ManualVm {
     /// The floored quantity, or why there is none.
     pub rounded: Result<Decimal, String>,
     pub est_notional: Option<Decimal>,
+    /// The validated leverage of an opening order; `None` for reduce-only (ignored) or while invalid.
+    pub leverage: Option<Decimal>,
+    /// The exchange cap line of an opening order (symbol-leverage-cap).
+    pub cap_text: Option<String>,
     pub submit_disabled: Vec<String>,
     pub cancel_disabled: Vec<String>,
     pub results: Vec<ManualResult>,
@@ -75,6 +81,8 @@ pub struct ManualConfirm {
     pub qty_text: String,
     pub est_notional: Option<Decimal>,
     pub reduce_only: bool,
+    pub leverage: Option<Decimal>,
+    pub cap_text: Option<String>,
     pub mode: ExecutionMode,
     pub env_text: String,
     pub warning: &'static str,
@@ -111,6 +119,23 @@ fn rounded(form: &ManualForm, snap: &UiSnapshot) -> Result<(Decimal, String), St
         Err(tong_funding_core::quantity::QuantityError::BelowMinimum { .. }) => Err("低於最小下單量".into()),
         Err(e) => Err(e.to_string()),
     }
+}
+
+/// A whole-number leverage from 1 to 125 (the range both exchanges take).
+pub fn parse_leverage(text: &str) -> Result<Decimal, String> {
+    let bad = || "Leverage 必須是 1–125 的整數".to_string();
+    let l: Decimal = text.trim().parse().map_err(|_| bad())?;
+    if !l.fract().is_zero() || l < Decimal::ONE || l > Decimal::from(125) {
+        return Err(bad());
+    }
+    Ok(l)
+}
+
+/// The notional a cap is requested for: the estimate rounded UP to the next 1,000 USDT (at least
+/// 1,000), so the reading does not change with every price tick and is never for a smaller notional.
+pub fn cap_request_notional(estimate: Decimal) -> Decimal {
+    let k = Decimal::from(1000);
+    ((estimate / k).ceil() * k).max(k)
 }
 
 fn s<'a>(v: &'a Value, k: &str) -> &'a str {
@@ -171,6 +196,23 @@ pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> Manua
         submit_disabled.push(why.clone());
     }
 
+    // manual-order-leverage: an opening order needs a valid leverage that fits the exchange cap.
+    let (mut leverage, mut cap_text) = (None, None);
+    if !form.reduce_only {
+        match parse_leverage(&form.leverage) {
+            Err(why) => submit_disabled.push(why),
+            Ok(l) => {
+                leverage = Some(l);
+                let now_ms = snap.engine.as_ref().map_or(0, |e| e.now_ms);
+                let cap = super::leverage_cap::leg(snap, form.exchange, &form.symbol.trim().to_ascii_uppercase(), est_notional.unwrap_or(Decimal::ZERO), now_ms);
+                cap_text = Some(super::leverage_cap::leg_text(form.exchange, &cap, l));
+                if let Some(why) = super::leverage_cap::leg_blocked_reason(form.exchange, &cap, l, mode) {
+                    submit_disabled.push(why);
+                }
+            }
+        }
+    }
+
     let mut cancel_disabled = Vec::new();
     if snap.engine.is_none() {
         cancel_disabled.push("引擎未啟動".into());
@@ -182,7 +224,7 @@ pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> Manua
         cancel_disabled.push("Symbol 為空".into());
     }
 
-    ManualVm { panels, mode, env_text: env_text(mode), rounded: r.map(|(q, _)| q), est_notional, submit_disabled, cancel_disabled, results: results(snap) }
+    ManualVm { panels, mode, env_text: env_text(mode), rounded: r.map(|(q, _)| q), est_notional, leverage, cap_text, submit_disabled, cancel_disabled, results: results(snap) }
 }
 
 /// Opens the confirmation; `None` while submit is disabled. Sends nothing.
@@ -202,6 +244,8 @@ pub fn open_confirm(vm: &ManualVm, form: &ManualForm) -> Option<ManualConfirm> {
         qty_text,
         est_notional: vm.est_notional,
         reduce_only: form.reduce_only,
+        leverage: vm.leverage,
+        cap_text: vm.cap_text.clone(),
         mode,
         env_text: env_text(Some(mode)),
         warning: "單腿下單不會自動建立對腿",
@@ -212,7 +256,7 @@ pub fn open_confirm(vm: &ManualVm, form: &ManualForm) -> Option<ManualConfirm> {
 pub fn confirm(c: &ManualConfirm, sink: &dyn CommandSink) {
     sink.send(
         format!("手動下單 {} {} {:?} {}", c.exchange.name(), c.symbol, c.side, c.qty_text),
-        Command::ManualOrder(ManualOrder { exchange: c.exchange, symbol: c.symbol.clone(), side: c.side, quantity: c.quantity, reduce_only: c.reduce_only }),
+        Command::ManualOrder(ManualOrder { exchange: c.exchange, symbol: c.symbol.clone(), side: c.side, quantity: c.quantity, reduce_only: c.reduce_only, leverage: if c.reduce_only { None } else { c.leverage } }),
     );
 }
 

@@ -39,6 +39,9 @@ pub struct ManualOrder {
     pub side: OrderSide,
     pub quantity: Decimal,
     pub reduce_only: bool,
+    /// Leverage to set on the exchange before an opening order (manual-order-leverage); ignored on
+    /// reduce-only orders, `None` leaves the account's leverage alone. Must be > 0 when present.
+    pub leverage: Option<Decimal>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -125,6 +128,9 @@ pub enum Event {
         short_rules: Result<OrderRules, String>,
         long_foreign: Result<bool, String>,
         short_foreign: Result<bool, String>,
+        /// symbol-leverage-cap: both legs' fresh leverage caps for the pair's notional; `None` for a
+        /// SIMULATION pair (no exchange involved). `Err` = unreadable (the gate fails closed).
+        leverage_caps: Option<[Result<Decimal, String>; 2]>,
     },
     /// Periodic re-fetch for the PREPARED auto-cancel evaluation (AUTO only).
     RecheckFetched { pair: PairUuid, long: Result<FreshQuote, String>, short: Result<FreshQuote, String> },
@@ -193,6 +199,9 @@ pub struct PairView {
     pub state: PairState,
     pub settlement_ms: i64,
     pub simulated: bool,
+    /// `CLOSING` whose flat confirmation (`CLOSE_CONFIRMED`) is recorded and that only waits for
+    /// its funding PnL: no exposure is left. Filled when the snapshot is built; `false` otherwise.
+    pub flat_confirmed: bool,
 }
 
 /// Why the engine refuses exposure-opening commands right now (shown in the UI).
@@ -251,6 +260,7 @@ mod tests {
             side: OrderSide::Sell,
             quantity: Decimal::new(1, 3),
             reduce_only,
+            leverage: None,
         })
     }
 

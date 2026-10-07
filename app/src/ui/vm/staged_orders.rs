@@ -17,6 +17,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{CommandSink, LegAccount, UiSnapshot, ACCOUNT_EXCHANGES};
 use super::contract_settings::{pair_quantity, QuoteCell};
+use super::leverage_cap::{self, CapCheck};
 use super::engine_view::{blocker_text, refusing_blockers};
 use super::risk_settings::missing_display;
 use crate::engine::command::{Blocker, Command, PairView};
@@ -39,6 +40,8 @@ pub struct StagedRow {
     pub margin: Option<Decimal>,
     pub long_qty: QuoteCell,
     pub short_qty: QuoteCell,
+    /// symbol-leverage-cap: both legs' caps and whether the leverage fits them (needs notional + leverage).
+    pub cap: Option<CapCheck>,
     /// `Err(reason)` = the checkbox is disabled.
     pub selectable: Result<(), String>,
     pub selected: bool,
@@ -256,10 +259,14 @@ fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms:
         (None, _, _) => (QuoteCell::NoRules("掃描快照缺少 notional".into()), QuoteCell::NoRules("掃描快照缺少 notional".into())),
         (_, _, _) => (QuoteCell::NoPrice, QuoteCell::NoPrice),
     };
+    let cap = notional.zip(leverage).map(|(n, l)| leverage_cap::check(snap, p.long_exchange, p.short_exchange, &p.symbol, n, l, now_ms));
+    let mode = snap.engine.as_ref().map(|e| e.execution_mode);
     let selectable = if p.state != PairState::Prepared {
         Err(format!("狀態 {}", p.state))
     } else if matches!(long_qty, QuoteCell::BelowMinimum) || matches!(short_qty, QuoteCell::BelowMinimum) {
         Err("低於最小下單量".into())
+    } else if let Some(why) = cap.as_ref().and_then(|c| c.blocked_reason(mode)) {
+        Err(why)
     } else if long_qty.order_qty().is_none() || short_qty.order_qty().is_none() {
         // Conservative: a leg whose quantity cannot be shown cannot be confirmed.
         Err(format!("數量未知（{}）", if long_qty.order_qty().is_none() { long_qty.text() } else { short_qty.text() }))
@@ -282,6 +289,7 @@ fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms:
         selectable,
         long_qty,
         short_qty,
+        cap,
         entry_in_ms: (entry_at > now_ms).then_some(entry_at - now_ms),
     }
 }

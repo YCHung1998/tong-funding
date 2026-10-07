@@ -33,6 +33,7 @@ fn pv(uuid: &str, symbol: &str, state: PairState, simulated: bool) -> PairView {
         state,
         settlement_ms: T,
         simulated,
+        flat_confirmed: false,
     }
 }
 
@@ -220,6 +221,7 @@ fn the_confirmation_lists_two_legs_per_pair_and_nothing_is_sent_before_confirmin
 fn exchange_demo_confirmation_warns_about_real_demo_orders() {
     let mut s = snap();
     eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
+    put_caps(&mut s, "BTCUSDT", "20", "10"); // EXCHANGE_DEMO needs known caps to select
     let vm = build(&s, &sel(&["u-BTCUSDT"]), NOW);
     assert_eq!(open_confirm(&vm).unwrap().env_text, "EXCHANGE_DEMO：將對 demo / testnet 帳戶真實下單");
 }
@@ -388,4 +390,40 @@ fn reconciled_pairs_offer_close_now_only_in_manual_mode() {
     let r = vm.running.iter().find(|r| r.uuid == "u-BTCUSDT").unwrap();
     assert!(!r.close_now, "AUTO shows 自動");
     assert_eq!(r.action_text(), "自動");
+}
+
+// ---- symbol-leverage-cap: staged rows --------------------------------------------------------
+
+fn put_caps(s: &mut UiSnapshot, sym: &str, bin: &str, byb: &str) {
+    for (ex, c) in [(Exchange::Binance, bin), (Exchange::Bybit, byb)] {
+        s.leverage_caps.insert((ex, sym.into()), crate::ui::bridge::CapReading { notional: d("1200"), cap: Ok(d(c)), fetched_at: NOW - 1_000 });
+    }
+}
+
+#[test]
+fn staged_row_shows_both_caps_and_a_leverage_above_a_cap_cannot_be_selected() {
+    let mut s = snap(); // every pair: leverage 3x
+    put_caps(&mut s, "BTCUSDT", "20", "10");
+    put_caps(&mut s, "ETHUSDT", "20", "2");
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    let btc = vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap();
+    let eth = vm.rows.iter().find(|r| r.symbol == "ETHUSDT").unwrap();
+    assert_eq!(btc.selectable, Ok(()));
+    assert!(btc.cap.as_ref().unwrap().text().contains("Binance 20×") && btc.cap.as_ref().unwrap().text().ends_with('✓'));
+    assert_eq!(eth.selectable, Err("槓桿 3× 超過 Bybit 上限 2×".to_string()));
+    assert!(eth.cap.as_ref().unwrap().text().contains("Bybit 2×"));
+    assert_eq!(select_all(&vm), sel(&["u-BTCUSDT"]), "select-all skips the pair above its cap");
+}
+
+#[test]
+fn staged_row_with_an_unknown_cap_is_selectable_in_simulation_but_not_in_exchange_demo() {
+    let mut s = snap();
+    assert_eq!(build(&s, &BTreeSet::new(), NOW).rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap().selectable, Ok(()), "SIMULATION: informational");
+    eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    let btc = vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap();
+    assert!(btc.selectable.clone().unwrap_err().contains("槓桿上限未知"), "{:?}", btc.selectable);
+    put_caps(&mut s, "BTCUSDT", "20", "10");
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    assert_eq!(vm.rows.iter().find(|r| r.symbol == "BTCUSDT").unwrap().selectable, Ok(()));
 }

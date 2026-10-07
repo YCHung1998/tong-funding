@@ -287,3 +287,26 @@ fn pnl_record_a_missing_close_reference_keeps_the_result_incomplete_with_the_rea
     let reasons: Vec<String> = serde_json::from_value(latest.payload["reasons"].clone()).unwrap();
     assert_eq!(reasons, vec!["無參考價（Bybit demo-p1-short-close）".to_string()], "only the short close lacks a reference");
 }
+
+/// candidate-readd-after-close: a symbol re-added while its earlier pair still waits for PnL. The
+/// earlier pair's PnL is the same with or without the later pair (its funding rows stay its own).
+#[test]
+fn pnl_record_a_later_pair_on_the_same_symbol_does_not_change_the_earlier_pairs_pnl() {
+    let fx = scenario(true);
+    // p1: open T-10 s .. close T+15 s; funding at T belongs to p1.
+    fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_fetched(&fx);
+    let before = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    let total_before = tong_funding_core::pnl::compute_pnl(&before.input).total.funding;
+
+    // p2 (re-added after p1's close): open T+30 s, still open; the next settlement (T+8 h) is ahead.
+    add_pair(&fx.db, "p2", "BTCUSDT", false);
+    order(&fx, T + 30_000, "p2", "long", "open", Exchange::Binance, "60100", "0.24");
+    order(&fx, T + 30_000, "p2", "short", "open", Exchange::Bybit, "60100", "0.24");
+
+    let after = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    assert_eq!(after.slots, before.slots);
+    assert_eq!((after.input.legs[0].funding.len(), after.input.legs[1].funding.len()), (1, 1), "p1 keeps both of its funding rows");
+    assert_eq!(tong_funding_core::pnl::compute_pnl(&after.input).total.funding, total_before);
+    assert_eq!(total_before, d("0.24"));
+}
