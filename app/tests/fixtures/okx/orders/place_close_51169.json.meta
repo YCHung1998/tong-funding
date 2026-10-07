@@ -1,0 +1,4 @@
+依文件構造、未在真實 demo 帳戶驗證 (hand-constructed from the OKX v5 official documentation error-code list, https://www.okx.com/docs-v5/en/#error-code , fetched 2026-10-07).
+NOT a recorded response: code 51169 and its wording are from memory of the documented list; values are invented.
+A reduce-only order with no position to reduce. 51169 is NOT in the refusal allowlist, so the outcome stays "unknown" (only its wording is adjusted).
+Replace with a de-identified real demo response after the user's real-machine probe (okx-trading-enablement task 4.2).

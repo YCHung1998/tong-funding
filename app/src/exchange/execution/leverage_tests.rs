@@ -6,7 +6,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::classify::SubmitClass;
 use super::endpoints::*;
-use super::executor_tests::{SYM, binance_ack, bybit_created, d, demo_id, req, rig};
+use super::executor_tests::{SYM, binance_ack, bybit_created, d, demo_id, okx_order_fx, okx_req, req, rig, script_okx_mode};
 use super::http::Method;
 use super::http::fake::Reply;
 use crate::engine::ports::{Leg, OrderAction, OrderRequest, OrderSide};
@@ -131,4 +131,132 @@ async fn no_leverage_or_reduce_only_sends_no_leverage_request() {
     assert!(matches!(r.ex.submit_classified(&close).await, SubmitClass::Accepted(_)));
     assert_eq!(r.t.count(Method::Post, BINANCE_LEVERAGE_PATH), 0);
     assert_eq!(r.t.count(Method::Post, BYBIT_SET_LEVERAGE_PATH), 0);
+}
+
+// ---- okx-trading-enablement 3.8: OKX set-leverage (cross, net mode) before the opening order ------
+
+fn okx_open_with(leverage: Option<&str>) -> OrderRequest {
+    let mut r = okx_req(&demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, "3", false);
+    r.leverage = leverage.map(d);
+    r
+}
+
+fn okx_requests(r: &super::executor_tests::Rig) -> Vec<String> {
+    r.t.requests().iter().map(|q| format!("{:?} {}", q.method(), q.full_url().trim_start_matches("https://openapi.okx.com"))).collect()
+}
+
+#[tokio::test]
+async fn okx_proves_the_demo_key_then_sets_the_leverage_then_sends_the_order() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, OKX_SET_LEVERAGE_PATH, Reply::ok(&okx_order_fx("set_leverage_ok")));
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+    assert!(matches!(r.ex.submit_classified(&okx_open_with(Some("5"))).await, SubmitClass::Accepted(_)));
+    assert_eq!(
+        okx_requests(&r),
+        ["Get /api/v5/account/config", "Post /api/v5/account/set-leverage", "Post /api/v5/trade/order"],
+        "the account-config read (the demo-key proof) comes first, the leverage second, the order last"
+    );
+    let lev = &r.t.requests()[1];
+    let body: serde_json::Value = serde_json::from_str(lev.body().unwrap()).unwrap();
+    assert_eq!(body, serde_json::json!({"instId":"BTC-USDT-SWAP","lever":"5","mgnMode":"cross"}), "cross margin, net mode: no posSide");
+    // it is a signed request like the order: the flag exactly once, the OKX headers, a signature over the body that was sent
+    let header = |n: &str| lev.headers().iter().filter(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.clone()).collect::<Vec<_>>();
+    assert_eq!(header("x-simulated-trading"), vec!["1".to_string()]);
+    assert_eq!(header("OK-ACCESS-KEY").len(), 1);
+    let want = crate::exchange::signed::signing::okx_signature("TEST_SECRET_NOT_REAL", &header("OK-ACCESS-TIMESTAMP")[0], "POST", OKX_SET_LEVERAGE_PATH, lev.body().unwrap()).unwrap();
+    assert_eq!(header("OK-ACCESS-SIGN"), vec![want]);
+    assert!(header("expTime").is_empty(), "set-leverage is not an order: no expTime");
+    // every OKX request, set-leverage included, passed the real admission rule (the fake panics otherwise)
+    for q in r.t.requests() {
+        let url = reqwest::Url::parse(q.full_url()).unwrap();
+        assert!(crate::exchange::reqwest_transport::HostPolicy::SignedDemo.allows(&url, q.headers()), "{}", q.full_url());
+    }
+}
+
+#[tokio::test]
+async fn an_okx_close_or_an_open_without_leverage_sends_no_set_leverage() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+    assert!(matches!(r.ex.submit_classified(&okx_open_with(None)).await, SubmitClass::Accepted(_)));
+    let mut close = okx_req(&demo_id(Leg::Short, OrderAction::Close, 0), OrderSide::Buy, "3", true);
+    close.leverage = Some(d("5"));
+    assert!(matches!(r.ex.submit_classified(&close).await, SubmitClass::Accepted(_)));
+    assert_eq!(r.t.count(Method::Post, OKX_SET_LEVERAGE_PATH), 0);
+}
+
+#[tokio::test]
+async fn a_failed_okx_leverage_request_means_no_order_is_sent() {
+    let cases: [(&str, Reply); 5] = [
+        ("refused 59102", Reply::ok(&okx_order_fx("set_leverage_59102"))),
+        ("rate limited", Reply::ok(&okx_order_fx("place_50011"))),
+        ("timeout", Reply::err(AdapterError::Timeout)),
+        ("unparsable", Reply::ok("<html>gateway</html>")),
+        ("unknown 50004", Reply::ok(&okx_order_fx("place_50004"))),
+    ];
+    for (what, reply) in cases {
+        let r = rig();
+        script_okx_mode(&r.t);
+        r.t.on(Method::Post, OKX_SET_LEVERAGE_PATH, reply);
+        r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+        match r.ex.submit_classified(&okx_open_with(Some("5"))).await {
+            SubmitClass::Rejected { code, message } => {
+                assert_eq!(code, "not_sent", "{what}");
+                assert!(message.contains("leverage"), "{what}: {message}");
+            }
+            other => panic!("{what}: {other:?}"),
+        }
+        assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0, "{what}: the order must not be sent");
+        assert_eq!(r.t.count(Method::Post, OKX_SET_LEVERAGE_PATH), 1, "{what}: exactly one attempt, no automatic retry");
+    }
+}
+
+#[tokio::test]
+async fn an_environment_mismatch_on_set_leverage_latches_okx_off_for_everything_that_can_open_exposure() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, OKX_SET_LEVERAGE_PATH, Reply::ok(&okx_order_fx("place_50101")));
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+    assert!(matches!(r.ex.submit_classified(&okx_open_with(Some("5"))).await, SubmitClass::Rejected { .. }));
+    assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0);
+    // latched: the next open sends nothing at all (no mode read, no leverage, no order)
+    let before = r.t.requests().len();
+    let again = r.ex.submit_classified(&okx_open_with(Some("5"))).await;
+    assert!(matches!(&again, SubmitClass::Rejected { message, .. } if message.contains("OKX disabled")), "{again:?}");
+    assert_eq!(r.t.requests().len(), before);
+}
+
+#[tokio::test]
+async fn an_okx_open_that_fails_the_size_guard_requests_nothing_not_even_the_leverage() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    let mut o = okx_open_with(Some("5"));
+    o.intended_base_qty = None; // an open must say its coin amount
+    assert!(matches!(r.ex.submit_classified(&o).await, SubmitClass::Rejected { .. }));
+    assert!(r.t.requests().is_empty(), "{:?}", okx_requests(&r));
+}
+
+#[tokio::test]
+async fn an_invalid_okx_leverage_sends_no_request_at_all() {
+    for bad in ["2.5", "0", "126", "-3"] {
+        let r = rig();
+        match r.ex.submit_classified(&okx_open_with(Some(bad))).await {
+            SubmitClass::Rejected { code, message } => assert!(code == "not_sent" && message.contains("leverage"), "{bad}: {message}"),
+            other => panic!("{bad}: {other:?}"),
+        }
+        assert!(r.t.requests().is_empty(), "{bad}");
+    }
+}
+
+#[tokio::test]
+async fn an_okx_leverage_without_a_proven_demo_key_is_never_sent() {
+    // the account-config read answers an error: the key is not proven, so neither the leverage nor the order may go out
+    let r = rig();
+    r.t.on(Method::Get, "/api/v5/account/config", Reply::ok(&okx_order_fx("place_50101")));
+    r.t.on(Method::Post, OKX_SET_LEVERAGE_PATH, Reply::ok(&okx_order_fx("set_leverage_ok")));
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+    assert!(matches!(r.ex.submit_classified(&okx_open_with(Some("5"))).await, SubmitClass::Rejected { .. }));
+    assert_eq!(r.t.count(Method::Post, OKX_SET_LEVERAGE_PATH), 0);
+    assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0);
 }

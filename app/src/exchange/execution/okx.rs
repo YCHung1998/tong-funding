@@ -19,8 +19,8 @@ use serde_json::{Value, json};
 use tong_funding_core::types::Decimal;
 
 use super::binance::ModeReading;
-use super::classify::{OKX_NOT_FOUND_CODES, Reply, SubmitClass, okx_is_env_mismatch, okx_reply, okx_state, query_outcome, submit_class};
-use super::endpoints::{OKX_ACCOUNT_CONFIG_PATH, OKX_CANCEL_PATH, OKX_ORDER_PATH};
+use super::classify::{LeverageOutcome, OKX_NOT_FOUND_CODES, Reply, SubmitClass, leverage_outcome, okx_is_env_mismatch, okx_reply, okx_state, query_outcome, submit_class};
+use super::endpoints::{OKX_ACCOUNT_CONFIG_PATH, OKX_CANCEL_PATH, OKX_ORDER_PATH, OKX_SET_LEVERAGE_PATH};
 use super::http::{DemoEnv, Method, OrderHttpRequest, OrderTransport};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderState, OrderStatus, QueryOutcome};
@@ -223,6 +223,14 @@ impl<T: OrderTransport> OkxOrderClient<T> {
         self.build(Method::Post, OKX_CANCEL_PATH, Some(json!({ "instId": inst_id, "clOrdId": id.as_str() }).to_string()), timestamp_ms)
     }
 
+    /// `POST /api/v5/account/set-leverage`: one leverage for the instrument in cross margin, net mode
+    /// (no `posSide`). Built by the same flagged constructor as every other OKX request.
+    pub fn leverage_request(&self, symbol: &str, leverage: u32, timestamp_ms: i64) -> Result<OrderHttpRequest, AdapterError> {
+        let inst_id = inst_id(symbol)?;
+        let body = json!({ "instId": inst_id, "lever": leverage.to_string(), "mgnMode": "cross" });
+        self.build(Method::Post, OKX_SET_LEVERAGE_PATH, Some(body.to_string()), timestamp_ms)
+    }
+
     /// `GET /api/v5/account/config`.
     pub fn position_mode_request(&self, timestamp_ms: i64) -> Result<OrderHttpRequest, AdapterError> {
         self.build(Method::Get, OKX_ACCOUNT_CONFIG_PATH, None, timestamp_ms)
@@ -243,6 +251,29 @@ impl<T: OrderTransport> OkxOrderClient<T> {
             return Reply::Unknown { reason };
         }
         self.send_lookup(req).await
+    }
+
+    /// Aligns the instrument's leverage before an opening order. Like the order itself it is sent only
+    /// while OKX is not latched off and the demo key has been proven (the account-config read has
+    /// answered `code "0"` with these credentials and the demo flag). Anything but a plain success
+    /// (refusal, rate limit, unknown outcome, `50101`) means the order after it is NOT sent. One attempt,
+    /// never retried here. "Already that leverage" is a normal success on OKX (`code "0"`).
+    pub async fn set_leverage(&self, symbol: &str, leverage: u32, timestamp_ms: i64) -> LeverageOutcome {
+        if let Some(reason) = self.disabled() {
+            return LeverageOutcome::Failed { reason };
+        }
+        if !self.demo_proven.load(Ordering::SeqCst) {
+            return LeverageOutcome::Failed { reason: "OKX demo key not proven: the account-config check has not succeeded yet".into() };
+        }
+        let req = match self.leverage_request(symbol, leverage, timestamp_ms) {
+            Ok(r) => r,
+            Err(e) => return LeverageOutcome::Failed { reason: format!("request not built: {e}") },
+        };
+        let (reply, mismatch) = self.call(req).await;
+        if mismatch {
+            return LeverageOutcome::Failed { reason: format!("{ENV_MISMATCH_REASON}; the leverage was refused before processing") };
+        }
+        leverage_outcome(reply, &[])
     }
 
     /// Nothing is sent unless OKX is not latched off and the demo key has been proven.

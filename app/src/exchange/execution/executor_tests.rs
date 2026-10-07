@@ -785,6 +785,38 @@ async fn okx_positions_reach_the_engine_as_signed_contracts() {
     assert_eq!(got, vec![("BTCUSDT", d("-3")), ("SOLUSDT", d("12.5"))], "contracts, short negative");
 }
 
+/// The public instrument catalog as recorded (`lever` = the instrument's maximum leverage).
+fn okx_instruments() -> HttpResponse {
+    HttpResponse::ok(std::fs::read_to_string(format!("{}/tests/fixtures/okx/instruments_swap.json", env!("CARGO_MANIFEST_DIR"))).unwrap())
+}
+
+#[tokio::test]
+async fn okx_max_leverage_is_the_instruments_lever_through_the_account_view() {
+    let t = okx_script().on("public/instruments", Ok(okx_instruments()));
+    let a = okx_account(t, okx_keys());
+    assert_eq!(a.max_leverage(Exchange::Okx, "BTCUSDT", d("1000")).await, Ok(d("100")));
+    assert_eq!(a.max_leverage(Exchange::Okx, "CHIPUSDT", d("1000")).await, Ok(d("20")));
+}
+
+#[tokio::test]
+async fn okx_max_leverage_failures_are_errors_never_a_default() {
+    let t = okx_script().on("public/instruments", Ok(okx_instruments()));
+    let a = okx_account(t, okx_keys());
+    // an instrument that is not in the reply, a symbol that is not BASEUSDT
+    assert!(a.max_leverage(Exchange::Okx, "NOPEUSDT", d("1000")).await.unwrap_err().starts_with("OKX:"));
+    assert!(a.max_leverage(Exchange::Okx, "BTCUSD", d("1000")).await.unwrap_err().starts_with("OKX:"));
+    // no keys: the reason, not a number
+    let no_pass = MemorySecrets::default().with(Exchange::Okx, SecretName::ApiKey, "k").with(Exchange::Okx, SecretName::ApiSecret, "s");
+    let a = okx_account(FakeTransport::new().on("public/instruments", Ok(okx_instruments())), no_pass);
+    assert!(a.max_leverage(Exchange::Okx, "BTCUSDT", d("1000")).await.unwrap_err().contains("NoPassphrase"));
+    // an HTTP failure and an empty lever
+    let a = okx_account(FakeTransport::new().on("public/instruments", Err(AdapterError::Timeout)), okx_keys());
+    assert!(a.max_leverage(Exchange::Okx, "BTCUSDT", d("1000")).await.is_err());
+    let empty = r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","lever":"","instType":"SWAP"}]}"#;
+    let a = okx_account(FakeTransport::new().on("public/instruments", Ok(HttpResponse::ok(empty.to_string()))), okx_keys());
+    assert!(a.max_leverage(Exchange::Okx, "BTCUSDT", d("1000")).await.is_err());
+}
+
 #[tokio::test]
 async fn okx_open_orders_carry_the_remaining_contracts() {
     let a = okx_account(okx_script(), okx_keys());
@@ -872,6 +904,31 @@ async fn an_open_whose_contracts_do_not_match_its_intended_coin_amount_is_not_se
     assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 0);
 }
 
+/// okx-trading-enablement 3.7 (4): a close that OKX answers with "no position to reduce" is not a naked
+/// leg by itself (the OKX side may already be flat). The refusal allowlist is unchanged, so the outcome is
+/// still "unknown" (looked up by id before anything is concluded); only its wording says what it likely is.
+#[tokio::test]
+async fn an_okx_close_with_no_position_to_reduce_is_worded_as_flat_not_as_a_naked_leg() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_close_51169")));
+    match r.ex.submit_classified(&okx_close()).await {
+        SubmitClass::Unknown { reason } => {
+            assert!(reason.contains("51169"), "{reason}");
+            assert!(reason.contains("no OKX position") && reason.contains("already flat"), "{reason}");
+            assert!(!reason.contains("naked"), "{reason}");
+        }
+        other => panic!("the allowlist is unchanged: still unknown, got {other:?}"),
+    }
+    // an open that gets the same code gets no such wording (an open has no position to reduce)
+    match r.ex.submit_classified(&okx_open()).await {
+        SubmitClass::Unknown { reason } => assert!(!reason.contains("already flat"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    // and the allowlist really is unchanged
+    assert!(!super::classify::OKX_REFUSAL_CODES.contains(&51169));
+}
+
 #[tokio::test]
 async fn any_rejected_okx_close_says_the_other_leg_is_naked_and_an_open_does_not() {
     // R6: not only 51000 / 51010
@@ -922,7 +979,7 @@ async fn account_max_leverage_is_read_per_symbol_and_notional_on_both_exchanges(
     assert_eq!(a.max_leverage(Exchange::Binance, "BTCUSDT", d("1000")).await, Ok(d("20")));
     assert_eq!(a.max_leverage(Exchange::Binance, "BTCUSDT", d("20000")).await, Ok(d("10")), "a larger position gets the smaller cap");
     assert_eq!(a.max_leverage(Exchange::Bybit, "BTCUSDT", d("1000")).await, Ok(d("12.5")));
-    assert!(a.max_leverage(Exchange::Okx, "BTCUSDT", d("1000")).await.is_err());
+    assert!(a.max_leverage(Exchange::Okx, "BTCUSDT", d("1000")).await.unwrap_err().contains("not wired"), "an account view without an OKX client says so");
     let urls: Vec<String> = t.requests().iter().map(|r| r.url.clone()).collect();
     assert!(urls[0].contains("/fapi/v1/leverageBracket?symbol=BTCUSDT&timestamp=") && urls[0].contains("&signature="), "{}", urls[0]);
     assert!(urls.iter().any(|u| u.contains("/v5/market/instruments-info?category=linear&symbol=BTCUSDT")), "{urls:?}");
@@ -938,20 +995,3 @@ async fn account_max_leverage_failures_are_errors_never_a_default() {
     assert!(a.max_leverage(Exchange::Bybit, "NOPEUSDT", d("1000")).await.unwrap_err().starts_with("Bybit:"));
 }
 
-// ---- order-leverage-sync x OKX: OKX set-leverage is not implemented ---------------------------------------
-
-#[tokio::test]
-async fn an_okx_open_that_carries_a_leverage_is_not_sent_and_nothing_at_all_is_requested() {
-    let r = rig();
-    script_okx_mode(&r.t);
-    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
-    let mut o = okx_open();
-    o.leverage = Some(d("5"));
-    match r.ex.submit(o).await {
-        SubmitOutcome::Rejected { reason } => assert!(reason.contains("OKX leverage sync not implemented yet"), "{reason}"),
-        other => panic!("{other:?}"),
-    }
-    assert!(r.t.requests().is_empty(), "no order, no mode read, and never a set-leverage call: {:?}", r.t.requests().iter().map(|q| q.full_url().to_string()).collect::<Vec<_>>());
-    // the same order without a leverage (the probe / manual path) is unaffected
-    assert!(matches!(r.ex.submit(okx_open()).await, SubmitOutcome::Accepted(_)));
-}

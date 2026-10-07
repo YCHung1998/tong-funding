@@ -559,7 +559,8 @@ pub fn production_literals(src: &str) -> Vec<String> {
 /// Literals that spell out the OKX boundary, and the only files (relative to `src/`) allowed to
 /// hold them. This rule is separate from the host-fragment scan, which deliberately exempts the
 /// whitelisted signed hosts everywhere: here even the whitelisted OKX host is confined to its home.
-const LITERAL_RULES: [(&str, &[&str]); 3] = [
+const LITERAL_RULES: [(&str, &[&str]); 4] = [
+    ("/api/v5/account/set-leverage", &["exchange/execution/endpoints.rs"]),
     ("x-simulated-trading", &["exchange/signed/endpoints.rs"]),
     ("ok-access", &["exchange/signed/endpoints.rs", "exchange/signed/signing.rs"]),
     ("okx.com", &["exchange/signed/endpoints.rs", "exchange/public/endpoints.rs"]),
@@ -573,6 +574,34 @@ pub fn literal_rule_violations(rel_path: &str, src: &str) -> Vec<String> {
     for (needle, homes) in LITERAL_RULES {
         if !homes.contains(&rel_path) && lits.iter().any(|l| l.contains(needle)) {
             out.push(format!("literal containing `{needle}` outside {homes:?}"));
+        }
+    }
+    out
+}
+
+/// okx-trading-enablement: OKX `set-leverage` is a signed POST that changes the account. Its path
+/// constant is named only by `execution/endpoints.rs` (definition) and `execution/okx.rs`, which
+/// may use it exactly once, as `self.build(Method::Post, OKX_SET_LEVERAGE_PATH, ..)`, and that file
+/// builds every request through the single flagged constructor `to_demo` (inside `build`).
+pub fn okx_set_leverage_violations(rel_path: &str, src: &str) -> Vec<String> {
+    const NAME: &str = "OKX_SET_LEVERAGE_PATH";
+    const HOMES: [&str; 2] = ["exchange/execution/endpoints.rs", "exchange/execution/okx.rs"];
+    let structure = production(src).structure;
+    let uses = structure.matches(NAME).count();
+    let mut out = Vec::new();
+    if uses > 0 && !HOMES.contains(&rel_path) {
+        out.push(format!("`{NAME}` named outside {HOMES:?}"));
+    }
+    if rel_path == "exchange/execution/okx.rs" {
+        // one `use`, and every other mention is the POST builder call
+        let builder_calls = structure.matches("self.build(Method::Post, OKX_SET_LEVERAGE_PATH").count();
+        let imports = structure.lines().filter(|l| l.trim_start().starts_with("use ") && l.contains(NAME)).count();
+        if uses != imports + builder_calls || builder_calls > 1 {
+            out.push(format!("`{NAME}` must be used only as `self.build(Method::Post, {NAME}, ..)` (found {uses} mentions, {builder_calls} builder calls)"));
+        }
+        // every OKX request is constructed by the one flagged constructor, called once, inside `build`
+        if structure.matches("to_demo(").count() != 1 {
+            out.push("okx.rs must construct requests through exactly one `to_demo(` call (the flagged builder)".to_string());
         }
     }
     out
@@ -1125,6 +1154,60 @@ const LATE: &str = "api.bybit.com";
         let from = live.find("ReqwestOrderTransport::signed_demo()").expect("live.rs builds the order transport");
         let to = live[from..].find("DemoExecutorFactory::new").expect("and passes it to the factory") + from;
         assert!(!live[from..to].contains("Gated"), "the order transport must reach the factory ungated: {}", &live[from..to]);
+    }
+
+    // ------------------------------------------------ okx-trading-enablement: set-leverage
+
+    const BUILD_USE: &str = "fn leverage_request(&self) { self.build(Method::Post, OKX_SET_LEVERAGE_PATH, Some(b), ts) }\nfn build(&self) { OrderHttpRequest::to_demo(m, DemoEnv::Okx(self.env), p, t) }";
+
+    #[test]
+    fn the_set_leverage_path_literal_is_confined_to_execution_endpoints() {
+        let lit = "pub const OKX_SET_LEVERAGE_PATH: &str = \"/api/v5/account/set-leverage\";";
+        assert!(literal_rule_violations("exchange/execution/endpoints.rs", lit).is_empty());
+        for elsewhere in ["exchange/execution/okx.rs", "exchange/signed/okx.rs", "ui/live.rs", "exchange/execution/executor.rs"] {
+            assert!(!literal_rule_violations(elsewhere, lit).is_empty(), "not caught in {elsewhere}");
+        }
+        assert!(literal_rule_violations("exchange/execution/okx.rs", "// /api/v5/account/set-leverage\n#[cfg(test)]\nmod t { const P: &str = \"/api/v5/account/set-leverage\"; }").is_empty(), "comments and tests do not count");
+    }
+
+    #[test]
+    fn the_set_leverage_path_is_built_only_through_the_flagged_builder_in_okx_rs() {
+        assert!(okx_set_leverage_violations("exchange/execution/okx.rs", &format!("use super::endpoints::OKX_SET_LEVERAGE_PATH;\n{BUILD_USE}")).is_empty());
+        // counter-examples
+        let bypass = [
+            // a second request constructor next to `build`
+            "use super::endpoints::OKX_SET_LEVERAGE_PATH;\nfn x() { OrderHttpRequest::to_demo(m, DemoEnv::Okx(e), OKX_SET_LEVERAGE_PATH, t) }\nfn build() { OrderHttpRequest::to_demo(m, DemoEnv::Okx(e), p, t) }",
+            // the path used for something that is not the builder call
+            "use super::endpoints::OKX_SET_LEVERAGE_PATH;\nfn x() { let p = OKX_SET_LEVERAGE_PATH; }\nfn build() { OrderHttpRequest::to_demo(m, DemoEnv::Okx(e), p, t) }",
+            // a GET instead of the POST the endpoint is
+            "use super::endpoints::OKX_SET_LEVERAGE_PATH;\nfn x() { self.build(Method::Get, OKX_SET_LEVERAGE_PATH, None, ts) }\nfn build() { OrderHttpRequest::to_demo(m, DemoEnv::Okx(e), p, t) }",
+        ];
+        for src in bypass {
+            assert!(!okx_set_leverage_violations("exchange/execution/okx.rs", src).is_empty(), "not caught: {src}");
+        }
+        // any other file naming the constant
+        for elsewhere in ["exchange/execution/executor.rs", "exchange/signed/okx.rs", "ui/live.rs", "exchange/execution/bybit.rs"] {
+            assert!(!okx_set_leverage_violations(elsewhere, "use x::OKX_SET_LEVERAGE_PATH;").is_empty(), "{elsewhere}");
+        }
+        assert!(okx_set_leverage_violations("exchange/execution/endpoints.rs", "pub const OKX_SET_LEVERAGE_PATH: &str = \"x\";").is_empty());
+        assert!(okx_set_leverage_violations("exchange/execution/executor.rs", "// OKX_SET_LEVERAGE_PATH in a comment\n#[cfg(test)]\nmod t { use x::OKX_SET_LEVERAGE_PATH; }").is_empty());
+    }
+
+    #[test]
+    fn the_real_tree_keeps_the_set_leverage_rules() {
+        let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut violations = Vec::new();
+        let mut okx_rs_seen = false;
+        for f in rust_files(&app) {
+            if f.file_name().is_some_and(|n| n == "static_checks.rs") {
+                continue;
+            }
+            let rel_path = f.strip_prefix(&app).unwrap().to_string_lossy().replace('\\', "/");
+            okx_rs_seen |= rel_path == "exchange/execution/okx.rs";
+            violations.extend(okx_set_leverage_violations(&rel_path, &std::fs::read_to_string(&f).unwrap()).into_iter().map(|v| format!("{rel_path}: {v}")));
+        }
+        assert!(okx_rs_seen);
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     #[test]

@@ -1,0 +1,14 @@
+{
+ "code": "1",
+ "msg": "All operations failed",
+ "data": [
+  {
+   "clOrdId": "demolo0001abcdefghijklm12345678",
+   "ordId": "",
+   "tag": "",
+   "ts": "1700000000123",
+   "sCode": "51169",
+   "sMsg": "Order failed because you don't have any positions in this direction for this contract to reduce."
+  }
+ ]
+}

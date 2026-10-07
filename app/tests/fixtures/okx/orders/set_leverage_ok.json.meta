@@ -1,0 +1,4 @@
+依文件構造、未在真實 demo 帳戶驗證 (hand-constructed from the OKX v5 official documentation, https://www.okx.com/docs-v5/en/#trading-account-rest-api-set-leverage , fetched 2026-10-07).
+NOT a recorded response: field names and shapes follow the documented response; values are invented.
+Set leverage accepted (cross margin, net mode).
+Replace with a de-identified real demo response after the user's real-machine probe (okx-trading-enablement task 4.2).

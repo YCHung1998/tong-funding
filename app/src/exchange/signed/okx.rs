@@ -13,7 +13,7 @@ use serde_json::Value;
 use tong_funding_core::redact::redact_secrets;
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::endpoints::{MAX_PAGES, OkxHost, okx_symbol};
+use super::endpoints::{MAX_PAGES, OkxHost, okx_inst_id, okx_symbol};
 use super::models::{Balance, Completeness, Listing, OpenOrder, OrderSide, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
     ClockOffsetSource, NotConnectedReason, Resync, SIGNED_TIMEOUT, check_status, is_timestamp_rejected, load_credentials, okx_auth_headers, okx_signature, okx_signed_timestamp,
@@ -28,6 +28,8 @@ const OKX_BALANCE_PATH: &str = "/api/v5/account/balance";
 const OKX_POSITIONS_PATH: &str = "/api/v5/account/positions";
 const OKX_PENDING_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
 const OKX_FUNDING_RATE_HISTORY_PATH: &str = "/api/v5/public/funding-rate-history";
+/// Instrument catalog (read-only, per instrument): `lever` is its maximum leverage.
+const OKX_INSTRUMENTS_PATH: &str = "/api/v5/public/instruments";
 /// Page size of `orders-pending` (documented maximum 100; UNVERIFIED against a real account).
 const OKX_ORDERS_PAGE_LIMIT: usize = 100;
 /// OKX codes meaning "slow down" (request too frequent, sub-account rate limit). ONE list for the
@@ -179,6 +181,16 @@ impl<T: HttpTransport> OkxSignedClient<T> {
             }
         }
         Ok(Listing { items, completeness: Completeness::Complete })
+    }
+
+    /// The instrument's maximum leverage (`lever` of `GET /api/v5/public/instruments?instType=SWAP&instId=..`),
+    /// sent as a signed demo-flagged GET like every other request of this client. It is the instrument's
+    /// ceiling, not a per-position-size tier (UNVERIFIED for large notionals: set-leverage itself is the
+    /// final check and an order is not sent when it is refused). Missing / non-positive is an error.
+    pub async fn get_max_leverage(&self, symbol: &str) -> Result<Decimal, AdapterError> {
+        let inst_id = okx_inst_id(symbol).ok_or_else(|| AdapterError::parse("symbol is not a BASEUSDT symbol"))?;
+        let (body, _) = self.signed_get(OKX_INSTRUMENTS_PATH, &format!("instType=SWAP&instId={inst_id}")).await?;
+        max_leverage_from_instruments(&body, &inst_id)
     }
 
     /// `GET /api/v5/trade/orders-pending?instType=SWAP` across all pages (`after` = last `ordId`).
@@ -375,6 +387,20 @@ pub fn available_margin_from(body: &Value, level: OkxAcctLv) -> Result<Decimal, 
     }
 }
 
+/// `lever` of the row of `inst_id` in an instruments reply (the reply may list several instruments).
+/// Missing, empty or not positive is an error: no default cap is ever substituted.
+pub fn max_leverage_from_instruments(body: &Value, inst_id: &str) -> Result<Decimal, AdapterError> {
+    let row = data_rows(body)?
+        .iter()
+        .find(|r| r.get("instId").and_then(Value::as_str) == Some(inst_id))
+        .ok_or_else(|| AdapterError::parse(format!("{inst_id} is not in the instruments reply")))?;
+    let lever = dec_req(row, "lever")?;
+    if lever <= Decimal::ZERO {
+        return Err(AdapterError::parse(format!("{inst_id}: lever {lever} is not positive")));
+    }
+    Ok(lever)
+}
+
 /// `None` for rows that are not `-USDT-SWAP` or have no position; an error for a row the system
 /// cannot represent (isolated margin, long/short side): see `get_positions`.
 fn parse_position(r: &Value, fetched_at: i64) -> Result<Option<OkxPosition>, AdapterError> {
@@ -558,6 +584,43 @@ mod tests {
 
     fn path_and_query(r: &HttpRequest) -> String {
         r.url.strip_prefix("https://openapi.okx.com").expect("every OKX request goes to the OKX host").to_string()
+    }
+
+    // ---- okx-trading-enablement 3.8: maximum leverage of one instrument ----
+
+    fn instruments() -> Result<HttpResponse, AdapterError> {
+        // the recorded PUBLIC instrument catalog (BTC-USD, BTC-USDT, ETH-USDT, CHIP-USDT)
+        Ok(HttpResponse::ok(std::fs::read_to_string(format!("{}/tests/fixtures/okx/instruments_swap.json", env!("CARGO_MANIFEST_DIR"))).unwrap()))
+    }
+
+    #[test]
+    fn max_leverage_is_the_lever_of_the_requested_instrument_over_a_flagged_signed_get() {
+        let (t, _clock, c) = client(FakeTransport::new().on("public/instruments", instruments()));
+        assert_eq!(block_on(c.get_max_leverage("BTCUSDT")).unwrap(), d("100"));
+        assert_eq!(block_on(c.get_max_leverage("CHIPUSDT")).unwrap(), d("20"), "picked by instId, not the first row");
+        let reqs = t.requests();
+        assert_eq!(path_and_query(&reqs[0]), "/api/v5/public/instruments?instType=SWAP&instId=BTC-USDT-SWAP");
+        assert_eq!(t.refused(), 0, "every request passed the real admission rule");
+        assert_eq!(header(&reqs[0], "x-simulated-trading"), vec!["1"]);
+        assert_eq!(header(&reqs[0], "OK-ACCESS-KEY"), vec![KEY]);
+    }
+
+    #[test]
+    fn max_leverage_is_an_error_for_a_missing_instrument_a_missing_lever_or_a_bad_symbol_and_sends_nothing_for_the_last() {
+        let (t, _c, c) = client(FakeTransport::new().on("public/instruments", instruments()));
+        assert!(block_on(c.get_max_leverage("NOPEUSDT")).is_err(), "not in the reply");
+        let before = t.requests().len();
+        assert!(matches!(block_on(c.get_max_leverage("BTCUSD")), Err(AdapterError::Parse(_))));
+        assert_eq!(t.requests().len(), before, "a symbol that is not BASEUSDT is refused before any request");
+        for body in [
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","instType":"SWAP"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","lever":"","instType":"SWAP"}]}"#,
+            r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","lever":"0","instType":"SWAP"}]}"#,
+            r#"{"code":"0","msg":"","data":[]}"#,
+        ] {
+            let (_t, _c, c) = client(FakeTransport::new().on("public/instruments", Ok(HttpResponse::ok(body.to_string()))));
+            assert!(block_on(c.get_max_leverage("BTCUSDT")).is_err(), "{body}");
+        }
     }
 
     // ---- demo boundary: every request carries the flag ----

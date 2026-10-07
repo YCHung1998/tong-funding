@@ -33,3 +33,7 @@ pub const OKX_ORDER_PATH: &str = "/api/v5/trade/order";
 pub const OKX_CANCEL_PATH: &str = "/api/v5/trade/cancel-order";
 /// OKX v5: account configuration (`acctLv`, `posMode`) for the one-way gate.
 pub const OKX_ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";
+/// OKX v5: set the leverage of one instrument (POST, cross margin, net mode). A signed request that
+/// changes the account: built only through `OkxOrderClient::build` (static check
+/// `okx_set_leverage_violations`), sent only after the demo-key proof.
+pub const OKX_SET_LEVERAGE_PATH: &str = "/api/v5/account/set-leverage";

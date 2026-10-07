@@ -19,8 +19,6 @@ use crate::exchange::error::AdapterError;
 use crate::exchange::signed::models::{Balance, OpenOrder, Position, PositionMode};
 use crate::exchange::transport::HttpTransport;
 
-/// OKX has no per-symbol leverage cap lookup yet (okx-trading-enablement: OKX leverage sync).
-pub const OKX_MAX_LEVERAGE_UNSUPPORTED: &str = "OKX max leverage lookup is not implemented yet";
 /// Reason when no OKX client was given to the view (not wired yet: UI wiring is okx-trading-enablement).
 pub const OKX_NOT_WIRED: &str = "OKX account client is not wired";
 /// Asset whose available balance is the margin of USDT-margined contracts.
@@ -153,7 +151,10 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
             match exchange {
                 Exchange::Binance => self.binance.get_max_leverage(&symbol, notional).await.map_err(|e| format!("Binance: {e}")),
                 Exchange::Bybit => self.bybit.get_max_leverage(&symbol).await.map_err(|e| format!("Bybit: {e}")),
-                Exchange::Okx => Err(OKX_MAX_LEVERAGE_UNSUPPORTED.to_string()),
+                Exchange::Okx => {
+                    let okx = self.okx()?;
+                    okx.get_max_leverage(&symbol).await.map_err(|e| Self::okx_error(okx, e))
+                }
             }
         })
     }

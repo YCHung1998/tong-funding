@@ -38,6 +38,9 @@ pub const BYBIT_NOT_FOUND_CODES: [i64; 1] = [110001];
 /// failure, and authentication failures (nothing was processed). Any other code is UNKNOWN, so the
 /// order is looked up instead of being written off. `50101` is not here: it latches OKX off.
 pub const OKX_REFUSAL_CODES: [i64; 15] = [51000, 51008, 51010, 51020, 51121, 51131, 51202, 51400, 51603, 50102, 50103, 50104, 50105, 50111, 50113];
+/// OKX "no position to reduce" (a reduce-only order with nothing to close). UNVERIFIED code. NOT part of
+/// the refusal allowlist (so the outcome stays unknown); it only selects the wording of a close's reason.
+pub const OKX_NO_POSITION_CODES: [i64; 1] = [51169];
 /// OKX "order does not exist".
 pub const OKX_NOT_FOUND_CODES: [i64; 1] = [51603];
 

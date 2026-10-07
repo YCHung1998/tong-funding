@@ -1,0 +1,4 @@
+依文件構造、未在真實 demo 帳戶驗證 (hand-constructed from the OKX v5 official documentation, https://www.okx.com/docs-v5/en/#error-code , fetched 2026-10-07).
+NOT a recorded response: the error code and wording are from memory of the documented list.
+Error 59102: leverage above the instrument's maximum. Not in the refusal allowlist: the order is still not sent (any non-"0" set-leverage reply stops the order).
+Replace with a de-identified real demo response after the user's real-machine probe (okx-trading-enablement task 4.2).
