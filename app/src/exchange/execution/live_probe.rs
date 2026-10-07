@@ -27,7 +27,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::account::DemoAccountView;
 use super::factory::DemoExecutorFactory;
-use super::okx::{OkxLimits, OkxLimitsSource};
+use super::okx::{OkxLimits, OkxLimitsSource, check_size};
 use super::http::ReqwestOrderTransport;
 use crate::engine::ids::{IdPrefix, client_order_id};
 use crate::engine::intent;
@@ -153,6 +153,37 @@ fn filled(o: &QueryOutcome) -> Decimal {
     }
 }
 
+/// One probe order. `units` is in the exchange's order unit (contracts on OKX); `coin_qty` is the
+/// intended coin amount. An opening OKX order carries it as `intended_base_qty` (the size guard
+/// requires it); closes and the other exchanges carry `None`.
+#[allow(clippy::too_many_arguments)]
+fn probe_request(pair: &str, symbol: &str, leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, units: Decimal, coin_qty: Decimal) -> OrderRequest {
+    OrderRequest {
+        client_order_id: client_order_id(IdPrefix::Demo, pair, leg, action, 0),
+        exchange,
+        symbol: symbol.to_string(),
+        side,
+        quantity: units,
+        reduce_only: action == OrderAction::Close,
+        intended_base_qty: (action == OrderAction::Open && exchange == Exchange::Okx).then_some(coin_qty),
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_opening_okx_order_carries_the_intended_coin_amount() {
+        let q = |a, e| probe_request("p", "ETHUSDT", Leg::Long, a, e, OrderSide::Buy, "5".parse().unwrap(), "0.05".parse().unwrap());
+        assert_eq!(q(OrderAction::Open, Exchange::Okx).intended_base_qty, Some("0.05".parse().unwrap()));
+        assert_eq!(q(OrderAction::Open, Exchange::Okx).quantity, "5".parse().unwrap(), "units stay contracts");
+        assert_eq!(q(OrderAction::Close, Exchange::Okx).intended_base_qty, None);
+        assert!(q(OrderAction::Close, Exchange::Okx).reduce_only);
+        assert_eq!(q(OrderAction::Open, Exchange::Bybit).intended_base_qty, None);
+    }
+}
+
 /// The quantity to close on one leg. A leg whose fill is known closes what was filled. A leg whose
 /// order ended without a known fill (lookup failed, or not found) is NEVER skipped silently: the
 /// account position is read and any non-zero position is closed; if even that fails a loud manual
@@ -210,6 +241,7 @@ async fn live_demo_probe() {
     println!("host: Binance {binance_host:?}, Bybit Demo; offsets: Binance {} ms (rtt {}), Bybit {} ms (rtt {})", b.offset_ms, b.rtt_ms, y.offset_ms, y.rtt_ms);
     // OKX: clock from the public time endpoint; contracts = coins / ctVal from the public instruments.
     let (mut okx_offset, mut okx_contracts, mut okx_limits) = (0i64, qty, std::collections::HashMap::new());
+    let mut okx_limit: Option<OkxLimits> = None;
     if uses_okx {
         let public = Arc::new(ReqwestTransport::public_production().expect("public transport"));
         okx_offset = ClockSync::new(clock.clone()).sync_once(public.as_ref(), Exchange::Okx, OKX_HOST).await.expect("OKX time").offset_ms;
@@ -224,7 +256,9 @@ async fn live_demo_probe() {
         println!("OKX leg: {qty} coin = {okx_contracts} contracts (ctVal {ct_val}, lotSz {}, mark {mark}); notional {} USDT", rules.step_size, qty * mark);
         assert!(!rules.step_size.is_zero() && (okx_contracts % rules.step_size).is_zero(), "TONG_DEMO_QTY / ctVal = {okx_contracts} is not a whole number of lots ({})", rules.step_size);
         // the cap for the probe is its own notional plus a margin: it only guards against unit mistakes
-        okx_limits.insert(symbol.clone(), OkxLimits { ct_val, lot_sz: rules.step_size, mark_px: mark, max_leg_notional: qty * mark * Decimal::from(2) });
+        let limit = OkxLimits { ct_val, lot_sz: rules.step_size, mark_px: mark, max_leg_notional: qty * mark * Decimal::from(2) };
+        okx_limit = Some(limit.clone());
+        okx_limits.insert(symbol.clone(), limit);
     }
     let leg_qty = |exchange: Exchange| if exchange == Exchange::Okx { okx_contracts } else { qty };
     let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms, okx: okx_offset });
@@ -250,14 +284,15 @@ async fn live_demo_probe() {
     for round in 0..rounds {
         let pair = format!("probe-{}-{round}", clock.now_ms());
         println!("round {} / {rounds}: {pair} {symbol} qty {qty}", round + 1);
-        let req = |leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, q: Decimal| OrderRequest {
-            client_order_id: client_order_id(IdPrefix::Demo, &pair, leg, action, 0),
-            exchange,
-            symbol: symbol.clone(),
-            side,
-            quantity: q,
-            reduce_only: action == OrderAction::Close, intended_base_qty: None,
-        };
+        let req = |leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, q: Decimal| probe_request(&pair, &symbol, leg, action, exchange, side, q, qty);
+        // The OKX leg is validated locally BEFORE any leg is sent: if the size guard would refuse it,
+        // the other exchange's leg must not be opened either (that would leave it one-sided).
+        if uses_okx && let Some(l) = &okx_limit {
+            if let Err(why) = check_size(okx_contracts, Some(qty), false, Some(l)) {
+                println!("  !!! the OKX leg would be refused locally ({why}); NOT opening either leg this round");
+                continue;
+            }
+        }
         let trigger = clock.now_ms();
         let long = req(Leg::Long, OrderAction::Open, long_ex, OrderSide::Buy, leg_qty(long_ex));
         let short = req(Leg::Short, OrderAction::Open, short_ex, OrderSide::Sell, leg_qty(short_ex));

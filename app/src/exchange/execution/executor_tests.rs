@@ -901,12 +901,10 @@ async fn the_factory_owns_one_latch_shared_with_the_executor_it_builds() {
     let f = factory(Arc::new(full), &t).with_okx_limits(btc_limits());
     let latch = f.okx_latch();
     let ex = f.build().unwrap();
-    assert!(Arc::ptr_eq(&latch, &f.okx_latch()), "the same latch every time");
     assert!(matches!(ex.submit_classified(&okx_open()).await, SubmitClass::Accepted(_)));
     latch.trip("tripped by the read client");
     match ex.submit_classified(&okx_open()).await {
         SubmitClass::Rejected { code, message } => assert_eq!((code.as_str(), message.contains("tripped by the read client")), ("not_sent", true), "{message}"),
         other => panic!("{other:?}"),
     }
-    assert!(Arc::ptr_eq(&latch, ex.okx_latch()), "the executor reports the same latch");
 }

@@ -18,7 +18,6 @@ use super::bybit::BybitOrderClient;
 use super::classify::SubmitClass;
 use super::http::OrderTransport;
 use super::okx::{OkxLimitsSource, OkxOrderClient, check_size};
-use crate::exchange::signed::okx::OkxLatch;
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{BoxFut, Executor, OrderRequest, QueryOutcome, ServerOffsets, SubmitOutcome};
 use crate::exchange::health::ratelimit::{BackoffState, RateLimiter, RequestClass};
@@ -50,8 +49,6 @@ pub struct DemoExecutor<T> {
     okx_unavailable: String,
     /// Per-instrument size limits for OKX; without a source OKX opens are not sent (fail closed).
     okx_limits: Option<Arc<dyn OkxLimitsSource>>,
-    /// The one latch (owned by the factory in production); the OKX client shares it.
-    okx_latch: Arc<OkxLatch>,
     clock: Arc<dyn TimeSource>,
     offsets: Arc<dyn ServerOffsets>,
     intents: Arc<dyn IntentLedger>,
@@ -69,23 +66,15 @@ impl<T: OrderTransport> DemoExecutor<T> {
         intents: Arc<dyn IntentLedger>,
         limiter: Arc<RateLimiter>,
     ) -> Self {
-        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, okx_latch: OkxLatch::new(), clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
+        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
     }
 
-    /// Adds the OKX client and binds it to this executor's latch.
+    /// Adds the OKX client. Its latch is the client's own: production attaches the factory's single
+    /// latch to the client when it builds it (`DemoExecutorFactory::build`), so there is no
+    /// builder-order-dependent second latch here.
     pub fn with_okx(mut self, okx: OkxOrderClient<T>) -> Self {
-        self.okx = Some(okx.with_latch(self.okx_latch.clone()));
+        self.okx = Some(okx);
         self
-    }
-
-    /// Uses `latch` (the factory's) instead of a private one; call before `with_okx`.
-    pub fn with_okx_latch(mut self, latch: Arc<OkxLatch>) -> Self {
-        self.okx_latch = latch;
-        self
-    }
-
-    pub fn okx_latch(&self) -> &Arc<OkxLatch> {
-        &self.okx_latch
     }
 
     pub fn with_okx_limits(mut self, limits: Arc<dyn OkxLimitsSource>) -> Self {

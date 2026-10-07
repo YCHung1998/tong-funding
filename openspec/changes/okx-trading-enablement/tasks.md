@@ -23,6 +23,8 @@
 
 - [ ] 3.6 （自 `okx-execution-guards` 移入）接線：`DemoExecutorFactory::with_okx_limits`（公開 instruments 的 `ctVal` / `lotSz`、標記價、風險設定的單腿名目上限）、`OkxSignedClient::with_latch(factory.okx_latch())`（工廠擁有唯一的 `Arc<OkxLatch>`，下單客戶端已共用）、`OkxLatch::reason()` 顯示為畫面橫幅；未接 limits 前 OKX 單全部 `not_sent`
 
+- [ ] 3.7 （自 `okx-execution-guards` 第三輪移入）①手動 OKX 下單（含 `reduceOnly`）必須在進入 engine 前把幣量換成張數（`Quantity::okx_contracts`），並為開倉填 `intended_base_qty`；②`engine/recovery.rs` 的 `okx_ct_val.unwrap_or(Decimal::ONE)` 對 OKX 改為「缺 ctVal = 錯誤」；③平倉 `lotSz` 檢查：持倉期間 `lotSz` 可能被交易所調大，使既有持倉張數不再是整數倍——本計畫僅文件化，不放寬檢查（放寬需持倉資料）；④平倉被拒是因為「沒有持倉」時，「對側腿裸露」警示文字不適用，需區分（例如 `51169` 類無持倉碼）
+
 ## 4. 驗證
 
 - [ ] 4.1 `cargo test -p tong-funding`、`cargo test -p tong-funding-core` 全套綠燈；`cargo clippy --all-targets -- -D warnings`；以 `rg -n "僅比價|CompareOnly|OKX_NOTE" app/src` 確認無殘留

@@ -10,7 +10,7 @@
 //! UNVERIFIED until the user's real demo probe (task 4.2): every field name, the reply shapes in
 //! `tests/fixtures/okx/orders`, `reduceOnly` as a JSON boolean, and the code lists in `classify`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -93,12 +93,26 @@ pub fn check_size(sz: Decimal, intended_base: Option<Decimal>, reduce_only: bool
     Ok(())
 }
 
+/// Records older than `expTime` + this are dropped on the next insert (a lookup that late is hopeless
+/// anyway), and each map is capped, so the maps cannot grow without bound over a long run.
+const RECORD_TTL_MS: i64 = 10 * 60 * 1000;
+const MAX_RECORDS: usize = 1_000;
+
 /// A submit left unknown (or rate limited): `expTime`, confirmations so far, when the last one was seen.
 #[derive(Debug, Clone, Copy)]
 struct PendingSubmit {
     exp_time: i64,
     confirmations: u8,
     last_confirmed_ms: i64,
+}
+
+/// Drops records past their `expTime` + `RECORD_TTL_MS`, then (still full) the oldest ones.
+fn prune<V>(map: &mut HashMap<String, V>, exp_of: impl Fn(&V) -> i64, now_ms: i64) {
+    map.retain(|_, v| exp_of(v).saturating_add(RECORD_TTL_MS) > now_ms);
+    while map.len() >= MAX_RECORDS {
+        let Some(oldest) = map.iter().min_by_key(|(_, v)| exp_of(v)).map(|(k, _)| k.clone()) else { break };
+        map.remove(&oldest);
+    }
 }
 
 fn inst_id(symbol: &str) -> Result<String, AdapterError> {
@@ -117,8 +131,9 @@ pub struct OkxOrderClient<T> {
     /// intents hold no `expTime`, so after a restart or a factory rebuild the record is gone and a
     /// `51603` for such an id is never concluded "not found" (see `query`).
     pending: Mutex<HashMap<String, PendingSubmit>>,
-    /// `clOrdId` of submits the exchange clearly refused: nothing exists, `51603` is believed at once.
-    refused: Mutex<HashSet<String>>,
+    /// `clOrdId` of submits the exchange clearly refused (with the `expTime` they carried): nothing
+    /// exists, `51603` is believed at once. Bounded like `pending`.
+    refused: Mutex<HashMap<String, i64>>,
 }
 
 fn side_param(side: OrderSide) -> &'static str {
@@ -130,7 +145,7 @@ fn side_param(side: OrderSide) -> &'static str {
 
 impl<T: OrderTransport> OkxOrderClient<T> {
     pub fn new(transport: Arc<T>, creds: Arc<Credentials>, demo_env: OkxHost) -> Self {
-        OkxOrderClient { transport, creds, env: demo_env, demo_proven: AtomicBool::new(false), latch: OkxLatch::new(), pending: Mutex::new(HashMap::new()), refused: Mutex::new(HashSet::new()) }
+        OkxOrderClient { transport, creds, env: demo_env, demo_proven: AtomicBool::new(false), latch: OkxLatch::new(), pending: Mutex::new(HashMap::new()), refused: Mutex::new(HashMap::new()) }
     }
 
     /// Shares an `OkxLatch` with the other OKX clients: `50101` anywhere disables OKX everywhere.
@@ -257,6 +272,7 @@ impl<T: OrderTransport> OkxOrderClient<T> {
         match &class {
             // The order may still be processed until `expTime`: remember it so a 51603 is not trusted early.
             SubmitClass::Unknown { .. } | SubmitClass::RateLimited { .. } => {
+                prune(&mut pending, |p| p.exp_time, timestamp_ms);
                 pending.insert(id, PendingSubmit { exp_time, confirmations: 0, last_confirmed_ms: 0 });
             }
             SubmitClass::Accepted(_) => {
@@ -264,7 +280,8 @@ impl<T: OrderTransport> OkxOrderClient<T> {
             }
             SubmitClass::Rejected { .. } => {
                 pending.remove(&id);
-                refused.insert(id);
+                prune(&mut refused, |e| *e, timestamp_ms);
+                refused.insert(id, exp_time);
             }
         }
         class
@@ -291,7 +308,7 @@ impl<T: OrderTransport> OkxOrderClient<T> {
     }
 
     fn not_found_verdict(&self, id: &str, now_ms: i64) -> QueryOutcome {
-        if self.refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(id) {
+        if self.refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(id) {
             return QueryOutcome::NotFound;
         }
         let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -922,5 +939,32 @@ mod tests {
         assert!(check_size(d("3"), None, true, None).is_ok(), "no limits at all");
         assert!(check_size(d("0"), None, true, None).unwrap_err().contains("positive"));
         assert!(check_size(d("2.5"), None, true, Some(&tiny_cap)).unwrap_err().contains("lotSz"), "a lot violation is still refused");
+    }
+
+    #[tokio::test]
+    async fn the_submit_records_are_bounded_by_age_and_by_count() {
+        let t = FakeOrderTransport::new();
+        let c = proven_client(&t).await;
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_50004"));
+        let order_n = |i: usize| {
+            let id = client_order_id(IdPrefix::Demo, &format!("p{i}"), Leg::Long, OrderAction::Open, 0);
+            ValidOrder::from_request(&OrderRequest { client_order_id: id, exchange: Exchange::Okx, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None }).unwrap()
+        };
+        // an old unknown submit is dropped once a newer one is recorded 10+ minutes after its expTime
+        c.submit(&order_n(0), TS).await;
+        assert_eq!(c.pending.lock().unwrap().len(), 1);
+        c.submit(&order_n(1), TS + 5_000 + RECORD_TTL_MS + 1).await;
+        assert_eq!(c.pending.lock().unwrap().len(), 1, "the first record aged out");
+        // and the count is capped
+        for i in 2..(MAX_RECORDS + 50) {
+            c.submit(&order_n(i), TS + 6_000_000 + i as i64).await;
+        }
+        assert!(c.pending.lock().unwrap().len() <= MAX_RECORDS);
+        let c2 = proven_client(&t).await;
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_rejected_51131"));
+        for i in 0..(MAX_RECORDS + 50) {
+            c2.submit(&order_n(i), TS + i as i64).await;
+        }
+        assert!(c2.refused.lock().unwrap().len() <= MAX_RECORDS);
     }
 }

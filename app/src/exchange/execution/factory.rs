@@ -81,15 +81,14 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
             self.offsets.clone(),
             self.intents.clone(),
             self.limiter.clone(),
-        )
-        .with_okx_latch(self.okx_latch.clone());
+        );
         // OKX is optional (design D5): key, secret and passphrase, else OKX orders are not sent.
         let executor = match &self.okx_limits {
             Some(l) => executor.with_okx_limits(l.clone()),
             None => executor,
         };
         Ok(match load_credentials(self.secrets.as_ref(), Exchange::Okx, true) {
-            Ok(okx) => executor.with_okx(OkxOrderClient::new(self.transport.clone(), Arc::new(okx), OkxHost::Demo)),
+            Ok(okx) => executor.with_okx(OkxOrderClient::new(self.transport.clone(), Arc::new(okx), OkxHost::Demo).with_latch(self.okx_latch.clone())),
             Err(reason) => executor.with_okx_unavailable(format!("OKX keys unavailable ({reason:?}); OKX order not sent")),
         })
     }

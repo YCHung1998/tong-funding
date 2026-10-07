@@ -48,3 +48,10 @@
 - R5：工廠擁有唯一的 `Arc<OkxLatch>`（`okx_latch()`），建出的每個 executor 與其 OKX 下單客戶端共用；讀取端的接線（`OkxSignedClient::with_latch(factory.okx_latch())`）屬 `okx-trading-enablement` 3.5。`OkxLatch` 改為 `OnceLock<String>`，原因文字為單一常數 `ENV_MISMATCH_REASON`。
 - R6：任何被拒絕的 OKX 平倉（含送出前的 `not_sent`）原因都帶「對側腿裸露」文字；開倉不帶。
 - R9：`live_probe` 對「成交未知」的腿讀帳戶持倉並平掉非零持倉；連持倉都讀不到時印出醒目的手動平倉指示，不再默默略過。
+
+## 抗辯修正（第三輪）
+
+- P1：`live_probe` 的開倉單由純函式 `probe_request` 建構，OKX 開倉帶 `intended_base_qty`；探針在送出任何一腿之前先以 `check_size` 驗證 OKX 腿，被本地拒絕就不開另一所的腿（避免單邊曝險）。
+- P2：閂鎖只有一個來源：工廠建立 OKX 客戶端時直接 `.with_latch(factory.okx_latch())`；executor 不再有自己的 latch 欄位 / `with_okx_latch` / `okx_latch()`。
+- P3：`pending` / `refused` 紀錄有界：每次插入時丟棄超過 `expTime + 10 分鐘` 的紀錄，且每個表上限 1000 筆（超過丟最舊）。
+- P4：移交 `okx-trading-enablement` 3.7。
