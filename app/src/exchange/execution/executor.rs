@@ -1,5 +1,5 @@
 //! `DemoExecutor`: the real `engine::ports::Executor` for EXCHANGE_DEMO (Binance + Bybit demo /
-//! testnet; OKX answers "unsupported" without any request). Built only by
+//! testnet, and OKX Demo Trading when the factory found OKX keys; otherwise OKX orders are not sent). Built only by
 //! `factory::DemoExecutorFactory` when switching to EXCHANGE_DEMO (design D6).
 //!
 //! Before every order: the id must be a `demo` engine id, the exchange clock must be calibrated
@@ -17,19 +17,22 @@ use super::binance::{BinanceOrderClient, ModeReading};
 use super::bybit::BybitOrderClient;
 use super::classify::{LeverageOutcome, SubmitClass};
 use super::http::OrderTransport;
+use super::okx::{OkxLimitsSource, OkxOrderClient, check_size};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{BoxFut, Executor, OrderRequest, QueryOutcome, ServerOffsets, SubmitOutcome};
 use crate::exchange::health::ratelimit::{BackoffState, RateLimiter, RequestClass};
 use crate::ports::TimeSource;
 use crate::store::db::Db;
 
-/// How long a confirmed one-way reading is trusted (my choice, UNVERIFIED that the exchanges
-/// refuse a mode switch with open positions; a switch inside the window is caught by the exchange
-/// rejecting `positionIdx` 0 / reduce-only orders).
-pub const POSITION_MODE_TTL_MS: i64 = 60_000;
+/// How long a confirmed one-way reading is trusted (defined in the signed layer, shared with the OKX read gate).
+pub use crate::exchange::signed::okx::POSITION_MODE_TTL_MS;
 
-/// Reason text of OKX order calls (no request is ever built for OKX).
-pub const OKX_UNSUPPORTED: &str = "OKX order execution is unsupported (public market data only)";
+/// An OKX opening order that carries a leverage is never sent: OKX set-leverage is not implemented, so
+/// the leverage could not be applied first (order-leverage-sync). No OKX set-leverage endpoint is ever called.
+pub const OKX_LEVERAGE_UNSUPPORTED: &str = "OKX leverage sync not implemented yet; OKX order not sent";
+
+/// Reason of OKX order calls on an executor built without an OKX client and without a reason.
+pub const OKX_UNAVAILABLE: &str = "OKX order client not configured";
 
 /// Which `client_order_id`s belong to this system (`order_intents`).
 pub trait IntentLedger: Send + Sync {
@@ -45,6 +48,11 @@ impl IntentLedger for Db {
 pub struct DemoExecutor<T> {
     binance: BinanceOrderClient<T>,
     bybit: BybitOrderClient<T>,
+    /// OKX is optional: without keys the factory gives a reason instead and OKX orders are not sent.
+    okx: Option<OkxOrderClient<T>>,
+    okx_unavailable: String,
+    /// Per-instrument size limits for OKX; without a source OKX opens are not sent (fail closed).
+    okx_limits: Option<Arc<dyn OkxLimitsSource>>,
     clock: Arc<dyn TimeSource>,
     offsets: Arc<dyn ServerOffsets>,
     intents: Arc<dyn IntentLedger>,
@@ -62,7 +70,32 @@ impl<T: OrderTransport> DemoExecutor<T> {
         intents: Arc<dyn IntentLedger>,
         limiter: Arc<RateLimiter>,
     ) -> Self {
-        DemoExecutor { binance, bybit, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
+        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
+    }
+
+    /// Adds the OKX client. Its latch is the client's own: production attaches the factory's single
+    /// latch to the client when it builds it (`DemoExecutorFactory::build`), so there is no
+    /// builder-order-dependent second latch here.
+    pub fn with_okx(mut self, okx: OkxOrderClient<T>) -> Self {
+        self.okx = Some(okx);
+        self
+    }
+
+    pub fn with_okx_limits(mut self, limits: Arc<dyn OkxLimitsSource>) -> Self {
+        self.okx_limits = Some(limits);
+        self
+    }
+
+    /// OKX orders answer `not_sent` with `reason` (never contains a key value).
+    pub fn with_okx_unavailable(mut self, reason: String) -> Self {
+        self.okx = None;
+        self.okx_unavailable = reason;
+        self
+    }
+
+    /// The OKX client, or the reason there is none.
+    fn okx(&self) -> Result<&OkxOrderClient<T>, String> {
+        self.okx.as_ref().ok_or_else(|| self.okx_unavailable.clone())
     }
 
     /// Exchange time for signing; `None` = never calibrated (nothing may be signed).
@@ -102,8 +135,8 @@ impl<T: OrderTransport> DemoExecutor<T> {
     /// One-way mode confirmed within the TTL, or read now. Any failure = do not send.
     async fn ensure_one_way(&self, exchange: Exchange, symbol: &str, timestamp: i64) -> Result<(), String> {
         let key = match exchange {
-            Exchange::Binance => (exchange, "*".to_string()), // account-wide setting
-            Exchange::Bybit | Exchange::Okx => (exchange, symbol.to_string()),
+            Exchange::Binance | Exchange::Okx => (exchange, "*".to_string()), // account-wide setting
+            Exchange::Bybit => (exchange, symbol.to_string()),
         };
         let now = self.clock.now_ms();
         if let Some(at) = self.one_way_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key)
@@ -114,7 +147,10 @@ impl<T: OrderTransport> DemoExecutor<T> {
         let reading = match exchange {
             Exchange::Binance => self.binance.position_mode(timestamp).await,
             Exchange::Bybit => self.bybit.position_mode(symbol, timestamp).await,
-            Exchange::Okx => Err(OKX_UNSUPPORTED.to_string()),
+            Exchange::Okx => match self.okx() {
+                Ok(okx) => okx.position_mode(timestamp).await,
+                Err(reason) => Err(reason),
+            },
         };
         match reading {
             Ok(ModeReading::OneWay) => {
@@ -126,16 +162,48 @@ impl<T: OrderTransport> DemoExecutor<T> {
         }
     }
 
-    /// The four-way classification (the engine sees `into_outcome`).
+    /// The four-way classification (the engine sees `into_outcome`). An OKX close (`reduce_only`)
+    /// that is rejected for ANY reason, sent or not, says the opposite leg is naked.
     pub async fn submit_classified(&self, req: &OrderRequest) -> SubmitClass {
+        match self.submit_inner(req).await {
+            SubmitClass::Rejected { code, message } if req.exchange == Exchange::Okx && req.reduce_only => SubmitClass::Rejected {
+                message: format!("OKX close refused ({code}: {message}): the opposite leg is naked (still open) and needs manual action"),
+                code,
+            },
+            other => other,
+        }
+    }
+
+    async fn submit_inner(&self, req: &OrderRequest) -> SubmitClass {
         let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
-        if req.exchange == Exchange::Okx {
-            return not_sent(OKX_UNSUPPORTED.into());
+        if req.exchange == Exchange::Okx
+            && let Err(reason) = self.okx()
+        {
+            return not_sent(reason);
         }
         let order = match ValidOrder::from_request(req) {
             Ok(o) => o,
             Err(e) => return not_sent(e),
         };
+        if req.exchange == Exchange::Okx && req.leverage.is_some() {
+            // before ANY request (not even the mode read): an open must not leave without its leverage applied
+            return not_sent(OKX_LEVERAGE_UNSUPPORTED.into());
+        }
+        if req.exchange == Exchange::Okx {
+            // size guard first: nothing is requested for an order that is not a sane number of contracts
+            // (a close is only checked for sz > 0 and the lot rule: never blocked by the cap or by missing data)
+            let limits = self.okx_limits.as_ref().and_then(|l| l.limits(order.symbol()));
+            if self.okx_limits.is_none() && !req.reduce_only {
+                return not_sent("OKX size limits source not configured; OKX order not sent".into());
+            }
+            if let Err(e) = check_size(order.quantity(), req.intended_base_qty, req.reduce_only, limits.as_ref()) {
+                return not_sent(e);
+            }
+            // a close must not trust a cached mode reading (a wrong mode leaves the other leg naked)
+            if req.reduce_only {
+                self.one_way_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&(Exchange::Okx, "*".to_string()));
+            }
+        }
         let Some(ts) = self.timestamp(req.exchange) else {
             return not_sent(format!("{} clock offset not calibrated", req.exchange.name()));
         };
@@ -152,7 +220,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
             let outcome = match req.exchange {
                 Exchange::Binance => self.binance.set_leverage(order.symbol(), leverage, ts).await,
                 Exchange::Bybit => self.bybit.set_leverage(order.symbol(), leverage, ts).await,
-                Exchange::Okx => return not_sent(OKX_UNSUPPORTED.into()),
+                Exchange::Okx => return not_sent(OKX_LEVERAGE_UNSUPPORTED.into()), // unreachable: refused before any request
             };
             match outcome {
                 LeverageOutcome::Set => self.limiter.on_success(req.exchange, RequestClass::Signed),
@@ -167,7 +235,10 @@ impl<T: OrderTransport> DemoExecutor<T> {
         let class = match req.exchange {
             Exchange::Binance => self.binance.submit(&order, ts).await,
             Exchange::Bybit => self.bybit.submit(&order, ts).await,
-            Exchange::Okx => not_sent(OKX_UNSUPPORTED.into()),
+            Exchange::Okx => match self.okx() {
+                Ok(okx) => okx.submit(&order, ts).await,
+                Err(reason) => not_sent(reason),
+            },
         };
         match &class {
             SubmitClass::RateLimited { retry_after_ms } => self.note_rate_limit(req.exchange, Some(*retry_after_ms)),
@@ -179,8 +250,10 @@ impl<T: OrderTransport> DemoExecutor<T> {
 
     /// Look an order up by `client_order_id` or by the exchange's order id.
     pub async fn query_by(&self, exchange: Exchange, symbol: &str, by: &OrderRef) -> QueryOutcome {
-        if exchange == Exchange::Okx {
-            return QueryOutcome::Failed { reason: OKX_UNSUPPORTED.into() };
+        if exchange == Exchange::Okx
+            && let Err(reason) = self.okx()
+        {
+            return QueryOutcome::Failed { reason };
         }
         if self.timestamp(exchange).is_none() {
             return QueryOutcome::Failed { reason: format!("{} clock offset not calibrated", exchange.name()) };
@@ -191,15 +264,20 @@ impl<T: OrderTransport> DemoExecutor<T> {
         let outcome = match exchange {
             Exchange::Binance => self.binance.query(symbol, by, self.stamp(exchange)).await,
             Exchange::Bybit => self.bybit.query(symbol, by, self.stamp(exchange)).await,
-            Exchange::Okx => QueryOutcome::Failed { reason: OKX_UNSUPPORTED.into() },
+            Exchange::Okx => match self.okx() {
+                Ok(okx) => okx.query(symbol, by, self.stamp(exchange)).await,
+                Err(reason) => QueryOutcome::Failed { reason },
+            },
         };
         self.note_query(exchange, &outcome);
         outcome
     }
 
     async fn cancel_own(&self, exchange: Exchange, symbol: &str, client_order_id: &str) -> QueryOutcome {
-        if exchange == Exchange::Okx {
-            return QueryOutcome::Failed { reason: OKX_UNSUPPORTED.into() };
+        if exchange == Exchange::Okx
+            && let Err(reason) = self.okx()
+        {
+            return QueryOutcome::Failed { reason };
         }
         let id = match ClientOrderId::parse(client_order_id) {
             Ok(id) => id,
@@ -219,7 +297,10 @@ impl<T: OrderTransport> DemoExecutor<T> {
         let outcome = match exchange {
             Exchange::Binance => self.binance.cancel(symbol, &id, ts).await,
             Exchange::Bybit => self.bybit.cancel(symbol, &id, self.stamp(exchange)).await,
-            Exchange::Okx => QueryOutcome::Failed { reason: OKX_UNSUPPORTED.into() },
+            Exchange::Okx => match self.okx() {
+                Ok(okx) => okx.cancel(symbol, &id, self.stamp(exchange)).await,
+                Err(reason) => QueryOutcome::Failed { reason },
+            },
         };
         self.note_query(exchange, &outcome);
         outcome

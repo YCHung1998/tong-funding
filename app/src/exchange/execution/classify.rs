@@ -14,6 +14,7 @@ use tong_funding_core::redact::redact_secrets;
 
 use crate::engine::ports::{OrderState, OrderStatus, QueryOutcome, SubmitOutcome};
 use crate::exchange::error::AdapterError;
+use crate::exchange::signed::okx::{ENV_MISMATCH_CODE, OKX_RATE_LIMIT_CODES, OKX_UNKNOWN_CODES};
 use crate::exchange::health::ratelimit::parse_retry_after_ms;
 use crate::exchange::transport::HttpResponse;
 
@@ -31,6 +32,14 @@ pub const BYBIT_UNKNOWN_CODES: [i64; 2] = [10000, 10016];
 pub const BYBIT_RATE_LIMIT_CODES: [i64; 2] = [10006, 10018];
 /// Bybit "order not exists or too late to cancel" (UNVERIFIED).
 pub const BYBIT_NOT_FOUND_CODES: [i64; 1] = [110001];
+
+/// The only OKX codes that make a reply "clearly refused" (documented; UNVERIFIED completeness):
+/// parameter / mode / lot / balance / market-order-size refusals, "order does not exist", cancel
+/// failure, and authentication failures (nothing was processed). Any other code is UNKNOWN, so the
+/// order is looked up instead of being written off. `50101` is not here: it latches OKX off.
+pub const OKX_REFUSAL_CODES: [i64; 15] = [51000, 51008, 51010, 51020, 51121, 51131, 51202, 51400, 51603, 50102, 50103, 50104, 50105, 50111, 50113];
+/// OKX "order does not exist".
+pub const OKX_NOT_FOUND_CODES: [i64; 1] = [51603];
 
 /// Bybit "leverage not modified" (set-leverage to the value the symbol already has): success.
 pub const BYBIT_LEVERAGE_UNCHANGED_CODES: [i64; 1] = [110043];
@@ -175,6 +184,58 @@ pub fn bybit_reply(result: Result<HttpResponse, AdapterError>) -> Reply {
     }
 }
 
+/// OKX: HTTP 200 with `code`, and for place / cancel the real result in `data[0].sCode` (General
+/// Info: with an `sCode`, `sCode` / `sMsg` are the result). A non-zero `sCode` wins over `code`, so
+/// `code "0"` + `sCode "51121"` is a refusal and never an acceptance.
+pub fn okx_reply(result: Result<HttpResponse, AdapterError>) -> Reply {
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => return transport_failure(&e),
+    };
+    if matches!(resp.status, 429 | 418) {
+        return Reply::RateLimited { retry_after_ms: retry_after(&resp) };
+    }
+    if resp.status >= 500 {
+        return Reply::Unknown { reason: format!("HTTP {}", resp.status) };
+    }
+    let Ok(body) = serde_json::from_str::<Value>(&resp.body) else {
+        return Reply::Unknown { reason: format!("HTTP {}: unparsable reply", resp.status) };
+    };
+    let Some(code) = body.get("code").and_then(Value::as_str) else {
+        return Reply::Unknown { reason: "reply without code".into() };
+    };
+    let row = body.get("data").and_then(Value::as_array).and_then(|d| d.first());
+    let s_code = row.and_then(|r| r.get("sCode")).and_then(Value::as_str).filter(|c| !c.is_empty());
+    let (effective, message) = match s_code {
+        Some(sc) if sc != "0" => (sc, row.and_then(|r| r.get("sMsg")).and_then(Value::as_str).unwrap_or("")),
+        _ => (code, body.get("msg").and_then(Value::as_str).unwrap_or("")),
+    };
+    if effective == "0" {
+        return Reply::Ok(body);
+    }
+    let Ok(n) = effective.parse::<i64>() else {
+        return Reply::Unknown { reason: redact_secrets(&format!("okx code {effective:?}: {message}")) };
+    };
+    if OKX_RATE_LIMIT_CODES.contains(&n) {
+        Reply::RateLimited { retry_after_ms: retry_after(&resp) }
+    } else if OKX_UNKNOWN_CODES.contains(&n) {
+        Reply::Unknown { reason: redact_secrets(&format!("okx {n}: {message} (status unknown)")) }
+    } else if OKX_REFUSAL_CODES.contains(&n) {
+        Reply::Refused { code: n, message: redact_secrets(message) }
+    } else {
+        Reply::Unknown { reason: redact_secrets(&format!("okx {n}: {message} (not a documented refusal; outcome unknown)")) }
+    }
+}
+
+/// True when the reply says `50101` (API key does not match the environment) in `code` or `sCode`.
+pub fn okx_is_env_mismatch(result: &Result<HttpResponse, AdapterError>) -> bool {
+    let Ok(resp) = result else { return false };
+    let Ok(body) = serde_json::from_str::<Value>(&resp.body) else { return false };
+    let code = body.get("code").and_then(Value::as_str);
+    let s_code = body.get("data").and_then(Value::as_array).and_then(|d| d.first()).and_then(|r| r.get("sCode")).and_then(Value::as_str);
+    code == Some(ENV_MISMATCH_CODE) || s_code == Some(ENV_MISMATCH_CODE)
+}
+
 /// A submit reply turned into a class; `parse_ack` reads the accepted body.
 pub fn submit_class(reply: Reply, parse_ack: impl FnOnce(&Value) -> Result<OrderStatus, AdapterError>) -> SubmitClass {
     match reply {
@@ -223,5 +284,15 @@ pub fn bybit_state(s: &str) -> Result<OrderState, AdapterError> {
         "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => Ok(OrderState::Cancelled),
         "Rejected" => Ok(OrderState::Rejected),
         other => Err(AdapterError::parse(format!("unknown Bybit order status {other}"))),
+    }
+}
+
+/// OKX order state → engine state. An unknown state is an error, never a guess.
+pub fn okx_state(s: &str) -> Result<OrderState, AdapterError> {
+    match s {
+        "live" | "partially_filled" => Ok(OrderState::Open),
+        "filled" => Ok(OrderState::Filled),
+        "canceled" | "mmp_canceled" => Ok(OrderState::Cancelled),
+        other => Err(AdapterError::parse(format!("unknown OKX order state {other}"))),
     }
 }

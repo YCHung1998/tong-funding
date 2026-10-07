@@ -875,9 +875,36 @@ async fn an_okx_leg_is_sent_in_contracts_and_compared_in_base_coin() {
     let sent = rig.sim.submitted();
     assert_eq!((sent[0].exchange, sent[0].quantity), (Exchange::Binance, dec("10")));
     assert_eq!((sent[1].exchange, sent[1].quantity), (Exchange::Okx, dec("1000")), "OKX quantity is contracts");
+    // R2: an opening order carries the coin amount it intends (1000 contracts x 0.01 = 10), a close does not
+    assert_eq!(sent[1].intended_base_qty, Some(dec("10")));
     run_until(&rig.clock, T + 15_000).await;
     assert_eq!(status(&rig.db, UUID), "FINALIZED");
     assert_eq!(rig.sim.submitted()[3].quantity, dec("1000"), "closed in contracts too");
+    assert_eq!(rig.sim.submitted()[3].intended_base_qty, None, "closes carry no intended amount");
+}
+
+/// okx-funding-ledger D5: the contract value used for sizing is recorded on the OKX leg's order events
+/// (so PnL can turn contracts into coins), and only there.
+#[tokio::test(start_paused = true)]
+async fn okx_order_events_record_the_contract_value_and_the_other_exchanges_do_not() {
+    let (rig, deps) = rig(Opts::default());
+    let okx = OrderRules { lot: LotSize { step_size: dec("1"), min_qty: dec("1") }, okx_ct_val: Some(dec("0.01")) };
+    rig.market.rules.lock().unwrap().insert(Exchange::Okx, okx);
+    let h = start(deps);
+    let mut p = pair_at(UUID, SYM, T);
+    p.short_exchange = Exchange::Okx;
+    assert_eq!(ask(&h, Command::AddPrepared(p)).await, CommandReply::Accepted);
+    run_until(&rig.clock, T + 15_000).await;
+    let order_events: Vec<Value> = events(&rig.db).into_iter().filter(|(_, l, _)| l == ORDER_SUBMITTED || l == ORDER_FILL).map(|(_, _, p)| p).collect();
+    assert!(order_events.iter().any(|p| p["exchange"] == json!("OKX") || p["exchange"] == json!(Exchange::Okx.name())), "{order_events:?}");
+    assert!(order_events.iter().any(|p| p["exchange"] == json!(Exchange::Okx.name()) && p["action"] == json!("close")), "the OKX close events are covered too");
+    for e in &order_events {
+        if e["exchange"] == json!(Exchange::Okx.name()) {
+            assert_eq!(e["ct_val"], json!("0.01"), "{e}");
+        } else {
+            assert!(e.get("ct_val").is_none(), "only OKX legs carry ct_val: {e}");
+        }
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -987,6 +1014,7 @@ async fn user_order(rig: &Rig, side: OrderSide, qty: &str, reduce_only: bool) {
         side,
         quantity: dec(qty),
         reduce_only,
+        intended_base_qty: None,
         leverage: None,
     };
     let out = rig.sim.submit(req).await;

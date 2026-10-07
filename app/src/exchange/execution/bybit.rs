@@ -225,13 +225,14 @@ mod tests {
             side,
             quantity: "0.019".parse().unwrap(),
             reduce_only,
+            intended_base_qty: None,
             leverage: None,
         })
         .unwrap()
     }
 
     fn client(t: &FakeOrderTransport) -> BybitOrderClient<FakeOrderTransport> {
-        BybitOrderClient::new(Arc::new(t.clone()), Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into() }), BybitHost::Demo)
+        BybitOrderClient::new(Arc::new(t.clone()), Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into(), passphrase: None }), BybitHost::Demo)
     }
 
     /// Independent HMAC (RFC 2104 by hand over sha2), see the Binance tests for the vector check.

@@ -27,6 +27,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::account::DemoAccountView;
 use super::factory::DemoExecutorFactory;
+use super::okx::{OkxLimits, OkxLimitsSource, check_size};
 use super::http::ReqwestOrderTransport;
 use crate::engine::ids::{IdPrefix, client_order_id};
 use crate::engine::intent;
@@ -38,7 +39,11 @@ use crate::exchange::health::ratelimit::RateLimiter;
 use crate::exchange::reqwest_transport::ReqwestTransport;
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
-use crate::exchange::signed::endpoints::{BinanceHost, BybitHost};
+use crate::exchange::public::adapter::{ExchangeAdapter, RulesLookup};
+use crate::exchange::public::endpoints::OKX_HOST;
+use crate::exchange::public::okx::OkxAdapter;
+use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost};
+use crate::exchange::signed::okx::OkxSignedClient;
 use crate::exchange::signed::signing::Resync;
 use crate::ports::{Clock, SecretProvider, SystemClock};
 use crate::store::db::Db;
@@ -50,14 +55,38 @@ const CONFIRM: &str = "I_AM_PRESENT_PLACE_DEMO_ORDERS";
 struct Offsets {
     binance: i64,
     bybit: i64,
+    okx: i64,
 }
 impl ServerOffsets for Offsets {
     fn offset_ms(&self, exchange: Exchange) -> Option<i64> {
         match exchange {
             Exchange::Binance => Some(self.binance),
             Exchange::Bybit => Some(self.bybit),
-            Exchange::Okx => None,
+            Exchange::Okx => Some(self.okx),
         }
+    }
+}
+
+/// `TONG_DEMO_EXCHANGES=long,short` (default `binance,bybit`): two different exchanges.
+fn parse_exchanges(v: &str) -> (Exchange, Exchange) {
+    let one = |n: &str| match n.trim().to_ascii_lowercase().as_str() {
+        "binance" => Exchange::Binance,
+        "bybit" => Exchange::Bybit,
+        "okx" => Exchange::Okx,
+        other => panic!("TONG_DEMO_EXCHANGES: unknown exchange {other:?}"),
+    };
+    let parts: Vec<&str> = v.split(',').collect();
+    assert_eq!(parts.len(), 2, "TONG_DEMO_EXCHANGES needs exactly two exchanges, e.g. bybit,okx");
+    let (a, b) = (one(parts[0]), one(parts[1]));
+    assert_ne!(a, b, "TONG_DEMO_EXCHANGES needs two different exchanges");
+    (a, b)
+}
+
+/// Size limits of the probe's OKX symbol, from the public instruments and mark price.
+struct ProbeLimits(std::collections::HashMap<String, OkxLimits>);
+impl OkxLimitsSource for ProbeLimits {
+    fn limits(&self, symbol: &str) -> Option<OkxLimits> {
+        self.0.get(symbol).cloned()
     }
 }
 
@@ -124,6 +153,63 @@ fn filled(o: &QueryOutcome) -> Decimal {
     }
 }
 
+/// One probe order. `units` is in the exchange's order unit (contracts on OKX); `coin_qty` is the
+/// intended coin amount. An opening OKX order carries it as `intended_base_qty` (the size guard
+/// requires it); closes and the other exchanges carry `None`.
+#[allow(clippy::too_many_arguments)]
+fn probe_request(pair: &str, symbol: &str, leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, units: Decimal, coin_qty: Decimal) -> OrderRequest {
+    OrderRequest {
+        client_order_id: client_order_id(IdPrefix::Demo, pair, leg, action, 0),
+        exchange,
+        symbol: symbol.to_string(),
+        side,
+        quantity: units,
+        reduce_only: action == OrderAction::Close,
+        intended_base_qty: (action == OrderAction::Open && exchange == Exchange::Okx).then_some(coin_qty),
+        // OKX set-leverage is not implemented: probe orders carry no leverage (an OKX open with one is not sent)
+        leverage: None,
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn only_an_opening_okx_order_carries_the_intended_coin_amount() {
+        let q = |a, e| probe_request("p", "ETHUSDT", Leg::Long, a, e, OrderSide::Buy, "5".parse().unwrap(), "0.05".parse().unwrap());
+        assert_eq!(q(OrderAction::Open, Exchange::Okx).intended_base_qty, Some("0.05".parse().unwrap()));
+        assert_eq!(q(OrderAction::Open, Exchange::Okx).quantity, "5".parse().unwrap(), "units stay contracts");
+        assert_eq!(q(OrderAction::Close, Exchange::Okx).intended_base_qty, None);
+        assert!(q(OrderAction::Close, Exchange::Okx).reduce_only);
+        assert_eq!(q(OrderAction::Open, Exchange::Bybit).intended_base_qty, None);
+    }
+}
+
+/// The quantity to close on one leg. A leg whose fill is known closes what was filled. A leg whose
+/// order ended without a known fill (lookup failed, or not found) is NEVER skipped silently: the
+/// account position is read and any non-zero position is closed; if even that fails a loud manual
+/// instruction is printed (a skipped close would leave an open demo position behind).
+async fn closing_quantity(account: &dyn AccountView, exchange: Exchange, symbol: &str, outcome: &QueryOutcome) -> Decimal {
+    if let QueryOutcome::Found(s) = outcome {
+        return s.filled_quantity;
+    }
+    match account.positions(exchange).await {
+        Ok(list) => {
+            let held = list.items.iter().filter(|p| p.symbol == symbol).map(|p| p.quantity.abs()).max().unwrap_or(Decimal::ZERO);
+            if held > Decimal::ZERO || !list.complete {
+                println!("  !!! {} leg ended with an unknown fill ({outcome:?}); position on the account: {held} (list complete: {}); closing that quantity", exchange.name(), list.complete);
+            }
+            held
+        }
+        Err(e) => {
+            println!("  !!! {} leg ended with an unknown fill ({outcome:?}) and its position could not be read ({e}).", exchange.name());
+            println!("  !!! MANUAL ACTION: check the {} demo account for an open {symbol} position and close it by hand; this probe sends no close for that leg.", exchange.name());
+            Decimal::ZERO
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "places real demo/testnet orders; run on the Mac with the user present (TODO.md)"]
 async fn live_demo_probe() {
@@ -138,6 +224,8 @@ async fn live_demo_probe() {
         Ok("demo") => BinanceHost::Demo,
         _ => BinanceHost::Testnet,
     };
+    let (long_ex, short_ex) = parse_exchanges(&std::env::var("TONG_DEMO_EXCHANGES").unwrap_or_else(|_| "binance,bybit".into()));
+    let uses_okx = long_ex == Exchange::Okx || short_ex == Exchange::Okx;
     let db_path = std::env::var("TONG_DEMO_DB").unwrap_or_else(|_| "/tmp/tong-demo-probe.db".into());
 
     let clock = Arc::new(SystemClock);
@@ -153,7 +241,29 @@ async fn live_demo_probe() {
     let b = sync_b.sync_once(reads.as_ref(), Exchange::Binance, binance_host.base_url()).await.expect("Binance serverTime");
     let y = sync_y.sync_once(reads.as_ref(), Exchange::Bybit, BybitHost::Demo.base_url()).await.expect("Bybit time");
     println!("host: Binance {binance_host:?}, Bybit Demo; offsets: Binance {} ms (rtt {}), Bybit {} ms (rtt {})", b.offset_ms, b.rtt_ms, y.offset_ms, y.rtt_ms);
-    let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms });
+    // OKX: clock from the public time endpoint; contracts = coins / ctVal from the public instruments.
+    let (mut okx_offset, mut okx_contracts, mut okx_limits) = (0i64, qty, std::collections::HashMap::new());
+    let mut okx_limit: Option<OkxLimits> = None;
+    if uses_okx {
+        let public = Arc::new(ReqwestTransport::public_production().expect("public transport"));
+        okx_offset = ClockSync::new(clock.clone()).sync_once(public.as_ref(), Exchange::Okx, OKX_HOST).await.expect("OKX time").offset_ms;
+        let adapter = OkxAdapter::new(public, clock.clone());
+        let rules = match adapter.instrument_rules(&symbol).await.expect("OKX instruments") {
+            RulesLookup::Available(r) => r,
+            other => panic!("no OKX rules for {symbol}: {other:?}"),
+        };
+        let ct_val = rules.ct_val.expect("OKX ctVal");
+        let mark = adapter.refetch_symbol(&symbol).await.expect("OKX mark price").mark_price;
+        okx_contracts = qty / ct_val;
+        println!("OKX leg: {qty} coin = {okx_contracts} contracts (ctVal {ct_val}, lotSz {}, mark {mark}); notional {} USDT", rules.step_size, qty * mark);
+        assert!(!rules.step_size.is_zero() && (okx_contracts % rules.step_size).is_zero(), "TONG_DEMO_QTY / ctVal = {okx_contracts} is not a whole number of lots ({})", rules.step_size);
+        // the cap for the probe is its own notional plus a margin: it only guards against unit mistakes
+        let limit = OkxLimits { ct_val, lot_sz: rules.step_size, mark_px: mark, max_leg_notional: qty * mark * Decimal::from(2) };
+        okx_limit = Some(limit.clone());
+        okx_limits.insert(symbol.clone(), limit);
+    }
+    let leg_qty = |exchange: Exchange| if exchange == Exchange::Okx { okx_contracts } else { qty };
+    let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms, okx: okx_offset });
 
     let factory = DemoExecutorFactory::new(
         Arc::new(ReqwestOrderTransport::signed_demo().expect("order transport")),
@@ -163,42 +273,44 @@ async fn live_demo_probe() {
         Arc::new(db.clone()),
         Arc::new(RateLimiter::new(clock.clone())),
         binance_host,
-    );
+    )
+    .with_okx_limits(Arc::new(ProbeLimits(okx_limits)));
     let ex = factory.build().expect("demo executor (keys in the Keychain?)");
-    let (ob, oy) = (b.offset_ms, y.offset_ms);
+    let (ob, oy, oo) = (b.offset_ms, y.offset_ms, okx_offset);
     let account = DemoAccountView::new(
         Arc::new(BinanceSignedClient::new(reads.clone(), secrets.clone(), clock.clone(), Arc::new(move || Some(ob)), Arc::new(NoResync), binance_host)),
-        Arc::new(BybitSignedClient::new(reads, secrets, clock.clone(), Arc::new(move || Some(oy)), Arc::new(NoResync), BybitHost::Demo)),
-    );
+        Arc::new(BybitSignedClient::new(reads.clone(), secrets.clone(), clock.clone(), Arc::new(move || Some(oy)), Arc::new(NoResync), BybitHost::Demo)),
+    )
+    .with_okx(Arc::new(OkxSignedClient::new(reads, secrets, clock.clone(), Arc::new(move || Some(oo)), Arc::new(NoResync), OkxHost::Demo)));
 
     for round in 0..rounds {
         let pair = format!("probe-{}-{round}", clock.now_ms());
         println!("round {} / {rounds}: {pair} {symbol} qty {qty}", round + 1);
-        let req = |leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, q: Decimal| OrderRequest {
-            client_order_id: client_order_id(IdPrefix::Demo, &pair, leg, action, 0),
-            exchange,
-            symbol: symbol.clone(),
-            side,
-            quantity: q,
-            reduce_only: action == OrderAction::Close,
-            leverage: None,
-        };
+        let req = |leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, q: Decimal| probe_request(&pair, &symbol, leg, action, exchange, side, q, qty);
+        // The OKX leg is validated locally BEFORE any leg is sent: if the size guard would refuse it,
+        // the other exchange's leg must not be opened either (that would leave it one-sided).
+        if uses_okx && let Some(l) = &okx_limit {
+            if let Err(why) = check_size(okx_contracts, Some(qty), false, Some(l)) {
+                println!("  !!! the OKX leg would be refused locally ({why}); NOT opening either leg this round");
+                continue;
+            }
+        }
         let trigger = clock.now_ms();
-        let long = req(Leg::Long, OrderAction::Open, Exchange::Binance, OrderSide::Buy, qty);
-        let short = req(Leg::Short, OrderAction::Open, Exchange::Bybit, OrderSide::Sell, qty);
+        let long = req(Leg::Long, OrderAction::Open, long_ex, OrderSide::Buy, leg_qty(long_ex));
+        let short = req(Leg::Short, OrderAction::Open, short_ex, OrderSide::Sell, leg_qty(short_ex));
         let (lid, sid) = (long.client_order_id.clone(), short.client_order_id.clone());
         let _ = tokio::join!(
             submit_logged(&db, &events, &ex, clock.as_ref(), &pair, Leg::Long, OrderAction::Open, long, trigger),
             submit_logged(&db, &events, &ex, clock.as_ref(), &pair, Leg::Short, OrderAction::Open, short, trigger),
         );
-        let (lf, sf) = tokio::join!(wait_final(&ex, Exchange::Binance, &symbol, &lid), wait_final(&ex, Exchange::Bybit, &symbol, &sid));
+        let (lf, sf) = tokio::join!(wait_final(&ex, long_ex, &symbol, &lid), wait_final(&ex, short_ex, &symbol, &sid));
         println!("  fills: long {lf:?}\n         short {sf:?}");
         let _ = events.append("PROBE_FILLS", Some(&pair), json!({ "long": format!("{lf:?}"), "short": format!("{sf:?}") }));
 
         let close_trigger = clock.now_ms();
-        let (lq, sq) = (filled(&lf), filled(&sf));
-        let lc = req(Leg::Long, OrderAction::Close, Exchange::Binance, OrderSide::Sell, lq);
-        let sc = req(Leg::Short, OrderAction::Close, Exchange::Bybit, OrderSide::Buy, sq);
+        let (lq, sq) = (closing_quantity(&account, long_ex, &symbol, &lf).await, closing_quantity(&account, short_ex, &symbol, &sf).await);
+        let lc = req(Leg::Long, OrderAction::Close, long_ex, OrderSide::Sell, lq);
+        let sc = req(Leg::Short, OrderAction::Close, short_ex, OrderSide::Buy, sq);
         let (lcid, scid) = (lc.client_order_id.clone(), sc.client_order_id.clone());
         let ((), ()) = tokio::join!(
             async {
@@ -212,8 +324,8 @@ async fn live_demo_probe() {
                 }
             },
         );
-        let _ = tokio::join!(wait_final(&ex, Exchange::Binance, &symbol, &lcid), wait_final(&ex, Exchange::Bybit, &symbol, &scid));
-        for exchange in [Exchange::Binance, Exchange::Bybit] {
+        let _ = tokio::join!(wait_final(&ex, long_ex, &symbol, &lcid), wait_final(&ex, short_ex, &symbol, &scid));
+        for exchange in [long_ex, short_ex] {
             let pos = account.positions(exchange).await;
             let orders = account.open_orders(exchange).await;
             println!("  after close {}: positions {pos:?}; open orders {orders:?}", exchange.name());
@@ -223,14 +335,15 @@ async fn live_demo_probe() {
 
     // Reduce-only with no position: how does each exchange refuse it?
     let pair = format!("probe-ro-{}", clock.now_ms());
-    for (leg, exchange, side) in [(Leg::Long, Exchange::Binance, OrderSide::Sell), (Leg::Short, Exchange::Bybit, OrderSide::Buy)] {
+    for (leg, exchange, side) in [(Leg::Long, long_ex, OrderSide::Sell), (Leg::Short, short_ex, OrderSide::Buy)] {
         let r = OrderRequest {
             client_order_id: client_order_id(IdPrefix::Demo, &pair, leg, OrderAction::Close, 0),
             exchange,
             symbol: symbol.clone(),
             side,
-            quantity: qty,
+            quantity: leg_qty(exchange),
             reduce_only: true,
+            intended_base_qty: None,
             leverage: None,
         };
         let out = submit_logged(&db, &events, &ex, clock.as_ref(), &pair, leg, OrderAction::Close, r, clock.now_ms()).await;
@@ -281,7 +394,7 @@ async fn live_leverage_probe() {
     let reads = Arc::new(ReqwestTransport::signed_demo().expect("transport"));
     let b = ClockSync::new(clock.clone()).sync_once(reads.as_ref(), Exchange::Binance, binance_host.base_url()).await.expect("Binance serverTime");
     let y = ClockSync::new(clock.clone()).sync_once(reads.as_ref(), Exchange::Bybit, BybitHost::Demo.base_url()).await.expect("Bybit time");
-    let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms });
+    let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms, okx: 0 }); // (this probe trades Binance + Bybit only)
     let factory = DemoExecutorFactory::new(
         Arc::new(ReqwestOrderTransport::signed_demo().expect("order transport")),
         secrets.clone(),
@@ -314,6 +427,7 @@ async fn live_leverage_probe() {
         side,
         quantity: qty,
         reduce_only: action == OrderAction::Close,
+        intended_base_qty: None,
         leverage,
     };
     let open_l = mk(Leg::Long, OrderAction::Open, Exchange::Binance, OrderSide::Buy, Some(want), 0);

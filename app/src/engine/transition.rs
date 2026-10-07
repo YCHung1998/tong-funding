@@ -142,6 +142,7 @@ mod tests {
             side: OrderSide::Buy,
             quantity: Decimal::new(1, 3),
             reduce_only: false,
+            intended_base_qty: None,
             leverage: None,
         }
     }

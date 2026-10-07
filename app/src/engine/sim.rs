@@ -418,6 +418,7 @@ mod tests {
             side,
             quantity: d(qty),
             reduce_only: false,
+            intended_base_qty: None,
             leverage: None,
         }
     }

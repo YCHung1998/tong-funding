@@ -27,3 +27,9 @@ pub const BYBIT_POSITION_PATH: &str = "/v5/position/list";
 /// Binance response type that carries `executedQty` / `avgPrice` in the order ACK (UNVERIFIED
 /// whether the testnet honours it for MARKET orders).
 pub const BINANCE_RESP_TYPE: &str = "RESULT";
+
+/// OKX v5: place order (POST) and order details (GET) share one path; cancel is its own path.
+pub const OKX_ORDER_PATH: &str = "/api/v5/trade/order";
+pub const OKX_CANCEL_PATH: &str = "/api/v5/trade/cancel-order";
+/// OKX v5: account configuration (`acctLv`, `posMode`) for the one-way gate.
+pub const OKX_ACCOUNT_CONFIG_PATH: &str = "/api/v5/account/config";

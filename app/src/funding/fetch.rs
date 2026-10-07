@@ -20,6 +20,7 @@ use super::pnl_record::{assemble, latest_pnl, recompute_if_changed};
 use super::{FETCH_DELAY_MS, FETCH_ERROR, FUNDING_LEDGER_FETCHED, PNL_RETRY_WINDOW_MS};
 use crate::exchange::error::AdapterError;
 use crate::exchange::signed::ledger::{BINANCE_INCOME_LIMIT, BinanceLedgerClient, BybitLedgerClient, LedgerPage};
+use crate::exchange::signed::okx::OkxSignedClient;
 use crate::exchange::transport::HttpTransport;
 use crate::store::db::Db;
 use crate::store::events::EventStore;
@@ -214,7 +215,7 @@ pub struct FetchPlan {
 }
 
 /// Which ledger fetches are due at `now_ms` (spec "取得流水的時機"): for every non-simulated pair
-/// with a held leg on Binance / Bybit, an expected settlement older than `FETCH_DELAY_MS` without
+/// with a held leg on Binance / Bybit / OKX, an expected settlement older than `FETCH_DELAY_MS` without
 /// a matching entry (until the retry window after it is over), or a closed leg whose PnL is not
 /// recorded yet. The kill switch does not stop this (read-only); a halted store does, and
 /// SIMULATION pairs never fetch. The caller paces repeats with `FETCH_RETRY_MS`.
@@ -231,9 +232,6 @@ pub fn plan_fetches(db: &Db, now_ms: i64) -> Result<Vec<FetchPlan>, String> {
         let has_pnl = latest_pnl(db, &row.internal_uuid)?.is_some();
         for (i, w) in a.windows.iter().enumerate() {
             let Some(w) = w else { continue };
-            if w.exchange == Exchange::Okx {
-                continue;
-            }
             let leg = &a.input.legs[i];
             let times: Vec<i64> = leg.funding.iter().map(|e| e.settled_at_ms).collect();
             let slots = match_slots(&a.slots[i], &times, now_ms, PNL_RETRY_WINDOW_MS + FETCH_DELAY_MS);
@@ -291,6 +289,22 @@ impl<T: HttpTransport + 'static> LedgerSource for BybitLedgerSource<T> {
     }
     fn page<'a>(&'a self, _symbol: &'a str, start_ms: i64, end_ms: i64, token: Option<&'a str>) -> BoxFut<'a, Result<LedgerPage, AdapterError>> {
         Box::pin(self.0.transaction_log_page(start_ms, end_ms, token))
+    }
+}
+
+/// OKX `bills-archive` as a `LedgerSource`: per symbol, paged by the last `billId` (`after`,
+/// "older than"); the cursor is the page's `next_cursor` (a full page only).
+pub struct OkxLedgerSource<T>(pub Arc<OkxSignedClient<T>>);
+
+impl<T: HttpTransport + 'static> LedgerSource for OkxLedgerSource<T> {
+    fn exchange(&self) -> Exchange {
+        Exchange::Okx
+    }
+    fn per_symbol(&self) -> bool {
+        true
+    }
+    fn page<'a>(&'a self, symbol: &'a str, start_ms: i64, end_ms: i64, token: Option<&'a str>) -> BoxFut<'a, Result<LedgerPage, AdapterError>> {
+        Box::pin(self.0.bills_page(symbol, start_ms, end_ms, token))
     }
 }
 

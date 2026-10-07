@@ -113,6 +113,10 @@ pub struct FillRecord {
     pub fee_asset: Option<String>,
     /// When the fill was recorded (Unix ms).
     pub filled_at_ms: i64,
+    /// OKX: the fill is in contracts and no contract value was recorded with it, so its coin
+    /// amount (and every price component built on it) is unknown.
+    #[serde(default)]
+    pub contract_value_missing: bool,
 }
 
 /// Whether the funding ledger behind a leg could be fetched.
@@ -230,6 +234,8 @@ pub enum IncompleteReason {
     MissingFillDetail { exchange: Exchange, id: String, what: String },
     FeeNotConvertible { exchange: Exchange, id: String, asset: String },
     MissingReferencePrice { exchange: Exchange, id: String },
+    /// OKX fill without the contract value (`ct_val`) it was converted with.
+    MissingContractValue { exchange: Exchange, id: String },
     OpenCloseQuantityMismatch { exchange: Exchange, opened: Decimal, closed: Decimal },
     AmbiguousAttribution,
     ReconciliationMismatch,
@@ -252,6 +258,7 @@ impl IncompleteReason {
             IncompleteReason::MissingFillDetail { exchange, id, what } => format!("成交明細缺漏（{} {id}：{what}）", exchange.name()),
             IncompleteReason::FeeNotConvertible { exchange, id, asset } => format!("手續費無法換算（{} {id}：{asset}）", exchange.name()),
             IncompleteReason::MissingReferencePrice { exchange, id } => format!("無參考價（{} {id}）", exchange.name()),
+            IncompleteReason::MissingContractValue { exchange, id } => format!("OKX 成交缺合約面值（{} {id}）", exchange.name()),
             IncompleteReason::OpenCloseQuantityMismatch { exchange, opened, closed } => {
                 format!("開平倉數量不一致（{}：開 {opened}，平 {closed}）", exchange.name())
             }
@@ -352,15 +359,23 @@ fn leg_pnl(leg: &LegInput, reasons: &mut Vec<IncompleteReason>) -> LegPnl {
         Side::Short => Decimal::NEGATIVE_ONE,
     };
     let (mut opened, mut closed) = (Decimal::ZERO, Decimal::ZERO);
+    let mut any_unconverted = false;
     for f in leg.fills.iter().filter(|f| !f.quantity.is_zero()) {
         // Price PnL of a long = Σ close (p × q) − Σ open (p × q); a short is the opposite.
+        // A fill whose quantity is in unconverted contracts (`contract_value_missing`) is not added to
+        // `opened` / `closed`: mixing contracts into coins would fake a quantity mismatch.
+        any_unconverted |= f.contract_value_missing;
         let dir = match f.action {
             FillAction::Open => {
-                opened += f.quantity;
+                if !f.contract_value_missing {
+                    opened += f.quantity;
+                }
                 -sign
             }
             FillAction::Close => {
-                closed += f.quantity;
+                if !f.contract_value_missing {
+                    closed += f.quantity;
+                }
                 sign
             }
         };
@@ -382,6 +397,12 @@ fn leg_pnl(leg: &LegInput, reasons: &mut Vec<IncompleteReason>) -> LegPnl {
                 missing.insert(fee_component);
             }
         }
+        if f.contract_value_missing {
+            // contracts cannot be priced as coins: no price component is built from this fill
+            reasons.push(IncompleteReason::MissingContractValue { exchange: ex, id: f.id.clone() });
+            missing.extend([Component::PriceRef, Component::PriceActual, Component::Slippage]);
+            continue;
+        }
         match f.actual_price {
             Some(p) => c.price_actual += dir * p * f.quantity,
             None => {
@@ -399,7 +420,8 @@ fn leg_pnl(leg: &LegInput, reasons: &mut Vec<IncompleteReason>) -> LegPnl {
             }
         }
     }
-    if opened != closed {
+    // (with an unconverted fill the totals are incomplete by construction; `MissingContractValue` already says so)
+    if opened != closed && !any_unconverted {
         reasons.push(IncompleteReason::OpenCloseQuantityMismatch { exchange: ex, opened, closed });
         missing.extend([Component::PriceRef, Component::PriceActual, Component::Slippage]);
     }

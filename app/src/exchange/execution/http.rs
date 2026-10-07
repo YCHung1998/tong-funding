@@ -12,7 +12,7 @@ use tong_funding_core::redact::redact_secrets;
 
 use crate::exchange::error::AdapterError;
 use crate::exchange::reqwest_transport::{HostPolicy, MAX_BODY_BYTES};
-use crate::exchange::signed::endpoints::{BinanceHost, BybitHost};
+use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost, is_okx_auth_header, is_protected_okx_header};
 use crate::exchange::transport::HttpResponse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,15 +37,9 @@ impl Method {
 pub enum DemoEnv {
     Binance(BinanceHost),
     Bybit(BybitHost),
-}
-
-impl DemoEnv {
-    fn base(self) -> &'static str {
-        match self {
-            DemoEnv::Binance(h) => h.base_url(),
-            DemoEnv::Bybit(h) => h.base_url(),
-        }
-    }
+    /// OKX shares its host with production: the URL comes from `OkxHost::target()` together with
+    /// the `x-simulated-trading: 1` header, which `to_demo` inserts itself.
+    Okx(OkxHost),
 }
 
 /// One signed order request. Fields are private: it is built only by [`OrderHttpRequest::to_demo`].
@@ -56,16 +50,48 @@ pub struct OrderHttpRequest {
     headers: Vec<(String, String)>,
     body: Option<String>,
     timeout: Duration,
+    /// `header()` / `okx_auth()` was handed a protected OKX header (`x-simulated-trading`, or
+    /// `OK-ACCESS-*` through `header()`): it was dropped and the transport refuses the request.
+    protected_header_misuse: bool,
 }
 
 impl OrderHttpRequest {
-    /// `path_and_query` starts with `/` and is appended to the demo host's base URL.
+    /// `path_and_query` starts with `/` and is appended to the demo host's base URL. An OKX
+    /// request gets its `x-simulated-trading: 1` header here, first, with no way to omit it.
     pub fn to_demo(method: Method, demo_env: DemoEnv, path_and_query: &str, timeout: Duration) -> Self {
-        OrderHttpRequest { method, url: format!("{}{}", demo_env.base(), path_and_query), headers: Vec::new(), body: None, timeout }
+        let (url, headers) = match demo_env {
+            DemoEnv::Binance(h) => (format!("{}{}", h.base_url(), path_and_query), Vec::new()),
+            DemoEnv::Bybit(h) => (format!("{}{}", h.base_url(), path_and_query), Vec::new()),
+            DemoEnv::Okx(h) => {
+                let target = h.target();
+                let (name, value) = target.sim_header();
+                (target.url(path_and_query), vec![(name.to_string(), value.to_string())])
+            }
+        };
+        OrderHttpRequest { method, url, headers, body: None, timeout, protected_header_misuse: false }
     }
+    /// Generic header. The OKX demo flag and `OK-ACCESS-*` are NOT settable here (see `okx_auth`).
     pub fn header(mut self, name: &str, value: &str) -> Self {
-        self.headers.push((name.to_string(), value.to_string()));
+        if !crate::exchange::transport::is_valid_header_name(name) || is_protected_okx_header(name) {
+            self.protected_header_misuse = true;
+        } else {
+            self.headers.push((name.to_string(), value.to_string()));
+        }
         self
+    }
+    /// The `OK-ACCESS-*` headers of an OKX request; any other name is dropped and marks the request.
+    pub fn okx_auth(mut self, auth: Vec<(String, String)>) -> Self {
+        for (n, v) in auth {
+            if is_okx_auth_header(&n) {
+                self.headers.push((n, v));
+            } else {
+                self.protected_header_misuse = true;
+            }
+        }
+        self
+    }
+    pub fn misuses_protected_header(&self) -> bool {
+        self.protected_header_misuse
     }
     pub fn json_body(mut self, body: String) -> Self {
         self.headers.push(("Content-Type".into(), "application/json".into()));
@@ -115,15 +141,21 @@ pub trait OrderTransport: Send + Sync {
 /// The real transport on `reqwest` + rustls, restricted to the signed demo/testnet hosts.
 pub struct ReqwestOrderTransport {
     client: reqwest::Client,
+    policy: HostPolicy,
 }
 
 impl ReqwestOrderTransport {
     pub fn signed_demo() -> Result<Self, AdapterError> {
+        Self::with_policy(HostPolicy::SignedDemo)
+    }
+
+    fn with_policy(policy: HostPolicy) -> Result<Self, AdapterError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| AdapterError::network(e.to_string()))?;
-        Ok(ReqwestOrderTransport { client })
+        Ok(ReqwestOrderTransport { client, policy })
     }
 }
 
@@ -134,7 +166,7 @@ fn map_error(e: reqwest::Error) -> AdapterError {
 impl OrderTransport for ReqwestOrderTransport {
     async fn send(&self, req: OrderHttpRequest) -> Result<HttpResponse, AdapterError> {
         let parsed = reqwest::Url::parse(&req.url).map_err(|_| AdapterError::network("invalid url"))?;
-        if !HostPolicy::SignedDemo.allows(&parsed) {
+        if req.protected_header_misuse || !self.policy.allows(&parsed, &req.headers) {
             return Err(AdapterError::network("host not allowed"));
         }
         let method = match req.method {
@@ -164,6 +196,18 @@ impl OrderTransport for ReqwestOrderTransport {
             buf.extend_from_slice(&chunk);
         }
         Ok(HttpResponse { status, headers, body: String::from_utf8_lossy(&buf).into_owned() })
+    }
+}
+
+#[cfg(test)]
+mod local {
+    use super::*;
+
+    impl ReqwestOrderTransport {
+        /// Policy `LocalOkxTest`: plain http to 127.0.0.1, the OKX header rule applies.
+        pub(super) fn local_okx_for_tests() -> Result<Self, AdapterError> {
+            Self::with_policy(HostPolicy::LocalOkxTest)
+        }
     }
 }
 
@@ -253,6 +297,16 @@ pub mod fake {
 
     impl OrderTransport for FakeOrderTransport {
         fn send(&self, req: OrderHttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {
+            // Every OKX request must pass the REAL admission rule, exactly like on the real transport,
+            // so executor-level tests cannot pass with a request the real transport would refuse.
+            if let Ok(url) = reqwest::Url::parse(req.full_url())
+                && url.host_str().is_some_and(crate::exchange::signed::endpoints::is_okx_host)
+            {
+                assert!(
+                    !req.misuses_protected_header() && HostPolicy::SignedDemo.allows(&url, req.headers()),
+                    "an OKX request the real admission rule would refuse: {req:?}"
+                );
+            }
             let reply = {
                 let mut script = self.inner.script.lock().unwrap();
                 // Longest matching key wins, so a specific script beats a generic one.
@@ -285,15 +339,164 @@ pub mod fake {
 mod tests {
     use super::*;
     use crate::exchange::signed::endpoints::ALLOWED_SIGNED_HOSTS;
+    use std::sync::Arc;
 
     #[test]
     fn every_demo_env_builds_a_url_on_an_allowed_host() {
-        for env in [DemoEnv::Binance(BinanceHost::Testnet), DemoEnv::Binance(BinanceHost::Demo), DemoEnv::Bybit(BybitHost::Demo)] {
+        for env in [DemoEnv::Binance(BinanceHost::Testnet), DemoEnv::Binance(BinanceHost::Demo), DemoEnv::Bybit(BybitHost::Demo), DemoEnv::Okx(OkxHost::Demo)] {
             let r = OrderHttpRequest::to_demo(Method::Post, env, "/x?a=1", Duration::from_secs(1));
             let parsed = reqwest::Url::parse(r.full_url()).unwrap();
             assert!(ALLOWED_SIGNED_HOSTS.contains(&parsed.host_str().unwrap()), "{}", r.full_url());
-            assert!(HostPolicy::SignedDemo.allows(&parsed));
+            assert!(HostPolicy::SignedDemo.allows(&parsed, r.headers()), "{env:?}: the request as built must be admitted by the real rule");
         }
+    }
+
+    // ---- OKX: the flag is part of the request, set by the constructor, not by callers ----
+
+    fn flags(r: &OrderHttpRequest) -> Vec<&str> {
+        r.headers().iter().filter(|(n, _)| n.eq_ignore_ascii_case("x-simulated-trading")).map(|(_, v)| v.as_str()).collect()
+    }
+
+    #[test]
+    fn every_okx_request_method_carries_the_simulated_flag_exactly_once_from_construction() {
+        for m in [Method::Get, Method::Post, Method::Delete] {
+            let r = OrderHttpRequest::to_demo(m, DemoEnv::Okx(OkxHost::Demo), "/api/v5/trade/order", Duration::from_secs(1));
+            assert_eq!(flags(&r), vec!["1"], "{m:?}");
+            assert!(r.full_url().starts_with("https://openapi.okx.com/api/v5/trade/order"));
+            assert!(!r.misuses_protected_header());
+        }
+        // and the flag survives the builder steps that follow
+        let r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/p", Duration::from_secs(1))
+            .okx_auth(vec![("OK-ACCESS-KEY".into(), "k".into())])
+            .json_body("{}".into());
+        assert_eq!(flags(&r), vec!["1"]);
+        assert_eq!(r.header_value("OK-ACCESS-KEY"), Some("k"));
+    }
+
+    #[test]
+    fn the_generic_header_api_cannot_set_the_flag_or_ok_access_names() {
+        for name in ["x-simulated-trading", "X-SIMULATED-TRADING", "OK-ACCESS-KEY", "ok-access-sign"] {
+            let r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/p", Duration::from_secs(1)).header(name, "0");
+            assert!(r.misuses_protected_header(), "{name}");
+            assert_eq!(flags(&r), vec!["1"], "{name}: the constructor's flag is the only one and keeps value 1");
+            assert!(r.header_value("OK-ACCESS-KEY").is_none() && r.header_value("ok-access-sign").is_none());
+        }
+        // okx_auth takes OK-ACCESS-* only: anything else it is handed is dropped and marked
+        let r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/p", Duration::from_secs(1)).okx_auth(vec![("x-simulated-trading".into(), "0".into())]);
+        assert!(r.misuses_protected_header());
+        assert_eq!(flags(&r), vec!["1"]);
+    }
+
+    // ---- real transport over a local server: refusals open zero connections ----
+
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn serve_counting(handler: impl Fn(&str) -> String + Send + 'static) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let counter = count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 8192];
+                let mut req = String::new();
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.push_str(&String::from_utf8_lossy(&buf[..n])),
+                    }
+                    if let Some(head_end) = req.find("\r\n\r\n") {
+                        let len = req.to_lowercase().split("content-length: ").nth(1).and_then(|t| t.split("\r\n").next()).and_then(|n| n.trim().parse::<usize>().ok()).unwrap_or(0);
+                        if req.len() >= head_end + 4 + len {
+                            break;
+                        }
+                    }
+                }
+                let body = handler(&req);
+                let _ = stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes());
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
+    /// A request for the local server built the way a real OKX request is, but pointed at 127.0.0.1.
+    fn local(method: Method, base: &str, headers: Vec<(&str, &str)>, body: Option<&str>) -> OrderHttpRequest {
+        let mut r = OrderHttpRequest::to_demo(method, DemoEnv::Bybit(BybitHost::Demo), "/api/v5/trade/order", Duration::from_secs(2));
+        r.url = format!("{base}/api/v5/trade/order");
+        r.headers = headers.into_iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        r.body = body.map(str::to_string);
+        r
+    }
+
+    #[tokio::test]
+    async fn get_and_post_without_a_valid_flag_are_refused_with_zero_connections() {
+        let (base, connections) = serve_counting(|_| "{}".into());
+        let t = ReqwestOrderTransport::local_okx_for_tests().unwrap();
+        for method in [Method::Get, Method::Post, Method::Delete] {
+            for (what, headers) in [
+                ("no flag", vec![("OK-ACCESS-KEY", "k")]),
+                ("none", vec![]),
+                ("flag 0", vec![("x-simulated-trading", "0")]),
+                ("duplicate 1", vec![("x-simulated-trading", "1"), ("x-simulated-trading", "1")]),
+                ("mixed-case duplicate", vec![("x-simulated-trading", "1"), ("X-Simulated-Trading", "0")]),
+            ] {
+                let r = local(method, &base, headers, Some("{\"sz\":\"1\"}"));
+                assert_eq!(t.send(r).await, Err(AdapterError::network("host not allowed")), "{method:?} {what}");
+            }
+            // the generic header() path: dropped and marked, so even with the "flag" set it is refused
+            let r = OrderHttpRequest::to_demo(method, DemoEnv::Okx(OkxHost::Demo), "/p", Duration::from_secs(1)).header("x-simulated-trading", "1");
+            let mut r = r;
+            r.url = format!("{base}/p");
+            assert_eq!(t.send(r).await, Err(AdapterError::network("host not allowed")), "{method:?} via header()");
+        }
+        assert_eq!(connections.load(Ordering::SeqCst), 0, "zero connections for every refusal");
+    }
+
+    #[tokio::test]
+    async fn a_post_with_the_flag_is_sent_once_with_the_flag_and_the_body() {
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_in = seen.clone();
+        let (base, connections) = serve_counting(move |req| {
+            *seen_in.lock().unwrap() = req.to_lowercase();
+            "{}".into()
+        });
+        let t = ReqwestOrderTransport::local_okx_for_tests().unwrap();
+        let built = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/api/v5/trade/order", Duration::from_secs(2)).okx_auth(vec![("OK-ACCESS-KEY".into(), "k".into())]).json_body("{\"sz\":\"3\"}".into());
+        let mut r = built.clone();
+        r.url = format!("{base}/api/v5/trade/order");
+        assert!(t.send(r).await.is_ok());
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        let raw = seen.lock().unwrap().clone();
+        assert!(raw.starts_with("post /api/v5/trade/order"), "{raw}");
+        assert_eq!(raw.matches("x-simulated-trading: 1").count(), 1, "{raw}");
+        assert!(raw.contains("{\"sz\":\"3\"}"));
+    }
+
+    #[tokio::test]
+    async fn the_order_transport_ignores_proxy_environment_variables() {
+        let _guard = crate::exchange::reqwest_transport::PROXY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (proxy, proxied) = serve_counting(|_| "via proxy".into());
+        let (origin, direct) = serve_counting(|_| "direct".into());
+        // SAFETY: serialised by PROXY_ENV_LOCK; the variables are removed before the lock is released.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", &proxy);
+            std::env::set_var("http_proxy", &proxy);
+        }
+        let control = reqwest::Client::builder().build().unwrap().get(format!("{origin}/c")).send().await.unwrap().text().await.unwrap();
+        let t = ReqwestOrderTransport::local_okx_for_tests().unwrap();
+        let r = t.send(local(Method::Get, &origin, vec![("x-simulated-trading", "1")], None)).await;
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("http_proxy");
+        }
+        assert_eq!(control, "via proxy", "control: the variable diverts a default client");
+        assert_eq!(proxied.load(Ordering::SeqCst), 1);
+        assert_eq!(r.unwrap().body, "direct");
+        assert_eq!(direct.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -302,7 +505,7 @@ mod tests {
         let r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "@evil.example/x", Duration::from_secs(1));
         let parsed = reqwest::Url::parse(r.full_url()).unwrap();
         // `https://api-demo.bybit.com@evil.example/x` would carry credentials: the policy refuses it.
-        assert!(!HostPolicy::SignedDemo.allows(&parsed) || parsed.host_str() == Some("api-demo.bybit.com"));
+        assert!(!HostPolicy::SignedDemo.allows(&parsed, &[]) || parsed.host_str() == Some("api-demo.bybit.com"));
     }
 
     #[test]
@@ -321,5 +524,46 @@ mod tests {
         let mut r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "/v5/order/create", Duration::from_millis(50));
         r.url = "https://example.invalid/v5/order/create".into();
         assert_eq!(t.send(r).await, Err(AdapterError::network("host not allowed")));
+    }
+
+    // ---- round 2: R7 (the fake runs the real admission rule), R8 (token-only names), S3 (real transport) ----
+
+    #[tokio::test]
+    #[should_panic(expected = "real admission rule")]
+    async fn the_fake_order_transport_panics_on_an_okx_request_the_real_rule_would_refuse() {
+        let fake = fake::FakeOrderTransport::new();
+        fake.on(Method::Get, "/x", fake::Reply::ok("{}"));
+        let mut r = OrderHttpRequest::to_demo(Method::Get, DemoEnv::Okx(OkxHost::Demo), "/x", Duration::from_secs(1));
+        r.headers.clear(); // an OKX request that lost its flag
+        let _ = fake.send(r).await;
+    }
+
+    #[test]
+    fn header_names_that_are_not_http_tokens_are_refused_and_mark_the_request() {
+        for name in ["x-simulated-trading ", " x-simulated-trading", "x-simulated-trading\n", "x\u{0445}-simulated-trading", "x simulated", "", "ok-access-key\r\nx: y", "na:me"] {
+            let r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/p", Duration::from_secs(1)).header(name, "1");
+            assert!(r.misuses_protected_header(), "{name:?} must be refused");
+            assert_eq!(r.headers().len(), 1, "{name:?}: only the constructor's flag is present");
+        }
+        let ok = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "/p", Duration::from_secs(1)).header("X-BAPI-API-KEY", "k");
+        assert!(!ok.misuses_protected_header() && ok.headers().len() == 1);
+    }
+
+    /// S3: the REAL order transport with the real `SignedDemo` policy refuses an OKX URL without the
+    /// flag before DNS or any connection. The error is the policy's refusal, not a network error, and
+    /// it comes back immediately. (A request that would pass is never sent here.)
+    #[tokio::test]
+    async fn the_real_order_transport_refuses_the_real_okx_host_without_the_flag_before_any_connection() {
+        let t = ReqwestOrderTransport::signed_demo().unwrap();
+        for method in [Method::Get, Method::Post, Method::Delete] {
+            let mut r = OrderHttpRequest::to_demo(method, DemoEnv::Okx(OkxHost::Demo), "/api/v5/trade/order", Duration::from_secs(30));
+            r.headers.clear();
+            let started = std::time::Instant::now();
+            assert_eq!(t.send(r).await, Err(AdapterError::network("host not allowed")), "{method:?}");
+            assert!(started.elapsed() < Duration::from_millis(500), "no DNS, no connection: {:?}", started.elapsed());
+        }
+        let mut dup = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Okx(OkxHost::Demo), "/api/v5/trade/order", Duration::from_secs(30));
+        dup.headers.push(("X-Simulated-Trading".into(), "0".into()));
+        assert_eq!(t.send(dup).await, Err(AdapterError::network("host not allowed")), "a second, different flag");
     }
 }

@@ -40,7 +40,7 @@ impl LedgerSource for FakeSource {
         self.exchange
     }
     fn per_symbol(&self) -> bool {
-        self.exchange == Exchange::Binance
+        matches!(self.exchange, Exchange::Binance | Exchange::Okx)
     }
     fn page<'a>(&'a self, _symbol: &'a str, start_ms: i64, end_ms: i64, token: Option<&'a str>) -> BoxFut<'a, Result<LedgerPage, AdapterError>> {
         self.calls.lock().unwrap().push((start_ms, end_ms, token.map(str::to_string)));
@@ -159,18 +159,22 @@ fn funding_fetch_a_halted_store_fetches_nothing() {
 // ---- timing: which fetches are due ------------------------------------------------------------
 
 fn seed_held_pair(db: &Db, clock: &ManualClock, uuid: &str, simulated: bool) {
+    seed_held_pair_on(db, clock, uuid, simulated, Exchange::Binance, Exchange::Bybit);
+}
+
+fn seed_held_pair_on(db: &Db, clock: &ManualClock, uuid: &str, simulated: bool, long: Exchange, short: Exchange) {
     use crate::engine::actor::PairEnvelope;
     use crate::store::state::NewPair;
     use tong_funding_core::pair::PairState;
-    let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: NOW, simulated, scan: json!({}) };
+    let env = PairEnvelope { long_exchange: long, short_exchange: short, settlement_ms: NOW, simulated, scan: json!({}) };
     db.add_pair_if_not_pending(&NewPair { internal_uuid: uuid.into(), pair_id: uuid.into(), symbol: "BTCUSDT".into(), status: PairState::Prepared, entry: serde_json::to_value(env).unwrap() })
         .unwrap();
     db.set_pair_status(uuid, PairState::Reconciled).unwrap();
     let es = EventStore::new(db.clone());
     clock.set(NOW - 10_000);
     let leg = |ex: &str| json!({ "exchange": ex, "expected_price": "100", "next_funding_time": NOW, "funding_interval_secs": 28_800 });
-    es.append("PAIR_TRANSITION", Some(uuid), json!({ "to": "ORDER_SUBMIT", "detail": { "entry_snapshot": { "long": leg("Binance"), "short": leg("Bybit") } } })).unwrap();
-    for (leg, ex) in [("long", "Binance"), ("short", "Bybit")] {
+    es.append("PAIR_TRANSITION", Some(uuid), json!({ "to": "ORDER_SUBMIT", "detail": { "entry_snapshot": { "long": leg(long.name()), "short": leg(short.name()) } } })).unwrap();
+    for (leg, ex) in [("long", long.name()), ("short", short.name())] {
         es.append(
             "ORDER_SUBMITTED",
             Some(uuid),
@@ -233,4 +237,84 @@ fn funding_fetch_binance_source_pages_until_a_short_page() {
     assert_eq!(out.entries.len(), BINANCE_INCOME_LIMIT as usize + 1);
     assert_eq!(t.requests().len(), 2);
     assert!(t.requests().iter().all(|r| r.url.contains(BINANCE_INCOME_PATH)));
+}
+
+#[test]
+fn funding_fetch_plan_includes_okx_legs_with_their_symbol() {
+    let (_d, db, clock) = open_tmp();
+    seed_held_pair_on(&db, &clock, "p1", false, Exchange::Bybit, Exchange::Okx);
+    let plans = plan_fetches(&db, NOW + FETCH_DELAY_MS).unwrap();
+    assert_eq!(plans.iter().map(|p| p.exchange).collect::<Vec<_>>(), [Exchange::Bybit, Exchange::Okx], "OKX is no longer skipped");
+    let okx = plans.iter().find(|p| p.exchange == Exchange::Okx).unwrap();
+    assert_eq!((okx.symbol.as_str(), okx.start_ms), ("BTCUSDT", NOW - 10_000));
+}
+
+// ---- the real OKX source: billId paging over the demo-flagged client ---------------------------------
+
+fn okx_source(script: Vec<Result<crate::exchange::transport::HttpResponse, AdapterError>>) -> (OkxLedgerSource<crate::exchange::transport::FakeTransport>, Arc<crate::exchange::transport::FakeTransport>) {
+    use crate::exchange::signed::endpoints::OkxHost;
+    use crate::exchange::signed::ledger::OKX_BILLS_ARCHIVE_PATH;
+    use crate::exchange::signed::okx::OkxSignedClient;
+    use crate::exchange::transport::FakeTransport;
+    use crate::ports::{MemorySecrets, SecretName};
+    struct NoResync;
+    impl crate::exchange::signed::signing::Resync for NoResync {
+        fn resync(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AdapterError>> + Send + '_>> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+    }
+    let mut t = FakeTransport::new();
+    for r in script {
+        t = t.on(OKX_BILLS_ARCHIVE_PATH, r);
+    }
+    let t = Arc::new(t);
+    let secrets: Arc<dyn crate::ports::SecretProvider> = Arc::new(
+        MemorySecrets::default().with(Exchange::Okx, SecretName::ApiKey, "K_NOT_REAL").with(Exchange::Okx, SecretName::ApiSecret, "S_NOT_REAL").with(Exchange::Okx, SecretName::Passphrase, "P_NOT_REAL"),
+    );
+    let signed = OkxSignedClient::new(t.clone(), secrets, Arc::new(ManualClock::new(NOW)), Arc::new(|| Some(0)), Arc::new(NoResync), OkxHost::Demo);
+    (OkxLedgerSource(Arc::new(signed)), t)
+}
+
+fn okx_body(name: &str) -> Result<crate::exchange::transport::HttpResponse, AdapterError> {
+    let path = format!("{}/tests/fixtures/funding/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    Ok(crate::exchange::transport::HttpResponse::ok(v["response"].to_string()))
+}
+
+#[test]
+fn funding_fetch_okx_source_follows_the_last_bill_id_until_a_short_page() {
+    let (src, t) = okx_source(vec![okx_body("okx_bills_funding_page1_full"), okx_body("okx_bills_funding_page2_short")]);
+    assert!(src.per_symbol());
+    let out = block_on(fetch_range(&src, &FakePause::default(), "BTCUSDT", NOW - DAY, NOW, NOW));
+    assert_eq!(out.status, FetchStatus::Complete);
+    assert_eq!(out.entries.len(), 91 + 12);
+    let reqs = t.requests();
+    assert_eq!(reqs.len(), 2);
+    assert!(!reqs[0].url.contains("after="));
+    assert!(reqs[1].url.contains("after=623950854533513120"), "the last billId of page 1: {}", reqs[1].url);
+    assert!(reqs.iter().all(|r| crate::exchange::signed::endpoints::okx_headers_valid(&r.headers)), "every OKX request carries the demo flag exactly once");
+}
+
+#[test]
+fn funding_fetch_okx_source_a_repeated_bill_id_cursor_is_incomplete() {
+    let (src, _t) = okx_source(vec![okx_body("okx_bills_funding_page1_full"), okx_body("okx_bills_repeat_cursor")]);
+    let out = block_on(fetch_range(&src, &FakePause::default(), "BTCUSDT", NOW - DAY, NOW, NOW));
+    assert!(matches!(&out.status, FetchStatus::Incomplete(r) if r.contains("cursor repeated")), "{:?}", out.status);
+    assert_eq!(out.entries.len(), 91 + 100, "what was parsed before the failure is kept");
+}
+
+#[test]
+fn funding_fetch_okx_source_a_failing_second_page_is_incomplete_not_empty() {
+    let (src, _t) = okx_source(vec![okx_body("okx_bills_funding_page1_full"), Err(AdapterError::Timeout)]);
+    let out = block_on(fetch_range(&src, &FakePause::default(), "BTCUSDT", NOW - DAY, NOW, NOW));
+    assert!(matches!(&out.status, FetchStatus::Incomplete(r) if r.contains("page 2")), "{:?}", out.status);
+    assert_eq!(out.entries.len(), 91);
+}
+
+#[test]
+fn funding_fetch_okx_source_a_contradicting_page_writes_nothing_from_that_page() {
+    let (src, _t) = okx_source(vec![okx_body("okx_bills_sign_mismatch")]);
+    let out = block_on(fetch_range(&src, &FakePause::default(), "BTCUSDT", NOW - DAY, NOW, NOW));
+    assert!(matches!(out.status, FetchStatus::Incomplete(_)));
+    assert!(out.entries.is_empty());
 }

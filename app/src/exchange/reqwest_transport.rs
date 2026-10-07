@@ -23,6 +23,9 @@ pub enum HostPolicy {
     /// 127.0.0.1 over http: local fake servers in tests.
     #[cfg(test)]
     LocalTest,
+    /// Like `LocalTest`, but 127.0.0.1 stands in for the OKX host: the OKX header rule applies.
+    #[cfg(test)]
+    LocalOkxTest,
 }
 
 fn host_of_base(base_url: &str) -> &str {
@@ -30,14 +33,28 @@ fn host_of_base(base_url: &str) -> &str {
 }
 
 impl HostPolicy {
-    pub fn allows(self, url: &reqwest::Url) -> bool {
+    /// The ONE admission rule of every real transport (GET and order transport alike): the host
+    /// must be on the policy's list AND the headers must satisfy the OKX demo rule.
+    ///
+    /// OKX demo and production share a host, so the host alone proves nothing: on the signed
+    /// policy an OKX host (any `*.okx.com`) needs exactly one `x-simulated-trading` header whose
+    /// value is exactly `1`, and so does any request carrying an `OK-ACCESS-*` header, whatever
+    /// its host. The public policy is unsigned: it refuses both header families.
+    pub fn allows(self, url: &reqwest::Url, headers: &[(String, String)]) -> bool {
         use crate::exchange::public::endpoints::{BINANCE_HOST, BYBIT_HOST, OKX_HOST};
-        use crate::exchange::signed::endpoints::ALLOWED_SIGNED_HOSTS;
+        use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, carries_okx_auth, is_okx_host, is_protected_okx_header, okx_headers_valid};
+        let okx_rule = || okx_headers_valid(headers);
         match self {
-            HostPolicy::PublicProduction => https_host_in(url, &[host_of_base(BINANCE_HOST), host_of_base(BYBIT_HOST), host_of_base(OKX_HOST)]),
-            HostPolicy::SignedDemo => https_host_in(url, &ALLOWED_SIGNED_HOSTS),
+            HostPolicy::PublicProduction => {
+                https_host_in(url, &[host_of_base(BINANCE_HOST), host_of_base(BYBIT_HOST), host_of_base(OKX_HOST)]) && !headers.iter().any(|(n, _)| is_protected_okx_header(n))
+            }
+            HostPolicy::SignedDemo => {
+                https_host_in(url, &ALLOWED_SIGNED_HOSTS) && (!(url.host_str().is_some_and(is_okx_host) || carries_okx_auth(headers)) || okx_rule())
+            }
             #[cfg(test)]
-            HostPolicy::LocalTest => url.scheme() == "http" && url.host_str() == Some("127.0.0.1"),
+            HostPolicy::LocalTest => url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && (!carries_okx_auth(headers) || okx_rule()),
+            #[cfg(test)]
+            HostPolicy::LocalOkxTest => url.scheme() == "http" && url.host_str() == Some("127.0.0.1") && okx_rule(),
         }
     }
 }
@@ -60,8 +77,12 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     fn build(policy: HostPolicy) -> Result<Self, AdapterError> {
+        // No redirects, no environment proxy (a proxy would see signed requests and could rewrite
+        // headers). reqwest's retry policy is off by default and stays off: a signed request is
+        // sent once, retries are decided by the callers.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| AdapterError::network(e.to_string()))?;
         Ok(Self { client, policy, max_body_bytes: MAX_BODY_BYTES })
@@ -80,6 +101,11 @@ impl ReqwestTransport {
     #[cfg(test)]
     fn local_for_tests() -> Result<Self, AdapterError> {
         Self::build(HostPolicy::LocalTest)
+    }
+
+    #[cfg(test)]
+    fn local_okx_for_tests() -> Result<Self, AdapterError> {
+        Self::build(HostPolicy::LocalOkxTest)
     }
 
     #[cfg(test)]
@@ -105,7 +131,7 @@ fn map_error(e: reqwest::Error) -> AdapterError {
 impl HttpTransport for ReqwestTransport {
     async fn get(&self, req: HttpRequest) -> Result<HttpResponse, AdapterError> {
         let url = reqwest::Url::parse(&req.url).map_err(|_| AdapterError::network("invalid url"))?;
-        if !self.policy.allows(&url) {
+        if req.misuses_protected_header() || !self.policy.allows(&url, &req.headers) {
             return Err(AdapterError::network("host not allowed"));
         }
         let mut builder = self.client.get(url).timeout(req.timeout);
@@ -134,6 +160,10 @@ impl HttpTransport for ReqwestTransport {
         Ok(HttpResponse { status, headers, body: String::from_utf8_lossy(&buf).into_owned() })
     }
 }
+
+/// Serialises the tests that set `HTTP_PROXY` (process-wide state), across both transports.
+#[cfg(test)]
+pub(crate) static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
@@ -258,7 +288,7 @@ mod tests {
     // ------------------------------------------------ round 2: host policy and body limit
 
     use crate::exchange::public::endpoints::{BINANCE_HOST, BYBIT_HOST, OKX_HOST};
-    use crate::exchange::signed::endpoints::ALLOWED_SIGNED_HOSTS;
+    use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, OKX_DEMO_HOST, is_okx_host};
 
     fn url(s: &str) -> reqwest::Url {
         reqwest::Url::parse(s).unwrap()
@@ -268,41 +298,185 @@ mod tests {
     fn public_production_policy_allows_exactly_the_three_public_hosts_over_https() {
         let p = HostPolicy::PublicProduction;
         for base in [BINANCE_HOST, BYBIT_HOST, OKX_HOST] {
-            assert!(p.allows(&url(&format!("{base}/x?symbol=A"))), "{base}");
-            assert!(p.allows(&url(&format!("{base}:443/x"))), "explicit default port");
-            assert!(!p.allows(&url(&base.replace("https://", "http://"))), "plain http");
-            assert!(!p.allows(&url(&format!("{base}:8443/x"))), "other port");
-            assert!(!p.allows(&url(&format!("{base}.evil.example/x"))), "suffix lookalike");
-            assert!(!p.allows(&url(&format!("{}evil.example/x", base.replace("https://", "https://x")))), "prefix lookalike");
-            assert!(!p.allows(&url(&format!("{}@evil.example/x", base))), "userinfo trick: real host is evil.example");
-            assert!(!p.allows(&url(&format!("{}:pw@{}/x", "https://user", base.replace("https://", "")))), "credentials in URL");
+            assert!(p.allows(&url(&format!("{base}/x?symbol=A")), &[]), "{base}");
+            assert!(p.allows(&url(&format!("{base}:443/x")), &[]), "explicit default port");
+            assert!(!p.allows(&url(&base.replace("https://", "http://")), &[]), "plain http");
+            assert!(!p.allows(&url(&format!("{base}:8443/x")), &[]), "other port");
+            assert!(!p.allows(&url(&format!("{base}.evil.example/x")), &[]), "suffix lookalike");
+            assert!(!p.allows(&url(&format!("{}evil.example/x", base.replace("https://", "https://x"))), &[]), "prefix lookalike");
+            assert!(!p.allows(&url(&format!("{}@evil.example/x", base)), &[]), "userinfo trick: real host is evil.example");
+            assert!(!p.allows(&url(&format!("{}:pw@{}/x", "https://user", base.replace("https://", ""))), &[]), "credentials in URL");
         }
         for h in ALLOWED_SIGNED_HOSTS {
-            assert!(!p.allows(&url(&format!("https://{h}/x"))), "demo host {h} is not a public host");
+            assert!(!p.allows(&url(&format!("https://{h}/x")), &[]), "demo host {h} is not a public host");
         }
-        assert!(!p.allows(&url("https://example.com/")));
+        assert!(!p.allows(&url("https://example.com/"), &[]));
     }
 
     #[test]
     fn signed_demo_policy_allows_exactly_the_demo_hosts_and_never_a_production_host() {
         let p = HostPolicy::SignedDemo;
+        let sim = hdrs(&[("x-simulated-trading", "1")]);
         for h in ALLOWED_SIGNED_HOSTS {
-            assert!(p.allows(&url(&format!("https://{h}/fapi/v2/balance?timestamp=1&signature=x"))), "{h}");
-            assert!(!p.allows(&url(&format!("http://{h}/x"))), "plain http {h}");
-            assert!(!p.allows(&url(&format!("https://{h}.evil.example/x"))), "{h}");
+            let headers = if is_okx_host(h) { &sim[..] } else { &[][..] };
+            assert!(p.allows(&url(&format!("https://{h}/fapi/v2/balance?timestamp=1&signature=x")), headers), "{h}");
+            assert!(!p.allows(&url(&format!("http://{h}/x")), headers), "plain http {h}");
+            assert!(!p.allows(&url(&format!("https://{h}.evil.example/x")), headers), "{h}");
         }
         for base in [BINANCE_HOST, BYBIT_HOST, OKX_HOST] {
-            assert!(!p.allows(&url(&format!("{base}/fapi/v2/balance"))), "production host {base} must never get a signed request");
+            assert!(!p.allows(&url(&format!("{base}/fapi/v2/balance")), &sim), "production host {base} must never get a signed request");
         }
-        assert!(!p.allows(&url("https://example.com/")));
+        assert!(!p.allows(&url("https://example.com/"), &sim));
     }
 
     #[test]
     fn a_trailing_dot_or_uppercase_does_not_slip_past_the_policy() {
         let p = HostPolicy::PublicProduction;
         let base = BINANCE_HOST.replace("https://", "");
-        assert!(p.allows(&url(&format!("https://{}/", base.to_uppercase()))), "host names are case-insensitive");
-        assert!(!p.allows(&url(&format!("https://{base}./"))), "FQDN dot is not in the whitelist: refuse (fail closed)");
+        assert!(p.allows(&url(&format!("https://{}/", base.to_uppercase())), &[]), "host names are case-insensitive");
+        assert!(!p.allows(&url(&format!("https://{base}./")), &[]), "FQDN dot is not in the whitelist: refuse (fail closed)");
+    }
+
+    // ------------------------------------------------ OKX: one policy function decides host AND header
+
+    fn hdrs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn signed_demo_requires_exactly_one_simulated_header_with_value_one_for_the_okx_host() {
+        let p = HostPolicy::SignedDemo;
+        let u = url(&format!("https://{OKX_DEMO_HOST}/api/v5/account/balance"));
+        assert!(p.allows(&u, &hdrs(&[("x-simulated-trading", "1")])));
+        assert!(p.allows(&u, &hdrs(&[("OK-ACCESS-KEY", "k"), ("X-SIMULATED-TRADING", "1")])));
+        for (what, h) in [
+            ("none", hdrs(&[])),
+            ("value 0", hdrs(&[("x-simulated-trading", "0")])),
+            ("empty", hdrs(&[("x-simulated-trading", "")])),
+            ("other value", hdrs(&[("x-simulated-trading", "true")])),
+            ("duplicate 1", hdrs(&[("x-simulated-trading", "1"), ("x-simulated-trading", "1")])),
+            ("mixed-case duplicate", hdrs(&[("x-simulated-trading", "1"), ("X-Simulated-Trading", "1")])),
+            ("duplicate 0 then 1", hdrs(&[("x-simulated-trading", "0"), ("x-simulated-trading", "1")])),
+            ("only auth headers", hdrs(&[("OK-ACCESS-KEY", "k")])),
+        ] {
+            assert!(!p.allows(&u, &h), "{what} must be refused");
+        }
+    }
+
+    #[test]
+    fn an_ok_access_header_needs_the_simulated_header_on_any_host_and_never_goes_to_public_hosts() {
+        let sim = ("x-simulated-trading", "1");
+        // (b): OK-ACCESS-* present => the flag is required even on a non-OKX signed host
+        let bybit = url("https://api-demo.bybit.com/x");
+        assert!(!HostPolicy::SignedDemo.allows(&bybit, &hdrs(&[("OK-ACCESS-KEY", "k")])));
+        assert!(HostPolicy::SignedDemo.allows(&bybit, &hdrs(&[])), "ordinary Bybit requests are unchanged");
+        assert!(HostPolicy::SignedDemo.allows(&bybit, &hdrs(&[("X-BAPI-API-KEY", "k")])));
+        // public clients are unsigned: neither the flag nor OK-ACCESS-* may appear, and the public OKX host stays usable
+        let public_okx = url(&format!("{OKX_HOST}/api/v5/public/time"));
+        assert!(HostPolicy::PublicProduction.allows(&public_okx, &[]));
+        assert!(!HostPolicy::PublicProduction.allows(&public_okx, &hdrs(&[sim])));
+        assert!(!HostPolicy::PublicProduction.allows(&public_okx, &hdrs(&[("OK-ACCESS-KEY", "k")])));
+        // the signed OKX host is never reachable by the public policy, with or without the flag
+        let signed_okx = url(&format!("https://{OKX_DEMO_HOST}/x"));
+        assert!(!HostPolicy::PublicProduction.allows(&signed_okx, &hdrs(&[sim])));
+    }
+
+    /// Local fake server + `LocalOkxTest` policy (127.0.0.1 counts as an OKX host): every refusal
+    /// below must leave the connection counter at zero.
+    #[test]
+    fn local_okx_requests_without_a_valid_flag_are_refused_with_zero_connections() {
+        let (base, connections) = serve_counting(|_| Some(response("200 OK", "", "{}")));
+        let t = ReqwestTransport::local_okx_for_tests().unwrap();
+        let get = |headers: &[(&str, &str)]| {
+            let mut r = HttpRequest::get(format!("{base}/api/v5/account/balance"), Duration::from_secs(2));
+            r.headers = hdrs(headers); // bypass header(): the transport itself must not trust its input
+            block_on(t.get(r))
+        };
+        for (what, h) in [
+            ("no flag", vec![("OK-ACCESS-KEY", "k")]),
+            ("flag 0", vec![("x-simulated-trading", "0")]),
+            ("duplicate 0 and 1", vec![("x-simulated-trading", "0"), ("x-simulated-trading", "1")]),
+            ("mixed-case duplicate", vec![("x-simulated-trading", "1"), ("X-Simulated-Trading", "1")]),
+            ("no headers at all", vec![]),
+        ] {
+            assert_eq!(get(&h), Err(AdapterError::network("host not allowed")), "{what}");
+        }
+        // an attempt through the generic header() API is refused too, even though the flag is "set"
+        let via_header = HttpRequest::get(format!("{base}/api/v5/account/balance"), Duration::from_secs(2)).header("x-simulated-trading", "1").header("OK-ACCESS-KEY", "k");
+        assert_eq!(block_on(t.get(via_header)), Err(AdapterError::network("host not allowed")), "header() attempt");
+        assert_eq!(connections.load(Ordering::SeqCst), 0, "zero connections for every refusal");
+    }
+
+    #[test]
+    fn a_request_built_by_the_okx_constructor_is_sent_with_the_flag_exactly_once() {
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_in = seen.clone();
+        let (base, connections) = serve_counting(move |req| {
+            *seen_in.lock().unwrap() = req.to_lowercase();
+            Some(response("200 OK", "", "{}"))
+        });
+        let t = ReqwestTransport::local_okx_for_tests().unwrap();
+        // the constructor targets openapi.okx.com; only its parts are reused so it can hit the local server
+        let target = crate::exchange::signed::endpoints::OkxHost::Demo.target();
+        let built = HttpRequest::okx_signed_get(&target, "/p", vec![("OK-ACCESS-KEY".into(), "k".into())], Duration::from_secs(2));
+        let mut local = HttpRequest::get(format!("{base}/p"), Duration::from_secs(2));
+        local.headers = built.headers.clone();
+        assert!(block_on(t.get(local)).is_ok());
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        let raw = seen.lock().unwrap().clone();
+        assert_eq!(raw.matches("x-simulated-trading: 1").count(), 1, "{raw}");
+        assert!(raw.contains("ok-access-key: k"));
+    }
+
+    /// S3: the REAL `ReqwestTransport::get` with the real `SignedDemo` policy. The real OKX host
+    /// without the flag is refused by the policy itself (not by a failed connection) and immediately.
+    #[test]
+    fn the_real_get_transport_refuses_the_real_okx_host_without_the_flag_before_any_connection() {
+        let t = ReqwestTransport::signed_demo().unwrap();
+        let url = format!("https://{OKX_DEMO_HOST}/api/v5/account/balance");
+        let bare = || HttpRequest::get(url.clone(), Duration::from_secs(30));
+        let mut dup = bare();
+        dup.headers = hdrs(&[("x-simulated-trading", "1"), ("X-Simulated-Trading", "1")]);
+        let mut zero = bare();
+        zero.headers = hdrs(&[("x-simulated-trading", "0")]);
+        for (what, r) in [("no flag", bare()), ("duplicate", dup), ("flag 0", zero), ("header() attempt", bare().header("x-simulated-trading", "1")), ("auth only", {
+            let mut r = bare();
+            r.headers = hdrs(&[("OK-ACCESS-KEY", "k")]);
+            r
+        })] {
+            let started = Instant::now();
+            assert_eq!(block_on(t.get(r)), Err(AdapterError::network("host not allowed")), "{what}: the policy's refusal, not a network error");
+            assert!(started.elapsed() < Duration::from_millis(500), "{what}: refused before DNS / connection ({:?})", started.elapsed());
+        }
+    }
+
+    // ------------------------------------------------ no proxy, no redirect, no retry
+
+    #[test]
+    fn the_real_clients_ignore_proxy_environment_variables() {
+        // A listener plays the "proxy". The control proves the environment variable really diverts a
+        // default reqwest client (otherwise this test would pass vacuously).
+        let _guard = PROXY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (proxy, proxied) = serve_counting(|_| Some(response("200 OK", "", "via proxy")));
+        let (origin, direct) = serve_counting(|_| Some(response("200 OK", "", "direct")));
+        // SAFETY: no other test in this crate reads proxy variables; every client built here is built before the variable is removed.
+        unsafe {
+            std::env::set_var("HTTP_PROXY", &proxy);
+            std::env::set_var("http_proxy", &proxy);
+        }
+        let control = reqwest::Client::builder().build().unwrap();
+        let control_body = block_on(async { control.get(format!("{origin}/c")).send().await.unwrap().text().await.unwrap() });
+        let t = ReqwestTransport::local_for_tests().unwrap();
+        let r = block_on(t.get(HttpRequest::get(format!("{origin}/p"), Duration::from_secs(2))));
+        unsafe {
+            std::env::remove_var("HTTP_PROXY");
+            std::env::remove_var("http_proxy");
+        }
+        assert_eq!(control_body, "via proxy", "control: the environment proxy must divert a default client");
+        let before = proxied.load(Ordering::SeqCst);
+        assert_eq!(before, 1, "only the control used the proxy");
+        assert_eq!(r.unwrap().body, "direct", "the transport must connect to the origin itself");
+        assert_eq!(direct.load(Ordering::SeqCst), 1);
     }
 
     #[test]

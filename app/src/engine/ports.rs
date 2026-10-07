@@ -67,6 +67,10 @@ pub struct OrderRequest {
     pub side: OrderSide,
     pub quantity: Decimal,
     pub reduce_only: bool,
+    /// The base-coin amount this order is meant to trade (an opening leg: `SizedLeg::base_qty`);
+    /// `None` for closes and manual orders. OKX checks `sz x ctVal` against it (a coin amount
+    /// passed as contracts is refused).
+    pub intended_base_qty: Option<Decimal>,
     /// Leverage the exchange account must have on `symbol` before this order is sent. `Some` only
     /// on the opening legs of a pair (both legs carry the entry snapshot's value); close, reduce-only
     /// and manual orders carry `None` and leave the leverage alone.

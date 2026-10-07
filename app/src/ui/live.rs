@@ -395,6 +395,9 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
             return;
         }
     };
+    if let Some(w) = proxy_env_warning(|k| std::env::var(k).ok()) {
+        eprintln!("{w}");
+    }
     let signed = ReqwestTransport::signed_demo().ok().map(Arc::new);
     let weight = Arc::new(WeightGate::new(time.clone()));
     let gated = |ex: Exchange| -> Result<Arc<PublicT>, AdapterError> {
@@ -902,8 +905,24 @@ async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<ReqwestTransport>) 
     }
 }
 
+/// One line for the operator when a proxy variable is set: the signed and order clients never use
+/// an environment proxy (an intercepting proxy would see keys and signatures), unlike curl-style tools.
+fn proxy_env_warning(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let set: Vec<&str> = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"].into_iter().filter(|k| get(k).is_some_and(|v| !v.is_empty())).collect();
+    (!set.is_empty()).then(|| format!("warning: {} set; signed and order traffic ignores proxy settings (direct connections only, by design)", set.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_proxy_variable_gets_a_one_line_warning_and_nothing_else_does() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+        assert_eq!(proxy_env_warning(env(&[])), None);
+        assert_eq!(proxy_env_warning(env(&[("HTTPS_PROXY", "")])), None, "an empty value is not a proxy");
+        let w = proxy_env_warning(env(&[("HTTPS_PROXY", "http://p:1"), ("http_proxy", "http://p:1")])).unwrap();
+        assert!(w.contains("HTTPS_PROXY") && w.contains("http_proxy") && w.contains("ignores") && !w.contains("p:1") && !w.contains('\n'), "{w}");
+    }
+
     use super::*;
     use crate::ui::testkit::{d, position};
     use serde_json::json;

@@ -2,8 +2,9 @@
 //! order-capable [`DemoExecutor`] only for `EXCHANGE_DEMO`, with credentials read from the
 //! injected `SecretProvider` (the macOS Keychain in production) at that moment. Missing, empty
 //! or unreadable keys for Binance OR Bybit -> `Err` (the engine stays in SIMULATION); an empty key
-//! is never used to sign. Both are required because OKX cannot trade, so every demo pair needs
-//! both. The error text names the exchange and the reason only, never a key value.
+//! is never used to sign. Binance and Bybit are required; OKX (key, secret and passphrase) is
+//! optional: without it the executor is still built and OKX orders are not sent, with the reason.
+//! The error text names the exchange and the reason only, never a key value.
 
 use std::sync::Arc;
 
@@ -14,9 +15,11 @@ use super::binance::BinanceOrderClient;
 use super::bybit::BybitOrderClient;
 use super::executor::{DemoExecutor, IntentLedger};
 use super::http::OrderTransport;
+use super::okx::{OkxLimitsSource, OkxOrderClient};
 use crate::engine::ports::{Executor, ExecutorFactory, ServerOffsets};
 use crate::exchange::health::ratelimit::RateLimiter;
-use crate::exchange::signed::endpoints::{BinanceHost, BybitHost};
+use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost};
+use crate::exchange::signed::okx::OkxLatch;
 use crate::exchange::signed::signing::{Credentials, load_credentials};
 use crate::ports::{SecretProvider, TimeSource};
 
@@ -28,6 +31,10 @@ pub struct DemoExecutorFactory<T> {
     intents: Arc<dyn IntentLedger>,
     limiter: Arc<RateLimiter>,
     binance_env: BinanceHost,
+    okx_limits: Option<Arc<dyn OkxLimitsSource>>,
+    /// The one OKX latch of the process: every executor this factory builds shares it, and the
+    /// read client gets the same `Arc` from `okx_latch()` (okx-trading-enablement 3.5).
+    okx_latch: Arc<OkxLatch>,
 }
 
 impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
@@ -42,7 +49,19 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
         limiter: Arc<RateLimiter>,
         binance_env: BinanceHost,
     ) -> Self {
-        DemoExecutorFactory { transport, secrets, clock, offsets, intents, limiter, binance_env }
+        DemoExecutorFactory { transport, secrets, clock, offsets, intents, limiter, binance_env, okx_limits: None, okx_latch: OkxLatch::new() }
+    }
+
+    /// The process-wide OKX latch (a `50101` anywhere disables OKX everywhere).
+    pub fn okx_latch(&self) -> Arc<OkxLatch> {
+        self.okx_latch.clone()
+    }
+
+    /// Where the OKX size guard gets `ctVal` / `lotSz` / mark price / the notional cap. Without it
+    /// OKX orders are not sent (fail closed); the production wiring is okx-trading-enablement.
+    pub fn with_okx_limits(mut self, limits: Arc<dyn OkxLimitsSource>) -> Self {
+        self.okx_limits = Some(limits);
+        self
     }
 
     fn credentials(&self, exchange: Exchange) -> Result<Arc<Credentials>, String> {
@@ -55,14 +74,23 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
     pub fn build(&self) -> Result<DemoExecutor<T>, String> {
         let binance = self.credentials(Exchange::Binance)?;
         let bybit = self.credentials(Exchange::Bybit)?;
-        Ok(DemoExecutor::new(
+        let executor = DemoExecutor::new(
             BinanceOrderClient::new(self.transport.clone(), binance, self.binance_env),
             BybitOrderClient::new(self.transport.clone(), bybit, BybitHost::Demo),
             self.clock.clone(),
             self.offsets.clone(),
             self.intents.clone(),
             self.limiter.clone(),
-        ))
+        );
+        // OKX is optional (design D5): key, secret and passphrase, else OKX orders are not sent.
+        let executor = match &self.okx_limits {
+            Some(l) => executor.with_okx_limits(l.clone()),
+            None => executor,
+        };
+        Ok(match load_credentials(self.secrets.as_ref(), Exchange::Okx, true) {
+            Ok(okx) => executor.with_okx(OkxOrderClient::new(self.transport.clone(), Arc::new(okx), OkxHost::Demo).with_latch(self.okx_latch.clone())),
+            Err(reason) => executor.with_okx_unavailable(format!("OKX keys unavailable ({reason:?}); OKX order not sent")),
+        })
     }
 }
 

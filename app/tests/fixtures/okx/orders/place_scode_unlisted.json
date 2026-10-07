@@ -1,0 +1,16 @@
+{
+ "code": "1",
+ "msg": "All operations failed",
+ "data": [
+  {
+   "clOrdId": "demolo0001abcdefghijklm12345678",
+   "ordId": "",
+   "tag": "",
+   "ts": "1700000000123",
+   "sCode": "59999",
+   "sMsg": "Some undocumented failure"
+  }
+ ],
+ "inTime": "1700000000120000",
+ "outTime": "1700000000125000"
+}

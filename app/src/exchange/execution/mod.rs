@@ -20,6 +20,7 @@ pub mod endpoints;
 pub mod executor;
 pub mod factory;
 pub mod http;
+pub mod okx;
 pub mod order;
 
 #[cfg(test)]

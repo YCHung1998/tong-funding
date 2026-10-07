@@ -1,0 +1,25 @@
+{
+ "code": "0",
+ "msg": "",
+ "data": [
+  {
+   "uid": "44705892343619584",
+   "mainUid": "44705892343619584",
+   "acctLv": "2",
+   "posMode": "long_short_mode",
+   "autoLoan": false,
+   "ctIsoMode": "automatic",
+   "greeksType": "PA",
+   "level": "Lv1",
+   "levelTmp": "",
+   "mgnIsoMode": "automatic",
+   "settleCcy": "USDT",
+   "perm": "read_only,trade",
+   "roleType": "0",
+   "kycLv": "0",
+   "label": "demo",
+   "ip": "",
+   "type": "0"
+  }
+ ]
+}

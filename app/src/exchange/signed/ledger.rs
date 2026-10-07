@@ -1,6 +1,7 @@
 //! Funding ledger (income / transaction-log) signed GET clients and parsers for Binance and Bybit
 //! demo/testnet (change funding-pnl, spec funding-history-fetch). Read-only: only GET requests to
-//! the compile-time demo/testnet hosts of `endpoints`. OKX has no ledger client (no orders there).
+//! the compile-time demo/testnet hosts of `endpoints`. OKX (okx-funding-ledger) reads `bills-archive`
+//! through `OkxSignedClient`, i.e. with the demo flag built into every request.
 //!
 //! UNVERIFIED (task 1.1): the parsers follow the exchanges' public documentation only. The
 //! fixtures in `app/tests/fixtures/funding/` are constructed from the docs and say so in their
@@ -11,9 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tong_funding_core::pnl::FundingLedgerEntry;
-use tong_funding_core::types::Exchange;
+use tong_funding_core::types::{Decimal, Exchange};
 
-use super::endpoints::{BinanceHost, BybitHost};
+use super::endpoints::{BinanceHost, BybitHost, okx_inst_id, okx_symbol};
+use super::okx::OkxSignedClient;
 use super::models::{dec_req, str_req};
 use super::signing::{
     ClockOffsetSource, NotConnectedReason, RECV_WINDOW_MS, Resync, SIGNED_TIMEOUT, binance_signature, bybit_signature, check_status, encode_cursor,
@@ -27,6 +29,13 @@ use crate::ports::{Clock, SecretProvider};
 pub const BINANCE_INCOME_PATH: &str = "/fapi/v1/income";
 /// `GET /v5/account/transaction-log` (UTA).
 pub const BYBIT_TRANSACTION_LOG_PATH: &str = "/v5/account/transaction-log";
+/// `GET /api/v5/account/bills-archive` (last three months; 5 requests per 2 seconds per the docs).
+pub const OKX_BILLS_ARCHIVE_PATH: &str = "/api/v5/account/bills-archive";
+/// OKX bill `subType`s of funding: 173 expense, 174 income (UNVERIFIED against `account/subtypes`).
+pub const OKX_FUNDING_EXPENSE: &str = "173";
+pub const OKX_FUNDING_INCOME: &str = "174";
+/// Rows per page requested (documented maximum 100); a full page means there may be more.
+pub const OKX_BILLS_LIMIT: u32 = 100;
 /// Binance `incomeType` of funding payments.
 pub const BINANCE_FUNDING_FEE: &str = "FUNDING_FEE";
 /// Bybit `type` of USDT perpetual funding settlements.
@@ -99,6 +108,42 @@ pub fn parse_bybit_transaction_log(body: &Value) -> Result<LedgerPage, AdapterEr
         ));
     }
     let next_cursor = body.pointer("/result/nextPageCursor").and_then(Value::as_str).filter(|c| !c.is_empty()).map(str::to_string);
+    Ok(LedgerPage { entries, rows: rows.len(), next_cursor })
+}
+
+/// OKX bills body (`code` already checked by the signed client; a body with a non-"0" code is
+/// refused here too). Only `subType` 173 / 174 rows become entries; `balChg` is the signed change
+/// (income positive). A sign that contradicts the sub type, a currency other than USDT, a missing
+/// field or an instrument the system cannot name fails the WHOLE page (nothing is written from it).
+/// `rows` counts every raw row; a full page gives the last row's `billId` as the next `after`.
+pub fn parse_okx_bills(body: &Value) -> Result<LedgerPage, AdapterError> {
+    if body.get("code").and_then(Value::as_str).is_some_and(|c| c != "0") {
+        return Err(AdapterError::parse("bills: the body reports an error code"));
+    }
+    let rows = body.get("data").and_then(Value::as_array).ok_or_else(|| AdapterError::parse("bills: missing data list"))?;
+    let mut entries = Vec::new();
+    for r in rows {
+        let sub_type = str_req(r, "subType")?;
+        if sub_type != OKX_FUNDING_EXPENSE && sub_type != OKX_FUNDING_INCOME {
+            continue;
+        }
+        let amount = dec_req(r, "balChg")?;
+        if (sub_type == OKX_FUNDING_EXPENSE && amount > Decimal::ZERO) || (sub_type == OKX_FUNDING_INCOME && amount < Decimal::ZERO) {
+            return Err(AdapterError::parse(format!("bills: subType {sub_type} contradicts the sign of balChg {amount}")));
+        }
+        let asset = str_req(r, "ccy")?;
+        if asset != "USDT" {
+            return Err(AdapterError::parse(format!("bills: funding row in {asset}, only USDT is supported")));
+        }
+        let inst_id = str_req(r, "instId")?;
+        let symbol = okx_symbol(&inst_id).ok_or_else(|| AdapterError::parse(format!("bills: funding row of an instrument the system cannot name ({inst_id})")))?;
+        let ts: i64 = str_req(r, "ts")?.parse().map_err(|_| AdapterError::parse("bills: ts is not an integer"))?;
+        entries.push(FundingLedgerEntry::new(Exchange::Okx, symbol, amount, asset, ts, str_req(r, "billId")?, sub_type, r.clone()));
+    }
+    let next_cursor = match rows.last() {
+        Some(last) if rows.len() >= OKX_BILLS_LIMIT as usize => Some(str_req(last, "billId")?),
+        _ => None,
+    };
     Ok(LedgerPage { entries, rows: rows.len(), next_cursor })
 }
 
@@ -293,6 +338,30 @@ impl<T: HttpTransport> BybitLedgerClient<T> {
     }
 }
 
+// ---- OKX bills --------------------------------------------------------------------------------------
+
+impl<T: HttpTransport> OkxSignedClient<T> {
+    /// One page of funding bills of `symbol` in `[begin_ms, end_ms]` (at most 7 days, our own
+    /// window rule); `after` = the previous page's last `billId` (results are newest first).
+    /// Same request construction, demo flag, `50102` retry and latch as every other OKX read.
+    pub async fn bills_page(&self, symbol: &str, begin_ms: i64, end_ms: i64, after: Option<&str>) -> Result<LedgerPage, AdapterError> {
+        let inst_id = okx_inst_id(symbol).ok_or_else(|| AdapterError::parse("symbol is not a BASEUSDT symbol"))?;
+        let mut params = vec![
+            ("instType", "SWAP".to_string()),
+            ("instId", inst_id),
+            ("type", "8".to_string()),
+            ("begin", begin_ms.to_string()),
+            ("end", end_ms.to_string()),
+            ("limit", OKX_BILLS_LIMIT.to_string()),
+        ];
+        if let Some(a) = after {
+            params.push(("after", a.to_string()));
+        }
+        let (body, _) = self.signed_get(OKX_BILLS_ARCHIVE_PATH, &encode_query(&params)).await?;
+        parse_okx_bills(&body)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,7 +371,7 @@ mod tests {
     use serde_json::json;
     use tong_funding_core::types::Decimal;
 
-    use crate::exchange::signed::endpoints::ALLOWED_SIGNED_HOSTS;
+    use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, OkxHost};
     use crate::exchange::transport::FakeTransport;
     use crate::ports::{ManualClock, MemorySecrets, SecretName};
 
@@ -436,5 +505,162 @@ mod tests {
         let t = Arc::new(FakeTransport::new().on(BYBIT_TRANSACTION_LOG_PATH, Ok(HttpResponse::ok(json!({"retCode": 10006, "retMsg": "Too many visits"}).to_string()))));
         let c = BybitLedgerClient::new(t, secrets(Exchange::Bybit), Arc::new(ManualClock::new(NOW)), Arc::new(|| Some(0)), Arc::new(NoResync), BybitHost::Demo);
         assert_eq!(block_on(c.transaction_log_page(1, 2, None)), Err(AdapterError::RateLimited { retry_after_ms: None }));
+    }
+
+    // ---- OKX bills-archive (okx-funding-ledger; fixtures are hand-built from the docs) ----
+
+    fn okx_fixture(name: &str) -> Value {
+        let path = format!("{}/tests/fixtures/funding/{name}.json", env!("CARGO_MANIFEST_DIR"));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(v["_fixture_note"].as_str().unwrap().starts_with("依文件構造、未在真實 demo 帳戶驗證"), "fixtures must say they are not recorded responses");
+        v["response"].clone()
+    }
+
+    #[test]
+    fn okx_parse_a_funding_expense_row_becomes_a_signed_entry_on_the_system_symbol() {
+        let page = parse_okx_bills(&okx_fixture("okx_bills_funding_page1_full")).unwrap();
+        let e = page.entries.iter().find(|e| e.exchange_id == "623950854533513219").unwrap();
+        assert_eq!((e.exchange, e.symbol.as_str(), e.amount, e.asset.as_str()), (Exchange::Okx, "BTCUSDT", d("-0.42"), "USDT"));
+        assert_eq!((e.settled_at_ms, e.kind.as_str()), (1_700_000_000_000, "173"));
+        assert_eq!(e.dedupe_key, "okx:173:623950854533513219");
+        assert_eq!(e.raw["balChg"], json!("-0.42"), "the whole original row is kept");
+    }
+
+    #[test]
+    fn okx_parse_keeps_only_173_and_174_counts_raw_rows_and_gives_the_last_bill_id_as_cursor() {
+        let page = parse_okx_bills(&okx_fixture("okx_bills_funding_page1_full")).unwrap();
+        assert_eq!(page.rows, 100, "raw rows, including the trade rows");
+        assert_eq!(page.entries.len(), 91, "the nine trade rows (type 2) are not funding");
+        assert!(page.entries.iter().all(|e| e.kind == "173" || e.kind == "174"));
+        assert_eq!(page.next_cursor.as_deref(), Some("623950854533513120"), "full page: the last billId is `after` of the next page");
+        let short = parse_okx_bills(&okx_fixture("okx_bills_funding_page2_short")).unwrap();
+        assert_eq!((short.rows, short.entries.len(), short.next_cursor), (12, 12, None), "fewer than the limit: exhausted");
+        // income is positive
+        assert!(page.entries.iter().any(|e| e.kind == "174" && e.amount > Decimal::ZERO));
+    }
+
+    #[test]
+    fn okx_parse_a_sign_that_contradicts_the_subtype_fails_the_whole_page() {
+        let e = parse_okx_bills(&okx_fixture("okx_bills_sign_mismatch")).unwrap_err();
+        assert!(matches!(e, AdapterError::Parse(_)) && e.to_string().contains("174"), "{e}");
+        // and 173 with a positive amount
+        let body = json!({"code":"0","data":[{"billId":"1","type":"8","subType":"173","balChg":"0.5","ccy":"USDT","instId":"BTC-USDT-SWAP","ts":"1"}]});
+        assert!(matches!(parse_okx_bills(&body), Err(AdapterError::Parse(_))));
+    }
+
+    #[test]
+    fn okx_parse_a_non_usdt_currency_or_a_missing_field_fails_instead_of_being_skipped() {
+        assert!(matches!(parse_okx_bills(&okx_fixture("okx_bills_not_usdt")), Err(AdapterError::Parse(_))));
+        let no_id = json!({"code":"0","data":[{"type":"8","subType":"173","balChg":"-1","ccy":"USDT","instId":"BTC-USDT-SWAP","ts":"1"}]});
+        assert!(matches!(parse_okx_bills(&no_id), Err(AdapterError::Parse(_))));
+        let bad_inst = json!({"code":"0","data":[{"billId":"1","type":"8","subType":"173","balChg":"-1","ccy":"USDT","instId":"BTC-USD-SWAP","ts":"1"}]});
+        assert!(matches!(parse_okx_bills(&bad_inst), Err(AdapterError::Parse(_))), "a funding row of an instrument the system cannot name");
+        assert!(matches!(parse_okx_bills(&json!({"code":"0"})), Err(AdapterError::Parse(_))));
+    }
+
+    fn okx_client(t: &Arc<FakeTransport>, secrets: Arc<dyn SecretProvider>) -> OkxSignedClient<FakeTransport> {
+        OkxSignedClient::new(t.clone(), secrets, Arc::new(ManualClock::new(1_607_418_537_000)), Arc::new(|| Some(715)), Arc::new(NoResync), OkxHost::Demo)
+    }
+
+    fn okx_secrets() -> Arc<dyn SecretProvider> {
+        Arc::new(
+            MemorySecrets::default()
+                .with(Exchange::Okx, SecretName::ApiKey, "TEST_KEY_NOT_REAL")
+                .with(Exchange::Okx, SecretName::ApiSecret, "TEST_SECRET_NOT_REAL")
+                .with(Exchange::Okx, SecretName::Passphrase, "TEST_PASS_NOT_REAL"),
+        )
+    }
+
+    #[test]
+    fn okx_client_sends_the_documented_filters_with_the_demo_flag_and_passes_after_on() {
+        let body = okx_fixture("okx_bills_funding_page2_short").to_string();
+        let t = Arc::new(FakeTransport::new().on(OKX_BILLS_ARCHIVE_PATH, Ok(HttpResponse::ok(body))));
+        let c = okx_client(&t, okx_secrets());
+        let page = block_on(c.bills_page("BTCUSDT", 10, 20, Some("623950854533513120"))).unwrap();
+        assert_eq!(page.entries.len(), 12);
+        let reqs = t.requests();
+        assert_eq!(reqs.len(), 1);
+        let url = &reqs[0].url;
+        assert!(url.starts_with("https://openapi.okx.com/api/v5/account/bills-archive?"), "{url}");
+        for p in ["instType=SWAP", "instId=BTC-USDT-SWAP", "type=8", "begin=10", "end=20", "limit=100", "after=623950854533513120"] {
+            assert!(url.contains(p), "{p} missing in {url}");
+        }
+        let flags: Vec<&str> = reqs[0].headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("x-simulated-trading")).map(|(_, v)| v.as_str()).collect();
+        assert_eq!(flags, vec!["1"]);
+        // the first page has no `after`
+        let t = Arc::new(FakeTransport::new().on(OKX_BILLS_ARCHIVE_PATH, Ok(HttpResponse::ok(okx_fixture("okx_bills_funding_page2_short").to_string()))));
+        block_on(okx_client(&t, okx_secrets()).bills_page("BTCUSDT", 10, 20, None)).unwrap();
+        assert!(!t.requests()[0].url.contains("after="));
+    }
+
+    #[test]
+    fn okx_client_a_rejected_timestamp_is_retried_once_and_rate_limits_are_reported() {
+        let ok = okx_fixture("okx_bills_funding_page2_short").to_string();
+        let expired = json!({"code":"50102","msg":"Timestamp request expired","data":[]}).to_string();
+        let t = Arc::new(FakeTransport::new().on(OKX_BILLS_ARCHIVE_PATH, Ok(HttpResponse::ok(expired))).on(OKX_BILLS_ARCHIVE_PATH, Ok(HttpResponse::ok(ok))));
+        let c = okx_client(&t, okx_secrets());
+        assert!(block_on(c.bills_page("BTCUSDT", 1, 2, None)).is_ok());
+        let reqs = t.requests();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs.iter().all(|r| r.headers.iter().any(|(n, v)| n.eq_ignore_ascii_case("x-simulated-trading") && v == "1")), "the retry carries the flag too");
+        let limited = json!({"code":"50011","msg":"Too Many Requests","data":[]}).to_string();
+        let t = Arc::new(FakeTransport::new().on(OKX_BILLS_ARCHIVE_PATH, Ok(HttpResponse::ok(limited))));
+        assert_eq!(block_on(okx_client(&t, okx_secrets()).bills_page("BTCUSDT", 1, 2, None)), Err(AdapterError::RateLimited { retry_after_ms: None }));
+    }
+
+    #[test]
+    fn okx_client_without_a_passphrase_sends_nothing() {
+        let t = Arc::new(FakeTransport::new());
+        let no_pass: Arc<dyn SecretProvider> = Arc::new(MemorySecrets::default().with(Exchange::Okx, SecretName::ApiKey, "k").with(Exchange::Okx, SecretName::ApiSecret, "s"));
+        assert_eq!(block_on(okx_client(&t, no_pass).bills_page("BTCUSDT", 1, 2, None)), Err(AdapterError::NotConnected));
+        assert!(t.requests().is_empty());
+    }
+
+    #[test]
+    fn okx_client_rejects_a_symbol_that_is_not_base_usdt_before_any_request() {
+        let t = Arc::new(FakeTransport::new());
+        assert!(matches!(block_on(okx_client(&t, okx_secrets()).bills_page("BTCUSD", 1, 2, None)), Err(AdapterError::Parse(_))));
+        assert!(t.requests().is_empty());
+    }
+
+    /// Real-machine probe (okx-funding-ledger task 3.2). `#[ignore]`: it reads the macOS Keychain and
+    /// sends GETs to OKX, so only the user runs it, after a demo position crossed a settlement:
+    ///   cargo test -p tong-funding okx_live_bills_probe -- --ignored --nocapture
+    /// Optional: `TONG_OKX_SYMBOL=ETHUSDT`. Only `bills-archive` GETs, all carrying the demo flag.
+    #[test]
+    #[ignore = "reads the real Keychain and sends GETs to OKX; the user runs it (okx-funding-ledger 3.2)"]
+    fn okx_live_bills_probe() {
+        use crate::exchange::health::clock_sync::ClockSync;
+        use crate::exchange::public::endpoints::OKX_HOST;
+        use crate::exchange::reqwest_transport::ReqwestTransport;
+        use crate::ports::SystemClock;
+        use crate::store::secrets::BundleSecrets;
+        let symbol = std::env::var("TONG_OKX_SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let clock = Arc::new(SystemClock);
+            let public = ReqwestTransport::public_production().expect("public transport");
+            let off = ClockSync::new(clock.clone()).sync_once(&public, Exchange::Okx, OKX_HOST).await.expect("OKX time").offset_ms;
+            let signed = OkxSignedClient::new(
+                Arc::new(ReqwestTransport::signed_demo().expect("signed transport")),
+                Arc::new(BundleSecrets::system()),
+                clock.clone(),
+                Arc::new(move || Some(off)),
+                Arc::new(NoResync),
+                OkxHost::Demo,
+            );
+            let client = signed;
+            let now = crate::ports::Clock::now_ms(clock.as_ref());
+            let page = client.bills_page(&symbol, now - 7 * 24 * 3_600_000, now, None).await;
+            match page {
+                Ok(p) => {
+                    println!("rows {} (funding entries {}); next cursor {:?}", p.rows, p.entries.len(), p.next_cursor);
+                    for e in &p.entries {
+                        println!("  {} {} {} {} (subType {}, billId {})", e.settled_at_ms, e.symbol, e.amount, e.asset, e.kind, e.exchange_id);
+                    }
+                }
+                Err(e) => println!("bills page failed: {e}"),
+            }
+        });
     }
 }

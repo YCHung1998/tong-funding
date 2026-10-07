@@ -1,0 +1,54 @@
+{
+ "code": "0",
+ "msg": "",
+ "data": [
+  {
+   "adjEq": "55415.9",
+   "availEq": "55415.62",
+   "borrowFroz": "",
+   "details": [
+    {
+     "ccy": "USDT",
+     "eq": "50000",
+     "cashBal": "50000",
+     "uTime": "1700000000000",
+     "isoEq": "0",
+     "availEq": "49000.1",
+     "disEq": "",
+     "fixedBal": "0",
+     "availBal": "50000",
+     "frozenBal": "165.69",
+     "ordFrozen": "0",
+     "liab": "",
+     "upl": "-0.6",
+     "uplLiab": "",
+     "crossLiab": "",
+     "rewardBal": "",
+     "isoLiab": "",
+     "mgnRatio": "",
+     "interest": "",
+     "twap": "0",
+     "maxLoan": "",
+     "eqUsd": "50000",
+     "borrowFroz": "",
+     "notionalLever": "",
+     "stgyEq": "0",
+     "isoUpl": "0",
+     "spotInUseAmt": "",
+     "spotIsoBal": "",
+     "imr": "",
+     "mmr": ""
+    }
+   ],
+   "imr": "0",
+   "isoEq": "0",
+   "mgnRatio": "",
+   "mmr": "0",
+   "notionalUsd": "0",
+   "ordFroz": "0",
+   "totalEq": "55415.9",
+   "uTime": "1700000000000",
+   "upl": "0"
+  }
+ ]
+}

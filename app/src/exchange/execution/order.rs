@@ -93,6 +93,10 @@ impl ValidOrder {
     pub fn quantity_text(&self) -> String {
         self.quantity.to_string()
     }
+    /// The quantity as a number (for guards); sending always uses [`Self::quantity_text`].
+    pub fn quantity(&self) -> Decimal {
+        self.quantity
+    }
     pub fn reduce_only(&self) -> bool {
         self.reduce_only
     }
@@ -113,6 +117,7 @@ mod tests {
             side: OrderSide::Buy,
             quantity: qty.parse().unwrap(),
             reduce_only: false,
+            intended_base_qty: None,
             leverage: None,
         }
     }

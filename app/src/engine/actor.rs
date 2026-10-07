@@ -1124,6 +1124,7 @@ impl Actor {
                 side: OrderSide::for_leg(side_of(leg), OrderAction::Open),
                 quantity: sized.order_qty.value(),
                 reduce_only: false,
+                intended_base_qty: Some(sized.base_qty),
                 // Both legs open at the entry snapshot's leverage (order-leverage-sync).
                 leverage: Some(entry.leverage),
             };
@@ -1476,6 +1477,7 @@ impl Actor {
                 side: OrderSide::for_leg(side_of(leg), OrderAction::Close),
                 quantity: close_qty,
                 reduce_only: true,
+                intended_base_qty: None,
                 leverage: None,
             };
             legs[idx(leg)] = Some(LegOrder::new(req, Decimal::ONE));
@@ -1597,6 +1599,7 @@ impl Actor {
             side: o.side,
             quantity: o.quantity,
             reduce_only: o.reduce_only,
+            intended_base_qty: None,
             leverage,
         };
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
@@ -1728,6 +1731,11 @@ impl Actor {
                 if let Some(mut p) = fill_event {
                     if let Some((leg, a)) = ids::leg_action_of(&client_order_id) {
                         p["leg"] = json!(leg.as_str());
+                        if p["exchange"] == json!(Exchange::Okx.name())
+                            && let Some(ct_val) = self.okx_ct_val_of(&pair, leg)
+                        {
+                            p["ct_val"] = json!(dstr(ct_val));
+                        }
                         if a == OrderAction::Close {
                             self.add_close_reference(&pair, leg, &mut p);
                         }
@@ -1771,6 +1779,13 @@ impl Actor {
         }
     }
 
+    /// The contract value an OKX leg was sized with: the open order's `unit_base` (a close order's
+    /// own unit is not a contract value, but the close is in the same contracts as the open).
+    /// `None` when the pair's open order is not in memory (e.g. after a restart): PnL then says so.
+    fn okx_ct_val_of(&self, pair: &str, leg: Leg) -> Option<Decimal> {
+        self.flows.get(pair).and_then(|f| f.open.as_ref()).and_then(|s| s.legs[idx(leg)].as_ref()).map(|o| o.unit_base)
+    }
+
     fn on_submitted(&mut self, pair: &str, leg: Leg, action: OrderAction, client_order_id: &str, outcome: SubmitOutcome) {
         let simulated = self.pairs.get(pair).is_some_and(|v| v.simulated);
         let mut payload = outcome_json(&outcome);
@@ -1791,6 +1806,13 @@ impl Actor {
         }
         if action == OrderAction::Close {
             self.add_close_reference(pair, leg, &mut payload);
+        }
+        // OKX quantities are contracts: record the contract value the order was sized with, so PnL
+        // can turn them into coins without guessing (okx-funding-ledger D5).
+        if payload["exchange"] == json!(Exchange::Okx.name())
+            && let Some(ct_val) = self.okx_ct_val_of(pair, leg)
+        {
+            payload["ct_val"] = json!(dstr(ct_val));
         }
         self.note(ORDER_SUBMITTED, Some(pair), payload);
         let Some(o) = self.flows.get_mut(pair).and_then(|f| f.set_mut(action)).and_then(|s| s.find_mut(client_order_id)) else {
@@ -2828,6 +2850,7 @@ mod tests {
             side: OrderSide::Buy,
             quantity: Decimal::new(1, 3),
             reduce_only: false,
+            intended_base_qty: None,
             leverage: None,
         };
         actor.spawn_submit("u-hang".into(), Leg::Long, OrderAction::Open, req, None);
@@ -2905,6 +2928,7 @@ mod tests {
             side,
             quantity: Decimal::new(19, 3),
             reduce_only: false,
+            intended_base_qty: None,
             leverage: None,
         };
         let triggered = T0 - 40;

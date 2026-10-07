@@ -28,7 +28,11 @@ pub(crate) struct Fx {
 }
 
 fn add_pair(db: &Db, uuid: &str, symbol: &str, simulated: bool) {
-    let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: T, simulated, scan: json!({}) };
+    add_pair_on(db, uuid, symbol, simulated, Exchange::Binance, Exchange::Bybit);
+}
+
+fn add_pair_on(db: &Db, uuid: &str, symbol: &str, simulated: bool, long: Exchange, short: Exchange) {
+    let env = PairEnvelope { long_exchange: long, short_exchange: short, settlement_ms: T, simulated, scan: json!({}) };
     let p = NewPair { internal_uuid: uuid.into(), pair_id: format!("pid-{uuid}"), symbol: symbol.into(), status: PairState::Prepared, entry: serde_json::to_value(env).unwrap() };
     db.add_pair_if_not_pending(&p).unwrap();
     db.set_pair_status(uuid, PairState::Closing).unwrap();
@@ -286,6 +290,129 @@ fn pnl_record_a_missing_close_reference_keeps_the_result_incomplete_with_the_rea
     let latest = latest_pnl(&fx.db, "p1").unwrap().unwrap();
     let reasons: Vec<String> = serde_json::from_value(latest.payload["reasons"].clone()).unwrap();
     assert_eq!(reasons, vec!["無參考價（Bybit demo-p1-short-close）".to_string()], "only the short close lacks a reference");
+}
+
+// ---- okx-funding-ledger: OKX legs are in contracts; ct_val makes them coins ------------------------
+
+/// Bybit long + OKX short on BTCUSDT; the OKX orders are 3 contracts, `ct_val` (when given) on every event.
+pub(crate) fn okx_round(ct_val: Option<&str>, close_reference: &str) -> Fx {
+    okx_round_with(ct_val, ct_val, close_reference)
+}
+
+/// Like `okx_round`, with separate `ct_val`s for the open and the close events (a close after a restart has none).
+pub(crate) fn okx_round_with(open_ct: Option<&str>, close_ct: Option<&str>, close_reference: &str) -> Fx {
+    let (dir, db, clock) = open_tmp();
+    let fx = Fx { events: EventStore::new(db.clone()), _dir: dir, db, clock };
+    add_pair_on(&fx.db, "p1", "BTCUSDT", false, Exchange::Bybit, Exchange::Okx);
+    let snap = {
+        let leg = |ex: &str| json!({ "exchange": ex, "expected_price": "60000", "next_funding_time": T, "funding_interval_secs": H8 });
+        json!({ "long": leg("Bybit"), "short": leg("Okx"), "notional_usdt": "1800", "leverage": "5",
+            "net_edge": { "net_edge_usdt": "1", "funding_income_usdt": "2", "fee_usdt": "0.5", "slippage_usdt": "0.1", "safety_margin_usdt": "0.1" } })
+    };
+    at(&fx, T - 10_000, |es| {
+        es.append("PAIR_TRANSITION", Some("p1"), json!({ "from": "PRE_TRADE_CHECK", "to": "ORDER_SUBMIT", "detail": { "checks": "pass", "entry_snapshot": snap } })).unwrap();
+    });
+    let ev = |fx: &Fx, ts: i64, leg: &str, action: &str, exchange: Exchange, qty: &str, avg: &str, reference: Option<&str>| {
+        at(fx, ts, |es| {
+            let mut p = json!({
+                "outcome": "accepted", "state": "Filled", "filled_quantity": qty, "avg_price": avg, "fee": "0.3", "fee_asset": "USDT",
+                "client_order_id": format!("demo-p1-{leg}-{action}"), "leg": leg, "action": action, "simulated": false,
+                "exchange": exchange.name(), "symbol": "BTCUSDT",
+            });
+            let ct_val = if action == "open" { open_ct } else { close_ct };
+            if exchange == Exchange::Okx && let Some(c) = ct_val {
+                p["ct_val"] = json!(c);
+            }
+            if let Some(r) = reference {
+                p["reference_price"] = json!(r);
+            }
+            es.append("ORDER_SUBMITTED", Some("p1"), p).unwrap();
+        });
+    };
+    ev(&fx, T - 10_000, "long", "open", Exchange::Bybit, "0.03", "60000", None);
+    ev(&fx, T - 10_000, "short", "open", Exchange::Okx, "3", "60000", None);
+    ev(&fx, T + 15_000, "long", "close", Exchange::Bybit, "0.03", "60300", Some("60300"));
+    ev(&fx, T + 15_000, "short", "close", Exchange::Okx, "3", "60300", Some(close_reference));
+    fx
+}
+
+#[test]
+fn okx_fills_become_coin_quantities_with_their_own_prices() {
+    let fx = okx_round(Some("0.01"), "60300");
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    let short = &a.input.legs[1];
+    assert_eq!(short.exchange, Exchange::Okx);
+    assert_eq!(short.fills.iter().map(|f| f.quantity).collect::<Vec<_>>(), vec![d("0.03"), d("0.03")], "3 contracts x 0.01 = 0.03 BTC");
+    assert_eq!((short.fills[0].expected_price, short.fills[0].actual_price), (Some(d("60000")), Some(d("60000"))));
+    assert_eq!((short.fills[1].expected_price, short.fills[1].actual_price), (Some(d("60300")), Some(d("60300"))));
+    assert!(short.fills.iter().all(|f| !f.contract_value_missing));
+    // the short opened at 60000 and closed at 60300: price PnL (60000 - 60300) x 0.03 = -9
+    let b = tong_funding_core::pnl::compute_pnl(&a.input);
+    assert_eq!(b.legs[1].components.price_actual, d("-9"));
+    assert_eq!(b.legs[0].components.price_actual, d("9"), "the Bybit long gains the same 9");
+}
+
+#[test]
+fn okx_fills_without_a_contract_value_are_unknown_and_named() {
+    let fx = okx_round(None, "60300");
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    assert!(a.input.legs[1].fills.iter().all(|f| f.contract_value_missing));
+    assert!(a.input.legs[0].fills.iter().all(|f| !f.contract_value_missing), "Bybit is unaffected");
+    both_okx_fetched(&fx);
+    fx.clock.set(T + 700_000);
+    let r = settle_pnl(&fx.db, "p1", T + 700_000, true).unwrap();
+    assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "INCOMPLETE"), "{r:?}");
+    let latest = latest_pnl(&fx.db, "p1").unwrap().unwrap();
+    assert!(latest.payload["reasons"].to_string().contains("OKX 成交缺合約面值"), "{}", latest.payload["reasons"]);
+}
+
+pub(crate) fn both_okx_fetched(fx: &Fx) {
+    fetched(fx, Exchange::Bybit, None, T - 10_000, T + 15_000);
+    fetched(fx, Exchange::Okx, Some("BTCUSDT"), T - 10_000, T + 15_000);
+}
+
+#[test]
+fn okx_funding_follows_the_fetch_state_instead_of_being_never_fetched() {
+    let fx = okx_round(Some("0.01"), "60300");
+    let state = |fx: &Fx| assemble(&fx.db, "p1", T + 80_000).unwrap().input.legs[1].funding_fetch.clone();
+    assert_eq!(state(&fx), FundingFetchState::NotFetched, "nothing fetched yet");
+    both_okx_fetched(&fx);
+    assert_eq!(state(&fx), FundingFetchState::Fetched);
+    let fx2 = okx_round(Some("0.01"), "60300");
+    at(&fx2, T + 70_000, |es| {
+        es.append(FUNDING_LEDGER_FETCHED, None, json!({ "exchange": Exchange::Okx.name(), "symbol": "BTCUSDT", "start_ms": T - 10_000, "end_ms": T + 15_000, "outcome": "incomplete", "reason": "page 2 failed" })).unwrap();
+    });
+    assert_eq!(state(&fx2), FundingFetchState::Failed("page 2 failed".into()));
+}
+
+#[test]
+fn okx_funding_entries_are_attributed_to_the_okx_leg() {
+    let fx = okx_round(Some("0.01"), "60300");
+    let okx = FundingLedgerEntry::new(Exchange::Okx, "BTCUSDT", d("-0.42"), "USDT", T + 500, "623950854533513219", "173", json!({}));
+    fx.db.write_funding_ledger(&[okx, ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    assert_eq!(a.input.legs[1].funding.len(), 1);
+    assert_eq!(a.input.legs[1].funding[0].amount, d("-0.42"));
+    both_okx_fetched(&fx);
+    fx.clock.set(T + 80_000);
+    let r = settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "COMPLETE"), "{r:?}");
+}
+
+#[test]
+fn an_okx_close_after_a_restart_has_no_contract_value_and_the_pair_is_incomplete_without_a_quantity_mismatch() {
+    // S1 at the store level: the open event carries ct_val, the close (written after a restart) does not
+    let fx = okx_round_with(Some("0.01"), None, "60300");
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    let short = &a.input.legs[1];
+    assert!(!short.fills[0].contract_value_missing && short.fills[1].contract_value_missing);
+    both_okx_fetched(&fx);
+    fx.clock.set(T + 700_000);
+    let r = settle_pnl(&fx.db, "p1", T + 700_000, true).unwrap();
+    assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "INCOMPLETE"), "{r:?}");
+    let reasons = latest_pnl(&fx.db, "p1").unwrap().unwrap().payload["reasons"].to_string();
+    assert!(reasons.contains("OKX 成交缺合約面值"), "{reasons}");
+    assert!(!reasons.contains("開平倉數量不一致"), "{reasons}");
 }
 
 /// candidate-readd-after-close: a symbol re-added while its earlier pair still waits for PnL. The

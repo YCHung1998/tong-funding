@@ -223,7 +223,7 @@ mod tests {
     const TS: i64 = 1_700_000_001_200;
 
     fn creds() -> Arc<Credentials> {
-        Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into() })
+        Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into(), passphrase: None })
     }
 
     fn id() -> String {
@@ -238,6 +238,7 @@ mod tests {
             side: if reduce_only { OrderSide::Sell } else { OrderSide::Buy },
             quantity: "0.019".parse().unwrap(),
             reduce_only,
+            intended_base_qty: None,
             leverage: None,
         })
         .unwrap()

@@ -3,7 +3,9 @@
 //! `positionAmt` is already signed, Bybit's unsigned `size` is normalised with `side` by the
 //! signed client (design Open Question 8). Lists say whether they are complete; an incomplete
 //! list is never "nothing". A hedge-mode position makes the list unusable (`Err`): the engine
-//! assumes one-way and summing both sides would hide exposure. OKX: `Err` (unsupported).
+//! assumes one-way and summing both sides would hide exposure. OKX (okx-signed-read): positions in CONTRACTS (`AccountPosition` unit contract), open orders
+//! `sz - accFillSz` in contracts, margin = the exchange's `availEq`. Without a wired OKX client, a
+//! missing key, an unsupported account mode or a failed query is an `Err` with the reason.
 
 use std::sync::Arc;
 
@@ -12,21 +14,45 @@ use tong_funding_core::types::{Decimal, Exchange};
 use crate::engine::ports::{AccountOrder, AccountPosition, AccountView, BoxFut, Listed};
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
+use crate::exchange::signed::okx::OkxSignedClient;
+use crate::exchange::error::AdapterError;
 use crate::exchange::signed::models::{Balance, OpenOrder, Position, PositionMode};
 use crate::exchange::transport::HttpTransport;
 
-pub const OKX_ACCOUNT_UNSUPPORTED: &str = "OKX account queries are unsupported (public market data only)";
+/// OKX has no per-symbol leverage cap lookup yet (okx-trading-enablement: OKX leverage sync).
+pub const OKX_MAX_LEVERAGE_UNSUPPORTED: &str = "OKX max leverage lookup is not implemented yet";
+/// Reason when no OKX client was given to the view (not wired yet: UI wiring is okx-trading-enablement).
+pub const OKX_NOT_WIRED: &str = "OKX account client is not wired";
 /// Asset whose available balance is the margin of USDT-margined contracts.
 pub const MARGIN_ASSET: &str = "USDT";
 
 pub struct DemoAccountView<T> {
     binance: Arc<BinanceSignedClient<T>>,
     bybit: Arc<BybitSignedClient<T>>,
+    okx: Option<Arc<OkxSignedClient<T>>>,
 }
 
 impl<T: HttpTransport + 'static> DemoAccountView<T> {
     pub fn new(binance: Arc<BinanceSignedClient<T>>, bybit: Arc<BybitSignedClient<T>>) -> Self {
-        DemoAccountView { binance, bybit }
+        DemoAccountView { binance, bybit, okx: None }
+    }
+
+    /// Adds the OKX signed client; without it every OKX query is `Err(OKX_NOT_WIRED)`.
+    pub fn with_okx(mut self, okx: Arc<OkxSignedClient<T>>) -> Self {
+        self.okx = Some(okx);
+        self
+    }
+
+    /// Error text of an OKX query; a not-connected answer names its reason (`NoPassphrase`, ...).
+    fn okx_error(okx: &OkxSignedClient<T>, e: AdapterError) -> String {
+        match (&e, okx.last_not_connected_reason()) {
+            (AdapterError::NotConnected, Some(reason)) => format!("OKX: not connected ({reason:?})"),
+            _ => format!("OKX: {e}"),
+        }
+    }
+
+    fn okx(&self) -> Result<&Arc<OkxSignedClient<T>>, String> {
+        self.okx.as_ref().ok_or_else(|| OKX_NOT_WIRED.to_string())
     }
 }
 
@@ -75,7 +101,13 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
                     let complete = l.is_complete();
                     to_positions(exchange, l.items, complete)
                 }
-                Exchange::Okx => Err(OKX_ACCOUNT_UNSUPPORTED.to_string()),
+                Exchange::Okx => {
+                    let okx = self.okx()?;
+                    let l = okx.get_positions().await.map_err(|e| Self::okx_error(okx, e))?;
+                    let complete = l.is_complete();
+                    let items = l.items.into_iter().map(|p| AccountPosition { exchange, symbol: p.symbol, quantity: p.contracts }).collect();
+                    Ok(Listed { items, complete })
+                }
             }
         })
     }
@@ -92,7 +124,12 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
                     let complete = l.is_complete();
                     Ok(to_orders(exchange, l.items, complete))
                 }
-                Exchange::Okx => Err(OKX_ACCOUNT_UNSUPPORTED.to_string()),
+                Exchange::Okx => {
+                    let okx = self.okx()?;
+                    let l = okx.get_open_orders().await.map_err(|e| Self::okx_error(okx, e))?;
+                    let complete = l.is_complete();
+                    Ok(to_orders(exchange, l.items, complete))
+                }
             }
         })
     }
@@ -102,7 +139,10 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
             match exchange {
                 Exchange::Binance => to_margin(exchange, &self.binance.get_balances().await.map_err(|e| e.to_string())?),
                 Exchange::Bybit => self.bybit.get_available_margin().await.map_err(|e| format!("Bybit: {e}")),
-                Exchange::Okx => Err(OKX_ACCOUNT_UNSUPPORTED.to_string()),
+                Exchange::Okx => {
+                    let okx = self.okx()?;
+                    okx.get_available_margin().await.map_err(|e| Self::okx_error(okx, e))
+                }
             }
         })
     }
@@ -113,7 +153,7 @@ impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
             match exchange {
                 Exchange::Binance => self.binance.get_max_leverage(&symbol, notional).await.map_err(|e| format!("Binance: {e}")),
                 Exchange::Bybit => self.bybit.get_max_leverage(&symbol).await.map_err(|e| format!("Bybit: {e}")),
-                Exchange::Okx => Err(OKX_ACCOUNT_UNSUPPORTED.to_string()),
+                Exchange::Okx => Err(OKX_MAX_LEVERAGE_UNSUPPORTED.to_string()),
             }
         })
     }
