@@ -1,0 +1,4 @@
+依文件構造、未在真實 demo 帳戶驗證 (hand-constructed from the OKX v5 official documentation, https://www.okx.com/docs-v5/en/ , fetched 2026-10-07).
+NOT a recorded response: field names and shapes follow the documented response; values are invented.
+GET /api/v5/trade/order, filled 3 contracts at 60010.5, fee -0.9 USDT (negative = paid)
+Replace with a de-identified real demo response after the user's real-machine probe (okx-demo-execution task 4.2).

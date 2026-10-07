@@ -1,0 +1,12 @@
+{
+ "code": "1",
+ "msg": "Operation failed",
+ "data": [
+  {
+   "clOrdId": "demolo0001abcdefghijklm12345678",
+   "ordId": "312269865356374016",
+   "sCode": "51400",
+   "sMsg": "Cancellation failed as the order has been filled, canceled or does not exist."
+  }
+ ]
+}

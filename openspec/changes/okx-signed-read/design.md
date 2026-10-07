@@ -86,12 +86,13 @@ OKX 以 ordId 游標分頁（非 Bybit 的 `nextPageCursor`）。重複游標視
 
 ## 路線圖
 
-OKX 對等分成四個依序的 change，每個 ≤ 12 項 task：
+OKX 對等分成五個依序的 change（原四個；`okx-execution-guards` 為抗辯審查後自 `okx-demo-execution` 拆出），每個 ≤ 12 項 task：
 
 | 順序 | change | 內容 | 依賴 |
 |---|---|---|---|
 | 1 | `okx-signed-read`（本 change） | demo 邊界、簽名、帳戶模式、餘額 / 保證金 / 持倉 / 委託、`AccountView`、輪詢接線 | 無 |
 | 2 | `okx-demo-execution` | 送單 / 撤單 / 查單（`clOrdId`、`tdMode=cross`、張數）、結果分類、手續費正負號、執行器與工廠（OKX 金鑰可選）、使用者實機探針 | 1 |
+| 2b | `okx-execution-guards` | 實盤前守衛：demo 金鑰正向證明與 `50101` 閂鎖、`lotSz` / `ctVal` / 名目上限、`expTime` 與雙重 `51603`、拒絕碼白名單、平倉模式不快取與裸腿告警、不經 `GatedTransport`；實機探針的 OKX 腿 | 1、2 |
 | 3 | `okx-funding-ledger` | 帳單（`type=8`）流水客戶端、`LedgerSource`、OKX 腿的 `ctVal` 寫入成交事件、PnL 不再把 OKX 腿標為未知 | 1、2（OKX 成交事件格式） |
 | 4 | `okx-trading-enablement` | 可下單集合納入 OKX、掃幣方向與達標涵蓋三所、候選勾選、手動下單 OKX 面板（輸入幣量換張數）、交易單頁保證金、總覽 OKX 帳戶卡、持倉頁 OKX 列 | 1、2、3；以及另一位 agent 進行中的 `trade-cost-estimate`（OKX 一檔掛單量為張數，見該 change 的風險） |
 

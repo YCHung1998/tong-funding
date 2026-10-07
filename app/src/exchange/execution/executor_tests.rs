@@ -10,6 +10,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 use super::account::DemoAccountView;
 use super::binance::BinanceOrderClient;
 use super::bybit::BybitOrderClient;
+use super::okx::OkxOrderClient;
 use super::classify::SubmitClass;
 use super::endpoints::*;
 use super::executor::{DemoExecutor, IntentLedger, POSITION_MODE_TTL_MS};
@@ -25,7 +26,7 @@ use crate::exchange::error::AdapterError;
 use crate::exchange::health::ratelimit::RateLimiter;
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
-use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, BinanceHost, BybitHost};
+use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, BinanceHost, BybitHost, OkxHost};
 use crate::exchange::signed::signing::{Credentials, Resync};
 use crate::exchange::transport::{FakeTransport, HttpResponse};
 use crate::ports::{ManualClock, MemorySecrets, SecretError, SecretName, SecretProvider};
@@ -67,6 +68,23 @@ pub(super) fn creds() -> Arc<Credentials> {
     Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into(), passphrase: None })
 }
 
+pub(super) fn okx_creds() -> Arc<Credentials> {
+    Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into(), passphrase: Some("TEST_PASS_NOT_REAL".into()) })
+}
+
+pub(super) fn okx_order_fx(name: &str) -> String {
+    std::fs::read_to_string(format!("{}/tests/fixtures/okx/orders/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()
+}
+
+pub(super) fn okx_signed_fx(name: &str) -> String {
+    std::fs::read_to_string(format!("{}/tests/fixtures/okx/signed/{name}.json", env!("CARGO_MANIFEST_DIR"))).unwrap()
+}
+
+/// OKX account mode: futures mode, net (the usual precondition for an OKX order).
+pub(super) fn script_okx_mode(t: &FakeOrderTransport) {
+    t.on(Method::Get, "/api/v5/account/config", Reply::ok(&okx_signed_fx("account_config_futures_net")));
+}
+
 /// One-way mode on both exchanges (the usual precondition).
 pub(super) fn script_one_way(t: &FakeOrderTransport) {
     t.on(Method::Get, BINANCE_POSITION_MODE_PATH, Reply::ok(r#"{"dualSidePosition":false}"#));
@@ -92,7 +110,8 @@ pub(super) fn rig_with(offset: Option<i64>) -> Rig {
         Arc::new(Offsets(offset)),
         ledger.clone(),
         limiter,
-    );
+    )
+    .with_okx(OkxOrderClient::new(Arc::new(t.clone()), okx_creds(), OkxHost::Demo));
     Rig { t, ex: Arc::new(ex), clock, ledger }
 }
 
@@ -299,13 +318,99 @@ async fn an_existing_position_never_counts_as_a_fill_and_a_failed_lookup_is_not_
     assert!(matches!(r.ex.query(Exchange::Binance, SYM, &id).await, QueryOutcome::Failed { .. }), "timeout = unknown, not 'not filled'");
 }
 
+fn okx_open() -> OrderRequest {
+    req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, "3", false)
+}
+
+/// Every request of the rig must pass the real admission rule (host + the flag exactly once).
+fn assert_okx_requests_admitted(t: &FakeOrderTransport) {
+    let mut seen = 0;
+    for r in t.requests().iter().filter(|r| r.full_url().contains("openapi.okx.com")) {
+        seen += 1;
+        let url = reqwest::Url::parse(r.full_url()).unwrap();
+        assert!(crate::exchange::reqwest_transport::HostPolicy::SignedDemo.allows(&url, r.headers()), "{}", r.full_url());
+        assert_eq!(r.headers().iter().filter(|(n, v)| n.eq_ignore_ascii_case("x-simulated-trading") && v == "1").count(), 1, "{}", r.full_url());
+    }
+    assert!(seen > 0, "no OKX request was made");
+}
+
 #[tokio::test]
-async fn okx_has_no_order_capability_and_never_sends_a_request() {
+async fn okx_orders_are_not_sent_without_an_okx_client_and_say_why() {
+    let t = FakeOrderTransport::new();
+    let clock = ManualClock::new(NOW);
+    let ex = DemoExecutor::new(
+        BinanceOrderClient::new(Arc::new(t.clone()), creds(), BinanceHost::Testnet),
+        BybitOrderClient::new(Arc::new(t.clone()), creds(), BybitHost::Demo),
+        Arc::new(clock.clone()),
+        Arc::new(Offsets(Some(0))),
+        Arc::new(Ledger::default()),
+        Arc::new(RateLimiter::new(Arc::new(clock))),
+    )
+    .with_okx_unavailable("OKX keys unavailable (NoPassphrase)".into());
+    match ex.submit(okx_open()).await {
+        SubmitOutcome::Rejected { reason } => assert!(reason.contains("NoPassphrase"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    let id = demo_id(Leg::Short, OrderAction::Open, 0);
+    assert!(matches!(ex.query(Exchange::Okx, SYM, &id).await, QueryOutcome::Failed { reason } if reason.contains("NoPassphrase")));
+    assert!(matches!(ex.cancel(Exchange::Okx, SYM, &id).await, QueryOutcome::Failed { .. }));
+    assert!(t.requests().is_empty());
+}
+
+#[tokio::test]
+async fn an_okx_order_checks_the_account_mode_once_then_posts_with_the_flag() {
     let r = rig();
-    let o = req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, "1", false);
-    assert!(matches!(r.ex.submit(o).await, SubmitOutcome::Rejected { reason } if reason.contains("unsupported")));
-    assert!(matches!(r.ex.query(Exchange::Okx, SYM, &demo_id(Leg::Short, OrderAction::Open, 0)).await, QueryOutcome::Failed { .. }));
-    assert!(matches!(r.ex.cancel(Exchange::Okx, SYM, &demo_id(Leg::Short, OrderAction::Open, 0)).await, QueryOutcome::Failed { .. }));
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+    assert!(matches!(r.ex.submit(okx_open()).await, SubmitOutcome::Accepted(_)));
+    assert!(matches!(r.ex.submit(req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 1), OrderSide::Sell, "3", false)).await, SubmitOutcome::Accepted(_)));
+    assert_eq!(r.t.count(Method::Get, "/api/v5/account/config"), 1, "the one-way reading is reused for 60 s (key: account level)");
+    assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 2);
+    assert_okx_requests_admitted(&r.t);
+    assert!(r.t.requests().iter().all(|q| q.full_url().contains("openapi.okx.com")), "no other exchange was touched");
+}
+
+#[tokio::test]
+async fn an_okx_account_in_long_short_mode_is_not_sent() {
+    let r = rig();
+    r.t.on(Method::Get, "/api/v5/account/config", Reply::ok(&okx_signed_fx("account_config_long_short")));
+    match r.ex.submit(okx_open()).await {
+        SubmitOutcome::Rejected { reason } => assert!(reason.contains("hedge"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 0);
+}
+
+#[tokio::test]
+async fn an_unknown_okx_submit_is_unknown_with_one_post_and_is_then_found_by_its_id() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_50004")));
+    r.t.on(Method::Get, "/api/v5/trade/order?", Reply::ok(&okx_order_fx("order_filled")));
+    let id = demo_id(Leg::Short, OrderAction::Open, 0);
+    assert!(matches!(r.ex.submit(okx_open()).await, SubmitOutcome::Unknown { .. }));
+    assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 1);
+    assert!(matches!(r.ex.query(Exchange::Okx, SYM, &id).await, QueryOutcome::Found(s) if s.filled_quantity == d("3")));
+    assert_okx_requests_admitted(&r.t);
+}
+
+#[tokio::test]
+async fn okx_cancel_only_touches_orders_in_order_intents() {
+    let r = rig();
+    let id = demo_id(Leg::Short, OrderAction::Open, 0);
+    assert!(matches!(r.ex.cancel(Exchange::Okx, SYM, &id).await, QueryOutcome::Failed { reason } if reason.contains("not an order of this system")));
+    assert!(r.t.requests().is_empty());
+    r.ledger.0.lock().unwrap().push(id.clone());
+    r.t.on(Method::Post, "/api/v5/trade/cancel-order", Reply::ok(&okx_order_fx("cancel_accepted")));
+    r.t.on(Method::Get, "/api/v5/trade/order?", Reply::ok(&okx_order_fx("order_canceled")));
+    assert!(matches!(r.ex.cancel(Exchange::Okx, SYM, &id).await, QueryOutcome::Found(s) if s.state == OrderState::Cancelled));
+    assert_okx_requests_admitted(&r.t);
+}
+
+#[tokio::test]
+async fn an_uncalibrated_okx_clock_sends_nothing() {
+    let r = rig_with(None);
+    assert!(matches!(r.ex.submit(okx_open()).await, SubmitOutcome::Rejected { reason } if reason.contains("not calibrated")));
     assert!(r.t.requests().is_empty());
 }
 
@@ -400,6 +505,37 @@ fn the_factory_fails_without_usable_keys_and_never_builds_an_empty_key_executor(
     assert!(factory(Arc::new(only_empty), &t).create(ExecutionMode::ExchangeDemo).is_err());
     assert!(factory(Arc::new(all_keys()), &t).create(ExecutionMode::Simulation).is_err(), "never builds for SIMULATION");
     assert!(t.requests().is_empty(), "building or failing sends nothing");
+}
+
+#[tokio::test]
+async fn without_okx_keys_the_executor_is_still_built_and_okx_orders_are_not_sent_with_the_reason() {
+    let t = FakeOrderTransport::new();
+    let ex = factory(Arc::new(all_keys()), &t).build().unwrap();
+    match ex.submit_classified(&okx_open()).await {
+        SubmitClass::Rejected { code, message } => assert_eq!((code.as_str(), message.contains("NoKey")), ("not_sent", true), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    // key and secret but no passphrase
+    let partial = all_keys().with(Exchange::Okx, SecretName::ApiKey, KEY).with(Exchange::Okx, SecretName::ApiSecret, SECRET);
+    let ex = factory(Arc::new(partial), &t).build().unwrap();
+    assert!(matches!(ex.submit_classified(&okx_open()).await, SubmitClass::Rejected { message, .. } if message.contains("NoPassphrase") && !message.contains(KEY)));
+    assert!(t.requests().is_empty());
+    // Binance and Bybit orders still go out as before
+    let ex = factory(Arc::new(all_keys()), &t).build().unwrap();
+    t.on(Method::Get, BINANCE_POSITION_MODE_PATH, Reply::ok(r#"{"dualSidePosition":false}"#));
+    t.on(Method::Post, "newClientOrderId=", Reply::ok(&binance_ack(&demo_id(Leg::Long, OrderAction::Open, 0), "FILLED", "0.019")));
+    assert!(matches!(ex.submit_classified(&open_long()).await, SubmitClass::Accepted(_)));
+}
+
+#[tokio::test]
+async fn with_okx_keys_the_factory_builds_an_okx_client_that_sends() {
+    let t = FakeOrderTransport::new();
+    script_okx_mode(&t);
+    t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+    let full = all_keys().with(Exchange::Okx, SecretName::ApiKey, KEY).with(Exchange::Okx, SecretName::ApiSecret, SECRET).with(Exchange::Okx, SecretName::Passphrase, "TEST_PASS_NOT_REAL");
+    let ex = factory(Arc::new(full), &t).build().unwrap();
+    assert!(matches!(ex.submit_classified(&okx_open()).await, SubmitClass::Accepted(_)));
+    assert_okx_requests_admitted(&t);
 }
 
 #[test]

@@ -1,0 +1,4 @@
+依文件構造、未在真實 demo 帳戶驗證 (hand-constructed from the OKX v5 official documentation, https://www.okx.com/docs-v5/en/ , fetched 2026-10-07).
+NOT a recorded response: field names and shapes follow the documented response; values are invented.
+POST /api/v5/trade/order: code 1, sCode 51131
+Replace with a de-identified real demo response after the user's real-machine probe (okx-demo-execution task 4.2).

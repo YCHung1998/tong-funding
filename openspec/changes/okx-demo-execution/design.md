@@ -39,7 +39,7 @@
 與 Bybit（`positionIdx` 0、`reduceOnly`）對等。`okx-signed-read` 已保證 `net_mode` 與 `acctLv` 2/3，在此前提下省略 `posSide` 即為 `net`，`reduceOnly` 有效。
 - 替代：`tdMode=isolated`。需要先轉入保證金且與 `okx-signed-read` 拒絕逐倉持倉的決定矛盾。
 
-**D2　`clOrdId` 直接用 engine id，OKX 端另加「英數 ≤ 32」檢查。**
+**D2　`clOrdId` 直接用 engine id；「英數 ≤ 32」由單元測試鎖定（見「抗辯修正」#8）。**
 `ClientOrderId::parse` 的通用規則允許 `_`、`-` 與 36 字元；OKX 建構時再檢查一次，不符 → `not_sent`（確定未送出）。engine 實際 id 恆通過。
 - 替代：收緊 `ClientOrderId` 全域規則。會影響 Binance / Bybit 既有測試與 spec，非必要。
 
@@ -94,3 +94,20 @@
 1. 工廠是否改為「`allowed_exchanges` 中每一所的金鑰都必須存在」（D5 替代 B）？
 2. OKX demo 的市價單是否在 ACK 時已成交（`Place order` 回應不含成交量，需查單）——探針確認首次查單的狀態分布，用以調整成交輪詢。
 3. 部分成交後撤銷的訂單在 OKX 保留多久（Risk 第二點）？
+
+## 實作時發現
+
+- 執行層沒有 `Resync` 把手，故查單 / 撤單遇 `50102` 不自行重校時：回報失敗，由 engine 既有的重複查詢吸收（原設計「重試一次」未實作；送單本來就不重試）。
+- OKX 送單 ACK 的 `client_order_id` 一律取自我們送出的 id，不採信回應中的回聲。
+- `DemoAccountView` 與 `DemoExecutor` 的 OKX 識別字白名單：`account.rs`（唯讀 AccountView）與 `execution/okx.rs` 可含 `okx` 識別字；`/api/v5/` 路徑字面只准在 `execution/endpoints.rs`；主機、`x-simulated-trading`、`OK-ACCESS` 字面在整個 `execution/` 皆禁止。
+- 實機探針的 OKX 腿移至 `okx-execution-guards`（見路線圖）：它需要 `ctVal` / lotSz 守衛才能安全地把幣量換成張數。
+
+## 抗辯修正
+
+- #1/#2：`OrderHttpRequest::to_demo(.., DemoEnv::Okx(host), ..)` 自行插入 `x-simulated-trading: 1`；`ReqwestOrderTransport` 與 `ReqwestTransport` 呼叫同一個 `HostPolicy::allows(url, headers)`。
+- #5：下單 / 查單 / 撤單 / 帳戶模式請求都經 `OkxOrderClient::build` → `to_demo`，每次呼叫重新建構（沒有任何重送路徑重用舊請求）。
+- #6：單向閘門沿用 executor `ensure_one_way`，OKX 鍵為 `(Okx, "*")`，不另建快取。
+- #7：`okx_inst_id` / `okx_symbol` 只有 `signed/endpoints.rs` 一份。
+- #8：clOrdId 的執行期 `not_sent` 分支改為單元測試 `engine_client_order_ids_always_fit_the_okx_clordid_rule`；spec 的「clOrdId 含底線」情境移除。
+- A/D：`OrderHttpRequest::header()` 拒絕 `x-simulated-trading` 與 `OK-ACCESS-*`（`okx_auth` 才能設 `OK-ACCESS-*`）；本機假伺服器測試證明 GET / POST / DELETE 缺標頭、重複、值 0、`header()` 嘗試皆零連線；`ReqwestOrderTransport` 亦 `.no_proxy()` 並有 `HTTP_PROXY` 測試。
+- E–J 另開 change `okx-execution-guards`（本 change 的 task 數已 ≤ 12，但守衛自成一組安全規則；依 coordinator 指示拆分）。

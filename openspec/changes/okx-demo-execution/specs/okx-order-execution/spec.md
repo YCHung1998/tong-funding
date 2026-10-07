@@ -19,18 +19,13 @@ OKX 的送單、查單、撤單請求 SHALL 只經由 `okx-signed-read` 定義�
 ### Requirement: OKX 市價單的參數
 
 OKX 送單 SHALL 為 `POST /api/v5/trade/order`，本文含：`instId`（`BASEUSDT` 轉為 `BASE-USDT-SWAP`）、`tdMode = cross`、`side`（`buy` / `sell`）、`ordType = market`、`sz`（core `Quantity` 的張數字串，SHALL NOT 在執行器內另行格式化或換算）、`clOrdId`（engine 的 `client_order_id`，原樣）、`reduceOnly`（明確的 `true` / `false`）。本文 SHALL NOT 含 `posSide`。
-`client_order_id` 不是 1 到 32 個英數字時，SHALL 不送出並回報已拒絕（`not_sent`）。
+`client_order_id` SHALL 為 engine 產生的 id（小寫英數、不超過 31 字元，落在 OKX `clOrdId` 的「英數 ≤ 32」限制內）；此性質由單元測試鎖定，執行器不另設執行期分支。
 送單前 SHALL 確認 OKX 帳戶模式讀數（`acctLv` 2 或 3 且 `net_mode`）在 60 秒內有效；無效、不符或讀取失敗時 SHALL 不送出並回報原因。
 
 #### Scenario: 張數原樣送出
 
 - **WHEN** engine 以數量 3（張）、`client_order_id` 為 `demolo0001abcdefghijklm12345678` 要求 OKX 買入 `BTCUSDT`
 - **THEN** 被記錄的請求本文含 `"instId":"BTC-USDT-SWAP"`、`"sz":"3"`、`"clOrdId":"demolo0001abcdefghijklm12345678"`、`"tdMode":"cross"`、`"ordType":"market"`，且沒有 `posSide`
-
-#### Scenario: clOrdId 含底線
-
-- **WHEN** `client_order_id` 為 `demo_ab12`
-- **THEN** 不送出任何請求，結果為已拒絕（`not_sent`），原因指出 OKX `clOrdId` 規則
 
 #### Scenario: 帳戶改為 long/short 模式
 

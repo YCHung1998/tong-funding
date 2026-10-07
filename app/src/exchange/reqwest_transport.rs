@@ -161,6 +161,10 @@ impl HttpTransport for ReqwestTransport {
     }
 }
 
+/// Serialises the tests that set `HTTP_PROXY` (process-wide state), across both transports.
+#[cfg(test)]
+pub(crate) static PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use std::io::{Read, Write};
@@ -430,6 +434,7 @@ mod tests {
     fn the_real_clients_ignore_proxy_environment_variables() {
         // A listener plays the "proxy". The control proves the environment variable really diverts a
         // default reqwest client (otherwise this test would pass vacuously).
+        let _guard = PROXY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (proxy, proxied) = serve_counting(|_| Some(response("200 OK", "", "via proxy")));
         let (origin, direct) = serve_counting(|_| Some(response("200 OK", "", "direct")));
         // SAFETY: no other test in this crate reads proxy variables; every client built here is built before the variable is removed.

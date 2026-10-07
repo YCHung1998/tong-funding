@@ -99,13 +99,7 @@ impl<T: HttpTransport> OkxSignedClient<T> {
         }
         let (body, _) = self.signed_get(OKX_CONFIG_PATH, "").await?;
         let row = data_rows(&body)?.first().ok_or_else(|| AdapterError::parse("empty account config"))?;
-        let acct_lv = str_req(row, "acctLv")?;
-        let pos_mode = str_req(row, "posMode")?;
-        let level = match (acct_lv.as_str(), pos_mode.as_str()) {
-            ("2", "net_mode") => OkxAcctLv::Futures,
-            ("3", "net_mode") => OkxAcctLv::MultiCurrency,
-            _ => return Err(AdapterError::exchange(ACCOUNT_MODE_CODE, format!("帳戶模式不支援 (acctLv {acct_lv}, posMode {pos_mode})"))),
-        };
+        let level = parse_account_mode(row)?;
         *self.mode.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((now, level));
         Ok(level)
     }
@@ -250,6 +244,18 @@ impl<T: HttpTransport> OkxSignedClient<T> {
             Some(err) => Err(err),
             None => Ok((body, fetched_at)),
         }
+    }
+}
+
+/// The supported account levels of one `account/config` row (design D4): `acctLv` 2 or 3 with
+/// `net_mode`. Everything else is the "帳戶模式不支援" error naming the actual settings.
+pub fn parse_account_mode(row: &Value) -> Result<OkxAcctLv, AdapterError> {
+    let acct_lv = str_req(row, "acctLv")?;
+    let pos_mode = str_req(row, "posMode")?;
+    match (acct_lv.as_str(), pos_mode.as_str()) {
+        ("2", "net_mode") => Ok(OkxAcctLv::Futures),
+        ("3", "net_mode") => Ok(OkxAcctLv::MultiCurrency),
+        _ => Err(AdapterError::exchange(ACCOUNT_MODE_CODE, format!("帳戶模式不支援 (acctLv {acct_lv}, posMode {pos_mode})"))),
     }
 }
 

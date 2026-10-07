@@ -32,6 +32,14 @@ pub const BYBIT_RATE_LIMIT_CODES: [i64; 2] = [10006, 10018];
 /// Bybit "order not exists or too late to cancel" (UNVERIFIED).
 pub const BYBIT_NOT_FOUND_CODES: [i64; 1] = [110001];
 
+/// OKX codes meaning "the outcome is unknown" (service unavailable, endpoint timeout - "does not
+/// mean the request was successful or failed" -, system busy, system error). UNVERIFIED list.
+pub const OKX_UNKNOWN_CODES: [i64; 4] = [50001, 50004, 50013, 50026];
+/// OKX rate-limit codes: request too frequent, sub-account rate limit.
+pub const OKX_RATE_LIMIT_CODES: [i64; 2] = [50011, 50061];
+/// OKX "order does not exist".
+pub const OKX_NOT_FOUND_CODES: [i64; 1] = [51603];
+
 /// The four submit classes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SubmitClass {
@@ -153,6 +161,47 @@ pub fn bybit_reply(result: Result<HttpResponse, AdapterError>) -> Reply {
     }
 }
 
+/// OKX: HTTP 200 with `code`, and for place / cancel the real result in `data[0].sCode` (General
+/// Info: with an `sCode`, `sCode` / `sMsg` are the result). A non-zero `sCode` wins over `code`, so
+/// `code "0"` + `sCode "51121"` is a refusal and never an acceptance.
+pub fn okx_reply(result: Result<HttpResponse, AdapterError>) -> Reply {
+    let resp = match result {
+        Ok(r) => r,
+        Err(e) => return transport_failure(&e),
+    };
+    if matches!(resp.status, 429 | 418) {
+        return Reply::RateLimited { retry_after_ms: retry_after(&resp) };
+    }
+    if resp.status >= 500 {
+        return Reply::Unknown { reason: format!("HTTP {}", resp.status) };
+    }
+    let Ok(body) = serde_json::from_str::<Value>(&resp.body) else {
+        return Reply::Unknown { reason: format!("HTTP {}: unparsable reply", resp.status) };
+    };
+    let Some(code) = body.get("code").and_then(Value::as_str) else {
+        return Reply::Unknown { reason: "reply without code".into() };
+    };
+    let row = body.get("data").and_then(Value::as_array).and_then(|d| d.first());
+    let s_code = row.and_then(|r| r.get("sCode")).and_then(Value::as_str).filter(|c| !c.is_empty());
+    let (effective, message) = match s_code {
+        Some(sc) if sc != "0" => (sc, row.and_then(|r| r.get("sMsg")).and_then(Value::as_str).unwrap_or("")),
+        _ => (code, body.get("msg").and_then(Value::as_str).unwrap_or("")),
+    };
+    if effective == "0" {
+        return Reply::Ok(body);
+    }
+    let Ok(n) = effective.parse::<i64>() else {
+        return Reply::Unknown { reason: redact_secrets(&format!("okx code {effective:?}: {message}")) };
+    };
+    if OKX_RATE_LIMIT_CODES.contains(&n) {
+        Reply::RateLimited { retry_after_ms: retry_after(&resp) }
+    } else if OKX_UNKNOWN_CODES.contains(&n) {
+        Reply::Unknown { reason: redact_secrets(&format!("okx {n}: {message} (status unknown)")) }
+    } else {
+        Reply::Refused { code: n, message: redact_secrets(message) }
+    }
+}
+
 /// A submit reply turned into a class; `parse_ack` reads the accepted body.
 pub fn submit_class(reply: Reply, parse_ack: impl FnOnce(&Value) -> Result<OrderStatus, AdapterError>) -> SubmitClass {
     match reply {
@@ -201,5 +250,15 @@ pub fn bybit_state(s: &str) -> Result<OrderState, AdapterError> {
         "Cancelled" | "PartiallyFilledCanceled" | "Deactivated" => Ok(OrderState::Cancelled),
         "Rejected" => Ok(OrderState::Rejected),
         other => Err(AdapterError::parse(format!("unknown Bybit order status {other}"))),
+    }
+}
+
+/// OKX order state → engine state. An unknown state is an error, never a guess.
+pub fn okx_state(s: &str) -> Result<OrderState, AdapterError> {
+    match s {
+        "live" | "partially_filled" => Ok(OrderState::Open),
+        "filled" => Ok(OrderState::Filled),
+        "canceled" | "mmp_canceled" => Ok(OrderState::Cancelled),
+        other => Err(AdapterError::parse(format!("unknown OKX order state {other}"))),
     }
 }

@@ -1,0 +1,36 @@
+{
+ "code": "0",
+ "msg": "",
+ "data": [
+  {
+   "accFillSz": "1",
+   "algoClOrdId": "",
+   "algoId": "",
+   "avgPx": "60010.5",
+   "cTime": "1700000000100",
+   "cancelSource": "",
+   "category": "normal",
+   "ccy": "",
+   "clOrdId": "demolo0001abcdefghijklm12345678",
+   "fee": "-0.3",
+   "feeCcy": "USDT",
+   "fillPx": "60010.5",
+   "fillSz": "1",
+   "fillTime": "1700000000150",
+   "instId": "BTC-USDT-SWAP",
+   "instType": "SWAP",
+   "lever": "5",
+   "ordId": "312269865356374016",
+   "ordType": "market",
+   "pnl": "0",
+   "posSide": "net",
+   "px": "",
+   "reduceOnly": "false",
+   "side": "buy",
+   "state": "partially_filled",
+   "sz": "3",
+   "tdMode": "cross",
+   "uTime": "1700000000150"
+  }
+ ]
+}

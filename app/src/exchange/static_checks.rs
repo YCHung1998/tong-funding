@@ -966,34 +966,38 @@ const LATE: &str = "api.bybit.com";
     }
 
     /// The order module names no host at all (hosts come only from `signed::endpoints` through
-    /// the `DemoEnv` enum) and has no OKX request: no `okx` identifier other than the
-    /// `Exchange::Okx` variant, no OKX path or domain in any literal.
+    /// `DemoEnv`) and no demo-flag header literal. OKX order code is allowed since
+    /// okx-demo-execution: `okx` identifiers are fine, and `/api/v5/` paths may be spelled only in
+    /// `execution/endpoints.rs`; any domain or URL in any literal is still forbidden.
     #[test]
-    fn execution_names_no_host_literal_and_has_no_okx_request() {
+    fn execution_names_no_host_literal_and_no_flag_literal_and_okx_paths_only_in_endpoints() {
         let mut violations = Vec::new();
         for f in rust_files(&execution_dir()) {
             let prod = production(&std::fs::read_to_string(&f).unwrap());
             let (_, _, lits) = mask(&prod.code);
+            let is_endpoints = f.file_name().is_some_and(|n| n == "endpoints.rs");
             for lit in &lits {
                 let text = prod.code.get(lit.start..lit.end).unwrap_or("").to_ascii_lowercase();
-                for bad in ["http://", "https://", "okx.com", "/api/v5/", ".com"] {
+                for bad in ["http://", "https://", "okx.com", ".com", "x-simulated-trading", "ok-access"] {
                     if text.contains(bad) {
                         violations.push(format!("{}: literal {text:?} contains {bad}", f.display()));
                     }
                 }
-            }
-            for ident in idents(&prod.structure) {
-                // `account.rs` is the read-only AccountView: it may name the OKX signed GET client
-                // (okx-signed-read). Order code (okx-demo-execution) lives in other files.
-                let account_view = f.file_name().is_some_and(|n| n == "account.rs");
-                if !account_view && ident.to_ascii_lowercase().contains("okx") && ident != "Okx" && ident != "OKX_UNSUPPORTED" && ident != "OKX_NOT_WIRED" {
-                    violations.push(format!("{}: identifier {ident}", f.display()));
+                if text.contains("/api/v5/") && !is_endpoints {
+                    violations.push(format!("{}: OKX path literal {text:?} outside execution/endpoints.rs", f.display()));
                 }
             }
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
     }
 
+    #[test]
+    fn the_execution_scan_would_catch_an_okx_host_or_flag_literal_in_execution() {
+        // the generic literal rules already confine these to signed/endpoints.rs for every execution file
+        for src in ["const H: &str = \"https://openapi.okx.com\";", "const H: &str = \"x-simulated-trading\";", "const H: &str = \"OK-ACCESS-KEY\";"] {
+            assert!(!literal_rule_violations("exchange/execution/okx.rs", src).is_empty(), "{src}");
+        }
+    }
 
     // ------------------------------------------------ OKX demo boundary (okx-signed-read)
 
