@@ -578,6 +578,19 @@ pub fn literal_rule_violations(rel_path: &str, src: &str) -> Vec<String> {
     out
 }
 
+/// The order path must never be wrapped in the queueing / retrying `GatedTransport`.
+pub fn gated_rule_violations(rel_path: &str, src: &str) -> Vec<String> {
+    let prod = production(src);
+    let mut out = Vec::new();
+    if rel_path.starts_with("exchange/execution/") && idents(&prod.structure).contains(&"GatedTransport") {
+        out.push("identifier `GatedTransport` inside exchange/execution".to_string());
+    }
+    if rel_path == "exchange/health/gated.rs" && prod.structure.contains("OrderTransport") {
+        out.push("GatedTransport must not be (or wrap) an OrderTransport".to_string());
+    }
+    out
+}
+
 /// Files that may name the `reqwest` crate: the two real transports.
 const REQWEST_HOMES: [&str; 2] = ["exchange/reqwest_transport.rs", "exchange/execution/http.rs"];
 
@@ -1090,6 +1103,28 @@ const LATE: &str = "api.bybit.com";
             violations.extend(reqwest_rule_violations(&rel_path, &text).into_iter().map(|v| format!("{rel_path}: {v}")));
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn the_okx_order_path_is_never_gated() {
+        // counter-examples
+        assert!(!gated_rule_violations("exchange/execution/okx.rs", "use crate::exchange::health::gated::GatedTransport;").is_empty());
+        assert!(!gated_rule_violations("exchange/execution/factory.rs", "fn f() { let t = GatedTransport::new(x); }").is_empty());
+        assert!(!gated_rule_violations("exchange/health/gated.rs", "impl OrderTransport for GatedTransport {}").is_empty());
+        assert!(gated_rule_violations("exchange/execution/okx.rs", "// GatedTransport is not used here\n#[cfg(test)]\nmod t { type X = GatedTransport; }").is_empty());
+        // the real tree
+        let app = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut violations = Vec::new();
+        for f in rust_files(&exchange_dir()) {
+            let rel_path = f.strip_prefix(app.join("src")).unwrap().to_string_lossy().replace('\\', "/");
+            violations.extend(gated_rule_violations(&rel_path, &std::fs::read_to_string(&f).unwrap()).into_iter().map(|v| format!("{rel_path}: {v}")));
+        }
+        assert!(violations.is_empty(), "{violations:?}");
+        // the factory is built on the plain order transport in ui/live.rs
+        let live = production_code(&std::fs::read_to_string(app.join("src/ui/live.rs")).unwrap());
+        let from = live.find("ReqwestOrderTransport::signed_demo()").expect("live.rs builds the order transport");
+        let to = live[from..].find("DemoExecutorFactory::new").expect("and passes it to the factory") + from;
+        assert!(!live[from..to].contains("Gated"), "the order transport must reach the factory ungated: {}", &live[from..to]);
     }
 
     #[test]

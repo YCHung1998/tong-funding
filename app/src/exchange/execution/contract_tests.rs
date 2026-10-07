@@ -37,6 +37,11 @@ trait Harness {
     fn exchange(&self) -> Exchange {
         Exchange::Binance
     }
+    /// OKX only (okx-execution-guards): a lost submit is "not found" only after `expTime` and two
+    /// consecutive lookups; this moves the clock past `expTime` and says a first lookup is needed.
+    fn expire_unknown_submits(&self) -> bool {
+        false
+    }
     fn executor(&self) -> Arc<dyn Executor>;
     fn simulated(&self) -> bool;
     fn id(&self, seq: u16) -> String;
@@ -98,6 +103,10 @@ fn okx_not_found() -> Reply {
 impl Harness for OkxDemo {
     fn exchange(&self) -> Exchange {
         Exchange::Okx
+    }
+    fn expire_unknown_submits(&self) -> bool {
+        self.0.clock.advance(6_000);
+        true
     }
     fn executor(&self) -> Arc<dyn Executor> {
         self.0.ex.clone()
@@ -233,6 +242,9 @@ async fn contract(h: &dyn Harness) {
     let id = h.id(4);
     h.script(&id, Behavior::UnknownNotArrived);
     assert!(matches!(ex.submit(order(h.exchange(), &id)).await, SubmitOutcome::Unknown { .. }));
+    if h.expire_unknown_submits() {
+        assert!(matches!(ex.query(h.exchange(), "BTCUSDT", &id).await, QueryOutcome::Failed { .. }), "one confirmation is not enough");
+    }
     assert_eq!(ex.query(h.exchange(), "BTCUSDT", &id).await, QueryOutcome::NotFound);
 
     // 5. Partial fill: open with 70 %, cancel stops it, the final lookup is terminal with 70 %.

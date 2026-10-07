@@ -35,6 +35,31 @@ const RATE_LIMIT_CODES: [&str; 2] = ["50011", "50061"];
 /// Code of the `AdapterError::Exchange` that reports an unsupported account mode.
 pub const ACCOUNT_MODE_CODE: &str = "acct_mode_unsupported";
 
+/// Process-wide "OKX is disabled" latch: tripped by an environment mismatch (`50101`) on any OKX
+/// request. Once tripped it never resets; the order client and the read client can share one `Arc`.
+#[derive(Debug, Default)]
+pub struct OkxLatch(Mutex<Option<String>>);
+
+impl OkxLatch {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+    pub fn trip(&self, reason: &str) {
+        let mut g = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.is_none() {
+            *g = Some(reason.to_string());
+        }
+    }
+    pub fn reason(&self) -> Option<String> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+
+/// Code of the `AdapterError::Exchange` returned while the latch is tripped.
+pub const OKX_DISABLED_CODE: &str = "okx_disabled";
+/// OKX "APIKey does not match current environment".
+pub const ENV_MISMATCH_CODE: &str = "50101";
+
 /// The account levels the system supports (design D4); 1 (spot) and 4 (portfolio margin) are not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OkxAcctLv {
@@ -73,13 +98,20 @@ pub struct OkxSignedClient<T> {
     reason: Mutex<Option<NotConnectedReason>>,
     /// Local ms and level of the last supported reading; unsupported or failed readings are never stored.
     mode: Mutex<Option<(i64, OkxAcctLv)>>,
+    latch: Arc<OkxLatch>,
 }
 
 impl<T: HttpTransport> OkxSignedClient<T> {
     pub const EXCHANGE: Exchange = Exchange::Okx;
 
     pub fn new(transport: Arc<T>, secrets: Arc<dyn SecretProvider>, clock: Arc<dyn Clock>, offset: Arc<dyn ClockOffsetSource>, resync: Arc<dyn Resync>, demo_env: OkxHost) -> Self {
-        OkxSignedClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None), mode: Mutex::new(None) }
+        OkxSignedClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None), mode: Mutex::new(None), latch: OkxLatch::new() }
+    }
+
+    /// Shares an `OkxLatch` (with the order client): `50101` anywhere disables OKX everywhere.
+    pub fn with_latch(mut self, latch: Arc<OkxLatch>) -> Self {
+        self.latch = latch;
+        self
     }
 
     /// Why the most recent signed call answered `NotConnected` (`None` if it did not, or no call yet).
@@ -206,6 +238,19 @@ impl<T: HttpTransport> OkxSignedClient<T> {
     /// Order of checks: key, secret, passphrase, calibrated time; only then a request is built.
     /// `query` is the final, already-encoded query string: the same text is signed and sent.
     async fn attempt(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
+        if let Some(reason) = self.latch.reason() {
+            return Err(AdapterError::exchange(OKX_DISABLED_CODE, format!("OKX disabled: {reason}")));
+        }
+        let result = self.attempt_inner(path, query).await;
+        if let Err(AdapterError::Exchange { code, .. }) = &result
+            && code == ENV_MISMATCH_CODE
+        {
+            self.latch.trip("OKX 50101: API key does not match the environment (demo flag sent); OKX disabled until restart");
+        }
+        result
+    }
+
+    async fn attempt_inner(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
         let prepared = load_credentials(self.secrets.as_ref(), Self::EXCHANGE, true).and_then(|c| require_offset(self.offset.as_ref()).map(|o| (c, o)));
         let (creds, offset_ms) = match prepared {
             Ok(v) => v,
@@ -873,6 +918,20 @@ mod tests {
         let (_, _, c) = client(futures(FakeTransport::new().on("trade/orders-pending", ok("orders_pending_page1_full"))));
         let l = block_on(c.get_open_orders()).unwrap();
         assert!(matches!(l.completeness, Completeness::Incomplete { ref reason } if reason.contains("cursor")), "{:?}", l.completeness);
+    }
+
+    #[test]
+    fn a_50101_trips_the_shared_latch_and_disables_the_read_client_without_further_requests() {
+        let body = json!({"code":"50101","msg":"APIKey does not match current environment.","data":[]}).to_string();
+        let latch = OkxLatch::new();
+        let t = Arc::new(PolicyTransport::new(FakeTransport::new().on("account/config", Ok(HttpResponse::ok(body)))));
+        let c = OkxSignedClient::new(t.clone(), Arc::new(full_secrets()), Arc::new(ManualClock::new(NOW)), Arc::new(|| Some(715)), FakeResync::ok(), OkxHost::Demo).with_latch(latch.clone());
+        assert!(matches!(block_on(c.get_positions()), Err(AdapterError::Exchange { code, .. }) if code == "50101"));
+        assert!(latch.reason().unwrap().contains("50101"));
+        let before = t.requests().len();
+        let e = block_on(c.get_balances()).unwrap_err();
+        assert!(matches!(&e, AdapterError::Exchange { code, .. } if code == OKX_DISABLED_CODE), "{e}");
+        assert_eq!(t.requests().len(), before, "no request while latched");
     }
 
     /// Real-machine read probe (okx-signed-read task 4.2). `#[ignore]`: it reads the macOS Keychain

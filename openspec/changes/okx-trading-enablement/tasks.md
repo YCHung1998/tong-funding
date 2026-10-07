@@ -21,6 +21,8 @@
 - [ ] 3.4 （自 `okx-signed-read` 3.2 移入）`OkxPosition` → `models::Position` 頁面用轉換純函式與測試（幣量 = 張數 × `ctVal`，`ctVal` 未知標示無法換算）
 - [ ] 3.5 （自 `okx-signed-read` 3.3 移入）`ui/live.rs`：建立 `OkxSignedClient`（OKX 校時偏移、`ClockResync` 走公開時間端點）並以 `DemoAccountView::with_okx` 接上，加入帳戶輪詢與 `LegAccount` 輪詢迴圈
 
+- [ ] 3.6 （自 `okx-execution-guards` 移入）接線：`DemoExecutorFactory::with_okx_limits`（公開 instruments 的 `ctVal` / `lotSz`、標記價、風險設定的單腿名目上限）、`OkxLatch` 由 `OkxSignedClient` 與下單客戶端共用、`OkxLatch::reason()` 顯示為畫面橫幅；未接 limits 前 OKX 單全部 `not_sent`
+
 ## 4. 驗證
 
 - [ ] 4.1 `cargo test -p tong-funding`、`cargo test -p tong-funding-core` 全套綠燈；`cargo clippy --all-targets -- -D warnings`；以 `rg -n "僅比價|CompareOnly|OKX_NOTE" app/src` 確認無殘留

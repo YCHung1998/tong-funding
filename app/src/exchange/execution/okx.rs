@@ -10,14 +10,16 @@
 //! UNVERIFIED until the user's real demo probe (task 4.2): every field name, the reply shapes in
 //! `tests/fixtures/okx/orders`, `reduceOnly` as a JSON boolean, and the code lists in `classify`.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 use tong_funding_core::types::Decimal;
 
 use super::binance::ModeReading;
-use super::classify::{OKX_NOT_FOUND_CODES, Reply, SubmitClass, okx_reply, okx_state, query_outcome, submit_class};
+use super::classify::{OKX_NOT_FOUND_CODES, Reply, SubmitClass, okx_is_env_mismatch, okx_reply, okx_state, query_outcome, submit_class};
 use super::endpoints::{OKX_ACCOUNT_CONFIG_PATH, OKX_CANCEL_PATH, OKX_ORDER_PATH};
 use super::http::{DemoEnv, Method, OrderHttpRequest, OrderTransport};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
@@ -25,15 +27,62 @@ use crate::engine::ports::{OrderSide, OrderState, OrderStatus, QueryOutcome};
 use crate::exchange::error::AdapterError;
 use crate::exchange::signed::endpoints::{OkxHost, okx_inst_id};
 use crate::exchange::signed::models::{dec_opt, dec_req, str_opt, str_req};
-use crate::exchange::signed::okx::{OkxAcctLv, parse_account_mode};
+use crate::exchange::signed::okx::{OkxAcctLv, OkxLatch, parse_account_mode};
 use crate::exchange::signed::signing::{Credentials, okx_auth_headers, okx_signature, okx_timestamp, percent_encode};
 
 pub const ORDER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Name of the header that makes OKX drop an order its server receives after the given epoch ms.
+const EXP_TIME_HEADER: &str = "expTime";
+/// Consecutive `51603` answers (after `expTime`) before an unknown submit counts as "never arrived".
+const NOT_FOUND_CONFIRMATIONS: u8 = 2;
+
+/// What the size guard needs about one instrument (from the public instruments, mark price and the
+/// risk settings; wired in `okx-trading-enablement`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OkxLimits {
+    /// Base coin per contract.
+    pub ct_val: Decimal,
+    /// Smallest order step in contracts; `sz` must be a whole multiple.
+    pub lot_sz: Decimal,
+    pub mark_px: Decimal,
+    /// Largest notional (USDT) one leg may have.
+    pub max_leg_notional: Decimal,
+}
+
+pub trait OkxLimitsSource: Send + Sync {
+    /// `None` = unknown instrument or no usable data: the order is not sent.
+    fn limits(&self, symbol: &str) -> Option<OkxLimits>;
+}
+
+/// `sz` (contracts) must be positive, a whole multiple of `lotSz`, and `sz x ctVal x mark` must not
+/// exceed the per-leg notional cap. Every limit must be positive: anything else refuses.
+pub fn check_size(sz: Decimal, l: &OkxLimits) -> Result<(), String> {
+    if l.ct_val <= Decimal::ZERO || l.lot_sz <= Decimal::ZERO || l.mark_px <= Decimal::ZERO || l.max_leg_notional <= Decimal::ZERO {
+        return Err("OKX size limits unusable (ctVal, lotSz, mark price and notional cap must be positive)".into());
+    }
+    if sz <= Decimal::ZERO {
+        return Err("OKX sz must be positive".into());
+    }
+    if !(sz % l.lot_sz).is_zero() {
+        return Err(format!("OKX sz {sz} is not a whole multiple of lotSz {}", l.lot_sz));
+    }
+    let notional = sz * l.ct_val * l.mark_px;
+    if notional > l.max_leg_notional {
+        return Err(format!("OKX notional {notional} USDT exceeds the per-leg cap {}", l.max_leg_notional));
+    }
+    Ok(())
+}
 
 pub struct OkxOrderClient<T> {
     transport: Arc<T>,
     creds: Arc<Credentials>,
     env: OkxHost,
+    /// Set by the first account-config read that answered `code "0"` with THESE credentials: the
+    /// proof that the key works as a demo key (the request carried the demo flag). Orders wait for it.
+    demo_proven: AtomicBool,
+    latch: Arc<OkxLatch>,
+    /// `clOrdId` -> (expTime ms, consecutive 51603 after expiry) for submits left unknown or rate limited.
+    pending: Mutex<HashMap<String, (i64, u8)>>,
 }
 
 fn side_param(side: OrderSide) -> &'static str {
@@ -45,7 +94,30 @@ fn side_param(side: OrderSide) -> &'static str {
 
 impl<T: OrderTransport> OkxOrderClient<T> {
     pub fn new(transport: Arc<T>, creds: Arc<Credentials>, demo_env: OkxHost) -> Self {
-        OkxOrderClient { transport, creds, env: demo_env }
+        OkxOrderClient { transport, creds, env: demo_env, demo_proven: AtomicBool::new(false), latch: OkxLatch::new(), pending: Mutex::new(HashMap::new()) }
+    }
+
+    /// Shares an `OkxLatch` with the other OKX clients: `50101` anywhere disables OKX everywhere.
+    pub fn with_latch(mut self, latch: Arc<OkxLatch>) -> Self {
+        self.latch = latch;
+        self
+    }
+
+    pub fn latch(&self) -> &Arc<OkxLatch> {
+        &self.latch
+    }
+
+    fn disabled(&self) -> Option<String> {
+        self.latch.reason().map(|r| format!("OKX disabled: {r}"))
+    }
+
+    /// Sends one request; an environment mismatch (`50101`) in the reply trips the latch.
+    async fn call(&self, req: OrderHttpRequest) -> Reply {
+        let result = self.transport.send(req).await;
+        if okx_is_env_mismatch(&result) {
+            self.latch.trip("OKX 50101: API key does not match the environment (demo flag sent); OKX disabled until restart");
+        }
+        okx_reply(result)
     }
 
     /// Builds one signed request. `path_and_query` is signed exactly as sent; `body` (POST) too.
@@ -62,6 +134,7 @@ impl<T: OrderTransport> OkxOrderClient<T> {
 
     /// `POST /api/v5/trade/order`: market order, `sz` in contracts exactly as given, `tdMode`
     /// cross, explicit `reduceOnly`, no `posSide` (net mode is guaranteed by the mode gate).
+    /// Carries `expTime` (signing time + the request timeout): after it OKX no longer processes it.
     pub fn submit_request(&self, order: &ValidOrder, timestamp_ms: i64) -> Result<OrderHttpRequest, AdapterError> {
         let inst_id = okx_inst_id(order.symbol()).ok_or_else(|| AdapterError::parse("symbol is not a BASEUSDT symbol"))?;
         let body = json!({
@@ -73,7 +146,8 @@ impl<T: OrderTransport> OkxOrderClient<T> {
             "clOrdId": order.id().as_str(),
             "reduceOnly": order.reduce_only(),
         });
-        self.build(Method::Post, OKX_ORDER_PATH, Some(body.to_string()), timestamp_ms)
+        let exp_time = timestamp_ms.saturating_add(ORDER_TIMEOUT.as_millis() as i64);
+        self.build(Method::Post, OKX_ORDER_PATH, Some(body.to_string()), timestamp_ms).map(|r| r.header(EXP_TIME_HEADER, &exp_time.to_string()))
     }
 
     /// `GET /api/v5/trade/order` by `clOrdId` or `ordId`.
@@ -99,24 +173,76 @@ impl<T: OrderTransport> OkxOrderClient<T> {
     }
 
     async fn send(&self, req: Result<OrderHttpRequest, AdapterError>) -> Reply {
+        if let Some(reason) = self.disabled() {
+            return Reply::Unknown { reason };
+        }
         match req {
-            Ok(r) => okx_reply(self.transport.send(r).await),
+            Ok(r) => self.call(r).await,
             Err(e) => Reply::Unknown { reason: format!("request not built: {e}") },
         }
     }
 
+    /// Nothing is sent unless OKX is not latched off and the demo key has been proven.
     pub async fn submit(&self, order: &ValidOrder, timestamp_ms: i64) -> SubmitClass {
+        let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
+        if let Some(reason) = self.disabled() {
+            return not_sent(reason);
+        }
+        if !self.demo_proven.load(Ordering::SeqCst) {
+            return not_sent("OKX demo key not proven: the account-config check has not succeeded yet".into());
+        }
         let req = match self.submit_request(order, timestamp_ms) {
             Ok(r) => r,
             Err(e) => return SubmitClass::Rejected { code: "local".into(), message: format!("not sent: {e}") },
         };
-        submit_class(okx_reply(self.transport.send(req).await), |b| parse_ack(b, order.id().as_str()))
+        let id = order.id().as_str().to_string();
+        let exp_time = timestamp_ms.saturating_add(ORDER_TIMEOUT.as_millis() as i64);
+        let class = submit_class(self.call(req).await, |b| parse_ack(b, &id));
+        let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &class {
+            // The order may still be processed until `expTime`: remember it so a 51603 is not trusted early.
+            SubmitClass::Unknown { .. } | SubmitClass::RateLimited { .. } => {
+                pending.insert(id, (exp_time, 0));
+            }
+            SubmitClass::Accepted(_) | SubmitClass::Rejected { .. } => {
+                pending.remove(&id);
+            }
+        }
+        class
     }
 
     /// One `GET /api/v5/trade/order`; `51603` is "not found". A rejected timestamp (`50102`) is
     /// a failure the engine's repeated lookup absorbs (no resync handle exists at this layer).
     pub async fn query(&self, symbol: &str, by: &OrderRef, timestamp: impl Fn() -> i64) -> QueryOutcome {
-        query_outcome(self.send(self.query_request(symbol, by, timestamp())).await, &OKX_NOT_FOUND_CODES, parse_order)
+        let reply = self.send(self.query_request(symbol, by, timestamp())).await;
+        if let (Reply::Refused { code, .. }, OrderRef::Client(id)) = (&reply, by)
+            && OKX_NOT_FOUND_CODES.contains(code)
+            && let Some(verdict) = self.not_found_verdict(id.as_str(), timestamp())
+        {
+            return verdict;
+        }
+        let outcome = query_outcome(reply, &OKX_NOT_FOUND_CODES, parse_order);
+        if matches!(outcome, QueryOutcome::Found(_)) && let OrderRef::Client(id) = by {
+            self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id.as_str());
+        }
+        outcome
+    }
+
+    /// `Some(Failed)` while the order, left unknown by a submit of this process, may still be
+    /// processed (before `expTime`, or before the second confirmation); `None` = no such memory,
+    /// the plain "not found" applies; `Some(NotFound)` once it is safe to say it never arrived.
+    fn not_found_verdict(&self, id: &str, now_ms: i64) -> Option<QueryOutcome> {
+        let mut pending = self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (exp_time, seen) = pending.get_mut(id)?;
+        if now_ms <= *exp_time {
+            return Some(QueryOutcome::Failed { reason: format!("51603 before expTime ({exp_time}): the order may still be processed; confirm later") });
+        }
+        *seen += 1;
+        if *seen < NOT_FOUND_CONFIRMATIONS {
+            return Some(QueryOutcome::Failed { reason: format!("51603 seen {seen} of {NOT_FOUND_CONFIRMATIONS} times after expTime; confirm again") });
+        }
+        pending.remove(id);
+        Some(QueryOutcome::NotFound)
     }
 
     /// Cancel, then read the order back: the cancel reply carries no state, and `51400`
@@ -136,6 +262,8 @@ impl<T: OrderTransport> OkxOrderClient<T> {
     pub async fn position_mode(&self, timestamp_ms: i64) -> Result<ModeReading, String> {
         match self.send(self.position_mode_request(timestamp_ms)).await {
             Reply::Ok(b) => {
+                // code "0" with these credentials and the demo flag: the key is proven (design D1)
+                self.demo_proven.store(true, Ordering::SeqCst);
                 let row = b.get("data").and_then(Value::as_array).and_then(|d| d.first()).ok_or("account config missing")?;
                 match parse_account_mode(row) {
                     Ok(OkxAcctLv::Futures | OkxAcctLv::MultiCurrency) => Ok(ModeReading::OneWay),
@@ -334,10 +462,19 @@ mod tests {
 
     // ---- result classification (recorded-style fixtures) ----
 
+    /// A client whose demo key was proven by a successful account-config read (design D1).
+    async fn proven_client(t: &FakeOrderTransport) -> OkxOrderClient<FakeOrderTransport> {
+        let path = format!("{}/tests/fixtures/okx/signed/account_config_futures_net.json", env!("CARGO_MANIFEST_DIR"));
+        t.on(Method::Get, "/api/v5/account/config", R::ok(&std::fs::read_to_string(path).unwrap()));
+        let c = client(t);
+        c.position_mode(TS).await.unwrap();
+        c
+    }
+
     async fn submit_with(r: R) -> (SubmitClass, FakeOrderTransport) {
         let t = FakeOrderTransport::new();
         t.on(Method::Post, "/api/v5/trade/order", r);
-        let class = client(&t).submit(&order(OrderSide::Buy, "3", false), TS).await;
+        let class = proven_client(&t).await.submit(&order(OrderSide::Buy, "3", false), TS).await;
         (class, t)
     }
 
@@ -496,5 +633,154 @@ mod tests {
         assert!(c.submit_request(&order(OrderSide::Buy, "1", false), TS).is_err());
         assert!(matches!(c.submit(&order(OrderSide::Buy, "1", false), TS).await, SubmitClass::Rejected { .. }));
         assert!(t.requests().is_empty());
+    }
+
+    // ---- guards (okx-execution-guards) ----
+
+    #[tokio::test]
+    async fn an_unproven_client_does_not_send_an_order() {
+        let t = FakeOrderTransport::new();
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_accepted"));
+        match client(&t).submit(&order(OrderSide::Buy, "3", false), TS).await {
+            SubmitClass::Rejected { code, message } => assert_eq!((code.as_str(), message.contains("not proven")), ("not_sent", true), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(t.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_config_read_does_not_prove_the_key() {
+        let t = FakeOrderTransport::new();
+        t.on(Method::Get, "/api/v5/account/config", ok("place_50102"));
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_accepted"));
+        let c = client(&t);
+        assert!(c.position_mode(TS).await.is_err());
+        assert!(matches!(c.submit(&order(OrderSide::Buy, "3", false), TS).await, SubmitClass::Rejected { .. }));
+        assert_eq!(t.count(Method::Post, "/api/v5/trade/order"), 0);
+    }
+
+    #[tokio::test]
+    async fn the_proof_and_the_order_use_the_same_credentials() {
+        let t = FakeOrderTransport::new();
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_accepted"));
+        let c = proven_client(&t).await;
+        assert!(matches!(c.submit(&order(OrderSide::Buy, "3", false), TS).await, SubmitClass::Accepted(_)));
+        let reqs = t.requests();
+        let keys: Vec<&str> = reqs.iter().map(|r| header(r, "OK-ACCESS-KEY")[0]).collect();
+        assert_eq!(keys, vec![KEY, KEY]);
+        assert_eq!(header(&reqs[0], "OK-ACCESS-PASSPHRASE"), header(&reqs[1], "OK-ACCESS-PASSPHRASE"));
+    }
+
+    #[tokio::test]
+    async fn a_50101_on_any_call_latches_okx_off_for_every_later_call() {
+        let t = FakeOrderTransport::new();
+        let c = proven_client(&t).await;
+        t.on(Method::Get, "/api/v5/trade/order?", ok("place_50101"));
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_accepted"));
+        let cid = ClientOrderId::parse(&id()).unwrap();
+        assert!(matches!(c.query("BTCUSDT", &OrderRef::Client(cid.clone()), || TS).await, QueryOutcome::Failed { .. }));
+        let posts = || t.count(Method::Post, "/api/v5/trade/order");
+        match c.submit(&order(OrderSide::Buy, "3", false), TS).await {
+            SubmitClass::Rejected { code, message } => assert_eq!((code.as_str(), message.contains("50101")), ("not_sent", true), "{message}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(posts(), 0);
+        let n = t.requests().len();
+        assert!(matches!(c.query("BTCUSDT", &OrderRef::Client(cid.clone()), || TS).await, QueryOutcome::Failed { reason } if reason.contains("50101")));
+        assert!(matches!(c.cancel("BTCUSDT", &cid, || TS).await, QueryOutcome::Failed { .. }));
+        assert!(c.position_mode(TS).await.unwrap_err().contains("50101"));
+        assert_eq!(t.requests().len(), n, "latched: nothing more is sent");
+    }
+
+    #[tokio::test]
+    async fn a_50101_inside_a_submit_reply_latches_too_and_is_not_an_ordinary_rejection() {
+        let t = FakeOrderTransport::new();
+        let c = proven_client(&t).await;
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_50101"));
+        let class = c.submit(&order(OrderSide::Buy, "3", false), TS).await;
+        assert!(matches!(class, SubmitClass::Unknown { .. }), "{class:?}: the outcome of that request is not 'clearly refused'");
+        assert!(c.latch().reason().is_some());
+    }
+
+    #[tokio::test]
+    async fn unlisted_rejection_codes_and_empty_data_are_unknown() {
+        assert!(matches!(submit_with(ok("place_scode_unlisted")).await.0, SubmitClass::Unknown { .. }));
+        assert!(matches!(submit_with(ok("place_code0_empty_data")).await.0, SubmitClass::Unknown { .. }));
+        // listed codes stay rejections
+        assert!(matches!(submit_with(ok("place_rejected_51131")).await.0, SubmitClass::Rejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn code_50013_on_a_submit_is_unknown_with_exactly_one_post() {
+        let body = json!({"code":"50013","msg":"Systems are busy","data":[]}).to_string();
+        let (class, t) = submit_with(R::ok(&body)).await;
+        assert!(matches!(class, SubmitClass::Unknown { .. }));
+        assert_eq!(t.count(Method::Post, "/api/v5/trade/order"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_submit_carries_exp_time_after_the_signing_time() {
+        let t = FakeOrderTransport::new();
+        let r = client(&t).submit_request(&order(OrderSide::Buy, "3", false), TS).unwrap();
+        assert_eq!(header(&r, "expTime"), vec![(TS + 5_000).to_string().as_str()]);
+    }
+
+    #[tokio::test]
+    async fn a_51603_after_an_unknown_submit_needs_expiry_and_two_confirmations() {
+        let t = FakeOrderTransport::new();
+        let c = proven_client(&t).await;
+        t.on(Method::Post, "/api/v5/trade/order", ok("place_50004"));
+        t.on(Method::Get, "/api/v5/trade/order?", ok("order_51603"));
+        let cid = ClientOrderId::parse(&id()).unwrap();
+        let by = OrderRef::Client(cid);
+        assert!(matches!(c.submit(&order(OrderSide::Buy, "3", false), TS).await, SubmitClass::Unknown { .. }));
+        // 50004, then 51603 right away: the order may still be processed until expTime
+        assert!(matches!(c.query("BTCUSDT", &by, || TS + 100).await, QueryOutcome::Failed { .. }));
+        // expired, but only one confirmation so far
+        let late = TS + 5_001;
+        assert!(matches!(c.query("BTCUSDT", &by, || late).await, QueryOutcome::Failed { .. }));
+        assert_eq!(c.query("BTCUSDT", &by, || late + 1_000).await, QueryOutcome::NotFound, "second 51603 after expiry");
+    }
+
+    #[tokio::test]
+    async fn a_51603_for_an_order_this_process_never_left_unknown_is_not_found_at_once() {
+        let t = FakeOrderTransport::new();
+        t.on(Method::Get, "/api/v5/trade/order?", ok("order_51603"));
+        let cid = ClientOrderId::parse(&id()).unwrap();
+        assert_eq!(client(&t).query("BTCUSDT", &OrderRef::Client(cid), || TS).await, QueryOutcome::NotFound);
+    }
+
+    // ---- size guard (okx-execution-guards D3) ----
+
+    fn limits(ct_val: &str, lot_sz: &str, mark_px: &str, cap: &str) -> OkxLimits {
+        OkxLimits { ct_val: d(ct_val), lot_sz: d(lot_sz), mark_px: d(mark_px), max_leg_notional: d(cap) }
+    }
+
+    #[test]
+    fn a_size_must_be_a_whole_number_of_lots_and_within_the_notional_cap() {
+        let btc = limits("0.01", "1", "60000", "5000");
+        assert!(check_size(d("3"), &btc).is_ok(), "3 contracts = 0.03 BTC = 1800 USDT");
+        assert!(check_size(d("8"), &btc).is_ok());
+        assert!(check_size(d("9"), &btc).unwrap_err().contains("notional"), "9 * 0.01 * 60000 = 5400 > 5000");
+        assert!(check_size(d("0.5"), &btc).unwrap_err().contains("lotSz"));
+        assert!(check_size(d("2.5"), &limits("0.01", "0.5", "60000", "5000")).is_ok(), "multiples of a fractional lot");
+        assert!(check_size(d("0.3"), &limits("0.01", "0.5", "60000", "5000")).is_err());
+    }
+
+    #[test]
+    fn a_coin_sized_quantity_on_a_big_contract_value_instrument_is_refused() {
+        // ctVal 1000 per contract: 0.5 "coins" sent as sz is not a lot multiple; 500000 would be 500 million coins
+        let pepe = limits("1000", "1", "0.5", "100000");
+        assert!(check_size(d("0.5"), &pepe).is_err());
+        assert!(check_size(d("3"), &pepe).is_ok());
+        assert!(check_size(d("500000"), &pepe).unwrap_err().contains("notional"));
+    }
+
+    #[test]
+    fn missing_or_nonsensical_limits_refuse_instead_of_guessing() {
+        for l in [limits("0", "1", "60000", "5000"), limits("0.01", "0", "60000", "5000"), limits("0.01", "1", "0", "5000"), limits("0.01", "1", "60000", "0"), limits("-1", "1", "60000", "5000")] {
+            assert!(check_size(d("1"), &l).is_err(), "{l:?}");
+        }
+        assert!(check_size(d("0"), &limits("0.01", "1", "60000", "5000")).is_err());
     }
 }

@@ -10,7 +10,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 use super::account::DemoAccountView;
 use super::binance::BinanceOrderClient;
 use super::bybit::BybitOrderClient;
-use super::okx::OkxOrderClient;
+use super::okx::{OkxLimits, OkxLimitsSource, OkxOrderClient};
 use super::classify::SubmitClass;
 use super::endpoints::*;
 use super::executor::{DemoExecutor, IntentLedger, POSITION_MODE_TTL_MS};
@@ -68,6 +68,22 @@ pub(super) fn creds() -> Arc<Credentials> {
     Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into(), passphrase: None })
 }
 
+/// Size limits of the test instrument: ctVal 0.01 BTC, lotSz 0.001 contracts, mark 60000, cap 100000 USDT.
+pub(super) struct StubLimits(pub std::collections::HashMap<String, OkxLimits>);
+impl OkxLimitsSource for StubLimits {
+    fn limits(&self, symbol: &str) -> Option<OkxLimits> {
+        self.0.get(symbol).cloned()
+    }
+}
+
+pub(super) fn limits_of(ct_val: &str, lot_sz: &str, mark_px: &str, cap: &str) -> Arc<StubLimits> {
+    Arc::new(StubLimits([(SYM.to_string(), OkxLimits { ct_val: d(ct_val), lot_sz: d(lot_sz), mark_px: d(mark_px), max_leg_notional: d(cap) })].into()))
+}
+
+pub(super) fn btc_limits() -> Arc<StubLimits> {
+    limits_of("0.01", "0.001", "60000", "100000")
+}
+
 pub(super) fn okx_creds() -> Arc<Credentials> {
     Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into(), passphrase: Some("TEST_PASS_NOT_REAL".into()) })
 }
@@ -111,7 +127,8 @@ pub(super) fn rig_with(offset: Option<i64>) -> Rig {
         ledger.clone(),
         limiter,
     )
-    .with_okx(OkxOrderClient::new(Arc::new(t.clone()), okx_creds(), OkxHost::Demo));
+    .with_okx(OkxOrderClient::new(Arc::new(t.clone()), okx_creds(), OkxHost::Demo))
+    .with_okx_limits(btc_limits());
     Rig { t, ex: Arc::new(ex), clock, ledger }
 }
 
@@ -407,6 +424,99 @@ async fn okx_cancel_only_touches_orders_in_order_intents() {
     assert_okx_requests_admitted(&r.t);
 }
 
+fn okx_close() -> OrderRequest {
+    req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Close, 0), OrderSide::Buy, "3", true)
+}
+
+#[tokio::test]
+async fn without_a_limits_source_okx_orders_are_not_sent_and_nothing_is_requested() {
+    let t = FakeOrderTransport::new();
+    let clock = ManualClock::new(NOW);
+    let ex = DemoExecutor::new(
+        BinanceOrderClient::new(Arc::new(t.clone()), creds(), BinanceHost::Testnet),
+        BybitOrderClient::new(Arc::new(t.clone()), creds(), BybitHost::Demo),
+        Arc::new(clock.clone()),
+        Arc::new(Offsets(Some(0))),
+        Arc::new(Ledger::default()),
+        Arc::new(RateLimiter::new(Arc::new(clock))),
+    )
+    .with_okx(OkxOrderClient::new(Arc::new(t.clone()), okx_creds(), OkxHost::Demo));
+    match ex.submit(okx_open()).await {
+        SubmitOutcome::Rejected { reason } => assert!(reason.contains("limits"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(t.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_coin_sized_quantity_on_a_ctval_1000_instrument_is_not_sent() {
+    let r = rig();
+    // ctVal 1000, lotSz 1, mark 0.5, cap 1000 USDT
+    let ex = Arc::new(DemoExecutor::new(
+        BinanceOrderClient::new(Arc::new(r.t.clone()), creds(), BinanceHost::Testnet),
+        BybitOrderClient::new(Arc::new(r.t.clone()), creds(), BybitHost::Demo),
+        Arc::new(r.clock.clone()),
+        Arc::new(Offsets(Some(0))),
+        r.ledger.clone(),
+        Arc::new(RateLimiter::new(Arc::new(r.clock.clone()))),
+    )
+    .with_okx(OkxOrderClient::new(Arc::new(r.t.clone()), okx_creds(), OkxHost::Demo))
+    .with_okx_limits(limits_of("1000", "1", "0.5", "1000")));
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+    for (qty, expect) in [("0.019", "lotSz"), ("3", "notional")] {
+        match ex.submit(req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 0), OrderSide::Sell, qty, false)).await {
+            SubmitOutcome::Rejected { reason } => assert!(reason.contains(expect), "{qty}: {reason}"),
+            other => panic!("{qty}: {other:?}"),
+        }
+    }
+    assert!(r.t.requests().is_empty(), "refused before any request");
+    assert!(matches!(ex.submit(req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, 1), OrderSide::Sell, "1", false)).await, SubmitOutcome::Accepted(_)), "1 contract = 1000 coins * 0.5 = 500 USDT is within the cap");
+}
+
+#[tokio::test]
+async fn a_close_rereads_the_account_mode_every_time_while_an_open_uses_the_cache() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
+    let open = |seq| req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Open, seq), OrderSide::Sell, "3", false);
+    let close = |seq| req(Exchange::Okx, &demo_id(Leg::Short, OrderAction::Close, seq), OrderSide::Buy, "3", true);
+    r.ex.submit(open(0)).await;
+    r.ex.submit(open(1)).await;
+    assert_eq!(r.t.count(Method::Get, "/api/v5/account/config"), 1);
+    r.ex.submit(close(0)).await;
+    r.ex.submit(close(1)).await;
+    assert_eq!(r.t.count(Method::Get, "/api/v5/account/config"), 3, "each close re-reads the mode");
+}
+
+#[tokio::test]
+async fn a_close_that_refuses_with_51000_or_51010_says_the_other_leg_is_naked() {
+    for code in ["51000", "51010"] {
+        let r = rig();
+        script_okx_mode(&r.t);
+        let body = serde_json::json!({"code":"1","msg":"All operations failed","data":[{"sCode":code,"sMsg":"refused","ordId":""}]}).to_string();
+        r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&body));
+        match r.ex.submit(okx_close()).await {
+            SubmitOutcome::Rejected { reason } => assert!(reason.contains("naked") && reason.contains(code), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+        // an open refused with the same code is an ordinary rejection
+        match r.ex.submit(okx_open()).await {
+            SubmitOutcome::Rejected { reason } => assert!(!reason.contains("naked"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_busy_50013_on_an_okx_submit_through_the_executor_is_unknown_with_one_post() {
+    let r = rig();
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, "/api/v5/trade/order", Reply::ok(r#"{"code":"50013","msg":"Systems are busy","data":[]}"#));
+    assert!(matches!(r.ex.submit(okx_open()).await, SubmitOutcome::Unknown { .. }));
+    assert_eq!(r.t.count(Method::Post, "/api/v5/trade/order"), 1);
+}
+
 #[tokio::test]
 async fn an_uncalibrated_okx_clock_sends_nothing() {
     let r = rig_with(None);
@@ -533,7 +643,7 @@ async fn with_okx_keys_the_factory_builds_an_okx_client_that_sends() {
     script_okx_mode(&t);
     t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&okx_order_fx("place_accepted")));
     let full = all_keys().with(Exchange::Okx, SecretName::ApiKey, KEY).with(Exchange::Okx, SecretName::ApiSecret, SECRET).with(Exchange::Okx, SecretName::Passphrase, "TEST_PASS_NOT_REAL");
-    let ex = factory(Arc::new(full), &t).build().unwrap();
+    let ex = factory(Arc::new(full), &t).with_okx_limits(btc_limits()).build().unwrap();
     assert!(matches!(ex.submit_classified(&okx_open()).await, SubmitClass::Accepted(_)));
     assert_okx_requests_admitted(&t);
 }

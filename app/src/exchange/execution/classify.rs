@@ -37,6 +37,11 @@ pub const BYBIT_NOT_FOUND_CODES: [i64; 1] = [110001];
 pub const OKX_UNKNOWN_CODES: [i64; 4] = [50001, 50004, 50013, 50026];
 /// OKX rate-limit codes: request too frequent, sub-account rate limit.
 pub const OKX_RATE_LIMIT_CODES: [i64; 2] = [50011, 50061];
+/// The only OKX codes that make a reply "clearly refused" (documented; UNVERIFIED completeness):
+/// parameter / mode / lot / balance / market-order-size refusals, "order does not exist", cancel
+/// failure, and authentication failures (nothing was processed). Any other code is UNKNOWN, so the
+/// order is looked up instead of being written off. `50101` is not here: it latches OKX off.
+pub const OKX_REFUSAL_CODES: [i64; 15] = [51000, 51008, 51010, 51020, 51121, 51131, 51202, 51400, 51603, 50102, 50103, 50104, 50105, 50111, 50113];
 /// OKX "order does not exist".
 pub const OKX_NOT_FOUND_CODES: [i64; 1] = [51603];
 
@@ -197,9 +202,20 @@ pub fn okx_reply(result: Result<HttpResponse, AdapterError>) -> Reply {
         Reply::RateLimited { retry_after_ms: retry_after(&resp) }
     } else if OKX_UNKNOWN_CODES.contains(&n) {
         Reply::Unknown { reason: redact_secrets(&format!("okx {n}: {message} (status unknown)")) }
-    } else {
+    } else if OKX_REFUSAL_CODES.contains(&n) {
         Reply::Refused { code: n, message: redact_secrets(message) }
+    } else {
+        Reply::Unknown { reason: redact_secrets(&format!("okx {n}: {message} (not a documented refusal; outcome unknown)")) }
     }
+}
+
+/// True when the reply says `50101` (API key does not match the environment) in `code` or `sCode`.
+pub fn okx_is_env_mismatch(result: &Result<HttpResponse, AdapterError>) -> bool {
+    let Ok(resp) = result else { return false };
+    let Ok(body) = serde_json::from_str::<Value>(&resp.body) else { return false };
+    let code = body.get("code").and_then(Value::as_str);
+    let s_code = body.get("data").and_then(Value::as_array).and_then(|d| d.first()).and_then(|r| r.get("sCode")).and_then(Value::as_str);
+    code == Some("50101") || s_code == Some("50101")
 }
 
 /// A submit reply turned into a class; `parse_ack` reads the accepted body.

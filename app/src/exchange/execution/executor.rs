@@ -17,7 +17,7 @@ use super::binance::{BinanceOrderClient, ModeReading};
 use super::bybit::BybitOrderClient;
 use super::classify::SubmitClass;
 use super::http::OrderTransport;
-use super::okx::OkxOrderClient;
+use super::okx::{OkxLimitsSource, OkxOrderClient, check_size};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{BoxFut, Executor, OrderRequest, QueryOutcome, ServerOffsets, SubmitOutcome};
 use crate::exchange::health::ratelimit::{BackoffState, RateLimiter, RequestClass};
@@ -49,6 +49,8 @@ pub struct DemoExecutor<T> {
     /// OKX is optional: without keys the factory gives a reason instead and OKX orders are not sent.
     okx: Option<OkxOrderClient<T>>,
     okx_unavailable: String,
+    /// Per-instrument size limits for OKX; without a source OKX orders are not sent (fail closed).
+    okx_limits: Option<Arc<dyn OkxLimitsSource>>,
     clock: Arc<dyn TimeSource>,
     offsets: Arc<dyn ServerOffsets>,
     intents: Arc<dyn IntentLedger>,
@@ -66,11 +68,16 @@ impl<T: OrderTransport> DemoExecutor<T> {
         intents: Arc<dyn IntentLedger>,
         limiter: Arc<RateLimiter>,
     ) -> Self {
-        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
+        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
     }
 
     pub fn with_okx(mut self, okx: OkxOrderClient<T>) -> Self {
         self.okx = Some(okx);
+        self
+    }
+
+    pub fn with_okx_limits(mut self, limits: Arc<dyn OkxLimitsSource>) -> Self {
+        self.okx_limits = Some(limits);
         self
     }
 
@@ -162,6 +169,21 @@ impl<T: OrderTransport> DemoExecutor<T> {
             Ok(o) => o,
             Err(e) => return not_sent(e),
         };
+        if req.exchange == Exchange::Okx {
+            // size guard first: nothing is requested for an order that is not a sane number of contracts
+            let verdict = match self.okx_limits.as_ref().map(|l| l.limits(order.symbol())) {
+                None => Err("OKX size limits source not configured; OKX order not sent".to_string()),
+                Some(None) => Err(format!("OKX size limits unknown for {}; OKX order not sent", order.symbol())),
+                Some(Some(l)) => check_size(order.quantity(), &l),
+            };
+            if let Err(e) = verdict {
+                return not_sent(e);
+            }
+            // a close must not trust a cached mode reading (a wrong mode leaves the other leg naked)
+            if req.reduce_only {
+                self.one_way_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&(Exchange::Okx, "*".to_string()));
+            }
+        }
         let Some(ts) = self.timestamp(req.exchange) else {
             return not_sent(format!("{} clock offset not calibrated", req.exchange.name()));
         };
@@ -179,6 +201,13 @@ impl<T: OrderTransport> DemoExecutor<T> {
                 Ok(okx) => okx.submit(&order, ts).await,
                 Err(reason) => not_sent(reason),
             },
+        };
+        let class = match class {
+            SubmitClass::Rejected { code, message } if req.exchange == Exchange::Okx && req.reduce_only && (code == "51000" || code == "51010") => SubmitClass::Rejected {
+                message: format!("OKX close refused ({code}: {message}): the opposite leg is naked (still open) and needs manual action"),
+                code,
+            },
+            other => other,
         };
         match &class {
             SubmitClass::RateLimited { retry_after_ms } => self.note_rate_limit(req.exchange, Some(*retry_after_ms)),

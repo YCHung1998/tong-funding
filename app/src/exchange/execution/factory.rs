@@ -15,7 +15,7 @@ use super::binance::BinanceOrderClient;
 use super::bybit::BybitOrderClient;
 use super::executor::{DemoExecutor, IntentLedger};
 use super::http::OrderTransport;
-use super::okx::OkxOrderClient;
+use super::okx::{OkxLimitsSource, OkxOrderClient};
 use crate::engine::ports::{Executor, ExecutorFactory, ServerOffsets};
 use crate::exchange::health::ratelimit::RateLimiter;
 use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost};
@@ -30,6 +30,7 @@ pub struct DemoExecutorFactory<T> {
     intents: Arc<dyn IntentLedger>,
     limiter: Arc<RateLimiter>,
     binance_env: BinanceHost,
+    okx_limits: Option<Arc<dyn OkxLimitsSource>>,
 }
 
 impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
@@ -44,7 +45,14 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
         limiter: Arc<RateLimiter>,
         binance_env: BinanceHost,
     ) -> Self {
-        DemoExecutorFactory { transport, secrets, clock, offsets, intents, limiter, binance_env }
+        DemoExecutorFactory { transport, secrets, clock, offsets, intents, limiter, binance_env, okx_limits: None }
+    }
+
+    /// Where the OKX size guard gets `ctVal` / `lotSz` / mark price / the notional cap. Without it
+    /// OKX orders are not sent (fail closed); the production wiring is okx-trading-enablement.
+    pub fn with_okx_limits(mut self, limits: Arc<dyn OkxLimitsSource>) -> Self {
+        self.okx_limits = Some(limits);
+        self
     }
 
     fn credentials(&self, exchange: Exchange) -> Result<Arc<Credentials>, String> {
@@ -66,6 +74,10 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
             self.limiter.clone(),
         );
         // OKX is optional (design D5): key, secret and passphrase, else OKX orders are not sent.
+        let executor = match &self.okx_limits {
+            Some(l) => executor.with_okx_limits(l.clone()),
+            None => executor,
+        };
         Ok(match load_credentials(self.secrets.as_ref(), Exchange::Okx, true) {
             Ok(okx) => executor.with_okx(OkxOrderClient::new(self.transport.clone(), Arc::new(okx), OkxHost::Demo)),
             Err(reason) => executor.with_okx_unavailable(format!("OKX keys unavailable ({reason:?}); OKX order not sent")),
