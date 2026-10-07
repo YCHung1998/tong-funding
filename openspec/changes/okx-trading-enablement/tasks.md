@@ -18,6 +18,9 @@
 - [ ] 3.2 `dashboard.rs` / `pages.rs`：OKX 真實帳戶卡，移除 `CompareOnly` 與 `OKX_NOTE`；更新 `dashboard_tests.rs`
 - [ ] 3.3 `positions.rs`：OKX 持倉列（幣量 + 張數、`ctVal` 未知標示）、移除 OKX 註記、分組以幣量；更新 `positions_tests.rs`
 
+- [ ] 3.4 （自 `okx-signed-read` 3.2 移入）`OkxPosition` → `models::Position` 頁面用轉換純函式與測試（幣量 = 張數 × `ctVal`，`ctVal` 未知標示無法換算）
+- [ ] 3.5 （自 `okx-signed-read` 3.3 移入）`ui/live.rs`：建立 `OkxSignedClient`（OKX 校時偏移、`ClockResync` 走公開時間端點）並以 `DemoAccountView::with_okx` 接上，加入帳戶輪詢與 `LegAccount` 輪詢迴圈
+
 ## 4. 驗證
 
 - [ ] 4.1 `cargo test -p tong-funding`、`cargo test -p tong-funding-core` 全套綠燈；`cargo clippy --all-targets -- -D warnings`；以 `rg -n "僅比價|CompareOnly|OKX_NOTE" app/src` 確認無殘留

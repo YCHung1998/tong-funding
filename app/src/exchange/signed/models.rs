@@ -88,36 +88,6 @@ impl<T> Listing<T> {
     }
 }
 
-/// Returned by account queries on an exchange without a signed client (OKX). Dedicated type so
-/// callers can show "price comparison only" instead of treating it as empty data or a failure.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{exchange:?}: account queries not supported ({reason})")]
-pub struct Unsupported {
-    pub exchange: Exchange,
-    pub reason: &'static str,
-}
-
-/// OKX has public market data only (design D8): its account methods never send a request
-/// (this type holds no transport and no credentials).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OkxAccount;
-
-impl OkxAccount {
-    const REASON: &'static str = "public market data only";
-    fn unsupported() -> Unsupported {
-        Unsupported { exchange: Exchange::Okx, reason: Self::REASON }
-    }
-    pub async fn get_balances(&self) -> Result<Vec<Balance>, Unsupported> {
-        Err(Self::unsupported())
-    }
-    pub async fn get_positions(&self) -> Result<Listing<Position>, Unsupported> {
-        Err(Self::unsupported())
-    }
-    pub async fn get_open_orders(&self) -> Result<Listing<OpenOrder>, Unsupported> {
-        Err(Self::unsupported())
-    }
-}
-
 // ---- JSON field helpers shared by the two parsers ----
 
 fn text_of(field: &str, v: &Value) -> Result<Option<String>, AdapterError> {
@@ -197,15 +167,5 @@ mod tests {
         assert!(matches!(dec_opt(&o, "b"), Err(AdapterError::Parse(_))));
         // a JSON float must never be accepted: it has already gone through binary floating point
         assert!(matches!(dec_opt(&o, "c"), Err(AdapterError::Parse(_))));
-    }
-
-    #[test]
-    fn okx_account_queries_are_unsupported_not_empty() {
-        let okx = OkxAccount;
-        let e1 = block_on(okx.get_balances()).unwrap_err();
-        assert_eq!(e1.exchange, Exchange::Okx);
-        assert!(e1.to_string().contains("public market data only"));
-        assert!(block_on(okx.get_positions()).is_err());
-        assert!(block_on(okx.get_open_orders()).is_err());
     }
 }

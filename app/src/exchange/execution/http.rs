@@ -121,6 +121,7 @@ impl ReqwestOrderTransport {
     pub fn signed_demo() -> Result<Self, AdapterError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
             .build()
             .map_err(|e| AdapterError::network(e.to_string()))?;
         Ok(ReqwestOrderTransport { client })
@@ -134,7 +135,7 @@ fn map_error(e: reqwest::Error) -> AdapterError {
 impl OrderTransport for ReqwestOrderTransport {
     async fn send(&self, req: OrderHttpRequest) -> Result<HttpResponse, AdapterError> {
         let parsed = reqwest::Url::parse(&req.url).map_err(|_| AdapterError::network("invalid url"))?;
-        if !HostPolicy::SignedDemo.allows(&parsed) {
+        if !HostPolicy::SignedDemo.allows(&parsed, &req.headers) {
             return Err(AdapterError::network("host not allowed"));
         }
         let method = match req.method {
@@ -292,7 +293,7 @@ mod tests {
             let r = OrderHttpRequest::to_demo(Method::Post, env, "/x?a=1", Duration::from_secs(1));
             let parsed = reqwest::Url::parse(r.full_url()).unwrap();
             assert!(ALLOWED_SIGNED_HOSTS.contains(&parsed.host_str().unwrap()), "{}", r.full_url());
-            assert!(HostPolicy::SignedDemo.allows(&parsed));
+            assert!(HostPolicy::SignedDemo.allows(&parsed, &[]));
         }
     }
 
@@ -302,7 +303,7 @@ mod tests {
         let r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "@evil.example/x", Duration::from_secs(1));
         let parsed = reqwest::Url::parse(r.full_url()).unwrap();
         // `https://api-demo.bybit.com@evil.example/x` would carry credentials: the policy refuses it.
-        assert!(!HostPolicy::SignedDemo.allows(&parsed) || parsed.host_str() == Some("api-demo.bybit.com"));
+        assert!(!HostPolicy::SignedDemo.allows(&parsed, &[]) || parsed.host_str() == Some("api-demo.bybit.com"));
     }
 
     #[test]

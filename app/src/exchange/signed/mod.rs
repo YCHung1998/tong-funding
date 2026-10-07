@@ -6,5 +6,6 @@ pub mod binance;
 pub mod bybit;
 pub mod endpoints;
 pub mod ledger;
+pub mod okx;
 pub mod models;
 pub mod signing;

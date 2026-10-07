@@ -48,7 +48,7 @@
 
 **D1　OKX demo 邊界 = 寫死主機 + 建構即帶模擬標頭 + 傳輸層檢查 + 靜態檢查。**
 `signed::endpoints` 新增 `OkxHost::Demo`（主機 `openapi.okx.com`）並加入 `ALLOWED_SIGNED_HOSTS`。`OkxHost` 不提供單獨取得主機或基底網址的方法，唯一的 API `OkxHost::target()` 同時回傳基底網址與模擬交易標頭（標頭名稱與值是同檔的常數）；signed 的 GET 建構與後續 execution 的下單建構都只能經由它取得網址，並無條件套用回傳的標頭，沒有參數可關閉。`ReqwestTransport`（`HostPolicy::SignedDemo`）與 `ReqwestOrderTransport` 在主機為 OKX 時，若標頭不存在或值不是 `1`，零連線拒絕。靜態檢查：`openapi.okx.com` 字面只准出現在 `signed/endpoints.rs`；`x-simulated-trading` 字面只准出現在 `signed/endpoints.rs` 的常數定義；`signed/okx.rs` 不得出現 `www.okx.com`。
-第三道（交易所端）防線：demo key 打正式環境、或正式 key 帶模擬標頭，OKX 皆回 `50101`。
+第三道（交易所端）防線（**未驗證，待使用者實機確認**）：依文件 Error Codes 的一行泛稱，環境不符時 OKX 回 `50101`；兩個方向（demo key 打正式、正式 key 帶模擬標頭）是否都如此，是推論而非保證。其中「demo key 缺標頭」我們的程式碼永遠不會送出，只能查文件。
 - 替代 A：簽名也用 `www.okx.com`（Python 版做法）。缺點：與公開行情主機相同，`HostPolicy` 與 `ratelimit::classify_request`（以主機判斷 Signed 類別）都無法區分；正式主機掃描必須開洞。
 - 替代 B：不做 OKX 簽名（維持現狀）。與本計畫目標衝突。
 - 選擇 `openapi.okx.com`：文件 2026-10 版明載為 REST 主機；與公開行情主機字面不同，`HostPolicy` 與限流分類可沿用「以主機判斷」；但它**也是正式主機**，所以安全不靠主機名而靠標頭與 demo key，spec 明寫這點。
@@ -101,7 +101,7 @@ OKX 對等分成四個依序的 change，每個 ≤ 12 項 task：
 
 ## Risks / Trade-offs
 
-- [`openapi.okx.com` 也是正式主機，安全不再由主機保證] → D1 的三層：建構即帶標頭（無法省略）、傳輸層零連線拒絕缺標頭的 OKX 請求、OKX 端 `50101` 拒絕環境不符的 key；加上靜態檢查與錄製測試逐一斷言每個 OKX 請求都帶 `x-simulated-trading: 1`。
+- [`openapi.okx.com` 也是正式主機，安全不再由主機保證] → D1 的三層：建構即帶標頭（無法省略）、傳輸層零連線拒絕缺標頭的 OKX 請求、OKX 端對環境不符 key 的 `50101`（未驗證的推論，不作為唯一依據）；加上靜態檢查與錄製測試逐一斷言每個 OKX 請求都帶 `x-simulated-trading: 1`。
 - [使用者的 OKX 帳戶若註冊在 EEA / US，`openapi.okx.com` 無效] → 實機步驟第一步即確認；不在本計畫加入地區網域（Open Question 1）。
 - [文件欄位與 demo 實際回應不同（Python 版從未驗證成功）] → 解析器只依文件、fixtures 標註「依文件構造、未驗證」；實機 task 由使用者以真實 demo 帳戶比對後才把 fixtures 換成去識別化的真實回應。
 - [`availEq` 在某些模式為空] → fail closed（保證金檢查不通過、頁面顯示「未知（原因）」），不 fallback。
@@ -126,3 +126,27 @@ OKX 對等分成四個依序的 change，每個 ≤ 12 項 task：
 2. 公開行情是否一併改用 `openapi.okx.com`？（目前 `www.okx.com` 仍可用；不在本計畫內改。）
 3. `50013` 在公開路徑是否應改為「暫時錯誤」而非限流？
 4. demo 帳戶的 `acctLv` 預設值為何（使用者實機回報）；若為 1（現貨模式）需使用者手動切換為合約模式。
+
+## 實作時發現
+
+- `Exchange::Okx` 的「帳戶模式不支援」沒有新增 `AdapterError` 變體（`feed.rs`、`classify.rs` 有窮舉 match），以 `Exchange { code: "acct_mode_unsupported", message: "帳戶模式不支援 (acctLv X, posMode Y)" }` 表示。
+- OKX 認證失敗可能帶 4xx 狀態與 JSON `code`：`attempt()` 對非 2xx（429 除外）先嘗試解析 `code`，使 `50102` 在 401 下仍會重校時重送；無法解析才回 `Http{status}`。
+- 公開策略（`HostPolicy::PublicProduction`）對 `www.okx.com` 不套用「必須有模擬標頭」：公開行情是無簽名請求；改為拒絕任何帶 `x-simulated-trading` 或 `OK-ACCESS-*` 的公開請求。「`*.okx.com` 必須帶標頭」只適用簽名策略。
+- 公開層與簽名層共用唯一的 `okx_inst_id` / `okx_symbol`（`signed/endpoints.rs`），`public/okx.rs` 的私有副本已刪除。
+- 模式快取維持在 `OkxSignedClient`（60 秒，沿用 `POSITION_MODE_TTL_MS`）：本 change 沒有 executor，spec 情境「60 秒內不再重讀帳戶設定」要求讀取端自己快取；`okx-demo-execution` 的 executor 對 OKX 直接呼叫同一個 `account_mode()`，不另建第二份快取（抗辯 #6）。
+
+## 抗辯修正
+
+1. `HostPolicy::allows(url, headers)` 是唯一的准入規則，host 與 OKX 標頭一起判斷，`reqwest_transport.rs` 與 `execution/http.rs` 皆呼叫它。
+2. 簽名策略下，任何 `*.okx.com` 主機須恰有一個 `x-simulated-trading`（名稱不分大小寫）且值恰為 `1`；零個、重複（含不同大小寫）、其他值皆零連線拒絕。
+3. `openapi.okx.com` 列入 `PRODUCTION_HOSTS`（只有 `signed/endpoints.rs` 可豁免）；字面規則涵蓋整個 crate 含 `ui/live.rs`。
+4. `50101` 的雙向拒絕標為「未驗證，待使用者實機確認」（見上方 D1 與 tasks 4.2）。
+5. 50102 重試重新經 `HttpRequest::okx_signed_get` 建構；測試斷言重送的請求仍帶標頭，且經真實 `HostPolicy` 准入。
+6. 模式閘門：單一 60 秒快取，常數沿用 `POSITION_MODE_TTL_MS`（見上「實作時發現」）。
+7. `okx_inst_id` / `okx_symbol` 單一配對（`signed/endpoints.rs`）。
+8. clOrdId 長度改為單元測試（屬 `okx-demo-execution`）。
+9. 原 3.2 / 3.3 移至 `okx-trading-enablement` 3.4 / 3.5。
+A. `HttpRequest::header()` 拒絕 `x-simulated-trading` 與 `OK-ACCESS-*`（丟棄並標記，傳輸層零連線拒絕）；OKX 請求只能由 `HttpRequest::okx_signed_get` 建構，旗標由它在私有欄位序列中先插入。傳輸層對「任何 `OK-ACCESS-*` 請求」也要求旗標。
+B. 靜態規則（`static_checks.rs`，整個 `src/` 與 `tests/`）：`reqwest` 識別字只准在 `reqwest_transport.rs` 與 `execution/http.rs`；`x-simulated-trading` 字面只准 `signed/endpoints.rs`；`OK-ACCESS` 只准 `signed/endpoints.rs` 與 `signed/signing.rs`；`okx.com` 只准 `signed/endpoints.rs` 與 `public/endpoints.rs`；各有反例測試，且與 `host_fragments`（豁免白名單主機）分開。
+C. 兩個真實客戶端皆 `.no_proxy()`、無重導向、無自動重試；測試以 `HTTP_PROXY` 驗證（含對照組證明測試非空轉）。
+D. 以本機假伺服器 + `LocalOkxTest` 策略證明缺標頭 / 重複 / `header()` 嘗試皆零連線；POST 版本在 `okx-demo-execution`。

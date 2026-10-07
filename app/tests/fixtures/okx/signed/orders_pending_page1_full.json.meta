@@ -1,0 +1,4 @@
+依文件構造、未在真實 demo 帳戶驗證 (hand-constructed from the OKX v5 official documentation, https://www.okx.com/docs-v5/en/ , fetched 2026-10-07).
+NOT a recorded response: field names, types and example shapes follow the documented response of the endpoint below; values are invented.
+Endpoint: GET /api/v5/trade/orders-pending?instType=SWAP&limit=100 (100 rows, newest first, ordId 600000000000000100 down to ...001; the last row's ordId is the `after` cursor of page 2)
+Replace with a de-identified real demo response after the user's real-machine check (okx-signed-read task 4.2).

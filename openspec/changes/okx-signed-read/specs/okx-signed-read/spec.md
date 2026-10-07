@@ -3,7 +3,7 @@
 ### Requirement: OKX 簽名請求只能以模擬交易身分送出
 
 OKX 的每一個簽名請求 SHALL 送往程式中寫死的 OKX 簽名主機常數，且 SHALL 帶有標頭 `x-simulated-trading: 1`；取得 OKX 簽名網址的唯一途徑 SHALL 同時給出該標頭，且每個 OKX 請求的建構 SHALL 無條件套用；呼叫端 SHALL NOT 有任何途徑省略、覆寫或改變其值。
-傳輸層 SHALL 拒絕（不建立任何連線）主機為 OKX 但缺少該標頭、或其值不是 `1` 的請求。
+傳輸層 SHALL 拒絕（不建立任何連線）主機為 OKX（`*.okx.com`）、或帶有任何 `OK-ACCESS-*` 標頭，但沒有恰好一個 `x-simulated-trading`（名稱不分大小寫）且其值恰為 `1` 的請求；通用的標頭 API SHALL 拒絕設定這兩類標頭。
 主機 SHALL NOT 可由設定、環境變數或使用者輸入覆寫。由於 OKX 正式與 demo 共用主機，系統 SHALL NOT 以主機名稱作為 OKX「非正式環境」的唯一依據。
 本 requirement 取代 `signed-read-access` 中「OKX SHALL NOT 有任何簽名請求的實作」一句。
 
@@ -135,7 +135,7 @@ OKX 回應 `50102`（時間戳過期）時，系統 SHALL 重新校時一次並�
 ### Requirement: engine 的 OKX 帳戶讀取使用 OKX 簽名客戶端
 
 `AccountView` 對 OKX 的持倉、未成交委託與可用保證金 SHALL 由 OKX 簽名客戶端提供，SHALL NOT 再回傳「不支援」。OKX 未連線、帳戶模式不支援或查詢失敗時 SHALL 回傳 `Err` 並附原因（engine 依既有規則 fail closed）。
-帳戶輪詢與交易頁的 `LegAccount` 輪詢 SHALL 包含 OKX。
+`DemoAccountView` SHALL 能接上 OKX 簽名客戶端（`with_okx`）；帳戶輪詢與 `LegAccount` 輪詢的接線屬 `okx-trading-enablement`。
 
 #### Scenario: 缺金鑰時 engine 看到原因而非不支援
 

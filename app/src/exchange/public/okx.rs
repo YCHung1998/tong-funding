@@ -30,9 +30,8 @@ use super::endpoints::{
 use super::refetch::earliest_observed_at;
 use crate::exchange::error::AdapterError;
 use crate::exchange::transport::HttpTransport;
+use crate::exchange::signed::endpoints::{okx_inst_id as inst_id_of, okx_symbol as symbol_of};
 use crate::ports::Clock;
-
-const USDT_SWAP_SUFFIX: &str = "-USDT-SWAP";
 
 struct Instrument {
     /// `state = live`, `ctType = linear` (the `-USDT-SWAP` suffix is implied by the key).
@@ -46,21 +45,6 @@ pub struct OkxAdapter<T: HttpTransport> {
     transport: Arc<T>,
     clock: Arc<dyn Clock>,
     catalog: TtlCell<Catalog>,
-}
-
-/// `BTC-USDT-SWAP` to `BTCUSDT`; anything that is not a `-USDT-SWAP` instrument gives `None`.
-fn symbol_of(inst_id: &str) -> Option<String> {
-    let base = inst_id.strip_suffix(USDT_SWAP_SUFFIX)?;
-    if base.is_empty() {
-        return None;
-    }
-    Some(format!("{}USDT", base.replace('-', "")))
-}
-
-/// `BTCUSDT` to `BTC-USDT-SWAP`.
-fn inst_id_of(symbol: &str) -> Option<String> {
-    let base = symbol.strip_suffix("USDT").filter(|b| !b.is_empty())?;
-    Some(format!("{base}{USDT_SWAP_SUFFIX}"))
 }
 
 /// OKX failures are `code != "0"` with HTTP 200. Returns the `data` array.

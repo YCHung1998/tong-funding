@@ -64,7 +64,7 @@ pub(super) fn req(exchange: Exchange, id: &str, side: OrderSide, qty: &str, redu
 }
 
 pub(super) fn creds() -> Arc<Credentials> {
-    Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into() })
+    Arc::new(Credentials { api_key: KEY.into(), api_secret: SECRET.into(), passphrase: None })
 }
 
 /// One-way mode on both exchanges (the usual precondition).
@@ -479,4 +479,85 @@ async fn account_open_orders_keep_completeness() {
 async fn query_by_client_id_parses_the_engine_id_unchanged() {
     let id = demo_id(Leg::Long, OrderAction::Close, 3);
     assert_eq!(ClientOrderId::parse(&id).unwrap().as_str(), id);
+}
+
+// ---- OKX through the engine's AccountView (okx-signed-read, spec: engine 的 OKX 帳戶讀取) ----
+
+fn okx_fx(name: &str) -> HttpResponse {
+    let path = format!("{}/tests/fixtures/okx/signed/{name}.json", env!("CARGO_MANIFEST_DIR"));
+    HttpResponse::ok(std::fs::read_to_string(path).unwrap())
+}
+
+fn okx_account(t: FakeTransport, secrets: MemorySecrets) -> DemoAccountView<FakeTransport> {
+    use crate::exchange::signed::endpoints::OkxHost;
+    use crate::exchange::signed::okx::OkxSignedClient;
+    let t = Arc::new(t);
+    let clock = Arc::new(ManualClock::new(NOW));
+    let offset = Arc::new(|| Some(0i64));
+    let secrets: Arc<dyn SecretProvider> = Arc::new(secrets);
+    let b = BinanceSignedClient::new(t.clone(), secrets.clone(), clock.clone(), offset.clone(), Arc::new(NoResync), BinanceHost::Testnet);
+    let y = BybitSignedClient::new(t.clone(), secrets.clone(), clock.clone(), offset.clone(), Arc::new(NoResync), BybitHost::Demo);
+    let o = OkxSignedClient::new(t, secrets, clock, offset, Arc::new(NoResync), OkxHost::Demo);
+    DemoAccountView::new(Arc::new(b), Arc::new(y)).with_okx(Arc::new(o))
+}
+
+fn okx_keys() -> MemorySecrets {
+    MemorySecrets::default()
+        .with(Exchange::Okx, SecretName::ApiKey, "TEST_KEY_NOT_REAL")
+        .with(Exchange::Okx, SecretName::ApiSecret, "TEST_SECRET_NOT_REAL")
+        .with(Exchange::Okx, SecretName::Passphrase, "TEST_PASS_NOT_REAL")
+}
+
+fn okx_script() -> FakeTransport {
+    FakeTransport::new()
+        .on("account/config", Ok(okx_fx("account_config_futures_net")))
+        .on("account/balance", Ok(okx_fx("balance_futures")))
+        .on("account/positions", Ok(okx_fx("positions_net")))
+        .on("trade/orders-pending", Ok(okx_fx("orders_pending_page2_short")))
+}
+
+#[tokio::test]
+async fn okx_positions_reach_the_engine_as_signed_contracts() {
+    let a = okx_account(okx_script(), okx_keys());
+    let p = a.positions(Exchange::Okx).await.unwrap();
+    assert!(p.complete);
+    let got: Vec<(&str, Decimal)> = p.items.iter().map(|x| (x.symbol.as_str(), x.quantity)).collect();
+    assert_eq!(got, vec![("BTCUSDT", d("-3")), ("SOLUSDT", d("12.5"))], "contracts, short negative");
+}
+
+#[tokio::test]
+async fn okx_open_orders_carry_the_remaining_contracts() {
+    let a = okx_account(okx_script(), okx_keys());
+    let o = a.open_orders(Exchange::Okx).await.unwrap();
+    assert!(o.complete);
+    assert_eq!(o.items.len(), 7);
+    assert!(o.items.iter().all(|x| x.remaining_quantity == d("2")), "sz 2 - accFillSz 0");
+}
+
+#[tokio::test]
+async fn okx_available_margin_is_the_usdt_availeq() {
+    let a = okx_account(okx_script(), okx_keys());
+    assert_eq!(a.available_margin(Exchange::Okx).await.unwrap(), d("4834.31"));
+}
+
+#[tokio::test]
+async fn a_missing_okx_passphrase_gives_the_reason_not_unsupported() {
+    let no_pass = MemorySecrets::default().with(Exchange::Okx, SecretName::ApiKey, "k").with(Exchange::Okx, SecretName::ApiSecret, "s");
+    let a = okx_account(okx_script(), no_pass);
+    for e in [
+        a.positions(Exchange::Okx).await.map(|_| ()).unwrap_err(),
+        a.open_orders(Exchange::Okx).await.map(|_| ()).unwrap_err(),
+        a.available_margin(Exchange::Okx).await.map(|_| ()).unwrap_err(),
+    ] {
+        assert!(e.contains("NoPassphrase"), "{e}");
+        assert!(!e.to_lowercase().contains("unsupported"), "{e}");
+    }
+}
+
+#[tokio::test]
+async fn an_unsupported_okx_account_mode_fails_the_engine_checks() {
+    let t = FakeTransport::new().on("account/config", Ok(okx_fx("account_config_long_short")));
+    let a = okx_account(t, okx_keys());
+    assert!(a.positions(Exchange::Okx).await.unwrap_err().contains("帳戶模式不支援"));
+    assert!(a.available_margin(Exchange::Okx).await.is_err());
 }

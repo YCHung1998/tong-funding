@@ -9,8 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-/// Production hosts that only the public (unsigned) clients may name.
-pub const PRODUCTION_HOSTS: [&str; 3] = ["fapi.binance.com", "api.bybit.com", "www.okx.com"];
+/// The OKX REST host. OKX demo and production share it (demo = the `x-simulated-trading: 1`
+/// header), so it counts as a production host everywhere except its single home, `signed/endpoints.rs`.
+pub const OKX_SIGNED_HOST: &str = "openapi.okx.com";
+
+/// Production hosts that only the public (unsigned) clients may name (and, for the OKX signed
+/// host, only `signed/endpoints.rs`).
+pub const PRODUCTION_HOSTS: [&str; 4] = ["fapi.binance.com", "api.bybit.com", "www.okx.com", OKX_SIGNED_HOST];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Violation {
@@ -544,6 +549,86 @@ pub fn scan_production_hosts(src: &str) -> Vec<Violation> {
     scan_production_hosts_in(&production_code(src))
 }
 
+/// Lower-cased text of every string literal in production code (comments and test modules excluded).
+pub fn production_literals(src: &str) -> Vec<String> {
+    let prod = production(src);
+    let (_, _, lits) = mask(&prod.code);
+    lits.iter().map(|l| prod.code.get(l.start..l.end).unwrap_or("").to_ascii_lowercase()).collect()
+}
+
+/// Literals that spell out the OKX boundary, and the only files (relative to `src/`) allowed to
+/// hold them. This rule is separate from the host-fragment scan, which deliberately exempts the
+/// whitelisted signed hosts everywhere: here even the whitelisted OKX host is confined to its home.
+const LITERAL_RULES: [(&str, &[&str]); 3] = [
+    ("x-simulated-trading", &["exchange/signed/endpoints.rs"]),
+    ("ok-access", &["exchange/signed/endpoints.rs", "exchange/signed/signing.rs"]),
+    ("okx.com", &["exchange/signed/endpoints.rs", "exchange/public/endpoints.rs"]),
+];
+
+/// Protected literals found in `src`'s production code when `rel_path` (relative to `src/`, `/`
+/// separated) is not one of their home files.
+pub fn literal_rule_violations(rel_path: &str, src: &str) -> Vec<String> {
+    let lits = production_literals(src);
+    let mut out = Vec::new();
+    for (needle, homes) in LITERAL_RULES {
+        if !homes.contains(&rel_path) && lits.iter().any(|l| l.contains(needle)) {
+            out.push(format!("literal containing `{needle}` outside {homes:?}"));
+        }
+    }
+    out
+}
+
+/// Files that may name the `reqwest` crate: the two real transports.
+const REQWEST_HOMES: [&str; 2] = ["exchange/reqwest_transport.rs", "exchange/execution/http.rs"];
+
+/// The identifier `reqwest` in production code outside the two transports: any other HTTP path
+/// would bypass `HostPolicy::allows` (the one rule that decides host and OKX header).
+pub fn reqwest_rule_violations(rel_path: &str, src: &str) -> Vec<String> {
+    if REQWEST_HOMES.contains(&rel_path) {
+        return Vec::new();
+    }
+    if idents(&production(src).structure).contains(&"reqwest") {
+        vec![format!("identifier `reqwest` outside {REQWEST_HOMES:?}")]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Names of the `pub` fns in every `impl OkxHost { .. }` block. The only allowed one is `target`:
+/// anything else could hand out an OKX host or URL without the `x-simulated-trading` header.
+pub fn okx_host_pub_fns(src: &str) -> Vec<String> {
+    let structure = production(src).structure;
+    let b = structure.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = find_from(b, b"impl OkxHost", from) {
+        let Some(open) = find_from(b, b"{", at) else { break };
+        let close = matching_brace(b, open);
+        let body = &structure[open..close];
+        let mut depth = 0usize;
+        let mut i = 0;
+        let bb = body.as_bytes();
+        while i < bb.len() {
+            match bb[i] {
+                b'{' => depth += 1,
+                b'}' => depth = depth.saturating_sub(1),
+                _ if depth == 1 && starts_with_at(bb, i, b"pub") && (i == 0 || !is_ident(bb[i - 1])) => {
+                    let rest = &body[i..];
+                    let head: String = rest.chars().take_while(|c| *c != '{' && *c != ';').collect();
+                    if let Some(pos) = head.find("fn ") {
+                        let name: String = head[pos + 3..].trim_start().chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+                        out.push(name);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        from = close.max(at + 1);
+    }
+    out
+}
+
 const ORDER_KEYWORDS: [&[&str]; 13] = [
     &["place"],
     &["cancel"],
@@ -762,10 +847,19 @@ const LATE: &str = "api.bybit.com";
         for f in &files {
             let src = std::fs::read_to_string(f).unwrap();
             for v in scan_signed_source(&src) {
+                // `signed/endpoints.rs` is the one file that names the OKX signed host (it is also a
+                // production host: demo and production share it, see `OkxHost`).
+                if f == &okx_home() && v == Violation::ProductionHost(OKX_SIGNED_HOST.to_string()) {
+                    continue;
+                }
                 violations.push(format!("{}: {v:?}", f.display()));
             }
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    fn okx_home() -> PathBuf {
+        exchange_dir().join("signed").join("endpoints.rs")
     }
 
     #[test]
@@ -778,6 +872,9 @@ const LATE: &str = "api.bybit.com";
         let mut violations = Vec::new();
         for f in &files {
             for v in scan_production_hosts(&std::fs::read_to_string(f).unwrap()) {
+                if f == &okx_home() && v == Violation::ProductionHost(OKX_SIGNED_HOST.to_string()) {
+                    continue;
+                }
                 violations.push(format!("{}: {v:?}", f.display()));
             }
         }
@@ -886,12 +983,116 @@ const LATE: &str = "api.bybit.com";
                 }
             }
             for ident in idents(&prod.structure) {
-                if ident.to_ascii_lowercase().contains("okx") && ident != "Okx" && ident != "OKX_UNSUPPORTED" && ident != "OKX_ACCOUNT_UNSUPPORTED" {
+                // `account.rs` is the read-only AccountView: it may name the OKX signed GET client
+                // (okx-signed-read). Order code (okx-demo-execution) lives in other files.
+                let account_view = f.file_name().is_some_and(|n| n == "account.rs");
+                if !account_view && ident.to_ascii_lowercase().contains("okx") && ident != "Okx" && ident != "OKX_UNSUPPORTED" && ident != "OKX_NOT_WIRED" {
                     violations.push(format!("{}: identifier {ident}", f.display()));
                 }
             }
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+
+    // ------------------------------------------------ OKX demo boundary (okx-signed-read)
+
+    #[test]
+    fn the_okx_signed_host_is_a_production_host_for_every_file_except_its_home() {
+        assert!(PRODUCTION_HOSTS.contains(&OKX_SIGNED_HOST));
+        let src = format!("const H: &str = \"https://{OKX_SIGNED_HOST}\";");
+        assert!(has(&src, prod_v), "a signed client naming the OKX host must be flagged");
+        assert!(has("const H: &str = \"OPENAPI.OKX.COM\";", prod_v), "any case");
+        assert!(has("let a = \"openapi.\"; let b = \"okx.com\"; let h = format!(\"{a}{b}\");", prod_v), "split literals");
+    }
+
+    #[test]
+    fn okx_host_exposes_target_and_no_other_public_method() {
+        // counter-examples: any other pub fn on OkxHost could hand out a host or URL without the flag
+        for bad in [
+            "impl OkxHost { pub fn target(self) -> T { todo!() } pub fn host(self) -> &'static str { \"x\" } }",
+            "impl OkxHost {\n    pub fn target(self) -> T { todo!() }\n    pub(crate) fn base_url(self) -> &'static str { \"x\" }\n}",
+            "impl OkxHost { pub fn url(&self) -> String { todo!() } }",
+            "impl OkxHost { pub const fn target(self) -> T { todo!() } pub async fn get(self) {} }",
+        ] {
+            let extra: Vec<String> = okx_host_pub_fns(bad).into_iter().filter(|n| n != "target").collect();
+            assert!(!extra.is_empty(), "not caught: {bad}");
+        }
+        assert_eq!(okx_host_pub_fns("impl OkxHost { pub fn target(self) -> T { todo!() } fn private(self) {} }"), vec!["target".to_string()]);
+        // the real file
+        let src = std::fs::read_to_string(okx_home()).unwrap();
+        assert_eq!(okx_host_pub_fns(&src), vec!["target".to_string()], "OkxHost::target is the only way to an OKX URL");
+    }
+
+    fn rel(p: &str) -> &str {
+        p
+    }
+
+    #[test]
+    fn literal_rules_catch_each_protected_literal_outside_its_home_files() {
+        let flag = "const H: &str = \"x-simulated-trading\";";
+        let flag_upper = "const H: &str = \"X-Simulated-Trading\";";
+        let auth = "const H: &str = \"OK-ACCESS-KEY\";";
+        let host = "const H: &str = \"https://openapi.okx.com\";";
+        let host_piece = "const H: &str = \"okx.com\";";
+        let elsewhere = rel("exchange/signed/okx.rs");
+        for (what, src) in [("flag", flag), ("flag upper-case", flag_upper), ("OK-ACCESS", auth), ("host", host), ("host piece", host_piece)] {
+            assert!(!literal_rule_violations(elsewhere, src).is_empty(), "{what} not caught in {elsewhere}");
+            assert!(!literal_rule_violations("ui/live.rs", src).is_empty(), "{what} not caught in ui/live.rs");
+            assert!(!literal_rule_violations("exchange/execution/okx.rs", src).is_empty(), "{what} not caught in execution");
+        }
+        // home files
+        assert!(literal_rule_violations("exchange/signed/endpoints.rs", flag).is_empty());
+        assert!(literal_rule_violations("exchange/signed/endpoints.rs", auth).is_empty());
+        assert!(literal_rule_violations("exchange/signed/endpoints.rs", host).is_empty());
+        assert!(literal_rule_violations("exchange/signed/signing.rs", auth).is_empty(), "the signing module builds the OK-ACCESS-* names");
+        assert!(!literal_rule_violations("exchange/signed/signing.rs", flag).is_empty(), "but not the flag");
+        assert!(!literal_rule_violations("exchange/signed/signing.rs", host).is_empty(), "nor the host");
+        // comments and test modules do not count
+        assert!(literal_rule_violations(elsewhere, "// x-simulated-trading\n#[cfg(test)]\nmod tests { const H: &str = \"OK-ACCESS-KEY\"; }").is_empty());
+    }
+
+    #[test]
+    fn the_reqwest_identifier_is_allowed_only_in_the_two_transports() {
+        let src = "fn f() { let c = reqwest::Client::new(); }";
+        assert!(!reqwest_rule_violations("exchange/signed/okx.rs", src).is_empty());
+        assert!(!reqwest_rule_violations("ui/live.rs", "use reqwest::Url;").is_empty());
+        assert!(!reqwest_rule_violations("main.rs", "use reqwest::Client;").is_empty());
+        assert!(!reqwest_rule_violations("exchange/execution/okx.rs", "fn f() { reqwest::get(\"x\"); }").is_empty());
+        assert!(reqwest_rule_violations("exchange/reqwest_transport.rs", src).is_empty());
+        assert!(reqwest_rule_violations("exchange/execution/http.rs", src).is_empty());
+        assert!(reqwest_rule_violations("exchange/signed/okx.rs", "use crate::exchange::reqwest_transport::ReqwestTransport;").is_empty(), "a different identifier");
+        assert!(reqwest_rule_violations("exchange/signed/okx.rs", "// reqwest is mentioned here\n#[cfg(test)]\nmod t { fn f() { reqwest::Url::parse(\"x\"); } }").is_empty());
+    }
+
+    /// The whole crate (src, tests, binaries), not just `exchange/signed`: the shared transport is
+    /// built in `ui/live.rs`, and a stray `x-simulated-trading` or `reqwest` call anywhere else could
+    /// build an OKX request the boundary does not know about.
+    #[test]
+    fn okx_literals_and_the_reqwest_identifier_stay_in_their_home_files_across_the_crate() {
+        let app = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = rust_files(&app.join("src"));
+        files.extend(rust_files(&app.join("tests")));
+        files.retain(|f| f.file_name().is_some_and(|n| n != "static_checks.rs"));
+        assert!(files.iter().any(|f| f.ends_with("ui/live.rs")), "ui/live.rs (the shared signed transport) must be scanned");
+        assert!(files.iter().any(|f| f.ends_with("main.rs")));
+        assert!(files.len() > 30, "scanned only {} files", files.len());
+        let mut violations = Vec::new();
+        for f in &files {
+            let rel_path = f.strip_prefix(app).unwrap().to_string_lossy().replace('\\', "/");
+            let rel_path = rel_path.strip_prefix("src/").unwrap_or(&rel_path).to_string();
+            let text = std::fs::read_to_string(f).unwrap();
+            violations.extend(literal_rule_violations(&rel_path, &text).into_iter().map(|v| format!("{rel_path}: {v}")));
+            violations.extend(reqwest_rule_violations(&rel_path, &text).into_iter().map(|v| format!("{rel_path}: {v}")));
+        }
+        assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn ui_live_names_no_production_host_literal() {
+        let live = Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("ui").join("live.rs");
+        let v = scan_production_hosts(&std::fs::read_to_string(live).unwrap());
+        assert!(v.is_empty(), "{v:?}");
     }
 
     // ------------------------------------------------ round 2: every known bypass must be caught

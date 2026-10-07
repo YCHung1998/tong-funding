@@ -1,0 +1,54 @@
+{
+ "code": "0",
+ "msg": "",
+ "data": [
+  {
+   "adjEq": "",
+   "availEq": "",
+   "borrowFroz": "",
+   "details": [
+    {
+     "ccy": "BTC",
+     "eq": "0.1",
+     "cashBal": "0.1",
+     "uTime": "1700000000000",
+     "isoEq": "0",
+     "availEq": "0.1",
+     "disEq": "",
+     "fixedBal": "0",
+     "availBal": "0.1",
+     "frozenBal": "165.69",
+     "ordFrozen": "0",
+     "liab": "",
+     "upl": "-0.6",
+     "uplLiab": "",
+     "crossLiab": "",
+     "rewardBal": "",
+     "isoLiab": "",
+     "mgnRatio": "",
+     "interest": "",
+     "twap": "0",
+     "maxLoan": "",
+     "eqUsd": "0.1",
+     "borrowFroz": "",
+     "notionalLever": "",
+     "stgyEq": "0",
+     "isoUpl": "0",
+     "spotInUseAmt": "",
+     "spotIsoBal": "",
+     "imr": "",
+     "mmr": ""
+    }
+   ],
+   "imr": "",
+   "isoEq": "0",
+   "mgnRatio": "",
+   "mmr": "",
+   "notionalUsd": "",
+   "ordFroz": "",
+   "totalEq": "100",
+   "uTime": "1700000000000",
+   "upl": ""
+  }
+ ]
+}
