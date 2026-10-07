@@ -24,7 +24,7 @@ impl LedgerSource for Remote {
         self.exchange
     }
     fn per_symbol(&self) -> bool {
-        self.exchange == Exchange::Binance
+        matches!(self.exchange, Exchange::Binance | Exchange::Okx)
     }
     fn page<'a>(&'a self, _s: &'a str, _a: i64, _b: i64, _t: Option<&'a str>) -> BoxFut<'a, Result<LedgerPage, AdapterError>> {
         *self.calls.lock().unwrap() += 1;
@@ -125,4 +125,51 @@ fn reconcile_a_mismatch_recomputes_an_existing_pnl_as_incomplete() {
     let after = latest_pnl(&fx.db, "p1").unwrap().unwrap();
     assert_ne!(after.event_id, before.event_id);
     assert!(after.payload["reasons"].to_string().contains("對帳差異"));
+}
+
+// ---- okx-funding-ledger -------------------------------------------------------------------------------
+
+fn okx_local() -> Fx {
+    use crate::funding::pnl_record::tests::{both_okx_fetched, okx_round};
+    let fx = okx_round(Some("0.01"), "60300");
+    let okx = FundingLedgerEntry::new(Exchange::Okx, "BTCUSDT", "-0.42".parse().unwrap(), "USDT", T + 500, "623950854533513219", "173", serde_json::json!({}));
+    fx.db.write_funding_ledger(&[okx, ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_okx_fetched(&fx);
+    fx.clock.set(T + 100_000);
+    fx
+}
+
+fn okx_remote(entries: Vec<FundingLedgerEntry>) -> Remote {
+    remote(Exchange::Okx, entries)
+}
+
+#[test]
+fn reconcile_an_okx_leg_with_the_same_entries_is_ok() {
+    let fx = okx_local();
+    let y = remote(Exchange::Bybit, vec![ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]);
+    let o = okx_remote(vec![FundingLedgerEntry::new(Exchange::Okx, "BTCUSDT", "-0.42".parse().unwrap(), "USDT", T + 500, "623950854533513219", "173", serde_json::json!({}))]);
+    assert_eq!(block_on(reconcile_pair(&fx.db, &[&y, &o], &NoPause, "p1", T + 100_000)).unwrap(), ReconcileResult::Ok);
+    let e = last_event(&fx);
+    assert_eq!(e["legs"][1]["exchange"], "OKX");
+    assert_eq!(e["legs"][1]["result"], "OK");
+    assert_eq!(*o.calls.lock().unwrap(), 1, "OKX refetched like every leg");
+}
+
+#[test]
+fn reconcile_an_okx_amount_difference_is_a_mismatch_and_a_failed_refetch_is_failed() {
+    let fx = okx_local();
+    let y = remote(Exchange::Bybit, vec![ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]);
+    let o = okx_remote(vec![FundingLedgerEntry::new(Exchange::Okx, "BTCUSDT", "-0.40".parse().unwrap(), "USDT", T + 500, "623950854533513219", "173", serde_json::json!({}))]);
+    assert_eq!(block_on(reconcile_pair(&fx.db, &[&y, &o], &NoPause, "p1", T + 100_000)).unwrap(), ReconcileResult::Mismatch);
+    let bad = Remote { exchange: Exchange::Okx, entries: Err(AdapterError::Timeout), calls: Mutex::new(0) };
+    assert_eq!(block_on(reconcile_pair(&fx.db, &[&y, &bad], &NoPause, "p1", T + 100_001)).unwrap(), ReconcileResult::Failed);
+    assert_eq!(last_event(&fx)["legs"][1]["result"], "FAILED");
+}
+
+#[test]
+fn reconcile_without_an_okx_source_still_records_failed_with_the_reason() {
+    let fx = okx_local();
+    let y = remote(Exchange::Bybit, vec![ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]);
+    assert_eq!(block_on(reconcile_pair(&fx.db, &[&y], &NoPause, "p1", T + 100_000)).unwrap(), ReconcileResult::Failed);
+    assert!(last_event(&fx)["legs"][1]["reason"].as_str().unwrap().contains("no ledger source"));
 }

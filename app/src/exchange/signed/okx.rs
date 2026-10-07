@@ -216,6 +216,12 @@ impl<T: HttpTransport> OkxSignedClient<T> {
         Ok(incomplete(items, format!("page cap of {MAX_PAGES} reached")))
     }
 
+    /// A signed GET of an OKX read endpoint for the sibling clients (ledger): the same request
+    /// construction, demo flag, `50102` retry and latch as every other read.
+    pub(in crate::exchange) async fn get_signed(&self, path: &str, query: &str) -> Result<(Value, i64), AdapterError> {
+        self.signed_get(path, query).await
+    }
+
     /// One attempt; if the exchange rejects the timestamp (`50102`), re-sync the clock once and send
     /// exactly one more request, rebuilt from scratch (so it carries the same demo flag by the same
     /// constructor). A second rejection, or a failed re-sync, is returned as is.

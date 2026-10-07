@@ -14,6 +14,7 @@
 //!   (a mismatch stays an alert; nothing is corrected automatically). `FAILED` is retried every
 //!   `FETCH_RETRY_MS` until `PNL_RETRY_WINDOW_MS` after the first failure; the last `FAILED`
 //!   then stays (alert) and nothing more is attempted.
+//! - OKX (okx-funding-ledger) is fetched per symbol like Binance and reconciled like every leg.
 //! - Missing demo keys: neither fetches nor reconciliations are attempted for that exchange (the
 //!   funding status stays "未取得", spec funding-history-fetch), and nothing is written. They
 //!   become due again once the keys are readable.
@@ -201,7 +202,8 @@ pub async fn tick(db: &Db, sources: &[&dyn LedgerSource], ready: Readiness<'_>, 
         Err(e) => report.errors.push(e),
         Ok(candidates) => {
             for c in candidates {
-                // OKX legs have no source: reconcile_pair records them as FAILED (truthful).
+                // A leg without a source is recorded as FAILED by reconcile_pair (truthful); only
+                // exchanges that have a source are checked for readiness (keys) here.
                 let not_ready = c.exchanges.iter().filter(|ex| source_of(**ex).is_some()).find_map(|ex| ready(*ex).err().map(|why| (*ex, why)));
                 if let Some(skip) = not_ready {
                     report.skipped.push(skip);

@@ -870,6 +870,29 @@ async fn an_okx_leg_is_sent_in_contracts_and_compared_in_base_coin() {
     assert_eq!(rig.sim.submitted()[3].quantity, dec("1000"), "closed in contracts too");
 }
 
+/// okx-funding-ledger D5: the contract value used for sizing is recorded on the OKX leg's order events
+/// (so PnL can turn contracts into coins), and only there.
+#[tokio::test(start_paused = true)]
+async fn okx_order_events_record_the_contract_value_and_the_other_exchanges_do_not() {
+    let (rig, deps) = rig(Opts::default());
+    let okx = OrderRules { lot: LotSize { step_size: dec("1"), min_qty: dec("1") }, okx_ct_val: Some(dec("0.01")) };
+    rig.market.rules.lock().unwrap().insert(Exchange::Okx, okx);
+    let h = start(deps);
+    let mut p = pair_at(UUID, SYM, T);
+    p.short_exchange = Exchange::Okx;
+    assert_eq!(ask(&h, Command::AddPrepared(p)).await, CommandReply::Accepted);
+    run_until(&rig.clock, T + 15_000).await;
+    let order_events: Vec<Value> = events(&rig.db).into_iter().filter(|(_, l, _)| l == ORDER_SUBMITTED || l == ORDER_FILL).map(|(_, _, p)| p).collect();
+    assert!(order_events.iter().any(|p| p["exchange"] == json!("OKX") || p["exchange"] == json!(Exchange::Okx.name())), "{order_events:?}");
+    for e in &order_events {
+        if e["exchange"] == json!(Exchange::Okx.name()) {
+            assert_eq!(e["ct_val"], json!("0.01"), "{e}");
+        } else {
+            assert!(e.get("ct_val").is_none(), "only OKX legs carry ct_val: {e}");
+        }
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_hanging_submit_ends_unresolved_at_the_timeout() {
     let (rig, _h) = started(Opts::default()).await;

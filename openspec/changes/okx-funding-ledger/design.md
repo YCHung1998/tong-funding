@@ -75,3 +75,11 @@ engine 送 OKX 單時已持有 `ct_val`（`fill.rs` 的 `LegSizing.okx_ct_val`�
 1. `bills-archive` 是否即時包含最新帳單（或需改用 `bills`）？
 2. OKX demo 是否真的產生資金費帳單？
 3. 是否需要啟動時以 `GET /api/v5/account/subtypes` 自我檢查 `type=8` 與 173/174 的對應？（目前只在實機驗證一次。）
+
+## 實作時發現
+
+- 「缺 `ct_val` → INCOMPLETE 並註明原因」需要 `core` 能表達該原因：新增 `FillRecord.contract_value_missing`（`#[serde(default)]`）與 `IncompleteReason::MissingContractValue`（標籤「OKX 成交缺合約面值」）；`leg_pnl` 對該成交不計價格分量（避免把張數當幣量），手續費照常。
+- `ct_val` 由 engine 的 `okx_ct_val_of(pair, leg)` 取自該腿**開倉單**的 `unit_base`（平倉單的 `unit_base` 是 1，不是合約面值）。重啟後 flow 不在記憶體（orphan / recovery 路徑）的 OKX 成交事件不帶 `ct_val`，PnL 因此為 INCOMPLETE 並指名原因——這是刻意的「不猜」，不是缺陷；若要回補需另案。
+- `FundingFetchState` 對 OKX 沿用 `fetch_state`（依 `FUNDING_LEDGER_FETCHED` 事件判定），不再固定 `NotFetched`。
+- `ui/live.rs` 的 OKX 流水來源接線屬 `okx-trading-enablement` 3.5：它同時建立 `OkxSignedClient`、校時與 `with_okx`，把兩處放在一起才不會各自建一份客戶端。
+- 流水客戶端 `OkxLedgerClient` 包 `OkxSignedClient`（`get_signed`）：簽名、模擬標頭、`50102` 重試、閂鎖與限流判讀與唯讀客戶端完全相同，沒有第三份 attempt 迴圈。

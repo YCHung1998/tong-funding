@@ -11,8 +11,11 @@
 //! - A close order's reference price is the `reference_price` the engine wrote on its close events
 //!   (a fresh single-symbol refetch right before the reduce-only close was sent). Without it the
 //!   close slippage is "無參考價" and the PnL INCOMPLETE; the fill price is never used instead.
-//! - OKX legs: quantities are contracts and no contract value is recorded with the fill, and OKX
-//!   has no ledger client; their prices are treated as unknown and their funding as not fetched.
+//! - OKX legs: the engine's quantities are contracts; the fill events carry the `ct_val` the order
+//!   was sized with (okx-funding-ledger), and the coin quantity is `filled_quantity x ct_val`. An
+//!   OKX fill without `ct_val` (or with a non-positive one) is marked `contract_value_missing`: its
+//!   quantity and prices are unknown, the PnL INCOMPLETE ("OKX 成交缺合約面值"); nothing is
+//!   guessed or looked up afterwards. OKX funding follows the fetch state like the other exchanges.
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -126,6 +129,8 @@ struct OrderFill {
     action: FillAction,
     exchange: Option<Exchange>,
     record: FillRecord,
+    /// OKX contract value recorded with the order's events (kept from an earlier event when a later one lacks it).
+    ct_val: Option<Decimal>,
 }
 
 fn order_fills(events: &[EventRow], entry_prices: [Option<Decimal>; 2]) -> Vec<OrderFill> {
@@ -145,12 +150,19 @@ fn order_fills(events: &[EventRow], entry_prices: [Option<Decimal>; 2]) -> Vec<O
             _ => continue,
         };
         let exchange = p["exchange"].as_str().and_then(exchange_named);
-        let quantity = dec(&p["filled_quantity"]).unwrap_or(Decimal::ZERO);
+        let raw_quantity = dec(&p["filled_quantity"]).unwrap_or(Decimal::ZERO);
         let idx = match leg {
             Side::Long => 0,
             Side::Short => 1,
         };
         let okx = exchange == Some(Exchange::Okx);
+        // OKX quantities are contracts: coins = contracts x the ct_val the engine sized the order with.
+        let ct_val = if okx { dec(&p["ct_val"]).filter(|c| *c > Decimal::ZERO).or_else(|| by_id.get(id).and_then(|f| f.ct_val)) } else { None };
+        let contract_value_missing = okx && ct_val.is_none() && !raw_quantity.is_zero();
+        let quantity = match (okx, ct_val) {
+            (true, Some(c)) => raw_quantity * c,
+            _ => raw_quantity,
+        };
         // Close reference: the price the engine fetched right before sending this reduce-only
         // close (`reference_price` on its close events). Kept from an earlier event of the same
         // order when a later one (e.g. ORDER_FILL) lacks it; never the fill price itself.
@@ -160,19 +172,20 @@ fn order_fills(events: &[EventRow], entry_prices: [Option<Decimal>; 2]) -> Vec<O
             action,
             quantity,
             expected_price: match action {
-                FillAction::Open if !okx => entry_prices[idx],
-                FillAction::Close if !okx => close_reference,
-                FillAction::Open | FillAction::Close => None,
+                _ if contract_value_missing => None,
+                FillAction::Open => entry_prices[idx],
+                FillAction::Close => close_reference,
             },
-            actual_price: if okx { None } else { dec(&p["avg_price"]) },
+            actual_price: if contract_value_missing { None } else { dec(&p["avg_price"]) },
             fee: dec(&p["fee"]),
             fee_asset: p["fee_asset"].as_str().map(str::to_string),
             filled_at_ms: e.ts_ms,
+            contract_value_missing,
         };
         if !by_id.contains_key(id) {
             order.push(id.to_string());
         }
-        by_id.insert(id.to_string(), OrderFill { leg, action, exchange, record });
+        by_id.insert(id.to_string(), OrderFill { leg, action, exchange, record, ct_val });
     }
     order.into_iter().filter_map(|id| by_id.remove(&id)).collect()
 }
@@ -313,10 +326,7 @@ pub fn assemble(db: &Db, pair: &str, now_ms: i64) -> Result<PairPnlInput, String
                     }
                     _ => None,
                 };
-                let fetch = match exchange {
-                    Exchange::Okx => FundingFetchState::NotFetched,
-                    Exchange::Binance | Exchange::Bybit => fetch_state(&fetches, exchange, &row.symbol, w.opened_at_ms, to),
-                };
+                let fetch = fetch_state(&fetches, exchange, &row.symbol, w.opened_at_ms, to);
                 (expected, fetch)
             }
         };
@@ -359,6 +369,7 @@ fn waiting_helps(r: &IncompleteReason) -> bool {
         | IncompleteReason::MissingFillDetail { .. }
         | IncompleteReason::FeeNotConvertible { .. }
         | IncompleteReason::MissingReferencePrice { .. }
+        | IncompleteReason::MissingContractValue { .. }
         | IncompleteReason::OpenCloseQuantityMismatch { .. }
         | IncompleteReason::AmbiguousAttribution
         | IncompleteReason::ReconciliationMismatch

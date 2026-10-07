@@ -113,6 +113,10 @@ pub struct FillRecord {
     pub fee_asset: Option<String>,
     /// When the fill was recorded (Unix ms).
     pub filled_at_ms: i64,
+    /// OKX: the fill is in contracts and no contract value was recorded with it, so its coin
+    /// amount (and every price component built on it) is unknown.
+    #[serde(default)]
+    pub contract_value_missing: bool,
 }
 
 /// Whether the funding ledger behind a leg could be fetched.
@@ -230,6 +234,8 @@ pub enum IncompleteReason {
     MissingFillDetail { exchange: Exchange, id: String, what: String },
     FeeNotConvertible { exchange: Exchange, id: String, asset: String },
     MissingReferencePrice { exchange: Exchange, id: String },
+    /// OKX fill without the contract value (`ct_val`) it was converted with.
+    MissingContractValue { exchange: Exchange, id: String },
     OpenCloseQuantityMismatch { exchange: Exchange, opened: Decimal, closed: Decimal },
     AmbiguousAttribution,
     ReconciliationMismatch,
@@ -252,6 +258,7 @@ impl IncompleteReason {
             IncompleteReason::MissingFillDetail { exchange, id, what } => format!("成交明細缺漏（{} {id}：{what}）", exchange.name()),
             IncompleteReason::FeeNotConvertible { exchange, id, asset } => format!("手續費無法換算（{} {id}：{asset}）", exchange.name()),
             IncompleteReason::MissingReferencePrice { exchange, id } => format!("無參考價（{} {id}）", exchange.name()),
+            IncompleteReason::MissingContractValue { exchange, id } => format!("OKX 成交缺合約面值（{} {id}）", exchange.name()),
             IncompleteReason::OpenCloseQuantityMismatch { exchange, opened, closed } => {
                 format!("開平倉數量不一致（{}：開 {opened}，平 {closed}）", exchange.name())
             }
@@ -381,6 +388,12 @@ fn leg_pnl(leg: &LegInput, reasons: &mut Vec<IncompleteReason>) -> LegPnl {
                 reasons.push(IncompleteReason::MissingFillDetail { exchange: ex, id: f.id.clone(), what: "fee / fee asset".into() });
                 missing.insert(fee_component);
             }
+        }
+        if f.contract_value_missing {
+            // contracts cannot be priced as coins: no price component is built from this fill
+            reasons.push(IncompleteReason::MissingContractValue { exchange: ex, id: f.id.clone() });
+            missing.extend([Component::PriceRef, Component::PriceActual, Component::Slippage]);
+            continue;
         }
         match f.actual_price {
             Some(p) => c.price_actual += dir * p * f.quantity,

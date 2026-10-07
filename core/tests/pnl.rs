@@ -26,6 +26,7 @@ fn fill(id: &str, action: FillAction, qty: &str, expected: Option<&str>, actual:
         fee: Some(d(fee)),
         fee_asset: Some("USDT".into()),
         filled_at_ms: 0,
+        contract_value_missing: false,
     }
 }
 
@@ -207,6 +208,30 @@ fn pnl_slippage_missing_reference_price_is_incomplete_not_zero() {
     assert!(b.missing.contains(&Component::PriceRef));
     assert!(!b.missing.contains(&Component::PriceActual));
     assert_eq!(slippage_summary(&b).short, None);
+}
+
+#[test]
+fn pnl_a_fill_without_its_contract_value_is_incomplete_with_a_named_reason_and_no_price_math() {
+    let mut p = spec_case();
+    p.legs[1].fills[0].contract_value_missing = true;
+    let with = compute_pnl(&p);
+    match &with.status {
+        PnlStatus::Incomplete(r) => {
+            let hit = r.iter().find(|x| matches!(x, IncompleteReason::MissingContractValue { id, .. } if id == "s-open"));
+            assert!(hit.is_some(), "{r:?}");
+            assert!(hit.unwrap().label().contains("合約面值"), "{}", hit.unwrap().label());
+        }
+        other => panic!("{other:?}"),
+    }
+    for c in [Component::PriceRef, Component::PriceActual, Component::Slippage] {
+        assert!(with.missing.contains(&c), "{c:?}");
+    }
+    // the fill's price x quantity is not added in contracts-as-coins: totals equal the case without that fill's prices
+    let mut q = spec_case();
+    q.legs[1].fills[0].contract_value_missing = false;
+    assert_ne!(with.legs[1].components.price_actual, compute_pnl(&q).legs[1].components.price_actual);
+    // a false flag changes nothing
+    assert_eq!(compute_pnl(&spec_case()), compute_pnl(&q));
 }
 
 fn window(exchange: Exchange, opened: i64, closed: Option<i64>) -> LegWindow {

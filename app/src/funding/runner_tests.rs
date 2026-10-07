@@ -38,7 +38,7 @@ impl LedgerSource for Src {
         self.exchange
     }
     fn per_symbol(&self) -> bool {
-        self.exchange == Exchange::Binance
+        matches!(self.exchange, Exchange::Binance | Exchange::Okx)
     }
     fn page<'a>(&'a self, symbol: &'a str, start: i64, end: i64, _t: Option<&'a str>) -> BoxFut<'a, Result<LedgerPage, AdapterError>> {
         self.calls.lock().unwrap().push((symbol.to_string(), start, end));
@@ -225,4 +225,47 @@ fn funding_loop_never_reconciles_a_simulated_pair() {
     EventStore::new(fx.db.clone()).append(PAIR_PNL_COMPUTED, Some("sim"), json!({ "status": "COMPLETE" })).unwrap();
     let c = reconcile_candidates(&fx.db, T + RECONCILE_DELAY_MS * 10).unwrap();
     assert!(c.iter().all(|c| c.pair != "sim"), "{c:?}");
+}
+
+// ---- okx-funding-ledger: OKX legs are fetched and reconciled like the others --------------------------
+
+use crate::funding::pnl_record::tests::{both_okx_fetched, okx_round};
+
+fn okx_entry(amount: &str, id: &str, ts: i64) -> FundingLedgerEntry {
+    FundingLedgerEntry::new(Exchange::Okx, "BTCUSDT", amount.parse().unwrap(), "USDT", ts, id, "173", json!({}))
+}
+
+#[test]
+fn funding_loop_fetches_the_okx_leg_per_symbol_and_reconciles_it() {
+    let fx = okx_round(Some("0.01"), "60300");
+    let bybit = Src::new(Exchange::Bybit, vec![ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]);
+    let okx = Src::new(Exchange::Okx, vec![okx_entry("-0.42", "623950854533513219", T + 500)]);
+    let mut state = FundingLoop::default();
+    let sources: [&dyn LedgerSource; 2] = [&bybit, &okx];
+    let r = block_on(tick(&fx.db, &sources, &all_ready, &NoPause, &mut state, T + 20_000));
+    assert!(r.skipped.is_empty() && r.errors.is_empty(), "{r:?}");
+    let keys: Vec<_> = r.fetched.iter().map(|(k, _)| k.clone()).collect();
+    assert!(keys.contains(&FetchKey { exchange: Exchange::Okx, symbol: Some("BTCUSDT".into()) }), "OKX is queried per symbol: {keys:?}");
+    assert!(keys.contains(&FetchKey { exchange: Exchange::Bybit, symbol: None }));
+    assert_eq!(okx.calls().len(), 1);
+    // the OKX funding is attributed and the PnL can be recorded
+    both_okx_fetched(&fx); // (moves the fixture clock to T + 70 s)
+    let pnl_at = T + 80_000;
+    fx.clock.set(pnl_at);
+    settle_pnl(&fx.db, "p1", pnl_at, true).unwrap();
+    let r = block_on(tick(&fx.db, &sources, &all_ready, &NoPause, &mut state, pnl_at + RECONCILE_DELAY_MS));
+    assert_eq!(r.reconciled, [("p1".to_string(), Result::Ok(ReconcileResult::Ok))], "{r:?}");
+}
+
+#[test]
+fn funding_loop_missing_okx_keys_skip_okx_only() {
+    let fx = okx_round(Some("0.01"), "60300");
+    let bybit = Src::new(Exchange::Bybit, vec![ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]);
+    let okx = Src::new(Exchange::Okx, vec![]);
+    let no_okx = |ex: Exchange| if ex == Exchange::Okx { Err("OKX keys unavailable (NoPassphrase)".to_string()) } else { Ok(()) };
+    let sources: [&dyn LedgerSource; 2] = [&bybit, &okx];
+    let r = block_on(tick(&fx.db, &sources, &no_okx, &NoPause, &mut FundingLoop::default(), T + 20_000));
+    assert!(okx.calls().is_empty(), "no request without OKX keys");
+    assert_eq!(r.skipped, [(Exchange::Okx, "OKX keys unavailable (NoPassphrase)".to_string())]);
+    assert_eq!(r.fetched.len(), 1, "Bybit still fetched");
 }

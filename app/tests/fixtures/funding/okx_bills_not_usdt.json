@@ -1,0 +1,43 @@
+{
+ "_fixture_note": "依文件構造、未在真實 demo 帳戶驗證 (UNVERIFIED, FROM DOCS). Hand-built from GET /api/v5/account/bills-archive in the OKX v5 documentation (https://www.okx.com/docs-v5/en/, fetched 2026-10-07); not a recorded response. A funding row whose ccy is BTC. Replace with a de-identified real demo response after okx-funding-ledger task 3.2.",
+ "response": {
+  "code": "0",
+  "msg": "",
+  "data": [
+   {
+    "bal": "5000.12",
+    "balChg": "-0.00001",
+    "billId": "623950854533513219",
+    "ccy": "BTC",
+    "clOrdId": "",
+    "execType": "",
+    "fee": "",
+    "fillFwdPx": "",
+    "fillIdxPx": "",
+    "fillMarkPrice": "",
+    "fillMarkVol": "",
+    "fillPxUsd": "",
+    "fillPxVol": "",
+    "fillTime": "",
+    "from": "",
+    "instId": "BTC-USDT-SWAP",
+    "instType": "SWAP",
+    "interest": "",
+    "mgnMode": "cross",
+    "notes": "",
+    "ordId": "",
+    "pnl": "",
+    "posBal": "",
+    "posBalChg": "",
+    "px": "",
+    "subType": "173",
+    "sz": "",
+    "tag": "",
+    "to": "",
+    "tradeId": "",
+    "ts": "1700000000000",
+    "type": "8"
+   }
+  ]
+ }
+}
