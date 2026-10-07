@@ -989,6 +989,7 @@ impl Actor {
             max_concurrent_pairs: risk.max_concurrent_pairs,
             allowed_exchanges: &risk.allowed_exchanges,
             open_pair_count,
+            rules: [&context.rules[0], &context.rules[1]],
         };
         let long = Node0Leg {
             exchange: view.long_exchange,

@@ -823,10 +823,12 @@ async fn a_leg_below_min_qty_is_never_sent() {
     let lot = OrderRules { lot: LotSize { step_size: dec("1"), min_qty: dec("20") }, okx_ct_val: None };
     rig.market.rules.lock().unwrap().insert(Exchange::Bybit, lot);
     run_until(&rig.clock, T - 9_000).await;
-    assert_eq!(status(&rig.db, UUID), "CANCELLED");
+    // trade-cost-estimate: the shared quantity cannot be computed, so pre-trade `Margin` fails
+    // (fail closed) and the pair is BLOCKED before Node 1; either way nothing is sent.
+    assert_eq!(status(&rig.db, UUID), "BLOCKED");
     assert!(rig.sim.submitted().is_empty(), "neither leg is sent");
-    let cancelled = events(&rig.db).into_iter().find(|(_, l, _)| l == "CANCELLED").unwrap().2;
-    assert!(cancelled.to_string().contains("short"), "{cancelled}");
+    let blocked = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
+    assert!(blocked.to_string().contains("Margin") && blocked.to_string().contains("short"), "{blocked}");
 }
 
 #[tokio::test(start_paused = true)]

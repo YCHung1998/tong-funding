@@ -24,7 +24,7 @@ use super::pages::{card, small, text, title, ClickFn};
 use super::risk_settings::{self, Field, RiskForm, Strictness, GLOBAL_FIELDS, MODE_OPTIONS, OVERRIDE_FIELDS};
 use super::scanner::ScanRow;
 use super::shell::Shell;
-use super::staged_orders::{self, CloseConfirm, PendingConfirm, RunningRow};
+use super::staged_orders::{self, CloseConfirm, CostView, PendingConfirm, RunningRow};
 use super::symbol_options;
 use super::symbol_select::{CoinPicker, SymbolPicker};
 use super::theme;
@@ -581,7 +581,14 @@ impl Shell {
                 this.trading.staged_sel.remove(&uuid);
                 this.sink.send("移除暫存配對".into(), Command::CancelPrepared { pair: uuid.clone(), reason: "使用者於交易單移除".into() });
             })));
-            table = table.child(line);
+            // trade-cost-estimate: the pair's estimated cost (or why there is none), under its row.
+            let estimate_ok = matches!(r.cost, CostView::Estimate(_));
+            let mut cost = div().flex().flex_col().pl(rx(28.0));
+            for (i, t) in r.cost.lines().into_iter().enumerate() {
+                let color = if estimate_ok && i < 4 { theme::TEXT_MUTED } else { theme::WARNING };
+                cost = cost.child(small(t, color));
+            }
+            table = table.child(div().flex().flex_col().gap_1().child(line).child(cost));
         }
         page = page.child(table);
 

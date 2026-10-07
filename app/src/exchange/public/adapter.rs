@@ -6,6 +6,7 @@
 //! get `observed_at` from the injected `Clock`.
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tong_funding_core::funding::{DataStatus, FundingObservation};
 use tong_funding_core::quantity::LotSize;
+use tong_funding_core::trade_cost::TopOfBook;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use crate::exchange::error::AdapterError;
@@ -97,6 +99,37 @@ pub enum RulesLookup {
     UnknownSymbol,
 }
 
+/// Best bid / ask by symbol (sizes in base-coin units).
+pub type Books = BTreeMap<String, TopOfBook>;
+
+/// One market poll: the funding observations plus the top-of-book quotes of the same round.
+/// `books` is `Err` when the quotes could not be fetched or parsed (e.g. Binance `bookTicker` rate
+/// limited): the observations are still good and the quotes are shown as unavailable.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarketSnapshot {
+    pub observations: Vec<FundingObservation>,
+    pub books: Result<Books, String>,
+}
+
+/// Builds a quote only when all four numbers are present and positive; anything else is `None`
+/// (never a mark price or 0 in its place; spec: trade-cost-estimate, 最佳一檔報價).
+pub(crate) fn top_of_book(
+    bid_price: Option<Decimal>,
+    bid_qty: Option<Decimal>,
+    ask_price: Option<Decimal>,
+    ask_qty: Option<Decimal>,
+    observed_at: i64,
+) -> Option<TopOfBook> {
+    let positive = |v: Option<Decimal>| v.filter(|x| *x > Decimal::ZERO);
+    Some(TopOfBook {
+        bid_price: positive(bid_price)?,
+        bid_qty: positive(bid_qty)?,
+        ask_price: positive(ask_price)?,
+        ask_qty: positive(ask_qty)?,
+        observed_at,
+    })
+}
+
 /// Read-only access to one exchange's public market data. There is deliberately no method that
 /// places, cancels or amends an order or changes leverage; the order path is a separate change.
 pub trait ExchangeAdapter: Send + Sync {
@@ -106,6 +139,18 @@ pub trait ExchangeAdapter: Send + Sync {
     /// requests (it doubles as the batch "refresh now"); only the catalog / interval metadata may
     /// come from its TTL cache. Symbols that are not tradable USDT perpetuals come back `NotListed`.
     fn fetch_snapshot(&self) -> impl Future<Output = Result<Vec<FundingObservation>, AdapterError>> + Send;
+
+    /// [`fetch_snapshot`](Self::fetch_snapshot) plus the best bid / ask of the same round. Bybit and
+    /// OKX read them from the tickers they already request (no extra request); Binance adds ONE
+    /// `bookTicker` request sent concurrently with the others. The default has no quotes.
+    fn fetch_market(&self) -> impl Future<Output = Result<MarketSnapshot, AdapterError>> + Send {
+        async move {
+            Ok(MarketSnapshot {
+                observations: self.fetch_snapshot().await?,
+                books: Err("this adapter provides no best bid / ask".to_string()),
+            })
+        }
+    }
 
     /// Re-fetch one symbol. Every call sends new HTTP requests and reads no observation cache.
     fn refetch_symbol(&self, symbol: &str) -> impl Future<Output = Result<FundingObservation, AdapterError>> + Send;
@@ -665,7 +710,7 @@ mod tests {
             .collect();
         assert_eq!(
             method_names,
-            vec!["exchange", "fetch_snapshot", "refetch_symbol", "instrument_rules", "listing_status"]
+            vec!["exchange", "fetch_snapshot", "fetch_market", "refetch_symbol", "instrument_rules", "listing_status"]
         );
         for banned in ["order", "cancel", "amend", "leverage", "place", "submit", "post"] {
             assert!(
@@ -691,5 +736,16 @@ mod tests {
             ct_mult: None,
         };
         assert_eq!(r.lot_size(), LotSize { step_size: d("0.1"), min_qty: d("0.2") });
+    }
+
+    #[test]
+    fn top_of_book_needs_all_four_positive_numbers() {
+        let some = |s: &str| Some(d(s));
+        let q = top_of_book(some("99"), some("1"), some("100"), some("2"), 7).unwrap();
+        assert_eq!((q.bid_price, q.bid_qty, q.ask_price, q.ask_qty, q.observed_at), (d("99"), d("1"), d("100"), d("2"), 7));
+        assert!(top_of_book(None, some("1"), some("100"), some("2"), 7).is_none());
+        assert!(top_of_book(some("99"), some("0"), some("100"), some("2"), 7).is_none());
+        assert!(top_of_book(some("99"), some("1"), some("0"), some("2"), 7).is_none());
+        assert!(top_of_book(some("99"), some("1"), some("100"), some("-1"), 7).is_none());
     }
 }

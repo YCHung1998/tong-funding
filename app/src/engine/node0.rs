@@ -16,9 +16,11 @@ use tong_funding_core::net_edge::{compute_net_edge, expected_net_pnl_pct, meets_
 use tong_funding_core::pair::PairState;
 use tong_funding_core::pretrade::{evaluate_pretrade, Check, LegInput, PretradeInput, PretradeLimits, PretradeVerdict};
 use tong_funding_core::risk::EffectiveConfig;
+use tong_funding_core::trade_cost::leg_cost;
 use tong_funding_core::types::{Exchange, Notional, Pct, Price};
 
-use super::ports::{FreshQuote, Leg};
+use super::fill::{plan_submit, LegSizing, SubmitPlan};
+use super::ports::{FreshQuote, Leg, OrderRules};
 
 /// The scan-time part of `pairs.entry_json` that Node 0 needs.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -66,6 +68,9 @@ pub struct Node0Context<'a> {
     pub allowed_exchanges: &'a [Exchange],
     /// [`count_open_pairs`] over the OTHER pairs.
     pub open_pair_count: u32,
+    /// Order rules per leg `[long, short]` (already fetched for Node 1): they size the quantity
+    /// the margin is computed for. `Err` = unknown, so Margin fails (nothing is guessed).
+    pub rules: [&'a Result<OrderRules, String>; 2],
 }
 
 /// Why Node 0 blocks.
@@ -153,6 +158,53 @@ pub fn net_edge_with_threshold(
         .map_err(|e| vec![e.to_string()])
 }
 
+/// Each leg's needed margin: `shared qty × that leg's pre-trade latest price ÷ leverage + opening
+/// fee` (spec: pretrade-validation). The quantity is the one Node 1 will send: it comes from
+/// `fill::plan_submit` over the same prices and rules, never a second formula. Uses only data the
+/// pre-trade step already holds (no request). Cannot be computed (rules unknown, below the minimum
+/// lot, no fee): `Decimal::MAX`, which no balance reaches, so core fails `Margin`.
+fn leg_margins_needed(ctx: &Node0Context<'_>, legs: [&Node0Leg<'_>; 2], notes: &mut Vec<String>) -> [Decimal; 2] {
+    const UNKNOWN: [Decimal; 2] = [Decimal::MAX, Decimal::MAX];
+    let names = [Leg::Long, Leg::Short];
+    let mut sizing = Vec::with_capacity(2);
+    for (i, leg) in legs.iter().enumerate() {
+        match ctx.rules[i] {
+            Ok(r) => sizing.push(LegSizing {
+                exchange: leg.exchange,
+                notional: ctx.entry.notional_usdt,
+                price: leg.pretrade.price,
+                lot: r.lot,
+                okx_ct_val: r.okx_ct_val,
+            }),
+            Err(e) => {
+                notes.push(format!("{}: order rules unavailable, margin needed not computable: {e}", names[i].as_str()));
+                return UNKNOWN;
+            }
+        }
+    }
+    let qty = match plan_submit(&sizing[0], &sizing[1]) {
+        SubmitPlan::Send { long, .. } => long.base_qty,
+        SubmitPlan::Abort { failed } => {
+            let why: Vec<String> = failed.iter().map(|(leg, e)| format!("{}: {e:?}", leg.as_str())).collect();
+            notes.push(format!("quantity not computable, margin needed not computable: {}", why.join("; ")));
+            return UNKNOWN;
+        }
+    };
+    let fees = [ctx.effective.long_taker_fee_pct, ctx.effective.short_taker_fee_pct];
+    let mut out = UNKNOWN;
+    for i in 0..2 {
+        let Some(fee) = fees[i] else {
+            notes.push(format!("{}: taker fee unset, margin needed not computable", names[i].as_str()));
+            continue;
+        };
+        match leg_cost(qty, legs[i].pretrade.price, fee, ctx.entry.leverage) {
+            Ok(c) => out[i] = c.margin,
+            Err(e) => notes.push(format!("{}: margin needed not computable: {e}", names[i].as_str())),
+        }
+    }
+    out
+}
+
 /// Builds core's input and limits plus notes on fail-closed substitutions.
 pub fn build_input(
     ctx: &Node0Context<'_>,
@@ -214,6 +266,7 @@ pub fn build_input(
                 false
             }
         };
+    let margins_needed = leg_margins_needed(ctx, [long, short], &mut notes);
     let mut leg_input = |name: Leg, leg: &Node0Leg<'_>, scan_price: Price| {
         let q = leg.pretrade;
         let mut price_observed_at_ms = q.price_observed_at_ms;
@@ -243,6 +296,7 @@ pub fn build_input(
             price_observed_at_ms,
             funding_observed_at_ms: q.funding.observed_at,
             available_margin,
+            margin_needed: margins_needed[name as usize],
             listed: q.listed && is_consistent_listed(&q.funding),
             exchange_allowed: ctx.allowed_exchanges.contains(&leg.exchange),
             volume_24h_quote: q.funding.volume_24h_quote,
@@ -257,7 +311,6 @@ pub fn build_input(
         net_edge_qualified,
         long: long_in,
         short: short_in,
-        margin_needed: entry.notional_usdt / entry.leverage,
         leverage: entry.leverage,
         open_pair_count: ctx.open_pair_count,
     };
@@ -287,7 +340,12 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
     use tong_funding_core::funding::DataStatus;
+    use tong_funding_core::quantity::LotSize;
     use tong_funding_core::risk::{effective_for_pair, RiskConfig, RiskOverride, RiskOverrides};
+
+    fn lot_rules(step: &str) -> Result<OrderRules, String> {
+        Ok(OrderRules { lot: LotSize { step_size: dec(step), min_qty: dec(step) }, okx_ct_val: None })
+    }
 
     const SETTLE: i64 = 10_000_000;
 
@@ -350,6 +408,8 @@ mod tests {
         pre_s: FreshQuote,
         margin_l: Result<Decimal, String>,
         margin_s: Result<Decimal, String>,
+        rules_l: Result<OrderRules, String>,
+        rules_s: Result<OrderRules, String>,
     }
 
     impl Fx {
@@ -366,6 +426,8 @@ mod tests {
                 pre_s: quote(Exchange::Bybit, "0.001", "100.01", 6_000),
                 margin_l: Ok(dec("1000")),
                 margin_s: Ok(dec("1000")),
+                rules_l: lot_rules("0.001"),
+                rules_s: lot_rules("0.001"),
             }
         }
 
@@ -379,6 +441,7 @@ mod tests {
                 max_concurrent_pairs: self.cfg.max_concurrent_pairs,
                 allowed_exchanges: &self.cfg.allowed_exchanges,
                 open_pair_count: self.open,
+                rules: [&self.rules_l, &self.rules_s],
             };
             let long = Node0Leg {
                 exchange: Exchange::Binance,
@@ -456,6 +519,7 @@ mod tests {
             max_concurrent_pairs: 3,
             allowed_exchanges: &fx.cfg.allowed_exchanges,
             open_pair_count: 0,
+            rules: [&fx.rules_l, &fx.rules_s],
         };
         let long = Node0Leg {
             exchange: Exchange::Binance,
@@ -596,6 +660,65 @@ mod tests {
         let mut fx = Fx::new();
         fx.entry.leverage = Decimal::ZERO;
         assert!(matches!(fx.verdict(), Node0Verdict::Block(Node0Block::InvalidEntry { .. })));
+    }
+
+    /// Fixture for the margin spec: both legs at `price`, qty 0.016 (1000 / 60000 floored to 0.001),
+    /// leverage 5, taker 0.05 on both exchanges.
+    fn margin_fx(price: &str, available: &str) -> Fx {
+        let mut fx = Fx::new();
+        fx.cfg.taker_fee_pct.insert(Exchange::Binance, dec("0.05"));
+        fx.cfg.taker_fee_pct.insert(Exchange::Bybit, dec("0.05"));
+        fx.entry.long_scan_price = dec(price);
+        fx.entry.short_scan_price = dec(price);
+        fx.base_l = quote(Exchange::Binance, "-0.001", price, 1_000);
+        fx.base_s = quote(Exchange::Bybit, "0.001", price, 1_000);
+        fx.pre_l = quote(Exchange::Binance, "-0.001", price, 6_000);
+        fx.pre_s = quote(Exchange::Bybit, "0.001", price, 6_000);
+        fx.margin_l = Ok(dec(available));
+        fx.margin_s = Ok(dec(available));
+        fx
+    }
+
+    fn margin_failed(fx: &Fx) -> bool {
+        let (input, limits, _) = fx.eval(build_input).expect("builds");
+        evaluate_pretrade(&input, &limits).failed().contains(&Check::Margin)
+    }
+
+    /// pretrade-validation: qty 0.016, latest 60,000, leverage 5, taker 0.05, available 192.2 ->
+    /// needed 192.48 (192 + 0.48) and Margin fails; 192.48 passes.
+    #[test]
+    fn margin_needed_includes_the_opening_fee_spec_case() {
+        let fx = margin_fx("60000", "192.2");
+        let (input, _, _) = fx.eval(build_input).unwrap();
+        assert_eq!(input.long.margin_needed, dec("192.48"));
+        assert_eq!(input.short.margin_needed, dec("192.48"));
+        assert!(margin_failed(&fx), "192.2 < 192.48");
+        assert!(!margin_failed(&margin_fx("60000", "192.48")), "exactly enough passes");
+        assert!(margin_failed(&margin_fx("60000", "192")), "notional / leverage alone (200) is not what is checked");
+    }
+
+    /// Each leg uses the SHARED quantity (priced by the higher leg) at its OWN latest price and fee.
+    #[test]
+    fn margin_needed_uses_the_shared_quantity_and_each_legs_own_price_and_fee() {
+        let mut fx = margin_fx("60000", "1000");
+        fx.pre_s = quote(Exchange::Bybit, "0.001", "60010", 6_000);
+        fx.base_s = quote(Exchange::Bybit, "0.001", "60010", 1_000);
+        fx.entry.short_scan_price = dec("60010");
+        fx.cfg.taker_fee_pct.insert(Exchange::Bybit, dec("0.055"));
+        let (input, _, _) = fx.eval(build_input).unwrap();
+        // qty = floor(1000 / 60010, 0.001) = 0.016 on both legs.
+        assert_eq!(input.long.margin_needed, dec("0.016") * dec("60000") / dec("5") + dec("0.48"));
+        assert_eq!(input.short.margin_needed, dec("0.016") * dec("60010") / dec("5") + dec("0.528088"));
+    }
+
+    #[test]
+    fn margin_needed_fails_closed_when_the_quantity_cannot_be_computed() {
+        let mut fx = margin_fx("60000", "1000000");
+        fx.rules_s = Err("instruments-info unavailable".into());
+        assert!(margin_failed(&fx), "unknown order rules must fail Margin, whatever the balance");
+        let mut fx = margin_fx("60000", "1000000");
+        fx.rules_l = lot_rules("1"); // 1000 / 60000 floors to 0: below the minimum
+        assert!(margin_failed(&fx));
     }
 
     #[test]

@@ -14,12 +14,12 @@ use tong_funding_core::funding::{DataStatus, FundingObservation, binance_interva
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::adapter::{
-    BATCH_TIMEOUT, ExchangeAdapter, InstrumentRules, ListingStatus, META_TTL_MS, RawObservation, RulesLookup,
-    SINGLE_TIMEOUT, TtlCell, assemble, dec_field, http_get, int, parse_json, percent_encode_value, str_field,
-    validate_symbol,
+    BATCH_TIMEOUT, Books, ExchangeAdapter, InstrumentRules, ListingStatus, MarketSnapshot, META_TTL_MS, RawObservation,
+    RulesLookup, SINGLE_TIMEOUT, TtlCell, assemble, dec_field, http_get, int, parse_json, percent_encode_value,
+    str_field, top_of_book, validate_symbol,
 };
 use super::endpoints::{
-    BINANCE_EXCHANGE_INFO, BINANCE_FUNDING_INFO, BINANCE_PREMIUM_INDEX, BINANCE_TICKER_24H, binance_url,
+    BINANCE_BOOK_TICKER, BINANCE_EXCHANGE_INFO, BINANCE_FUNDING_INFO, BINANCE_PREMIUM_INDEX, BINANCE_TICKER_24H, binance_url,
 };
 use super::refetch::earliest_observed_at;
 use crate::exchange::error::AdapterError;
@@ -132,6 +132,29 @@ fn raw_from_premium(row: &Value, volume: Option<Decimal>) -> Result<Option<RawOb
     }))
 }
 
+/// `bookTicker` (all symbols): best bid / ask in base coin. A row with a missing, empty or
+/// non-positive field is skipped (that symbol has no quote); a JSON number in a decimal field or a
+/// body that is not an array is a `Parse` error.
+fn parse_book_ticker(body: &str, observed_at: i64) -> Result<Books, AdapterError> {
+    let v = parse_binance_body(body)?;
+    let rows = v.as_array().ok_or_else(|| AdapterError::parse("bookTicker is not an array"))?;
+    let mut out = Books::new();
+    for row in rows {
+        let Some(symbol) = str_field(row, "symbol") else { continue };
+        let book = top_of_book(
+            dec_field(row, "bidPrice")?,
+            dec_field(row, "bidQty")?,
+            dec_field(row, "askPrice")?,
+            dec_field(row, "askQty")?,
+            observed_at,
+        );
+        if let Some(b) = book {
+            out.insert(symbol.to_string(), b);
+        }
+    }
+    Ok(out)
+}
+
 impl<T: HttpTransport> BinanceAdapter<T> {
     pub fn new(transport: Arc<T>, clock: Arc<dyn Clock>) -> Self {
         BinanceAdapter { transport, clock, catalog: TtlCell::new(), intervals: TtlCell::new() }
@@ -172,6 +195,46 @@ impl<T: HttpTransport> BinanceAdapter<T> {
         }
     }
 
+    /// One batch round. With `with_book` the `bookTicker` request is sent in the SAME `join!` as the
+    /// other requests (total latency = the slowest, never the sum); its failure only makes the
+    /// quotes unavailable, never the observations.
+    async fn snapshot(&self, with_book: bool) -> Result<(Vec<FundingObservation>, Result<Books, String>), AdapterError> {
+        let book_get = async {
+            if with_book { Some(self.timed_get(BINANCE_BOOK_TICKER, BATCH_TIMEOUT).await) } else { None }
+        };
+        let (premium, ticker, book, catalog, intervals) = tokio::join!(
+            self.timed_get(BINANCE_PREMIUM_INDEX, BATCH_TIMEOUT),
+            self.timed_get(BINANCE_TICKER_24H, BATCH_TIMEOUT),
+            book_get,
+            self.catalog(),
+            self.intervals(),
+        );
+        let (premium, premium_at) = premium;
+        let (ticker, ticker_at) = ticker;
+        let premium = parse_binance_body(&premium?)?;
+        let ticker = parse_binance_body(&ticker?)?;
+        let observed_at = earliest_observed_at(&[premium_at, ticker_at]).unwrap_or(premium_at);
+
+        let mut volumes: HashMap<&str, Decimal> = HashMap::new();
+        for r in ticker.as_array().ok_or_else(|| AdapterError::parse("ticker/24hr is not an array"))? {
+            if let (Some(symbol), Some(volume)) = (str_field(r, "symbol"), dec_field(r, "quoteVolume")?) {
+                volumes.insert(symbol, volume);
+            }
+        }
+        let rows = premium.as_array().ok_or_else(|| AdapterError::parse("premiumIndex is not an array"))?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(symbol) = str_field(row, "symbol") else { continue };
+            let Some(raw) = raw_from_premium(row, volumes.get(symbol).copied())? else { continue };
+            out.push(self.finish(raw, &catalog, &intervals, observed_at));
+        }
+        let books = match book {
+            None => Err("bookTicker not requested".to_string()),
+            Some((body, at)) => body.and_then(|b| parse_book_ticker(&b, at)).map_err(|e| e.to_string()),
+        };
+        Ok((out, books))
+    }
+
     fn finish(
         &self,
         raw: RawObservation,
@@ -195,32 +258,12 @@ impl<T: HttpTransport> ExchangeAdapter for BinanceAdapter<T> {
     }
 
     async fn fetch_snapshot(&self) -> Result<Vec<FundingObservation>, AdapterError> {
-        let (premium, ticker, catalog, intervals) = tokio::join!(
-            self.timed_get(BINANCE_PREMIUM_INDEX, BATCH_TIMEOUT),
-            self.timed_get(BINANCE_TICKER_24H, BATCH_TIMEOUT),
-            self.catalog(),
-            self.intervals(),
-        );
-        let (premium, premium_at) = premium;
-        let (ticker, ticker_at) = ticker;
-        let premium = parse_binance_body(&premium?)?;
-        let ticker = parse_binance_body(&ticker?)?;
-        let observed_at = earliest_observed_at(&[premium_at, ticker_at]).unwrap_or(premium_at);
+        Ok(self.snapshot(false).await?.0)
+    }
 
-        let mut volumes: HashMap<&str, Decimal> = HashMap::new();
-        for r in ticker.as_array().ok_or_else(|| AdapterError::parse("ticker/24hr is not an array"))? {
-            if let (Some(symbol), Some(volume)) = (str_field(r, "symbol"), dec_field(r, "quoteVolume")?) {
-                volumes.insert(symbol, volume);
-            }
-        }
-        let rows = premium.as_array().ok_or_else(|| AdapterError::parse("premiumIndex is not an array"))?;
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let Some(symbol) = str_field(row, "symbol") else { continue };
-            let Some(raw) = raw_from_premium(row, volumes.get(symbol).copied())? else { continue };
-            out.push(self.finish(raw, &catalog, &intervals, observed_at));
-        }
-        Ok(out)
+    async fn fetch_market(&self) -> Result<MarketSnapshot, AdapterError> {
+        let (observations, books) = self.snapshot(true).await?;
+        Ok(MarketSnapshot { observations, books })
     }
 
     async fn refetch_symbol(&self, symbol: &str) -> Result<FundingObservation, AdapterError> {
@@ -777,5 +820,99 @@ mod tests {
     fn binance_adapter_reports_its_exchange() {
         let (_, adapter, _) = setup(happy_fake(), 0);
         assert_eq!(adapter.exchange(), Exchange::Binance);
+    }
+
+    // ----- trade-cost-estimate: bookTicker -----
+
+    fn book_fake() -> FakeTransport {
+        happy_fake().on("/fapi/v1/ticker/bookTicker", ok("binance/bookTicker.json"))
+    }
+
+    #[test]
+    fn book_ticker_gives_the_best_bid_and_ask() {
+        let (t, adapter, _) = setup(book_fake(), 0);
+        let m = block_on(adapter.fetch_market()).unwrap();
+        let books = m.books.expect("books available");
+        let b = books["BTCUSDT"];
+        assert_eq!((b.bid_price, b.bid_qty, b.ask_price, b.ask_qty), (d("85710.10"), d("2.820"), d("85710.20"), d("11.286")));
+        assert_eq!(b.observed_at, NOW);
+        assert_eq!(t.count("/fapi/v1/ticker/bookTicker"), 1, "one all-symbols request per round");
+        assert_eq!(m.observations.len(), 10);
+    }
+
+    #[test]
+    fn fetch_snapshot_alone_sends_no_book_ticker_request() {
+        let (t, adapter, _) = setup(book_fake(), 0);
+        block_on(adapter.fetch_snapshot()).unwrap();
+        assert_eq!(t.count("bookTicker"), 0);
+    }
+
+    #[test]
+    fn empty_or_zero_book_fields_skip_that_symbol_only() {
+        let body = mutated("binance/bookTicker.json", |v| {
+            for r in v.as_array_mut().unwrap() {
+                if r["symbol"] == "BTCUSDT" {
+                    r["bidPrice"] = Value::from("");
+                }
+                if r["symbol"] == "ETHUSDT" {
+                    r["askQty"] = Value::from("0.000");
+                }
+            }
+        });
+        let books = parse_book_ticker(&body.to_string(), NOW).unwrap();
+        assert!(!books.contains_key("BTCUSDT"));
+        assert!(!books.contains_key("ETHUSDT"));
+        assert!(books.len() >= 4, "{:?}", books.keys());
+        assert!(parse_book_ticker("{\"a\":1}", NOW).is_err());
+    }
+
+    #[test]
+    fn book_ticker_failure_leaves_the_observations_good_and_the_books_unavailable() {
+        let fake = happy_fake().on("/fapi/v1/ticker/bookTicker", Err(AdapterError::Timeout));
+        let (_, adapter, _) = setup(fake, 0);
+        let m = block_on(adapter.fetch_market()).unwrap();
+        assert_eq!(m.observations.len(), 10);
+        assert!(m.books.is_err());
+        // Rate limited: same.
+        let fake = happy_fake().on("/fapi/v1/ticker/bookTicker", Ok(HttpResponse::with_status(429, "")));
+        let (_, adapter, _) = setup(fake, 0);
+        let m = block_on(adapter.fetch_market()).unwrap();
+        assert_eq!(m.observations.len(), 10);
+        assert!(m.books.is_err());
+    }
+
+    /// Spec: the bookTicker request is sent in the SAME round as the others (design: 並行, never
+    /// added in sequence). The transport lets no request finish until all five are in flight; a
+    /// sequential implementation would never reach five and time out.
+    #[test]
+    fn book_ticker_is_sent_concurrently_with_the_existing_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Barrier {
+            inner: FakeTransport,
+            in_flight: AtomicUsize,
+            expected: usize,
+        }
+        impl HttpTransport for Barrier {
+            fn get(&self, req: crate::exchange::transport::HttpRequest) -> impl std::future::Future<Output = Result<HttpResponse, AdapterError>> + Send {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    while self.in_flight.load(Ordering::SeqCst) < self.expected {
+                        tokio::task::yield_now().await;
+                    }
+                    self.inner.get(req).await
+                }
+            }
+        }
+        // First round: premiumIndex, ticker/24hr, bookTicker, exchangeInfo, fundingInfo.
+        let transport = Arc::new(Barrier { inner: book_fake(), in_flight: AtomicUsize::new(0), expected: 5 });
+        let adapter = BinanceAdapter::new(Arc::clone(&transport), Arc::new(ManualClock::new(NOW)));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let m = rt
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), adapter.fetch_market()).await.expect("requests were not concurrent")
+            })
+            .unwrap();
+        assert!(m.books.is_ok());
+        assert_eq!(transport.in_flight.load(Ordering::SeqCst), 5);
     }
 }

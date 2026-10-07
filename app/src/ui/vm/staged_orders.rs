@@ -12,7 +12,8 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 use tong_funding_core::pair::PairState;
-use tong_funding_core::risk::{ExecutionMode, TriggerMode};
+use tong_funding_core::risk::{effective_for_pair, ExecutionMode, TriggerMode};
+use tong_funding_core::trade_cost::{estimate_cost, CostEstimate, CostInput};
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{CommandSink, LegAccount, UiSnapshot, ACCOUNT_EXCHANGES};
@@ -39,11 +40,70 @@ pub struct StagedRow {
     pub margin: Option<Decimal>,
     pub long_qty: QuoteCell,
     pub short_qty: QuoteCell,
+    /// Estimated cost at the shared quantity (trade-cost-estimate), recomputed with every snapshot.
+    pub cost: CostView,
     /// `Err(reason)` = the checkbox is disabled.
     pub selectable: Result<(), String>,
     pub selected: bool,
     /// Time until the entry trigger (`T − entry_lead`), if still ahead.
     pub entry_in_ms: Option<i64>,
+}
+
+/// The cost estimate of one pair, or why there is none (no number is shown without its inputs).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CostView {
+    Unavailable(String),
+    Estimate(CostDisplay),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostDisplay {
+    pub long: Exchange,
+    pub short: Exchange,
+    pub qty: Decimal,
+    /// Best ask of the long leg's exchange / best bid of the short leg's exchange.
+    pub long_ask: Decimal,
+    pub short_bid: Decimal,
+    pub estimate: CostEstimate,
+    /// The OLDER of the two quotes' receive times (the number is only as fresh as this).
+    pub quote_at: i64,
+    pub quote_age_ms: i64,
+    /// "會吃到第二檔" hints and quote-refresh failures; never block anything.
+    pub warnings: Vec<String>,
+}
+
+impl CostView {
+    /// The text lines the page shows.
+    pub fn lines(&self) -> Vec<String> {
+        match self {
+            CostView::Unavailable(why) => vec![format!("預估成本：{why}")],
+            CostView::Estimate(c) => {
+                let e = &c.estimate;
+                let leg = |tag: &str, ex: Exchange, side: &str, px: Decimal, l: &tong_funding_core::trade_cost::LegEstimate| {
+                    format!(
+                        "{tag} {} {side} {} → 價值 {} · 開倉費 {} · 保證金 {}",
+                        ex.name(),
+                        px.normalize(),
+                        super::format::money(l.cost.value, 2),
+                        super::format::fixed(l.cost.open_fee, 4),
+                        super::format::money(l.cost.margin, 2)
+                    )
+                };
+                let mut out = vec![
+                    leg("L", c.long, "賣一", c.long_ask, &e.long),
+                    leg("S", c.short, "買一", c.short_bid, &e.short),
+                    format!(
+                        "合計保證金 {} USDT · 手續費（開倉＋預估平倉）{} USDT",
+                        super::format::money(e.total_margin, 2),
+                        super::format::money(e.total_fees, 2)
+                    ),
+                    format!("報價 {} UTC（{} 秒前）", super::format::utc_hms(c.quote_at), super::format::secs(c.quote_age_ms)),
+                ];
+                out.extend(c.warnings.iter().cloned());
+                out
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +302,88 @@ fn price_of(snap: &UiSnapshot, ex: Exchange, symbol: &str) -> Option<Decimal> {
     snap.market.get(&ex)?.observations.iter().find(|o| o.symbol == symbol).map(|o| o.mark_price)
 }
 
+/// The shared base-coin quantity of a pair (the same number `plan_submit` will send).
+fn base_qty_of(c: &QuoteCell) -> Option<Decimal> {
+    match c {
+        QuoteCell::Qty { qty, .. } => Some(*qty),
+        QuoteCell::Contracts { base, .. } => Some(*base),
+        _ => None,
+    }
+}
+
+/// Estimate at the shared quantity: long leg buys at the best ask, short leg sells at the best bid.
+/// Uses only the snapshot (quotes, fees, leverage, quantity): no request, background-computed.
+fn cost_of(snap: &UiSnapshot, p: &PairView, leverage: Option<Decimal>, long_qty: &QuoteCell, short_qty: &QuoteCell, now_ms: i64) -> CostView {
+    let no = |why: String| CostView::Unavailable(why);
+    let (Some(qty_l), Some(qty_s)) = (base_qty_of(long_qty), base_qty_of(short_qty)) else {
+        let why = if base_qty_of(long_qty).is_none() { long_qty.text() } else { short_qty.text() };
+        return no(format!("無共同數量（{why}）"));
+    };
+    let Some(leverage) = leverage else { return no("槓桿未知".into()) };
+    let eff = effective_for_pair(&snap.settings.risk, &snap.settings.overrides, p.long_exchange, p.short_exchange);
+    let unset: Vec<&str> = [(eff.long_taker_fee_pct, p.long_exchange), (eff.short_taker_fee_pct, p.short_exchange)]
+        .into_iter()
+        .filter_map(|(f, ex)| f.is_none().then_some(ex.name()))
+        .collect();
+    let (Some(fee_l), Some(fee_s)) = (eff.long_taker_fee_pct, eff.short_taker_fee_pct) else {
+        return no(format!("未設定手續費率（{}）", unset.join("、")));
+    };
+    let book = |ex: Exchange| snap.books.get(&ex).and_then(|f| f.books.get(&p.symbol));
+    let (Some(bl), Some(bs)) = (book(p.long_exchange), book(p.short_exchange)) else {
+        let missing: Vec<&str> = [(book(p.long_exchange).is_none(), p.long_exchange), (book(p.short_exchange).is_none(), p.short_exchange)]
+            .into_iter()
+            .filter_map(|(m, ex)| m.then_some(ex.name()))
+            .collect();
+        return no(format!("無報價（{}）", missing.join("、")));
+    };
+    // Both legs are sized to one quantity; a mismatch would mean the two cells disagree.
+    debug_assert_eq!(qty_l, qty_s);
+    let input = CostInput {
+        qty: qty_l,
+        long_ask: bl.ask_price,
+        long_ask_qty: bl.ask_qty,
+        short_bid: bs.bid_price,
+        short_bid_qty: bs.bid_qty,
+        long_fee_pct: fee_l,
+        short_fee_pct: fee_s,
+        leverage,
+    };
+    let estimate = match estimate_cost(&input) {
+        Ok(e) => e,
+        Err(e) => return no(format!("無法計算（{e}）")),
+    };
+    let mut warnings = Vec::new();
+    for (ex, side, est, top_qty) in
+        [(p.long_exchange, "多腿", estimate.long, bl.ask_qty), (p.short_exchange, "空腿", estimate.short, bs.bid_qty)]
+    {
+        if est.exceeds_top_level {
+            warnings.push(format!(
+                "{} {side}數量 {} 大於一檔掛單量 {}，會吃到第二檔，實際價格會更差",
+                ex.name(),
+                qty_l.normalize(),
+                top_qty.normalize()
+            ));
+        }
+    }
+    for ex in [p.long_exchange, p.short_exchange] {
+        if let Some((why, _)) = snap.books.get(&ex).and_then(|f| f.last_error.as_ref()) {
+            warnings.push(format!("{} 報價更新失敗（{why}），顯示的是舊報價", ex.name()));
+        }
+    }
+    let quote_at = bl.observed_at.min(bs.observed_at);
+    CostView::Estimate(CostDisplay {
+        long: p.long_exchange,
+        short: p.short_exchange,
+        qty: qty_l,
+        long_ask: bl.ask_price,
+        short_bid: bs.bid_price,
+        estimate,
+        quote_at,
+        quote_age_ms: (now_ms - quote_at).max(0),
+        warnings,
+    })
+}
+
 fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms: i64) -> StagedRow {
     let empty = Value::Null;
     let entry = snap.pair_entries.get(&p.internal_uuid).unwrap_or(&empty);
@@ -280,6 +422,7 @@ fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms:
         margin: notional.zip(leverage).map(|(n, l)| n / l),
         selected: selectable.is_ok() && selection.contains(&p.internal_uuid),
         selectable,
+        cost: cost_of(snap, p, leverage, &long_qty, &short_qty, now_ms),
         long_qty,
         short_qty,
         entry_in_ms: (entry_at > now_ms).then_some(entry_at - now_ms),

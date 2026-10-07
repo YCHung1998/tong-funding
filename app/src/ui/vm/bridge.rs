@@ -13,6 +13,7 @@ use serde_json::Value;
 use tong_funding_core::funding::FundingObservation;
 use tong_funding_core::pair::PairState;
 use tong_funding_core::risk::{ExecutionMode, RiskConfig, RiskOverrides, TriggerMode};
+use tong_funding_core::trade_cost::TopOfBook;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use crate::engine::command::{Alert as EngineAlert, Blocker, Command, CommandReply, Notice, PairView};
@@ -45,6 +46,18 @@ pub struct MarketFeed {
     /// Local time of the last successful fetch (`None` = never).
     pub last_success_at: Option<i64>,
     /// Message and local time of the latest failure, if it is newer than the last success.
+    pub last_error: Option<(String, i64)>,
+}
+
+/// Latest best bid / ask of one exchange (trade-cost-estimate). Kept apart from [`MarketFeed`]:
+/// a failed quote fetch must not touch the funding observations, and the other way round.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BookFeed {
+    pub books: BTreeMap<String, TopOfBook>,
+    /// Local time of the last successful quote fetch (`None` = never).
+    pub last_success_at: Option<i64>,
+    /// Why the latest quote fetch failed; cleared by the next success. The old quotes are KEPT (they
+    /// carry their own `observed_at`, so the page shows their age).
     pub last_error: Option<(String, i64)>,
 }
 
@@ -286,6 +299,8 @@ impl Default for SystemFlags {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UiSnapshot {
     pub market: BTreeMap<Exchange, MarketFeed>,
+    /// Best bid / ask per exchange (trade-cost-estimate), refreshed with each market poll.
+    pub books: BTreeMap<Exchange, BookFeed>,
     pub accounts: BTreeMap<Exchange, AccountState>,
     pub health: Vec<SourceHealth>,
     pub clocks: BTreeMap<Exchange, ClockState>,
@@ -343,6 +358,9 @@ pub enum SourceUpdate {
     /// Partial update (e.g. a WebSocket frame): replaces only the given symbols.
     MarketPartial { exchange: Exchange, observations: Vec<FundingObservation>, at: i64 },
     MarketError { exchange: Exchange, error: String, at: i64 },
+    /// Best bid / ask of one poll: a success replaces that exchange's quotes, a failure keeps the
+    /// old ones and records why (never presented as new data).
+    Books { exchange: Exchange, books: Result<BTreeMap<String, TopOfBook>, String>, at: i64 },
     Account { exchange: Exchange, state: AccountState },
     Health(Vec<SourceHealth>),
     Clock { exchange: Exchange, state: ClockState },
@@ -365,7 +383,7 @@ pub enum SourceUpdate {
 impl SourceUpdate {
     /// Market data changes feed the rate-limited recompute; everything else is applied the same way.
     pub fn is_market(&self) -> bool {
-        matches!(self, SourceUpdate::Market { .. } | SourceUpdate::MarketPartial { .. } | SourceUpdate::MarketError { .. })
+        matches!(self, SourceUpdate::Market { .. } | SourceUpdate::MarketPartial { .. } | SourceUpdate::MarketError { .. } | SourceUpdate::Books { .. })
     }
 }
 
@@ -392,6 +410,18 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         }
         SourceUpdate::MarketError { exchange, error, at } => {
             snap.market.entry(exchange).or_default().last_error = Some((error, at));
+            snap.market_updates += 1;
+        }
+        SourceUpdate::Books { exchange, books, at } => {
+            let feed = snap.books.entry(exchange).or_default();
+            match books {
+                Ok(b) => {
+                    feed.books = b;
+                    feed.last_success_at = Some(at);
+                    feed.last_error = None;
+                }
+                Err(e) => feed.last_error = Some((e, at)),
+            }
             snap.market_updates += 1;
         }
         SourceUpdate::Account { exchange, state } => {
