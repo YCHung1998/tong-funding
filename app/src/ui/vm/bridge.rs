@@ -29,9 +29,9 @@ pub const MAX_RECOMPUTE_HZ: i64 = 2;
 pub const COUNTDOWN_TICK_MS: i64 = 1_000;
 /// Every exchange can take orders (okx-trading-enablement); which ones are actually traded is
 /// decided by the risk setting `allowed_exchanges`, not by this list.
-pub const TRADABLE_EXCHANGES: [Exchange; 3] = [Exchange::Binance, Exchange::Bybit, Exchange::Okx];
+pub const TRADABLE_EXCHANGES: [Exchange; 3] = Exchange::ALL;
 /// Exchanges whose account (signed) data the pages show.
-pub const ACCOUNT_EXCHANGES: [Exchange; 3] = [Exchange::Binance, Exchange::Bybit, Exchange::Okx];
+pub const ACCOUNT_EXCHANGES: [Exchange; 3] = Exchange::ALL;
 
 pub fn is_tradable(e: Exchange) -> bool {
     TRADABLE_EXCHANGES.contains(&e)
@@ -349,6 +349,10 @@ impl UiSnapshot {
             Some(a) => a.clone(),
             None => AccountState::Loading,
         }
+    }
+    /// OKX `ctVal` (base coin per contract) of `symbol`, when the rules are known and it is positive.
+    pub fn okx_ct_val(&self, symbol: &str) -> Option<Decimal> {
+        self.rules.get(&(Exchange::Okx, symbol.to_string()))?.as_ref().ok()?.okx_ct_val.filter(|c| *c > Decimal::ZERO)
     }
     pub fn health_of(&self, s: SourceId) -> Option<&SourceHealth> {
         self.health.iter().find(|h| h.source == s)

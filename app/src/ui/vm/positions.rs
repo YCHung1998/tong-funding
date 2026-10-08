@@ -277,7 +277,7 @@ fn contracts_of(snap: &UiSnapshot, p: &Position) -> Option<Decimal> {
     if p.exchange != Exchange::Okx {
         return None;
     }
-    let ct_val = snap.rules.get(&(Exchange::Okx, p.symbol.clone()))?.as_ref().ok()?.okx_ct_val.filter(|c| *c > Decimal::ZERO)?;
+    let ct_val = snap.okx_ct_val(&p.symbol)?;
     Some((p.quantity / ct_val).normalize())
 }
 

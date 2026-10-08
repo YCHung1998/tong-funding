@@ -148,7 +148,7 @@ pub fn okx_to_position(p: &OkxPosition, ct_val: Option<Decimal>) -> Result<Posit
 /// so the list is never read as complete. Contract equity stays unset, like the other exchanges: the
 /// wallet rows already include the margin in use, so adding used + available margin would count it twice
 /// (the field mapping is unverified, design D9).
-pub fn okx_account_data(balances: &[Balance], positions: Vec<OkxPosition>, ct_val: &dyn Fn(&str) -> Option<Decimal>, marks: &HashMap<String, Decimal>) -> AccountData {
+pub fn okx_account_data(balances: &[Balance], positions: Vec<OkxPosition>, incomplete: Option<String>, ct_val: &dyn Fn(&str) -> Option<Decimal>, marks: &HashMap<String, Decimal>) -> AccountData {
     let mut data = account_data(balances, vec![], None, marks, "DEMO");
     let mut skipped = Vec::new();
     for p in &positions {
@@ -157,7 +157,11 @@ pub fn okx_account_data(balances: &[Balance], positions: Vec<OkxPosition>, ct_va
             Err(why) => skipped.push(why),
         }
     }
-    data.positions_incomplete = (!skipped.is_empty()).then(|| skipped.join("；"));
+    let own = (!skipped.is_empty()).then(|| skipped.join("；"));
+    data.positions_incomplete = match (incomplete, own) {
+        (Some(reason), Some(own)) => Some(format!("{reason}；{own}")),
+        (reason, own) => reason.or(own),
+    };
     data
 }
 
@@ -200,6 +204,9 @@ struct LimitsState {
 impl LiveOkxLimits {
     fn state(&self) -> std::sync::MutexGuard<'_, LimitsState> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    pub fn table(&self) -> HashMap<String, (Decimal, Decimal)> {
+        self.state().table.clone()
     }
     pub fn set_table(&self, table: HashMap<String, (Decimal, Decimal)>) {
         self.state().table = table;
@@ -607,7 +614,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         let ledger_binance = BinanceLedgerClient::new(t.clone(), ledger_secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost);
         let ledger_bybit = BybitLedgerClient::new(t.clone(), ledger_secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo);
         ledger_sources = Some((BinanceLedgerSource(Arc::new(ledger_binance)), BybitLedgerSource(Arc::new(ledger_bybit)), OkxLedgerSource(okx.clone())));
-        let (ctx, adapters) = (ctx.clone(), adapters.clone());
+        let (ctx, adapters, okx_limits_poll) = (ctx.clone(), adapters.clone(), okx_limits.clone());
         tokio::spawn(async move {
             // Give clock sync a moment so the first poll is not refused as "unsynced".
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -615,7 +622,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                 *ctx.next_account_poll.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = clock_now(&ctx.clock) + ACCOUNT_POLL_MS;
                 poll_binance_account(&ctx, &binance, env_label(bhost)).await;
                 poll_bybit_account(&ctx, &bybit).await;
-                poll_okx_account(&ctx, &okx, &adapters.2).await;
+                poll_okx_account(&ctx, &okx, &adapters.2, &okx_limits_poll).await;
                 tokio::time::sleep(Duration::from_millis(ACCOUNT_POLL_MS as u64)).await;
             }
         });
@@ -1096,11 +1103,15 @@ async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<ReqwestTransport>) 
 /// OKX account poll: balances and positions (converted to coins with the catalog's `ctVal`), shown as
 /// the dashboard's OKX card. A position whose `ctVal` is unknown is named in the incomplete reason
 /// instead of being dropped; the rules of the positions' symbols are requested for the pages.
-async fn poll_okx_account(ctx: &Ctx, c: &OkxSignedClient<ReqwestTransport>, adapter: &OkxAdapter<PublicT>) {
+async fn poll_okx_account(ctx: &Ctx, c: &OkxSignedClient<ReqwestTransport>, adapter: &OkxAdapter<PublicT>, limits: &LiveOkxLimits) {
     let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
     match res {
         Ok((balances, listing)) => {
-            let table = adapter.limit_table().await.unwrap_or_default();
+            // the market loop keeps the catalog table current; ask the adapter (cached) only before its first round
+            let table = match limits.table() {
+                t if !t.is_empty() => t,
+                _ => adapter.limit_table().await.unwrap_or_default(),
+            };
             let incomplete = match &listing.completeness {
                 Completeness::Complete => None,
                 Completeness::Incomplete { reason } => Some(reason.clone()),
@@ -1110,13 +1121,7 @@ async fn poll_okx_account(ctx: &Ctx, c: &OkxSignedClient<ReqwestTransport>, adap
                     let _ = tx.send((Exchange::Okx, p.symbol.clone()));
                 }
             }
-            let mut data = okx_account_data(&balances, listing.items, &|s: &str| table.get(s).map(|(ct, _)| *ct), &marks_of(ctx, Exchange::Okx));
-            if let Some(reason) = incomplete {
-                data.positions_incomplete = Some(match data.positions_incomplete.take() {
-                    Some(own) => format!("{reason}；{own}"),
-                    None => reason,
-                });
-            }
+            let data = okx_account_data(&balances, listing.items, incomplete, &|s: &str| table.get(s).map(|(ct, _)| *ct), &marks_of(ctx, Exchange::Okx));
             account_loaded(ctx, Exchange::Okx, data);
         }
         Err(e) => account_failed(ctx, Exchange::Okx, &e, c.last_not_connected_reason()),
@@ -1202,7 +1207,7 @@ mod tests {
     fn okx_account_data_keeps_the_assets_converts_the_positions_and_never_drops_one_silently() {
         let bals = [Balance { exchange: Exchange::Okx, asset: "USDT".into(), amount: d("5000"), available: Some(d("4600")), usdt_value: Some(d("4999.8")), fetched_at: 1 }];
         let ct = |s: &str| (s == "BTCUSDT").then(|| d("0.01"));
-        let data = okx_account_data(&bals, vec![okx_pos("BTCUSDT", "-3"), okx_pos("ETHUSDT", "7")], &ct, &HashMap::new());
+        let data = okx_account_data(&bals, vec![okx_pos("BTCUSDT", "-3"), okx_pos("ETHUSDT", "7")], None, &ct, &HashMap::new());
         assert_eq!(data.assets.len(), 1);
         assert_eq!((data.assets[0].asset.as_str(), data.assets[0].quantity, data.assets[0].usdt_value), ("USDT", d("5000"), Some(d("4999.8"))));
         assert_eq!(data.positions.len(), 1, "only the convertible one is a position");
@@ -1211,7 +1216,7 @@ mod tests {
         assert!(why.contains("ETHUSDT") && why.contains("7 張") && why.contains("無法換算"), "{why}");
         assert_eq!(data.environment, "DEMO");
         assert_eq!(data.contract_equity, None, "the wallet rows already include the margin: not counted twice (unverified mapping, like the other exchanges)");
-        let all_ok = okx_account_data(&bals, vec![okx_pos("BTCUSDT", "-3")], &ct, &HashMap::new());
+        let all_ok = okx_account_data(&bals, vec![okx_pos("BTCUSDT", "-3")], None, &ct, &HashMap::new());
         assert_eq!(all_ok.positions_incomplete, None);
     }
 

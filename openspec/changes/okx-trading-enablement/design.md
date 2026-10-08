@@ -82,3 +82,14 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 ## 實作時發現（合併 main 的 order-leverage-sync 之後）
 
 - engine 的開倉單現在帶 `leverage`（`order-leverage-sync`），Binance / Bybit 的 executor 在送單前先設槓桿。OKX 的 set-leverage **尚未實作**：executor 對帶 `leverage` 的 OKX 開倉在任何請求之前回 `not_sent`（「OKX leverage sync not implemented yet」，測試涵蓋且斷言零請求），絕不呼叫任何 OKX set-leverage 端點，也絕不在槓桿未套用時送出 OKX 開倉。因此在 task 3.8 完成前，engine 自動進場含 OKX 腿的配對都會在送單階段失敗；手動單與實機探針的 OKX 腿不帶 `leverage`（探針已註明），不受影響。
+
+## 抗辯修正（enablement）
+
+- F1：OKX executor 才會做的拒絕（數量守衛：名目上限 / lotSz / 預期幣量 / ctVal、limits 未載入、標記價過舊）改在**送任何一腿之前**對兩腿檢查：`Executor::prepare_open`（DemoExecutor 以同一組 `local_checks` + `gate` 實作）。失敗 = 兩腿都不送，配對以 `nothing sent` 取消並帶原因。腿的名目上限來自該配對自己的進場 notional（`OrderRequest.notional_usdt` × 2，`OKX_LEG_CAP_FACTOR`），不再受之後調低的合約範本影響；手動單沒有配對 notional，仍用範本 × 2。executor 內的同一檢查保留為第二道防線。
+- F2：槓桿屏障（所有交易所）：`prepare_open` 先對每腿做本地檢查與 gate（時鐘、單向模式、OKX 示範金鑰證明），再對**每一腿**設槓桿；全部成功才送單，且送單不重複設槓桿。任一腿被拒 / 限流 / 逾時 = 不送任何訂單（設槓桿不產生曝險）。Binance / Bybit 的「槓桿未變更」碼語意不變。
+- F3：OKX set-leverage 成功需回覆 `data[0]` 的 `lever` 等於所求、`mgnMode` 為 `cross`、`instId` 吻合，否則視為失敗、不送單。
+- F4：`actor.rs` 對 OKX 缺 `ctVal` 改為錯誤（與 recovery 一致）。
+- F5：OKX 在 `allowed_exchanges` 內時，OKX 帳戶斷線 / 時鐘警示與其他兩所相同；`demo_keys` 在 OKX 被允許時要求 OKX 金鑰與 passphrase（否則不可切換 EXCHANGE_DEMO，附原因）。
+- F6：掃幣頁每列依自己的配對設定判斷；缺 OKX 手續費只讓含 OKX 的列顯示「未設定」，Binance–Bybit 列不受影響（全域 `decidable` 旗標與排序仍以全部配對為準，行為不變）。
+- F7：OKX 帳戶不顯示合約權益列（與 live 一致，避免與錢包資產重複計入）；測試固定值已對齊。
+- 簡化（無行為變更）：`UiSnapshot::okx_ct_val`、`PositionRow` 去掉重複欄位、刪除未使用的 `close_prefill(&AccountPosition)`、`OkxOrderClient::order_gate`、`okx_account_data` 接收 `incomplete`、帳戶輪詢沿用市場迴圈的 limits 表、`TRADABLE/ACCOUNT_EXCHANGES = Exchange::ALL`。

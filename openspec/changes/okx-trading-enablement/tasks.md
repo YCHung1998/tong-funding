@@ -33,3 +33,10 @@
 - [ ] 4.2 實機（使用者執行；agent 不得讀 Keychain、不得送單）：啟動 app（EXCHANGE_DEMO），確認：總覽 OKX 卡數字與 OKX demo 網頁一致；掃幣頁出現含 OKX 的方向；在手動下單頁對 OKX 以小額幣量開倉後平倉，持倉頁顯示幣量與張數正確；交易單頁送出一組含 OKX 的配對並於平倉後檢查 PnL 不再是「OKX 價格未知」
 
 實作備註：3.1 的 OKX 轉換在 `ui/live.rs`（`okx_to_position` / `okx_account_data`）；3.7 ③ 僅文件化，④ 因拒絕白名單不得變更，僅調整 51169 的「不明」原因文字；單腿名目上限取合約範本 notional × 2；`max_leverage` 為標的上限（大名目分級未驗證，set-leverage 為最終檢查）。4.2 實機項目未勾，由使用者執行：`cargo run`（EXCHANGE_DEMO，OKX demo 金鑰已在 Keychain），並依序驗證總覽 OKX 卡、掃幣方向、手動 OKX 小額開倉（含槓桿）與平倉、交易單含 OKX 配對。
+
+## 5. 抗辯修正（enablement）
+
+- [x] 5.1 F1 / F2：`Executor::prepare_open` 送前屏障、`OrderRequest.notional_usdt`、引擎在 `OpenPrepared` 後才送兩腿；流程與 executor 測試
+- [x] 5.2 F3 set-leverage 回覆驗證；F4 ctVal 缺失為錯誤
+- [x] 5.3 F5 OKX 警示與 demo 金鑰依 `allowed_exchanges`；F6 掃幣頁每列判斷測試；F7 儀表板固定值對齊
+- [x] 5.4 簡化項目（見 design）

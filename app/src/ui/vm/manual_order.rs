@@ -13,7 +13,7 @@ use super::bridge::{CommandSink, LegAccount, UiSnapshot, TRADABLE_EXCHANGES};
 use super::engine_view::{blocker_text, refusing_blockers};
 use super::format;
 use crate::engine::command::{Command, ManualOrder};
-use crate::engine::ports::{AccountPosition, Listed, OrderSide};
+use crate::engine::ports::{Listed, OrderSide};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManualForm {
@@ -341,11 +341,9 @@ pub struct PositionRow {
     /// multiplied by `ctVal` here (and `ZERO` while `unconvertible`: never contracts as coins).
     pub quantity: Decimal,
     pub is_long: bool,
-    /// OKX only: the signed contract count, when `ctVal` is known.
-    pub contracts: Option<Decimal>,
     /// OKX position whose `ctVal` is unknown: it cannot be shown in coins or closed from here.
     pub unconvertible: bool,
-    /// OKX only: the position as the exchange reported it (contracts), for the "無法換算" label.
+    /// OKX only: the position as the exchange reported it (signed contracts).
     pub raw_contracts: Option<Decimal>,
 }
 
@@ -429,9 +427,9 @@ pub fn open_positions(snap: &UiSnapshot) -> Vec<PickList<PositionRow>> {
         }
         let is_long = p.quantity > Decimal::ZERO;
         Some(match ct_val_of(snap, p.exchange, &p.symbol) {
-            CtVal::NotOkx => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity, is_long, contracts: None, unconvertible: false, raw_contracts: None },
-            CtVal::Known(c) => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity * c, is_long, contracts: Some(p.quantity), unconvertible: false, raw_contracts: Some(p.quantity) },
-            CtVal::Unknown => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: Decimal::ZERO, is_long, contracts: None, unconvertible: true, raw_contracts: Some(p.quantity) },
+            CtVal::NotOkx => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity, is_long, unconvertible: false, raw_contracts: None },
+            CtVal::Known(c) => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: p.quantity * c, is_long, unconvertible: false, raw_contracts: Some(p.quantity) },
+            CtVal::Unknown => PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: Decimal::ZERO, is_long, unconvertible: true, raw_contracts: Some(p.quantity) },
         })
     })
 }
@@ -447,10 +445,7 @@ fn ct_val_of(snap: &UiSnapshot, exchange: Exchange, symbol: &str) -> CtVal {
     if exchange != Exchange::Okx {
         return CtVal::NotOkx;
     }
-    match snap.rules.get(&(exchange, symbol.to_string())) {
-        Some(Ok(r)) => r.okx_ct_val.filter(|c| *c > Decimal::ZERO).map_or(CtVal::Unknown, CtVal::Known),
-        _ => CtVal::Unknown,
-    }
+    snap.okx_ct_val(symbol).map_or(CtVal::Unknown, CtVal::Known)
 }
 
 /// Open orders per tradable exchange; rows without an id are kept (shown, not pickable).
@@ -462,19 +457,6 @@ pub fn open_orders(snap: &UiSnapshot) -> Vec<PickList<OrderRow>> {
             CtVal::Known(c) => OrderRow { exchange: o.exchange, symbol: o.symbol.clone(), order_id, remaining: o.remaining_quantity * c, remaining_contracts: Some(o.remaining_quantity), unconvertible: false },
             CtVal::Unknown => OrderRow { exchange: o.exchange, symbol: o.symbol.clone(), order_id, remaining: Decimal::ZERO, remaining_contracts: Some(o.remaining_quantity), unconvertible: true },
         })
-    })
-}
-
-/// Close prefill of an engine position that is already in COINS (Binance / Bybit). OKX positions
-/// are contracts and are converted by `open_positions` first: this refuses them (`None`) so contracts
-/// can never be written into the coin form.
-pub fn close_prefill(p: &AccountPosition) -> Option<ManualPrefill> {
-    (p.exchange != Exchange::Okx).then(|| ManualPrefill {
-        exchange: p.exchange,
-        symbol: p.symbol.clone(),
-        side: if p.quantity > Decimal::ZERO { OrderSide::Sell } else { OrderSide::Buy },
-        quantity: p.quantity.abs().normalize().to_string(),
-        reduce_only: true,
     })
 }
 

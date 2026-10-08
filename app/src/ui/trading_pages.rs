@@ -946,9 +946,9 @@ impl Shell {
                     }
                     for r in rows {
                         let side = if r.is_long { "多" } else { "空" };
-                        let size = match (r.unconvertible, r.contracts, r.raw_contracts) {
-                            (true, _, Some(n)) => format!("{} 張（無法換算：ctVal 未知）", n.abs().normalize()),
-                            (false, Some(n), _) => format!("{} {}（{} 張）", r.quantity.abs().normalize(), format::base_coin(&r.symbol), n.abs().normalize()),
+                        let size = match (r.unconvertible, r.raw_contracts) {
+                            (true, Some(n)) => format!("{} 張（無法換算：ctVal 未知）", n.abs().normalize()),
+                            (false, Some(n)) => format!("{} {}（{} 張）", r.quantity.abs().normalize(), format::base_coin(&r.symbol), n.abs().normalize()),
                             _ => format!("{} {}", r.quantity.abs().normalize(), format::base_coin(&r.symbol)),
                         };
                         let label = format!("{name} · {} · {side} {size}{age}", r.symbol);

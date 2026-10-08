@@ -83,3 +83,17 @@ OKX 開倉單帶 `leverage` 時，executor SHALL 在帳戶模式讀取（示範�
 
 - **WHEN** OKX 平倉回 51169（無持倉可減）
 - **THEN** 結果維持「不明」（拒絕白名單不變），原因文字說明可能已是空倉而非斷言對腿裸露
+
+### Requirement: 開倉前先檢查並設定兩腿，才送任何訂單
+
+配對的兩個開倉腿 SHALL 在送出任何一腿之前通過 executor 的送前屏障：兩腿的本地檢查（OKX 數量守衛、limits 與標記價）、時鐘與模式檢查，以及**兩腿**的槓桿設定；任一失敗 SHALL 使兩腿都不送出，配對以原因取消。OKX 腿的名目上限 SHALL 來自該配對自己的進場 notional。OKX 缺 `ctVal` SHALL 為錯誤。OKX 在 `allowed_exchanges` 內時，其未連線與時鐘警示、以及切換 EXCHANGE_DEMO 所需的金鑰 SHALL 與另兩所相同。
+
+#### Scenario: 一所拒絕槓桿
+
+- **WHEN** OKX 或 Binance 的 set-leverage 被拒絕
+- **THEN** 兩所都不送單，配對取消，原因含 `nothing sent` 與 leverage
+
+#### Scenario: 合約範本事後調低
+
+- **WHEN** 配對加入後合約範本 notional 被調低
+- **THEN** OKX 腿的上限仍依該配對自己的 notional，配對不因此被擋

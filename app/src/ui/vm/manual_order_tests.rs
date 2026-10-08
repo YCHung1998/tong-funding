@@ -212,6 +212,11 @@ mod picker {
     fn ord(ex: Exchange, sym: &str, id: Option<&str>, q: &str) -> AccountOrder {
         AccountOrder { exchange: ex, symbol: sym.into(), client_order_id: id.map(String::from), remaining_quantity: d(q) }
     }
+    /// What `open_positions` makes of an engine position: OKX contracts have no coin amount here.
+    fn close_prefill(p: &AccountPosition) -> Option<ManualPrefill> {
+        let okx = p.exchange == Exchange::Okx;
+        PositionRow { exchange: p.exchange, symbol: p.symbol.clone(), quantity: if okx { Decimal::ZERO } else { p.quantity }, is_long: p.quantity > Decimal::ZERO, unconvertible: okx, raw_contracts: okx.then_some(p.quantity) }.close_prefill()
+    }
     fn ok<T>(items: Vec<T>) -> Result<Listed<T>, String> {
         Ok(Listed { items, complete: true })
     }
@@ -482,7 +487,7 @@ mod okx {
         let lists = open_positions(&s);
         let okx = lists.iter().find(|l| l.exchange == Exchange::Okx).expect("an OKX list");
         let PickState::Rows { rows, .. } = &okx.state else { panic!("{:?}", okx.state) };
-        assert_eq!((rows[0].quantity, rows[0].contracts, rows[0].is_long, rows[0].unconvertible), (d("-0.03"), Some(d("-3")), false, false));
+        assert_eq!((rows[0].quantity, rows[0].raw_contracts, rows[0].is_long, rows[0].unconvertible), (d("-0.03"), Some(d("-3")), false, false));
         assert_eq!(
             rows[0].close_prefill(),
             Some(ManualPrefill { exchange: Exchange::Okx, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: "0.03".into(), reduce_only: true })

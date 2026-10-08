@@ -257,17 +257,25 @@ impl<T: OrderTransport> OkxOrderClient<T> {
         self.send_lookup(req).await
     }
 
+    /// The gate every state-changing OKX request passes first: not latched off, and the demo key proven.
+    fn order_gate(&self) -> Result<(), String> {
+        if let Some(reason) = self.disabled() {
+            return Err(reason);
+        }
+        if !self.demo_proven.load(Ordering::SeqCst) {
+            return Err("OKX demo key not proven: the account-config check has not succeeded yet".into());
+        }
+        Ok(())
+    }
+
     /// Aligns the instrument's leverage before an opening order. Like the order itself it is sent only
     /// while OKX is not latched off and the demo key has been proven (the account-config read has
     /// answered `code "0"` with these credentials and the demo flag). Anything but a plain success
     /// (refusal, rate limit, unknown outcome, `50101`) means the order after it is NOT sent. One attempt,
     /// never retried here. "Already that leverage" is a normal success on OKX (`code "0"`).
     pub async fn set_leverage(&self, symbol: &str, leverage: u32, timestamp_ms: i64) -> LeverageOutcome {
-        if let Some(reason) = self.disabled() {
+        if let Err(reason) = self.order_gate() {
             return LeverageOutcome::Failed { reason };
-        }
-        if !self.demo_proven.load(Ordering::SeqCst) {
-            return LeverageOutcome::Failed { reason: "OKX demo key not proven: the account-config check has not succeeded yet".into() };
         }
         let req = match self.leverage_request(symbol, leverage, timestamp_ms) {
             Ok(r) => r,
@@ -293,11 +301,8 @@ impl<T: OrderTransport> OkxOrderClient<T> {
     /// Nothing is sent unless OKX is not latched off and the demo key has been proven.
     pub async fn submit(&self, order: &ValidOrder, timestamp_ms: i64) -> SubmitClass {
         let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
-        if let Some(reason) = self.disabled() {
+        if let Err(reason) = self.order_gate() {
             return not_sent(reason);
-        }
-        if !self.demo_proven.load(Ordering::SeqCst) {
-            return not_sent("OKX demo key not proven: the account-config check has not succeeded yet".into());
         }
         let exp_time = exp_time_of(timestamp_ms);
         let req = match self.submit_request_expiring(order, timestamp_ms, exp_time) {
