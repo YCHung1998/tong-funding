@@ -71,6 +71,10 @@ pub struct OrderRequest {
     /// `None` for closes and manual orders. OKX checks `sz x ctVal` against it (a coin amount
     /// passed as contracts is refused).
     pub intended_base_qty: Option<Decimal>,
+    /// The pair's own per-leg notional (USDT) from its entry snapshot, on the opening legs of a pair;
+    /// `None` on closes and manual orders. OKX's size guard derives the leg cap from it (a later change
+    /// of the contract template must not strand a staged pair).
+    pub notional_usdt: Option<Decimal>,
     /// Leverage the exchange account must have on `symbol` before this order is sent. `Some` only
     /// on the opening legs of a pair (both legs carry the entry snapshot's value); close, reduce-only
     /// and manual orders carry `None` and leave the leverage alone.
@@ -127,6 +131,13 @@ pub trait Executor: Send + Sync {
     fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome>;
     fn cancel(&self, exchange: Exchange, symbol: &str, client_order_id: &str) -> BoxFut<'_, QueryOutcome>;
     fn query(&self, exchange: Exchange, symbol: &str, client_order_id: &str) -> BoxFut<'_, QueryOutcome>;
+
+    /// The barrier before the legs of a pair are sent: everything the executor itself would refuse
+    /// (size guard, limits, clock, mode) is checked for EVERY leg, then the leverage is set on EVERY
+    /// leg. `Err` = send nothing. The default (the simulator) has nothing to check.
+    fn prepare_open(&self, _legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 /// Builds the order-capable executor when switching to EXCHANGE_DEMO; never called during

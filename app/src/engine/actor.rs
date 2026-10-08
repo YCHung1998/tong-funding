@@ -374,6 +374,8 @@ struct Flow {
     recheck_inflight: bool,
     last_recheck_ms: Option<i64>,
     open: Option<OrderSet>,
+    /// The opening legs waiting for the executor's pre-send barrier (nothing is sent yet).
+    preparing: Option<OrderSet>,
     close: Option<OrderSet>,
     /// Signed position per leg that is expected to remain after the close: exposure on the same
     /// symbol that is not the pair's (left untouched). The flat check compares against it.
@@ -1109,9 +1111,13 @@ impl Actor {
             SubmitPlan::Send { long, short } => (long, short),
         };
         let prefix = self.id_prefix();
-        let unit = |ex: Exchange, r: &OrderRules| match ex {
-            Exchange::Okx => r.okx_ct_val.unwrap_or(Decimal::ONE),
-            Exchange::Binance | Exchange::Bybit => Decimal::ONE,
+        // a missing OKX contract value is an error, never "1 contract = 1 coin" (plan_submit already
+        // refuses it; this keeps the unit honest if that ever changes)
+        let unit = |ex: Exchange, r: &OrderRules| -> Result<Decimal, String> {
+            match ex {
+                Exchange::Okx => r.okx_ct_val.filter(|c| *c > Decimal::ZERO).ok_or_else(|| "OKX ctVal missing".to_string()),
+                Exchange::Binance | Exchange::Bybit => Ok(Decimal::ONE),
+            }
         };
         let mut legs: [Option<LegOrder>; 2] = [None, None];
         for (leg, sized, exchange, r) in
@@ -1125,13 +1131,28 @@ impl Actor {
                 quantity: sized.order_qty.value(),
                 reduce_only: false,
                 intended_base_qty: Some(sized.base_qty),
+                notional_usdt: Some(entry.notional_usdt),
                 // Both legs open at the entry snapshot's leverage (order-leverage-sync).
                 leverage: Some(entry.leverage),
             };
-            legs[idx(leg)] = Some(LegOrder::new(req, unit(exchange, &r)));
+            let u = match unit(exchange, &r) {
+                Ok(u) => u,
+                Err(why) => {
+                    let _ = self.land(pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": [format!("{}: {why}", leg.as_str())] }));
+                    return;
+                }
+            };
+            legs[idx(leg)] = Some(LegOrder::new(req, u));
         }
         let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs, cancel_started: false };
-        self.send_set(pair, OrderAction::Open, set);
+        // Nothing is sent before the executor has checked BOTH legs and set the leverage on BOTH.
+        let reqs: Vec<OrderRequest> = Leg::BOTH.into_iter().filter_map(|l| set.legs[idx(l)].as_ref().map(|o| o.req.clone())).collect();
+        self.flows.entry(pair.to_string()).or_default().preparing = Some(set);
+        let (executor, tx, pair) = (self.executor.clone(), self.event_tx.clone(), pair.to_string());
+        tokio::spawn(async move {
+            let result = executor.prepare_open(reqs).await;
+            let _ = tx.send(Event::OpenPrepared { pair, result }).await;
+        });
     }
 
     /// Remember the set, then spawn one intent-first submit per leg.
@@ -1471,6 +1492,7 @@ impl Actor {
                 continue;
             }
             let req = OrderRequest {
+                notional_usdt: None,
                 client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Close),
                 exchange,
                 symbol: view.symbol.clone(),
@@ -1593,6 +1615,7 @@ impl Actor {
             }
         };
         let req = OrderRequest {
+            notional_usdt: None,
             client_order_id: id.clone(),
             exchange: o.exchange,
             symbol: o.symbol,
@@ -1693,6 +1716,21 @@ impl Actor {
                 let ctx = EntryContext { rules: [long_rules, short_rules], foreign: [long_foreign, short_foreign], leverage_caps };
                 self.flows.entry(pair.clone()).or_default().context = Some(ctx);
                 self.maybe_run_node0(&pair);
+            }
+            Event::OpenPrepared { pair, result } => {
+                let Some(mut set) = self.flows.get_mut(&pair).and_then(|f| f.preparing.take()) else { return };
+                if self.pairs.get(&pair).map(|v| v.state) != Some(PairState::OrderSubmit) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        set.sent_at_ms = self.clock.now_ms();
+                        self.send_set(&pair, OrderAction::Open, set);
+                    }
+                    Err(why) => {
+                        let _ = self.land(&pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": [format!("pre-send checks: {why}")] }));
+                    }
+                }
             }
             Event::Submitted { pair, leg, action, client_order_id, outcome } => {
                 self.on_submitted(&pair, leg, action, &client_order_id, outcome);
@@ -2845,6 +2883,7 @@ mod tests {
         let (rig, deps) = rig();
         let (actor, h) = Actor::new(deps);
         let req = OrderRequest {
+            notional_usdt: None,
             client_order_id: "sim-hang".into(),
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".into(),
@@ -2923,6 +2962,7 @@ mod tests {
         let (actor, _h) = Actor::new(deps);
         let id = |leg| client_order_id(IdPrefix::Demo, "pair-lat", leg, OrderAction::Open, 0);
         let req = |leg, exchange, side| OrderRequest {
+            notional_usdt: None,
             client_order_id: id(leg),
             exchange,
             symbol: "BTCUSDT".into(),

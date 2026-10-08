@@ -217,6 +217,7 @@ mod tests {
 
     fn req(leg: Leg, seq: u16) -> OrderRequest {
         OrderRequest {
+            notional_usdt: None,
             client_order_id: client_order_id(IdPrefix::Sim, PAIR, leg, OrderAction::Open, seq),
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".into(),

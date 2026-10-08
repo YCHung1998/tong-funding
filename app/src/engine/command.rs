@@ -117,6 +117,9 @@ pub enum Event {
     PretradeFetched { pair: PairUuid, long: Result<FreshQuote, String>, short: Result<FreshQuote, String> },
     MarginFetched { pair: PairUuid, long: Result<Decimal, String>, short: Result<Decimal, String> },
     Submitted { pair: PairUuid, leg: Leg, action: OrderAction, client_order_id: String, outcome: SubmitOutcome },
+    /// The executor's pre-send barrier for a pair's opening legs finished: `Ok` = send both legs,
+    /// `Err` = send nothing (okx-trading-enablement F1 / F2).
+    OpenPrepared { pair: PairUuid, result: Result<(), String> },
     Queried { pair: Option<PairUuid>, client_order_id: String, outcome: QueryOutcome },
     /// Manual order (not part of a pair) finished.
     ManualSubmitted { client_order_id: String, outcome: SubmitOutcome },

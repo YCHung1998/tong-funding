@@ -147,8 +147,16 @@ struct FakeDemo {
     orders: Mutex<HashMap<String, OrderStatus>>,
     /// Scripted leverage caps per exchange (symbol-leverage-cap); unscripted = a permissive 125.
     caps: Mutex<HashMap<Exchange, Result<Decimal, String>>>,
+    /// The legs given to each `prepare_open`, and a scripted refusal (okx-trading-enablement F1 / F2).
+    prepares: Mutex<Vec<Vec<OrderRequest>>>,
+    prepare_error: Mutex<Option<String>>,
 }
 impl Executor for FakeDemo {
+    fn prepare_open(&self, legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
+        self.prepares.lock().unwrap().push(legs);
+        let r = self.prepare_error.lock().unwrap().clone().map_or(Ok(()), Err);
+        Box::pin(std::future::ready(r))
+    }
     fn is_simulated(&self) -> bool {
         false
     }
@@ -1009,6 +1017,7 @@ async fn a_manual_order_goes_through_the_simulator_with_an_intent() {
 async fn user_order(rig: &Rig, side: OrderSide, qty: &str, reduce_only: bool) {
     let action = if reduce_only { OrderAction::Close } else { OrderAction::Open };
     let req = OrderRequest {
+        notional_usdt: None,
         client_order_id: client_order_id(IdPrefix::Sim, "user-own-position", Leg::Long, action, 0),
         exchange: Exchange::Binance,
         symbol: SYM.into(),
@@ -2338,4 +2347,28 @@ async fn a_manual_okx_opening_order_passes_the_intended_coin_amount_to_the_execu
     sleep(Duration::from_millis(50)).await;
     let sent: Vec<_> = rig.demo.requests.lock().unwrap().iter().filter(|r| r.exchange == Exchange::Okx).cloned().collect();
     assert_eq!(sent.iter().map(|r| (r.quantity, r.reduce_only, r.intended_base_qty)).collect::<Vec<_>>(), vec![(dec("3"), false, Some(dec("0.037"))), (dec("3"), true, None)]);
+}
+
+// ---- okx-trading-enablement F1 / F2: nothing is sent unless BOTH legs are prepared ----------------
+
+#[tokio::test(start_paused = true)]
+async fn both_open_legs_are_prepared_together_with_the_pairs_own_notional_before_either_is_sent() {
+    let (rig, _h) = okx_pair_demo(Some(Ok(dec("20")))).await;
+    run_until(&rig.clock, T - 9_000).await;
+    assert_eq!(status(&rig.db, UUID), "RECONCILED", "{:?}", labels(&rig.db));
+    let prepares = rig.demo.prepares.lock().unwrap().clone();
+    assert_eq!(prepares.len(), 1, "one barrier for the pair");
+    assert_eq!(prepares[0].iter().map(|r| r.exchange).collect::<Vec<_>>(), vec![Exchange::Binance, Exchange::Okx]);
+    assert!(prepares[0].iter().all(|r| r.notional_usdt == Some(dec("1000")) && r.leverage == Some(dec("5")) && !r.reduce_only), "{prepares:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_refused_preparation_sends_no_leg_at_all_and_cancels_the_pair_with_the_reason() {
+    let (rig, _h) = okx_pair_demo(Some(Ok(dec("20")))).await;
+    *rig.demo.prepare_error.lock().unwrap() = Some("OKX leverage 5x not set: refused".into());
+    run_until(&rig.clock, T - 9_000).await;
+    assert_eq!(status(&rig.db, UUID), "CANCELLED", "{:?}", labels(&rig.db));
+    assert!(rig.demo.requests.lock().unwrap().is_empty(), "neither leg may be sent");
+    let ev = events(&rig.db).into_iter().find(|(_, l, _)| l == "CANCELLED").unwrap().2;
+    assert!(ev.to_string().contains("nothing sent") && ev.to_string().contains("OKX leverage 5x not set"), "{ev}");
 }

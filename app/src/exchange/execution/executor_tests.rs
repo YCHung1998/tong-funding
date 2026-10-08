@@ -61,7 +61,7 @@ pub(super) fn demo_id(leg: Leg, action: OrderAction, seq: u16) -> String {
 }
 
 pub(super) fn req(exchange: Exchange, id: &str, side: OrderSide, qty: &str, reduce_only: bool) -> OrderRequest {
-    OrderRequest { client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None, leverage: None }
+    OrderRequest { notional_usdt: None, client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None, leverage: None }
 }
 
 /// An OKX order: contracts `qty`; an opening one intends `qty x 0.01` coins (the test instrument's ctVal).
@@ -121,7 +121,20 @@ pub(super) struct Rig {
     pub ledger: Arc<Ledger>,
 }
 
+pub(super) fn rig_without_limits() -> Rig {
+    rig_custom(Some(0), None)
+}
+
+/// The live per-leg cap (the template-derived one) is `cap`.
+pub(super) fn rig_with_cap(cap: &str) -> Rig {
+    rig_custom(Some(0), Some(limits_of("0.01", "0.001", "60000", cap)))
+}
+
 pub(super) fn rig_with(offset: Option<i64>) -> Rig {
+    rig_custom(offset, Some(btc_limits()))
+}
+
+fn rig_custom(offset: Option<i64>, limits: Option<Arc<StubLimits>>) -> Rig {
     let t = FakeOrderTransport::new();
     let clock = ManualClock::new(NOW);
     let ledger = Arc::new(Ledger::default());
@@ -134,8 +147,11 @@ pub(super) fn rig_with(offset: Option<i64>) -> Rig {
         ledger.clone(),
         limiter,
     )
-    .with_okx(OkxOrderClient::new(Arc::new(t.clone()), okx_creds(), OkxHost::Demo))
-    .with_okx_limits(btc_limits());
+    .with_okx(OkxOrderClient::new(Arc::new(t.clone()), okx_creds(), OkxHost::Demo));
+    let ex = match limits {
+        Some(l) => ex.with_okx_limits(l),
+        None => ex,
+    };
     Rig { t, ex: Arc::new(ex), clock, ledger }
 }
 

@@ -159,6 +159,7 @@ fn filled(o: &QueryOutcome) -> Decimal {
 #[allow(clippy::too_many_arguments)]
 fn probe_request(pair: &str, symbol: &str, leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, units: Decimal, coin_qty: Decimal) -> OrderRequest {
     OrderRequest {
+        notional_usdt: None,
         client_order_id: client_order_id(IdPrefix::Demo, pair, leg, action, 0),
         exchange,
         symbol: symbol.to_string(),
@@ -337,6 +338,7 @@ async fn live_demo_probe() {
     let pair = format!("probe-ro-{}", clock.now_ms());
     for (leg, exchange, side) in [(Leg::Long, long_ex, OrderSide::Sell), (Leg::Short, short_ex, OrderSide::Buy)] {
         let r = OrderRequest {
+            notional_usdt: None,
             client_order_id: client_order_id(IdPrefix::Demo, &pair, leg, OrderAction::Close, 0),
             exchange,
             symbol: symbol.clone(),
@@ -421,6 +423,7 @@ async fn live_leverage_probe() {
     // 2. open both legs at `want`, read the leverage back
     let pair = format!("levprobe-{}", clock.now_ms());
     let mk = |leg: Leg, action: OrderAction, exchange: Exchange, side: OrderSide, leverage: Option<Decimal>, seq: u16| OrderRequest {
+        notional_usdt: None,
         client_order_id: client_order_id(IdPrefix::Demo, &pair, leg, action, seq),
         exchange,
         symbol: symbol.clone(),

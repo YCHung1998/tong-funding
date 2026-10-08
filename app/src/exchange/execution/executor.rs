@@ -14,13 +14,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tong_funding_core::types::Exchange;
+use tong_funding_core::types::{Decimal, Exchange};
 
 use super::binance::{BinanceOrderClient, ModeReading};
 use super::bybit::BybitOrderClient;
 use super::classify::{LeverageOutcome, OKX_NO_POSITION_CODES, SubmitClass};
 use super::http::OrderTransport;
-use super::okx::{OkxLimitsSource, OkxOrderClient, check_size};
+use super::okx::{OKX_LEG_CAP_FACTOR, OkxLimitsSource, OkxOrderClient, check_size};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{BoxFut, Executor, OrderRequest, QueryOutcome, ServerOffsets, SubmitOutcome};
 use crate::exchange::health::ratelimit::{BackoffState, RateLimiter, RequestClass};
@@ -58,6 +58,8 @@ pub struct DemoExecutor<T> {
     limiter: Arc<RateLimiter>,
     /// (exchange, symbol or "*") → local ms of the last confirmed one-way reading.
     one_way_at: Mutex<HashMap<(Exchange, String), i64>>,
+    /// Client order ids whose leverage the pre-send barrier already set.
+    prepared: Mutex<std::collections::HashSet<String>>,
 }
 
 impl<T: OrderTransport> DemoExecutor<T> {
@@ -69,7 +71,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
         intents: Arc<dyn IntentLedger>,
         limiter: Arc<RateLimiter>,
     ) -> Self {
-        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
+        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()), prepared: Mutex::new(Default::default()) }
     }
 
     /// Adds the OKX client. Its latch is the client's own: production attaches the factory's single
@@ -179,62 +181,104 @@ impl<T: OrderTransport> DemoExecutor<T> {
         }
     }
 
-    async fn submit_inner(&self, req: &OrderRequest) -> SubmitClass {
-        let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
-        if req.exchange == Exchange::Okx
-            && let Err(reason) = self.okx()
-        {
-            return not_sent(reason);
+    /// Everything the executor refuses without a request: the OKX client, the order's own validity and the
+    /// OKX size guard. The leg cap comes from the pair's own notional when the request carries it (a later
+    /// change of the template must not strand a staged pair), else from the live limits (manual orders).
+    fn local_checks(&self, req: &OrderRequest) -> Result<ValidOrder, String> {
+        if req.exchange == Exchange::Okx {
+            self.okx()?;
         }
-        let order = match ValidOrder::from_request(req) {
-            Ok(o) => o,
-            Err(e) => return not_sent(e),
-        };
+        let order = ValidOrder::from_request(req)?;
         if req.exchange == Exchange::Okx {
             // size guard first: nothing is requested for an order that is not a sane number of contracts
             // (a close is only checked for sz > 0 and the lot rule: never blocked by the cap or by missing data)
-            let limits = self.okx_limits.as_ref().and_then(|l| l.limits(order.symbol()));
+            let mut limits = self.okx_limits.as_ref().and_then(|l| l.limits(order.symbol()));
             if self.okx_limits.is_none() && !req.reduce_only {
-                return not_sent("OKX size limits source not configured; OKX order not sent".into());
+                return Err("OKX size limits source not configured; OKX order not sent".into());
             }
-            if let Err(e) = check_size(order.quantity(), req.intended_base_qty, req.reduce_only, limits.as_ref()) {
-                return not_sent(e);
+            if let (Some(l), Some(n)) = (limits.as_mut(), req.notional_usdt) {
+                l.max_leg_notional = n * Decimal::from(OKX_LEG_CAP_FACTOR);
             }
+            check_size(order.quantity(), req.intended_base_qty, req.reduce_only, limits.as_ref())?;
+        }
+        Ok(order)
+    }
+
+    /// Clock, back-off and the one-way mode (for OKX this read is also the demo-key proof). Returns the
+    /// signing timestamp.
+    async fn gate(&self, req: &OrderRequest, order: &ValidOrder) -> Result<i64, String> {
+        if req.exchange == Exchange::Okx && req.reduce_only {
             // a close must not trust a cached mode reading (a wrong mode leaves the other leg naked)
-            if req.reduce_only {
-                self.one_way_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&(Exchange::Okx, "*".to_string()));
-            }
+            self.one_way_at.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&(Exchange::Okx, "*".to_string()));
         }
         let Some(ts) = self.timestamp(req.exchange) else {
-            return not_sent(format!("{} clock offset not calibrated", req.exchange.name()));
+            return Err(format!("{} clock offset not calibrated", req.exchange.name()));
         };
-        if let Err(e) = self.backoff(req.exchange) {
-            return not_sent(e);
-        }
-        if let Err(e) = self.ensure_one_way(req.exchange, order.symbol(), ts).await {
-            return not_sent(e);
-        }
-        // order-leverage-sync: an opening order leaves only after both exchanges hold the same
-        // leverage; a failure here means nothing was sent (a certain rejection).
-        if let Some(leverage) = order.leverage() {
-            let ts = self.timestamp(req.exchange).unwrap_or(ts);
-            let outcome = match req.exchange {
-                Exchange::Binance => self.binance.set_leverage(order.symbol(), leverage, ts).await,
-                Exchange::Bybit => self.bybit.set_leverage(order.symbol(), leverage, ts).await,
-                // after the mode read (the demo-key proof) and the size guard: the same gates as the order
-                Exchange::Okx => match self.okx() {
-                    Ok(okx) => okx.set_leverage(order.symbol(), leverage, ts).await,
-                    Err(reason) => return not_sent(reason),
-                },
-            };
-            match outcome {
-                LeverageOutcome::Set => self.limiter.on_success(req.exchange, RequestClass::Signed),
-                LeverageOutcome::RateLimited { retry_after_ms } => {
-                    self.note_rate_limit(req.exchange, Some(retry_after_ms));
-                    return not_sent(format!("leverage not set (rate limited, retry after {retry_after_ms:?} ms)"));
-                }
-                LeverageOutcome::Failed { reason } => return not_sent(format!("leverage {leverage}x not set on {}: {reason}", req.exchange.name())),
+        self.backoff(req.exchange)?;
+        self.ensure_one_way(req.exchange, order.symbol(), ts).await?;
+        Ok(ts)
+    }
+
+    /// order-leverage-sync: the leverage of an opening order, set on its exchange (nothing for an order
+    /// without one). A failure means the order must not be sent.
+    async fn apply_leverage(&self, req: &OrderRequest, order: &ValidOrder, ts: i64) -> Result<(), String> {
+        let Some(leverage) = order.leverage() else { return Ok(()) };
+        let ts = self.timestamp(req.exchange).unwrap_or(ts);
+        let outcome = match req.exchange {
+            Exchange::Binance => self.binance.set_leverage(order.symbol(), leverage, ts).await,
+            Exchange::Bybit => self.bybit.set_leverage(order.symbol(), leverage, ts).await,
+            // after the mode read (the demo-key proof) and the size guard: the same gates as the order
+            Exchange::Okx => self.okx()?.set_leverage(order.symbol(), leverage, ts).await,
+        };
+        match outcome {
+            LeverageOutcome::Set => {
+                self.limiter.on_success(req.exchange, RequestClass::Signed);
+                Ok(())
             }
+            LeverageOutcome::RateLimited { retry_after_ms } => {
+                self.note_rate_limit(req.exchange, Some(retry_after_ms));
+                Err(format!("leverage not set (rate limited, retry after {retry_after_ms:?} ms)"))
+            }
+            LeverageOutcome::Failed { reason } => Err(format!("leverage {leverage}x not set on {}: {reason}", req.exchange.name())),
+        }
+    }
+
+    /// The pre-send barrier for a pair's opening legs (okx-trading-enablement F1 / F2): every leg's local
+    /// checks, then every leg's gate (clock, mode, demo-key proof), then the leverage on EVERY leg. Only
+    /// when all of it passed may the engine send either order; the legs' leverage is remembered so the
+    /// submits do not set it again. Any failure sends no order (setting a leverage opens no exposure).
+    pub async fn prepare_legs(&self, legs: &[OrderRequest]) -> Result<(), String> {
+        let mut checked = Vec::new();
+        for req in legs {
+            let order = self.local_checks(req).map_err(|e| format!("{} {}: {e}", req.exchange.name(), req.symbol))?;
+            checked.push((req, order));
+        }
+        let mut stamped = Vec::new();
+        for (req, order) in &checked {
+            let ts = self.gate(req, order).await.map_err(|e| format!("{}: {e}", req.exchange.name()))?;
+            stamped.push(ts);
+        }
+        for ((req, order), ts) in checked.iter().zip(stamped) {
+            self.apply_leverage(req, order, ts).await?;
+            self.prepared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(req.client_order_id.clone());
+        }
+        Ok(())
+    }
+
+    async fn submit_inner(&self, req: &OrderRequest) -> SubmitClass {
+        let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
+        let order = match self.local_checks(req) {
+            Ok(o) => o,
+            Err(e) => return not_sent(e),
+        };
+        let ts = match self.gate(req, &order).await {
+            Ok(ts) => ts,
+            Err(e) => return not_sent(e),
+        };
+        // the barrier already set this leg's leverage: not again
+        let prepared = self.prepared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&req.client_order_id);
+        if !prepared && let Err(e) = self.apply_leverage(req, &order, ts).await {
+            return not_sent(e);
         }
         let ts = self.timestamp(req.exchange).unwrap_or(ts);
         let class = match req.exchange {
@@ -315,6 +359,10 @@ impl<T: OrderTransport> DemoExecutor<T> {
 impl<T: OrderTransport + 'static> Executor for DemoExecutor<T> {
     fn is_simulated(&self) -> bool {
         false
+    }
+
+    fn prepare_open(&self, legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
+        Box::pin(async move { self.prepare_legs(&legs).await })
     }
 
     fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {

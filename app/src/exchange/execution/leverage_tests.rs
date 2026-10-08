@@ -8,6 +8,7 @@ use super::classify::SubmitClass;
 use super::endpoints::*;
 use super::executor_tests::{SYM, binance_ack, bybit_created, d, demo_id, okx_order_fx, okx_req, req, rig, script_okx_mode};
 use super::http::Method;
+use crate::engine::ports::Executor;
 use super::http::fake::Reply;
 use crate::engine::ports::{Leg, OrderAction, OrderRequest, OrderSide};
 use crate::exchange::error::AdapterError;
@@ -259,4 +260,105 @@ async fn an_okx_leverage_without_a_proven_demo_key_is_never_sent() {
     assert!(matches!(r.ex.submit_classified(&okx_open_with(Some("5"))).await, SubmitClass::Rejected { .. }));
     assert_eq!(r.t.count(Method::Post, OKX_SET_LEVERAGE_PATH), 0);
     assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0);
+}
+
+// ---- okx-trading-enablement F1 / F2 / F3: the pre-send barrier --------------------------------------
+
+fn pair_legs(leverage: &str) -> Vec<OrderRequest> {
+    let mut bin = open(Exchange::Binance, Some(leverage));
+    bin.notional_usdt = Some(d("1000"));
+    let mut okx = okx_open_with(Some(leverage));
+    okx.notional_usdt = Some(d("1000"));
+    vec![bin, okx]
+}
+
+fn script_both_ok(r: &super::executor_tests::Rig) {
+    script_okx_mode(&r.t);
+    r.t.on(Method::Post, OKX_SET_LEVERAGE_PATH, Reply::ok(&okx_order_fx("set_leverage_ok")));
+    r.t.on(Method::Post, BINANCE_LEVERAGE_PATH, binance_leverage_ok());
+}
+
+#[tokio::test]
+async fn a_pair_is_prepared_with_the_leverage_on_both_legs_and_the_orders_do_not_set_it_again() {
+    let r = rig();
+    script_both_ok(&r);
+    let legs = pair_legs("5");
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    assert_eq!((r.t.count(Method::Post, BINANCE_LEVERAGE_PATH), r.t.count(Method::Post, OKX_SET_LEVERAGE_PATH)), (1, 1));
+    assert_eq!(r.t.count(Method::Post, BINANCE_ORDER_PATH) + r.t.count(Method::Post, OKX_ORDER_PATH), 0, "preparing sends no order");
+    r.t.on(Method::Post, BINANCE_ORDER_PATH, Reply::ok(&binance_ack(&legs[0].client_order_id, "FILLED", "0.019")));
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+    for l in &legs {
+        assert!(matches!(r.ex.submit_classified(l).await, SubmitClass::Accepted(_)), "{l:?}");
+    }
+    assert_eq!((r.t.count(Method::Post, BINANCE_LEVERAGE_PATH), r.t.count(Method::Post, OKX_SET_LEVERAGE_PATH)), (1, 1), "the barrier's leverage is not set twice");
+}
+
+#[tokio::test]
+async fn if_okx_refuses_the_leverage_nothing_is_sent_to_binance() {
+    let r = rig();
+    script_both_ok(&r);
+    r.t.replace(Method::Post, OKX_SET_LEVERAGE_PATH, Reply::ok(&okx_order_fx("set_leverage_59102")));
+    let e = r.ex.prepare_open(pair_legs("5")).await.unwrap_err();
+    assert!(e.contains("leverage") && e.contains("OKX"), "{e}");
+    assert_eq!(r.t.count(Method::Post, BINANCE_ORDER_PATH) + r.t.count(Method::Post, OKX_ORDER_PATH), 0);
+}
+
+#[tokio::test]
+async fn if_binance_refuses_the_leverage_nothing_is_sent_to_okx() {
+    let r = rig();
+    script_both_ok(&r);
+    r.t.replace(Method::Post, BINANCE_LEVERAGE_PATH, Reply::status(400, r#"{"code":-4028,"msg":"Leverage 5 is not valid"}"#));
+    let e = r.ex.prepare_open(pair_legs("5")).await.unwrap_err();
+    assert!(e.contains("leverage") && e.contains("Binance"), "{e}");
+    assert_eq!(r.t.count(Method::Post, BINANCE_ORDER_PATH) + r.t.count(Method::Post, OKX_ORDER_PATH), 0);
+    // a refused leg is also never submitted afterwards by an engine that obeys the barrier; the
+    // unchanged-leverage codes keep their meaning (Bybit 110043 counts as set)
+}
+
+#[tokio::test]
+async fn okx_size_refusals_are_found_before_any_request_for_either_leg() {
+    // cap derives from the pair's own notional: 500 USDT -> cap 1000 < 0.03 BTC x 60000 = 1800
+    let r = rig();
+    script_both_ok(&r);
+    let mut legs = pair_legs("5");
+    legs[1].notional_usdt = Some(d("500"));
+    let e = r.ex.prepare_open(legs).await.unwrap_err();
+    assert!(e.contains("exceeds the per-leg cap"), "{e}");
+    assert!(r.t.requests().is_empty(), "a size refusal on the OKX leg means nothing is requested, not even for Binance: {:?}", okx_requests(&r));
+    // a lowered template (the live cap) does not strand a pair whose own notional is fine
+    let ok = super::executor_tests::rig_with_cap("10");
+    super::executor_tests::script_one_way(&ok.t);
+    script_both_ok(&ok);
+    assert_eq!(ok.ex.prepare_open(pair_legs("5")).await, Ok(()));
+}
+
+#[tokio::test]
+async fn missing_limits_are_found_before_any_request() {
+    let r = super::executor_tests::rig_without_limits();
+    super::executor_tests::script_one_way(&r.t);
+    script_both_ok(&r);
+    let e = r.ex.prepare_open(pair_legs("5")).await.unwrap_err();
+    assert!(e.contains("limits"), "{e}");
+    assert!(r.t.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_set_leverage_reply_must_echo_the_requested_lever_and_cross_margin() {
+    for (what, body) in [
+        ("other lever", r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","lever":"3","mgnMode":"cross","posSide":""}]}"#),
+        ("isolated", r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","lever":"5","mgnMode":"isolated","posSide":""}]}"#),
+        ("no data", r#"{"code":"0","msg":"","data":[]}"#),
+        ("other instrument", r#"{"code":"0","msg":"","data":[{"instId":"ETH-USDT-SWAP","lever":"5","mgnMode":"cross","posSide":""}]}"#),
+    ] {
+        let r = rig();
+        script_okx_mode(&r.t);
+        r.t.on(Method::Post, OKX_SET_LEVERAGE_PATH, Reply::ok(body));
+        r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+        match r.ex.submit_classified(&okx_open_with(Some("5"))).await {
+            SubmitClass::Rejected { code, message } => assert!(code == "not_sent" && message.contains("leverage"), "{what}: {message}"),
+            other => panic!("{what}: {other:?}"),
+        }
+        assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0, "{what}");
+    }
 }

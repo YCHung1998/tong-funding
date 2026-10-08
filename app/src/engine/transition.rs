@@ -136,6 +136,7 @@ mod tests {
 
     fn order() -> OrderRequest {
         OrderRequest {
+            notional_usdt: None,
             client_order_id: "sim-x".into(),
             exchange: Exchange::Binance,
             symbol: "BTCUSDT".into(),

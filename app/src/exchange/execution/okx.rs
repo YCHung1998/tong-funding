@@ -38,6 +38,10 @@ const EXP_TIME_MARGIN_MS: i64 = 2_000;
 /// ... and two such answers must be at least this far apart (one observation is not two).
 const CONFIRMATION_GAP_MS: i64 = 1_000;
 
+/// The leg cap of a pair's OKX opening order is this multiple of the pair's own entry notional (room for
+/// lot rounding and price drift; a larger order is refused). Manual orders use the live template-derived cap.
+pub const OKX_LEG_CAP_FACTOR: i64 = 2;
+
 /// What the size guard needs about one instrument (from the public instruments, mark price and the
 /// risk settings; wired in `okx-trading-enablement`).
 #[derive(Debug, Clone, PartialEq)]
@@ -273,6 +277,16 @@ impl<T: OrderTransport> OkxOrderClient<T> {
         if mismatch {
             return LeverageOutcome::Failed { reason: format!("{ENV_MISMATCH_REASON}; the leverage was refused before processing") };
         }
+        // success needs the reply to say what was asked for: this instrument, this leverage, cross margin
+        if let Reply::Ok(body) = &reply {
+            let row = body.get("data").and_then(Value::as_array).and_then(|d| d.first());
+            let lever_ok = row.and_then(|r| dec_opt(r, "lever").ok().flatten()).is_some_and(|l| l == Decimal::from(leverage));
+            let cross = row.and_then(|r| str_opt(r, "mgnMode").ok().flatten()).as_deref() == Some("cross");
+            let same = row.and_then(|r| str_opt(r, "instId").ok().flatten()).is_none_or(|i| okx_inst_id(symbol).as_deref() == Some(i.as_str()));
+            if !(lever_ok && cross && same) {
+                return LeverageOutcome::Failed { reason: format!("OKX set-leverage reply does not confirm {symbol} at {leverage}x cross: {}", row.map_or("no data".to_string(), |r| r.to_string())) };
+            }
+        }
         leverage_outcome(reply, &[])
     }
 
@@ -465,6 +479,7 @@ mod tests {
 
     fn order(side: OrderSide, qty: &str, reduce_only: bool) -> ValidOrder {
         ValidOrder::from_request(&OrderRequest {
+            notional_usdt: None,
             client_order_id: id(),
             exchange: Exchange::Okx,
             symbol: "BTCUSDT".into(),
@@ -561,7 +576,7 @@ mod tests {
     fn a_symbol_that_is_not_base_usdt_is_not_built_into_a_request() {
         let t = FakeOrderTransport::new();
         let c = client(&t);
-        let bad = ValidOrder::from_request(&OrderRequest { client_order_id: id(), exchange: Exchange::Okx, symbol: "BTCUSD".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap();
+        let bad = ValidOrder::from_request(&OrderRequest { notional_usdt: None, client_order_id: id(), exchange: Exchange::Okx, symbol: "BTCUSD".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap();
         assert!(c.submit_request(&bad, TS).is_err());
         assert!(c.query_request("BTCUSD", &OrderRef::Exchange("1".into()), TS).is_err());
     }
@@ -980,7 +995,7 @@ mod tests {
         t.on(Method::Post, "/api/v5/trade/order", ok("place_50004"));
         let order_n = |i: usize| {
             let id = client_order_id(IdPrefix::Demo, &format!("p{i}"), Leg::Long, OrderAction::Open, 0);
-            ValidOrder::from_request(&OrderRequest { client_order_id: id, exchange: Exchange::Okx, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap()
+            ValidOrder::from_request(&OrderRequest { notional_usdt: None, client_order_id: id, exchange: Exchange::Okx, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap()
         };
         // an old unknown submit is dropped once a newer one is recorded 10+ minutes after its expTime
         c.submit(&order_n(0), TS).await;

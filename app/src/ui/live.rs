@@ -163,10 +163,9 @@ pub fn okx_account_data(balances: &[Balance], positions: Vec<OkxPosition>, ct_va
 
 /// A mark price older than this is not evidence for the OKX notional cap (a missing mark refuses opens).
 pub const MARK_MAX_AGE_MS: i64 = 60_000;
-/// The OKX per-leg notional cap is this multiple of the contract template's notional (open question 1
-/// of okx-execution-guards, decided in okx-trading-enablement): room for lot rounding and a manual order
-/// somewhat above the template, never an unbounded one.
-pub const OKX_LEG_CAP_FACTOR: i64 = 2;
+/// The live (manual-order) OKX leg cap is the same multiple of the contract template notional as a pair's
+/// own cap is of its entry notional.
+use crate::exchange::execution::okx::OKX_LEG_CAP_FACTOR;
 
 /// The per-leg cap for OKX orders; `None` (unknown: opens are refused) when the template is unreadable.
 pub fn okx_leg_cap(settings: &Settings) -> Option<Decimal> {
