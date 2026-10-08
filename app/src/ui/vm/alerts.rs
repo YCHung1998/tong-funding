@@ -10,9 +10,11 @@ use super::format;
 use crate::exchange::signed::signing::RECV_WINDOW_MS;
 use crate::ui::nav::Page;
 
-/// The accounts whose keys are required: an unconnected one is an alert. OKX keys are optional (no
-/// keys = OKX is simply not connected, shown on its dashboard card), so OKX raises no account alert.
-const ALERT_ACCOUNT_EXCHANGES: [Exchange; 2] = [Exchange::Binance, Exchange::Bybit];
+/// The accounts whose keys and clock are watched: Binance and Bybit, and OKX while it is in
+/// `allowed_exchanges` (an exchange that is not traded needs no keys).
+fn alert_accounts(snap: &UiSnapshot) -> Vec<Exchange> {
+    Exchange::ALL.into_iter().filter(|e| *e != Exchange::Okx || snap.settings.risk.allowed_exchanges.contains(e)).collect()
+}
 
 pub const MANUAL_TEXT: &str = "需人工處理，系統不會自動補單或平倉";
 
@@ -147,7 +149,7 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
     }
 
     // 3. Disconnected / not connected accounts.
-    for e in ALERT_ACCOUNT_EXCHANGES {
+    for e in alert_accounts(snap) {
         let source = SourceId::Account(e).label();
         match snap.account(e) {
             AccountState::NotConnected { reason } => push(Category::Disconnected, source, format!("{} 帳戶未連線：{reason}", e.name()), None, None),
@@ -163,7 +165,7 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
         expected.push(SourceId::BinanceWs);
     }
     expected.extend(Exchange::ALL.into_iter().filter(|e| enabled.contains(e)).map(SourceId::MarketPoll));
-    for e in ALERT_ACCOUNT_EXCHANGES {
+    for e in alert_accounts(snap) {
         if matches!(snap.account(e), AccountState::Loaded { .. } | AccountState::Loading) {
             expected.push(SourceId::Account(e));
         }
@@ -202,7 +204,7 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
     }
 
     // 5. Clocks of the exchanges that sign requests.
-    for e in ALERT_ACCOUNT_EXCHANGES {
+    for e in alert_accounts(snap) {
         let source = format!("{} 時鐘", e.name());
         match snap.clock(e) {
             ClockState::Unsynced => push(Category::RateLimitOrClock, source, format!("{} 時鐘未校時", e.name()), None, None),

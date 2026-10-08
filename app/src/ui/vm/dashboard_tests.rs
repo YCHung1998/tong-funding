@@ -203,11 +203,9 @@ fn unconnected_exchange_is_excluded_and_named() {
 }
 
 fn okx_connected() -> AccountState {
-    let mut a = loaded(vec![asset("USDT", "5000", Some("4999.8"), None), asset("BTC", "0.1", Some("6000"), None)], vec![position(Okx, "BTCUSDT", "-0.03", "60000", "60000", "5", "0", Some("360"))], NOW);
-    if let AccountState::Loaded { data, .. } = &mut a {
-        data.contract_equity = Some(ContractEquity { used_margin: d("360"), available_margin: d("4640") });
-    }
-    a
+    // as `live::okx_account_data` produces it: wallet rows and positions, no contract-equity row (the
+    // wallet already includes the margin in use, so it would be counted twice)
+    loaded(vec![asset("USDT", "5000", Some("4999.8"), None), asset("BTC", "0.1", Some("6000"), None)], vec![position(Okx, "BTCUSDT", "-0.03", "60000", "60000", "5", "0", Some("360"))], NOW)
 }
 
 #[test]
@@ -217,11 +215,11 @@ fn okx_is_a_real_account_card_counted_in_the_total_and_the_shares() {
     let vm = build(&s, NOW);
     let o = connected(&vm, Okx);
     assert_eq!(o.status_label, "● CONNECTED · DEMO");
-    // USDT 5,000 + BTC 6,000 (exchange valuation) + contract equity 360 + 4,640
-    assert_eq!(format::money(o.value, 2), "16,000.00");
-    assert_eq!(format::money(vm.total, 2), "56,000.00", "40,000 + OKX");
+    // USDT 5,000 + BTC 6,000 (exchange valuation); no contract-equity row
+    assert_eq!(format::money(o.value, 2), "11,000.00");
+    assert_eq!(format::money(vm.total, 2), "51,000.00", "40,000 + OKX");
     assert!(vm.excluded_note.is_none(), "{:?}", vm.excluded_note);
-    assert_eq!(o.assets.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["USDT", "BTC", CONTRACT_EQUITY_LABEL]);
+    assert_eq!(o.assets.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["USDT", "BTC"]);
     assert!(matches!(&o.margin, MarginDistribution::Slices { used_total, .. } if *used_total == d("360")));
     assert!(!vm.cards.iter().any(|c| format!("{c:?}").contains("CompareOnly")));
     assert_eq!(vm.open_positions, 2, "Binance BTC + OKX BTC");

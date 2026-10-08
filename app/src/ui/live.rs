@@ -699,7 +699,8 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                     }
                 }
                 if ticks % 15 == 0 {
-                    ctx.shared.push(SourceUpdate::DemoKeys(demo_keys(secrets.as_ref())));
+                    let allowed: Vec<Exchange> = ctx.enabled.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().copied().collect();
+                    ctx.shared.push(SourceUpdate::DemoKeys(demo_keys_for(secrets.as_ref(), &allowed)));
                 }
                 ticks += 1;
                 if !latch_reported && let Some(reason) = okx_latch.reason() {
@@ -764,10 +765,14 @@ pub fn pair_entries(rows: &[PairRow]) -> BTreeMap<String, serde_json::Value> {
     rows.iter().map(|r| (r.internal_uuid.clone(), r.entry.get("scan").cloned().unwrap_or(serde_json::Value::Null))).collect()
 }
 
-/// Binance AND Bybit demo keys readable (no value is kept or printed, only the reason).
-fn demo_keys(secrets: &dyn SecretProvider) -> Result<(), String> {
-    for ex in [Exchange::Binance, Exchange::Bybit] {
-        if let Err(reason) = load_credentials(secrets, ex, false) {
+/// Binance AND Bybit demo keys readable, and OKX's (key, secret, passphrase) while OKX is in
+/// `allowed_exchanges` (no value is kept or printed, only the reason). EXCHANGE_DEMO is refused otherwise.
+fn demo_keys_for(secrets: &dyn SecretProvider, allowed: &[Exchange]) -> Result<(), String> {
+    for ex in Exchange::ALL {
+        if ex == Exchange::Okx && !allowed.contains(&ex) {
+            continue;
+        }
+        if let Err(reason) = load_credentials(secrets, ex, ex == Exchange::Okx) {
             return Err(format!("{} keys unavailable ({reason:?})", ex.name()));
         }
     }
@@ -1237,6 +1242,35 @@ mod tests {
         assert_eq!(okx_leg_cap(&s), Some(d("600")));
         let bad = Settings { contract_error: Some("contract_template.notional_usdt must be > 0".into()), ..Settings::default() };
         assert_eq!(okx_leg_cap(&bad), None, "an unreadable template means an unknown cap: fail closed");
+    }
+
+    // ---- F5: the demo keys EXCHANGE_DEMO needs depend on the exchanges that may be traded ----
+
+    fn keys(exchanges: &[(Exchange, bool)]) -> crate::ports::MemorySecrets {
+        use crate::ports::SecretName::{ApiKey, ApiSecret, Passphrase};
+        let mut m = crate::ports::MemorySecrets::default();
+        for (e, with_pass) in exchanges {
+            m = m.with(*e, ApiKey, "k").with(*e, ApiSecret, "s");
+            if *with_pass {
+                m = m.with(*e, Passphrase, "p");
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn okx_keys_are_required_for_exchange_demo_only_while_okx_is_allowed() {
+        let two = keys(&[(Exchange::Binance, false), (Exchange::Bybit, false)]);
+        let all = [Exchange::Binance, Exchange::Bybit, Exchange::Okx];
+        let e = demo_keys_for(&two, &all).unwrap_err();
+        assert!(e.contains("OKX") && e.contains("NoKey"), "{e}");
+        assert_eq!(demo_keys_for(&two, &[Exchange::Binance, Exchange::Bybit]), Ok(()), "OKX excluded: not needed");
+        let no_pass = keys(&[(Exchange::Binance, false), (Exchange::Bybit, false), (Exchange::Okx, false)]);
+        assert!(demo_keys_for(&no_pass, &all).unwrap_err().contains("NoPassphrase"));
+        let full = keys(&[(Exchange::Binance, false), (Exchange::Bybit, false), (Exchange::Okx, true)]);
+        assert_eq!(demo_keys_for(&full, &all), Ok(()));
+        // Binance / Bybit stay required whatever is allowed
+        assert!(demo_keys_for(&keys(&[(Exchange::Okx, true)]), &all).unwrap_err().contains("Binance"));
     }
 
     fn row(status: &str, entry: serde_json::Value) -> PairRow {

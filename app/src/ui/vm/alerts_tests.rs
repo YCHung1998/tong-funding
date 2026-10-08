@@ -38,8 +38,9 @@ fn healthy() -> UiSnapshot {
         hs(SourceId::MarketPoll(Okx), true, Some(1_000), 10_000),
         hs(SourceId::Account(Binance), true, Some(1_000), 30_000),
         hs(SourceId::Account(Bybit), true, Some(1_000), 30_000),
+        hs(SourceId::Account(Okx), true, Some(1_000), 30_000),
     ];
-    for e in [Binance, Bybit] {
+    for e in [Binance, Bybit, Okx] {
         s.accounts.insert(e, loaded(vec![], vec![], NOW));
         s.clocks.insert(e, ClockState::Synced { offset_ms: 10 });
     }
@@ -228,4 +229,18 @@ fn a_tripped_okx_latch_is_a_severe_banner_that_cannot_be_dismissed() {
     assert_eq!(okx.category, Category::Halted);
     assert!(!okx.dismissible());
     assert!(okx.message.contains("50101") && okx.message.contains("重新啟動"), "{}", okx.message);
+}
+
+#[test]
+fn okx_is_alerted_like_the_other_exchanges_while_it_is_allowed_and_silent_when_it_is_not() {
+    let mut s = healthy();
+    s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
+    s.clocks.insert(Okx, ClockState::Unsynced);
+    let msgs: Vec<_> = alerts(&s, NOW).into_iter().map(|a| a.message).collect();
+    assert!(msgs.contains(&"OKX 帳戶未連線：Keychain 沒有 API key".to_string()), "{msgs:?}");
+    assert!(msgs.contains(&"OKX 時鐘未校時".to_string()), "{msgs:?}");
+    // OKX taken out of allowed_exchanges: it is not traded, so its keys and clock are not an alert
+    s.settings.risk.allowed_exchanges = vec![Binance, Bybit];
+    let msgs: Vec<_> = alerts(&s, NOW).into_iter().map(|a| a.message).collect();
+    assert!(msgs.iter().all(|m| !m.contains("OKX")), "{msgs:?}");
 }

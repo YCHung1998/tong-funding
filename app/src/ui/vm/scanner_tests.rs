@@ -419,3 +419,16 @@ fn vm_carries_breakdown_for_tradable_enabled_pairs() {
     let vm = build(&snap(s, &[]), NOW);
     assert_eq!(vm.breakdown.len(), 1);
 }
+
+#[test]
+fn a_missing_okx_fee_makes_only_okx_pairs_undecidable_never_binance_bybit_rows() {
+    let mut settings = complete_settings("0.01");
+    settings.risk.taker_fee_pct.remove(&Okx);
+    let vm = build(&snap(settings, &[(Binance, "AUSDT", "0.0003"), (Bybit, "AUSDT", "-0.0001"), (Binance, "BUSDT", "0.0003"), (Okx, "BUSDT", "-0.0001")]), NOW);
+    let a = row(&vm, "AUSDT");
+    assert!(a.net_edge.value().is_some(), "{:?}", a.net_edge);
+    let b = row(&vm, "BUSDT");
+    assert!(matches!(&b.net_edge, NetEdgeCell::NotConfigured(m) if m.contains(&"OKX taker_fee_pct".to_string())), "{:?}", b.net_edge);
+    assert_eq!(b.qualified, Qualified::NotConfigured);
+    assert!(a.qualified != Qualified::NotConfigured, "the Binance-Bybit row is judged on its own settings");
+}
