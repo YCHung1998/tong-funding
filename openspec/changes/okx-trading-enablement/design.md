@@ -116,8 +116,13 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 ## 抗辯修正（enablement 第四輪）
 
 - I1：衝突窗口 = PRE_TRADE_CHECK ∪ ORDER_SUBMIT。單一 helper `entering_pair(symbol, exchanges, except)` 供 `entry_conflict`（進場）與手動開倉守衛共用；`entry_conflict` 在 `start_entry`、`submit_entry`（寫入 `preparing` 之前）與 `entry_still_allowed`（`OpenPrepared` Ok）三處再檢查，之後才出現的衝突 = 配對以 nothing sent 取消。兩個同標的、共用交易所的配對同時啟動時只有先到的進入屏障；PRE_TRADE_CHECK 期間的手動帶槓桿開倉被拒。
-- I2：`manual_inflight` 每筆記錄開始時間，tick 時丟棄超過 2 × `order_timeout_seconds` 的紀錄；手動單的任務若未回報就結束（panic），`ManualDoneGuard` 在 drop 時補送 Unknown 結果以清除紀錄。Unknown 結果同樣清除該紀錄（交易所端是否有單交給查詢 / 對帳，對帳未完成本來就阻擋所有進場）。
+- I2：`manual_inflight` 每筆記錄開始時間，tick 時丟棄過期紀錄（第五輪 J1 改為固定的安全網，不再依 `order_timeout_seconds`）；手動單的任務若未回報就結束（panic），`ManualDoneGuard` 在 drop 時補送 Unknown 結果以清除紀錄。Unknown 結果同樣清除該紀錄（交易所端是否有單交給查詢 / 對帳，對帳未完成本來就阻擋所有進場）。
 - I3：更正第三輪措辭：「對側腿可能裸露」的文字只適用於已核准的腿**確定未送出 / 被拒**（`Rejected`，含 `not_sent`）；`RateLimited` / `Unknown` 走查單，依定義不是裸腿，不加此文字。
 - I4：更正第三輪：兩腿意圖落地失敗會**停機**儲存庫（fail-safe，含重複 id）；配對停在 ORDER_SUBMIT、什麼都沒送，重啟後由恢復流程處理（沒有意圖 = 沒送出）。不會「取消配對」。
 - I5：`OpenPrepared` Ok 時對兩腿各取一次校時偏移，帶在請求上（`OrderRequest.prepared = Some(Prepared { offset_ms })`）；已核准的腿以此簽名，不再逐腿重讀，偏移在兩腿之間過期不會只送一腿。缺任一偏移 = nothing sent。
 - I6：`insert_intent_row` 由 `create_intent` / `create_submitted_intents` 共用；`land_intents` 只回 `StoreError`（移除不可達分支）；`manual_order` 不再用暫存 tuple。
+
+## 抗辯修正（enablement 第五輪）
+
+- J1：手動單任務本體包在 `tokio::time::timeout(MANUAL_DEADLINE_MS = 20 s)` 內（高於 executor 最壞情況：模式讀取 + set-leverage + 送單，各 ≤ 5 秒），逾時回報 Unknown（交易所端是否有單交給查詢 / 對帳），因此活著的手動任務一定在期限內經 `ManualSubmitted` / `ManualDoneGuard` 回報。`manual_inflight` 的 tick 到期只是安全網：`MANUAL_DEADLINE_MS + 10 s`，與 `order_timeout_seconds` 無關。`order_timeout_seconds = 1` 時，仍在飛行中的手動帶槓桿開倉不再於 2 秒後被放行（測試：3 秒後 `ManualEnter` 仍被拒）。
+- J2：`on_tick` 對停在 PRE_TRADE_CHECK 超過 `PREPARE_DEADLINE_MS` 的配對落 `CheckFailed`（「pre-trade check timed out」，nothing sent，配對 BLOCKED），遺失的事件不會讓該交易所 / 標的在整個執行期間被占用。

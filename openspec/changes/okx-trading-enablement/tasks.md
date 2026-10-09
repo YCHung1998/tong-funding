@@ -43,3 +43,4 @@
 - [x] 5.5 第二輪 G1–G7：`prepared` 標記、送前窗口（kill switch / 視窗 / 逾時 / 手動單）、instId 必填、demo 金鑰即時重算；骨架回歸與真實 executor 流程測試
 - [x] 5.6 第三輪 H1–H6：兩腿意圖原子落地、裸腿文字涵蓋所有非成功、校時偏移、手動單 / 重複配對進場衝突、屏障期限、簡化
 - [x] 5.7 第四輪 I1–I6：衝突窗口含 PRE_TRADE_CHECK、manual_inflight 衛生、文件更正、校時偏移快照、清理
+- [x] 5.8 第五輪 J1 / J2：手動單任務期限與固定安全網、PRE_TRADE_CHECK 逾時

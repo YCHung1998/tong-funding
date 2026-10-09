@@ -377,6 +377,11 @@ impl Drop for ManualDoneGuard {
 /// independent of the fill timeout: per leg it may need a mode read and a set-leverage (each bounded by the
 /// 5 s order-request timeout), for two legs, plus margin.
 pub(crate) const PREPARE_DEADLINE_MS: i64 = 30_000;
+/// A manual order task is cut off after this long and reports an Unknown result.
+pub(crate) const MANUAL_DEADLINE_MS: i64 = 20_000;
+/// Safety net for a manual order that never reported (a lost event): its in-flight guard is dropped this long
+/// after the start. Strictly above `MANUAL_DEADLINE_MS`, independent of `order_timeout_seconds`.
+const MANUAL_GUARD_MAX_MS: i64 = MANUAL_DEADLINE_MS + 10_000;
 
 /// In-memory progress of one pair. Lost on restart (orders in flight then belong to the
 /// reconciler; see `orphan`).
@@ -760,6 +765,15 @@ impl Actor {
 
     // ---- scheduler ----
 
+    /// A pair whose pre-trade check has not finished within PREPARE_DEADLINE_MS (a lost event) is blocked with
+    /// nothing sent, so it cannot hold its exchange and symbol for the rest of the session.
+    fn abort_stuck_pretrade(&mut self, pair: &str, now: i64) {
+        let started = self.flows.get(pair).and_then(|f| f.open_triggered_ms);
+        if started.is_some_and(|t| now.saturating_sub(t) >= PREPARE_DEADLINE_MS) {
+            let _ = self.land(pair, SystemEvent::CheckFailed, json!({ "reason": "pre-trade check timed out", "detail": "nothing sent" }));
+        }
+    }
+
     /// A pair whose pre-send barrier has not answered within the order timeout is aborted: nothing was sent.
     /// Returns whether it was handled here (still waiting counts as handled: there are no orders to check yet).
     fn abort_stuck_preparing(&mut self, pair: &str, now: i64) -> bool {
@@ -773,10 +787,9 @@ impl Actor {
 
     fn on_tick(&mut self) -> CommandReply {
         let now = self.clock.now_ms();
-        // a manual open that never reported back (a lost task) must not hold entries forever: after twice the
-        // order timeout it is dropped (reconciliation-pending already blocks entries after a crash)
-        let max_age = i64::from(load_risk_config(&self.db).map_or(RiskConfig::default().order_timeout_seconds, |(r, _)| r.order_timeout_seconds)) * 2_000;
-        self.manual_inflight.retain(|_, (_, _, since)| now.saturating_sub(*since) < max_age);
+        // Safety net only: a manual open whose report was lost stops holding entries after MANUAL_GUARD_MAX_MS,
+        // strictly above the task's own deadline (so a live task, which always reports by then, is never dropped).
+        self.manual_inflight.retain(|_, (_, _, since)| now.saturating_sub(*since) < MANUAL_GUARD_MAX_MS);
         self.maybe_retry_reconciliation(now);
         let ids: Vec<PairUuid> = self.pairs.keys().cloned().collect();
         for id in ids {
@@ -785,6 +798,7 @@ impl Actor {
             match view.state {
                 PairState::Prepared => self.tick_prepared(&view, now),
                 PairState::Reconciled if !orphan => self.tick_reconciled(&view, now),
+                PairState::PreTradeCheck if !orphan => self.abort_stuck_pretrade(&id, now),
                 PairState::OrderSubmit if !orphan && self.abort_stuck_preparing(&id, now) => {}
                 PairState::OrderSubmit if !orphan => self.check_submitted(&id, now),
                 PairState::FillMonitor if !orphan => {
@@ -1750,10 +1764,13 @@ impl Actor {
         tokio::spawn(async move {
             // if this task ends without reporting (a panic), the guard still tells the actor
             let mut guard = ManualDoneGuard { tx: tx.clone(), id: Some(id.clone()) };
-            let outcome = match intent::submit_with_intent(&db, executor.as_ref(), &key, leg, req).await {
-                Ok(report) => report.outcome,
-                Err(IntentError::NotLanded(e)) => SubmitOutcome::Rejected { reason: format!("not sent: {e}") },
-                Err(IntentError::ResultNotRecorded(e)) => SubmitOutcome::Unknown { reason: format!("result not recorded: {e}") },
+            // worst case of the executor: mode read + set-leverage + submit, each bounded by a 5 s request timeout
+            let run = intent::submit_with_intent(&db, executor.as_ref(), &key, leg, req);
+            let outcome = match tokio::time::timeout(Duration::from_millis(MANUAL_DEADLINE_MS as u64), run).await {
+                Ok(Ok(report)) => report.outcome,
+                Ok(Err(IntentError::NotLanded(e))) => SubmitOutcome::Rejected { reason: format!("not sent: {e}") },
+                Ok(Err(IntentError::ResultNotRecorded(e))) => SubmitOutcome::Unknown { reason: format!("result not recorded: {e}") },
+                Err(_) => SubmitOutcome::Unknown { reason: "manual order did not finish within its deadline; it may still exist on the exchange (left to the lookup / reconciliation)".into() },
             };
             guard.id = None;
             let _ = tx.send(Event::ManualSubmitted { client_order_id: id, outcome }).await;

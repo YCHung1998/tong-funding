@@ -2605,3 +2605,53 @@ async fn a_manual_open_that_never_reports_back_stops_holding_entries_after_twice
     run_until(&rig.clock, T - 20_000 + 31_000).await; // order_timeout_seconds 15 x 2
     assert_eq!(ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await, CommandReply::Accepted, "the lost manual order no longer holds the entry");
 }
+
+// ---- okx-trading-enablement round 5 (J1 / J2) ------------------------------------------------------------
+
+async fn eth_pair_and_manual_eth_open(order_timeout_seconds: u32) -> (Rig, EngineHandle) {
+    let (rig, h) = started(Opts { demo: true, trigger: "MANUAL", ..Opts::default() }).await;
+    let mut cfg = risk();
+    cfg.order_timeout_seconds = order_timeout_seconds;
+    store_risk(&rig.db, &cfg);
+    let mut later = pair_at("pair-0002", "ETHUSDT", T + 3_600_000);
+    later.pair_id = "pid-2".into();
+    assert_eq!(ask(&h, Command::AddPrepared(later)).await, CommandReply::Accepted);
+    rig.demo.hold_submit.store(true, Ordering::SeqCst); // the manual order is still "in flight" at the exchange
+    let manual = Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side: OrderSide::Sell, quantity: dec("1"), reduce_only: false, leverage: Some(dec("3")), intended_base_qty: None });
+    assert_eq!(ask(&h, manual).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(20)).await;
+    (rig, h)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_low_order_timeout_does_not_drop_the_guard_of_a_manual_open_that_is_still_in_flight() {
+    let (rig, h) = eth_pair_and_manual_eth_open(1).await;
+    run_until(&rig.clock, T - 20_000 + 3_000).await; // 3 s: past 2 x the 1 s order timeout
+    match ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await {
+        CommandReply::Rejected(why) => assert!(why.contains("in flight"), "{why}"),
+        other => panic!("the manual task can still set a leverage: {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_open_that_exceeds_its_own_deadline_reports_unknown_and_then_releases_the_entry() {
+    let (rig, h) = eth_pair_and_manual_eth_open(15).await;
+    run_until(&rig.clock, T - 20_000 + MANUAL_DEADLINE_MS + 1_000).await;
+    let results = events(&rig.db).into_iter().filter(|(_, l, _)| l == "MANUAL_ORDER_RESULT").count();
+    assert_eq!(results, 1, "the task reported by its deadline: {:?}", labels(&rig.db));
+    assert_eq!(ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await, CommandReply::Accepted);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lost_pre_trade_check_is_blocked_by_the_tick_and_stops_holding_the_symbol() {
+    let (rig, h) = started(Opts { demo: true, trigger: "MANUAL", ..Opts::default() }).await;
+    rig.demo.hold_margin.store(true, Ordering::SeqCst); // the pre-trade task never answers
+    assert_eq!(ask(&h, Command::ManualEnter { pair: UUID.into() }).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(status(&rig.db, UUID), "PRE_TRADE_CHECK");
+    run_until(&rig.clock, T - 20_000 + PREPARE_DEADLINE_MS + 1_000).await;
+    assert_eq!(status(&rig.db, UUID), "BLOCKED", "{:?}", labels(&rig.db));
+    let ev = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
+    assert!(ev.to_string().contains("pre-trade check timed out"), "{ev}");
+    assert!(rig.demo.requests.lock().unwrap().is_empty() && rig.demo.prepares.lock().unwrap().is_empty());
+}
