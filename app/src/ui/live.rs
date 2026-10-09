@@ -784,8 +784,7 @@ struct DemoKeysCadence {
 
 impl DemoKeysCadence {
     fn due(&mut self, allowed: &[Exchange]) -> bool {
-        let mut now: Vec<Exchange> = allowed.to_vec();
-        now.sort();
+        let now: Vec<Exchange> = allowed.to_vec(); // already in the order of the set it comes from
         let changed = self.last_allowed.as_ref() != Some(&now);
         let slow = self.ticks % DEMO_KEYS_EVERY_TICKS == 0;
         self.ticks += 1;

@@ -153,6 +153,9 @@ struct FakeDemo {
     /// While set, `prepare_open` waits for `release` (the barrier is "in flight").
     hold: std::sync::atomic::AtomicBool,
     release: tokio::sync::Notify,
+    /// While set, `submit` waits for `submit_release` (a manual order "in flight").
+    hold_submit: std::sync::atomic::AtomicBool,
+    submit_release: tokio::sync::Notify,
 }
 impl Executor for FakeDemo {
     fn prepare_open(&self, legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
@@ -169,6 +172,23 @@ impl Executor for FakeDemo {
         false
     }
     fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {
+        Box::pin(async move {
+            if self.hold_submit.load(Ordering::SeqCst) {
+                self.submit_release.notified().await;
+            }
+            self.submit_now(req)
+        })
+    }
+    fn cancel(&self, _: Exchange, _: &str, _: &str) -> BoxFut<'_, QueryOutcome> {
+        Box::pin(std::future::ready(QueryOutcome::NotFound))
+    }
+    fn query(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
+        let o = self.orders.lock().unwrap().get(id).cloned().map_or(QueryOutcome::NotFound, QueryOutcome::Found);
+        Box::pin(std::future::ready(o))
+    }
+}
+impl FakeDemo {
+    fn submit_now(&self, req: OrderRequest) -> SubmitOutcome {
         self.requests.lock().unwrap().push(req.clone());
         let signed = match req.side {
             OrderSide::Buy => req.quantity,
@@ -185,14 +205,7 @@ impl Executor for FakeDemo {
             state: OrderState::Filled,
         };
         self.orders.lock().unwrap().insert(req.client_order_id.clone(), status.clone());
-        Box::pin(std::future::ready(SubmitOutcome::Accepted(status)))
-    }
-    fn cancel(&self, _: Exchange, _: &str, _: &str) -> BoxFut<'_, QueryOutcome> {
-        Box::pin(std::future::ready(QueryOutcome::NotFound))
-    }
-    fn query(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
-        let o = self.orders.lock().unwrap().get(id).cloned().map_or(QueryOutcome::NotFound, QueryOutcome::Found);
-        Box::pin(std::future::ready(o))
+        SubmitOutcome::Accepted(status)
     }
 }
 
@@ -2419,7 +2432,7 @@ async fn a_barrier_that_finishes_after_settlement_sends_nothing() {
 #[tokio::test(start_paused = true)]
 async fn a_barrier_stuck_longer_than_the_order_timeout_is_aborted_by_the_tick_with_a_reason() {
     let (rig, _h) = held_pair().await;
-    run_until(&rig.clock, T - 9_500 + 16_000).await; // order_timeout_seconds is 15
+    run_until(&rig.clock, T - 9_500 + PREPARE_DEADLINE_MS + 1_000).await; // the barrier has its own deadline
     assert_eq!(status(&rig.db, UUID), "CANCELLED", "{:?}", labels(&rig.db));
     let ev = events(&rig.db).into_iter().find(|(_, l, _)| l == "CANCELLED").unwrap().2;
     assert!(ev.to_string().contains("nothing sent") && ev.to_string().contains("pre-send barrier timed out"), "{ev}");
@@ -2475,4 +2488,52 @@ pub(crate) async fn run_okx_pair_with(make: impl FnOnce(EngineParts) -> Arc<dyn 
     assert_eq!(ask(&h, Command::AddPrepared(p)).await, CommandReply::Accepted);
     run_until(&rig.clock, T - 9_000).await;
     rig.db.clone()
+}
+
+// ---- okx-trading-enablement round 3 (H3 / H4 / H5) ------------------------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_missing_clock_offset_for_either_leg_when_the_barrier_returns_sends_neither_leg() {
+    let (rig, _h) = held_pair().await;
+    run_until(&rig.clock, T - 9_500).await;
+    rig.offsets.0.lock().unwrap().insert(Exchange::Okx, None);
+    rig.demo.release.notify_one();
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(status(&rig.db, UUID), "CANCELLED", "{:?}", labels(&rig.db));
+    assert!(rig.demo.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_entry_waits_for_a_manual_opening_order_in_flight_on_either_legs_exchange_and_symbol() {
+    let (rig, h) = started(Opts { demo: true, ..Opts::default() }).await; // pair: Binance long / Bybit short on BTCUSDT
+    let manual = |exchange: Exchange| {
+        Command::ManualOrder(crate::engine::command::ManualOrder { exchange, symbol: SYM.into(), side: OrderSide::Sell, quantity: dec("1"), reduce_only: false, leverage: Some(dec("3")), intended_base_qty: None })
+    };
+    // keep the manual order in flight: the demo fake answers at once, so hold it with the barrier-free path
+    rig.demo.hold_submit.store(true, Ordering::SeqCst);
+    assert_eq!(ask(&h, manual(Exchange::Bybit)).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(20)).await;
+    match ask(&h, Command::ManualEnter { pair: UUID.into() }).await {
+        CommandReply::Rejected(why) => assert!(why.contains("manual") && why.contains("in flight") && why.contains("Bybit"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    rig.demo.hold_submit.store(false, Ordering::SeqCst);
+    rig.demo.submit_release.notify_one();
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(ask(&h, Command::ManualEnter { pair: UUID.into() }).await, CommandReply::Accepted, "once the manual order is done the entry may start");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_pair_cannot_enter_the_same_exchange_and_symbol_while_one_is_in_order_submit() {
+    let (rig, h) = held_pair().await;
+    run_until(&rig.clock, T - 9_500).await;
+    assert_eq!(status(&rig.db, UUID), "ORDER_SUBMIT");
+    let mut second = pair_at("pair-0002", SYM, T);
+    second.pair_id = "pid-2".into();
+    second.short_exchange = Exchange::Okx;
+    assert_eq!(ask(&h, Command::AddPrepared(second)).await, CommandReply::Accepted);
+    match ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await {
+        CommandReply::Rejected(why) => assert!(why.contains("in flight") || why.contains("ORDER_SUBMIT"), "{why}"),
+        other => panic!("{other:?}"),
+    }
 }

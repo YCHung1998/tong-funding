@@ -102,6 +102,13 @@ pub fn land_intent(db: &Db, pair_uuid: &str, leg: Leg, req: &OrderRequest) -> Re
         .map_err(|e| IntentError::NotLanded(halt_on(db, "order intent (SUBMITTED)", e)))
 }
 
+/// Land the intents of several orders (a pair's two legs) in ONE transaction, before any of them is sent.
+/// On any error the store is halted and NONE is landed: the caller must send none.
+pub fn land_intents(db: &Db, pair_uuid: &str, legs: &[(Leg, &OrderRequest)]) -> Result<(), IntentError> {
+    let rows: Vec<NewIntent> = legs.iter().map(|(leg, req)| new_intent(pair_uuid, *leg, req)).collect();
+    db.create_submitted_intents(&rows).map_err(|e| IntentError::NotLanded(halt_on(db, "order intents (both legs)", e)))
+}
+
 /// The intent state an exchange-reported order state settles to.
 fn settled_state(status: &OrderStatus) -> IntentState {
     match status.state {
@@ -181,6 +188,12 @@ pub async fn submit_with_intent_clocked(
     req: OrderRequest,
 ) -> Result<SubmitReport, IntentError> {
     land_intent(db, pair_uuid, leg, &req)?;
+    send_landed(db, executor, clock, req).await
+}
+
+/// Everything after the intent has been landed (by `land_intent` or, for a pair, `land_intents`):
+/// send, record the answer, look an unknown result up by id.
+pub async fn send_landed(db: &Db, executor: &dyn Executor, clock: Option<&dyn Clock>, req: OrderRequest) -> Result<SubmitReport, IntentError> {
     let simulated = executor.is_simulated();
     let request_sent_at_ms = clock.map(|c| c.now_ms());
     let outcome = executor.submit(req.clone()).await;

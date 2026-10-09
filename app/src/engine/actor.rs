@@ -357,6 +357,11 @@ struct EntryContext {
 
 type QuotePair = (Result<FreshQuote, String>, Result<FreshQuote, String>);
 
+/// How long the executor's pre-send barrier may take before the pair is aborted ("nothing sent"). It is
+/// independent of the fill timeout: per leg it may need a mode read and a set-leverage (each bounded by the
+/// 5 s order-request timeout), for two legs, plus margin.
+pub(crate) const PREPARE_DEADLINE_MS: i64 = 30_000;
+
 /// In-memory progress of one pair. Lost on restart (orders in flight then belong to the
 /// reconciler; see `orphan`).
 #[derive(Debug, Clone, Default)]
@@ -427,6 +432,9 @@ struct Actor {
     reported: BTreeSet<(PairUuid, String)>,
     /// Disambiguates manual order ids created at the same clock millisecond.
     manual_seq: u64,
+    /// Manual OPENING orders with a leverage that are in flight, by `client_order_id` (a pair must not
+    /// enter the same exchange and symbol meanwhile: its leverage could change under it).
+    manual_inflight: BTreeMap<String, (Exchange, String)>,
     /// Set at startup while unfinished intents / in-flight pairs await reconciliation; refuses
     /// exposure meanwhile (in EXCHANGE_DEMO only, decision 8; always shown in the Snapshot).
     reconciliation_pending: Option<String>,
@@ -519,6 +527,7 @@ impl Actor {
             flows,
             reported: BTreeSet::new(),
             manual_seq: 0,
+            manual_inflight: BTreeMap::new(),
             reconciliation_pending,
             reconcile_scope,
             notices,
@@ -739,7 +748,7 @@ impl Actor {
     /// Returns whether it was handled here (still waiting counts as handled: there are no orders to check yet).
     fn abort_stuck_preparing(&mut self, pair: &str, now: i64) -> bool {
         let Some(set) = self.flows.get(pair).and_then(|f| f.preparing.as_ref()) else { return false };
-        if set.timed_out(now) {
+        if now.saturating_sub(set.sent_at_ms) >= PREPARE_DEADLINE_MS {
             self.flows.entry(pair.to_string()).or_default().preparing = None;
             let _ = self.land(pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": ["pre-send barrier timed out (the executor did not answer within the order timeout)"] }));
         }
@@ -916,6 +925,9 @@ impl Actor {
         if let Some(why) = self.executor_mismatch(&view) {
             return CommandReply::Rejected(why);
         }
+        if let Some(why) = self.entry_conflict(&view) {
+            return CommandReply::Rejected(why);
+        }
         // Never enter without calibrated exchange time, never at or after settlement (D9).
         match self.reading(&view, self.clock.now_ms()).exchange_now_range() {
             None => return CommandReply::Rejected("serverTime offset unavailable: no entry (fail closed)".into()),
@@ -1081,6 +1093,20 @@ impl Actor {
         }
     }
 
+    /// What keeps this pair from entering now: a manual opening order (with a leverage) in flight on either leg's
+    /// exchange and symbol, or another pair of the same exchange and symbol that is already in ORDER_SUBMIT. Both
+    /// could change the leverage the pair is approved with, or double the exposure, in the window.
+    fn entry_conflict(&self, view: &PairView) -> Option<String> {
+        let legs = [view.long_exchange, view.short_exchange];
+        if let Some((ex, _)) = self.manual_inflight.values().find(|(ex, sym)| *sym == view.symbol && legs.contains(ex)) {
+            return Some(format!("a manual opening order on {} {} is in flight: wait for it before entering", ex.name(), view.symbol));
+        }
+        self.pairs
+            .values()
+            .find(|p| p.internal_uuid != view.internal_uuid && p.state == PairState::OrderSubmit && p.symbol == view.symbol && (legs.contains(&p.long_exchange) || legs.contains(&p.short_exchange)))
+            .map(|p| format!("pair {} is entering {} (ORDER_SUBMIT, orders in flight) on a shared exchange: wait for it", p.pair_id, view.symbol))
+    }
+
     /// Right before the legs are sent: no blocker refuses exposure and the entry window is still open.
     fn entry_still_allowed(&self, pair: &str) -> Result<(), String> {
         let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
@@ -1195,9 +1221,29 @@ impl Actor {
             OrderAction::Open => flow.open = Some(set),
             OrderAction::Close => flow.close = Some(set),
         }
-        // Both legs are spawned before either can answer: they run in parallel (D5).
-        for (leg, req) in reqs {
-            self.spawn_submit(pair.to_string(), leg, action, req, triggered);
+        // H1: both legs' intents are landed in ONE transaction before either leg is sent; if that cannot be
+        // done (halted store, duplicate id) neither is sent and each leg reports "not sent" (the pair then
+        // takes the ordinary both-submits-failed path). A later write failure cannot split the pair any more.
+        let legs: Vec<(Leg, &OrderRequest)> = reqs.iter().map(|(l, r)| (*l, r)).collect();
+        match intent::land_intents(&self.db, pair, &legs) {
+            Ok(()) => {
+                // Both legs are spawned before either can answer: they run in parallel (D5).
+                for (leg, req) in reqs {
+                    self.spawn_submit_inner(pair.to_string(), leg, action, req, triggered, true);
+                }
+            }
+            Err(e) => {
+                let why = match e {
+                    IntentError::NotLanded(e) | IntentError::ResultNotRecorded(e) => e.to_string(),
+                };
+                for (leg, req) in reqs {
+                    let (tx, pair) = (self.event_tx.clone(), pair.to_string());
+                    let outcome = SubmitOutcome::Rejected { reason: format!("not sent: order intents not landed ({why}); neither leg was sent") };
+                    tokio::spawn(async move {
+                        let _ = tx.send(Event::Submitted { pair, leg, action, client_order_id: req.client_order_id, outcome }).await;
+                    });
+                }
+            }
         }
     }
 
@@ -1651,6 +1697,7 @@ impl Actor {
                 Err(e) => return CommandReply::Rejected(format!("cannot check order id: {e}")),
             }
         };
+        let (o_reduce_only, o_has_leverage, o_exchange, o_symbol) = (o.reduce_only, leverage.is_some(), o.exchange, o.symbol.clone());
         let req = OrderRequest {
             prepared: false,
             notional_usdt: None,
@@ -1664,6 +1711,9 @@ impl Actor {
             intended_base_qty: if o.reduce_only { None } else { o.intended_base_qty },
             leverage,
         };
+        if !o_reduce_only && o_has_leverage {
+            self.manual_inflight.insert(id.clone(), (o_exchange, o_symbol));
+        }
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
         tokio::spawn(async move {
             let outcome = match intent::submit_with_intent(&db, executor.as_ref(), &key, leg, req).await {
@@ -1833,6 +1883,7 @@ impl Actor {
             }
             Event::Queried { pair: None, .. } => {} // manual orders are not polled
             Event::ManualSubmitted { client_order_id, outcome } => {
+                self.manual_inflight.remove(&client_order_id);
                 let mut payload = outcome_json(&outcome);
                 payload["client_order_id"] = json!(client_order_id);
                 payload["simulated"] = json!(self.executor.is_simulated());
@@ -2162,11 +2213,20 @@ impl Actor {
     /// Every submit writes one `ORDER_LATENCY` event (request sent / ACK on the injected clock,
     /// `triggered_at` of the entry or close) from the spawned task.
     fn spawn_submit(&self, pair: PairUuid, leg: Leg, action: OrderAction, req: OrderRequest, triggered_at: Option<i64>) {
+        self.spawn_submit_inner(pair, leg, action, req, triggered_at, false);
+    }
+
+    /// `landed`: the intent was already landed (with the other leg's, atomically): only send and record.
+    fn spawn_submit_inner(&self, pair: PairUuid, leg: Leg, action: OrderAction, req: OrderRequest, triggered_at: Option<i64>, landed: bool) {
         let (db, executor, tx, clock, events) = (self.db.clone(), self.executor.clone(), self.event_tx.clone(), self.clock.clone(), self.events.clone());
         tokio::spawn(async move {
             let client_order_id = req.client_order_id.clone();
             let exchange = req.exchange;
-            let result = intent::submit_with_intent_clocked(&db, executor.as_ref(), Some(clock.as_ref()), &pair, leg, req).await;
+            let result = if landed {
+                intent::send_landed(&db, executor.as_ref(), Some(clock.as_ref()), req).await
+            } else {
+                intent::submit_with_intent_clocked(&db, executor.as_ref(), Some(clock.as_ref()), &pair, leg, req).await
+            };
             if let Ok(report) = &result
                 && let Some(t) = report.timing
             {

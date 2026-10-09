@@ -103,3 +103,12 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 - G5：配對處於 ORDER_SUBMIT（含屏障）時，引擎拒絕同交易所同標的的手動**開倉**單（避免手動 set-leverage 改掉配對核准的槓桿）；平倉永不被擋。
 - G6：set-leverage 回覆必須帶 `instId` 且吻合（OKX 文件的回覆資料含 `instId`、`lever`、`mgnMode`、`posSide`；仍屬依文件、未實機驗證，列入 4.2）。
 - G7：`demo_keys` 在 `allowed_exchanges` 改變時於下一個 2 秒的設定讀取就重算（`DemoKeysCadence`），其餘維持每 15 次的慢節奏。
+
+## 抗辯修正（enablement 第三輪）
+
+- H1：兩腿的訂單意圖（`order_intents`）在送任何一腿之前、於**同一個資料庫交易**一起落地（`Db::create_submitted_intents` / `intent::land_intents`）；失敗（停機 / 重複 id）= 兩腿都不送，各腿回報「not sent: order intents not landed」，配對走既有的雙腿送單失敗路徑（CANCELLED）。落地後才各自送單，之後的寫入失敗不再能拆開配對。適用所有交易所與開 / 平倉；單腿路徑（手動單、測試）仍自己落地。回歸測試：`skeptic_store_halt_between_leg_landings_sends_neither_leg`（在 Binance 下單時停機）——先紅（只送出 1 腿），修後兩腿都送出或都不送。
+- H2：已核准的腿在屏障之後的**任何**非成功（含 OKX 50101 回覆、`local` 建構失敗、Binance 拒絕）都附上「對側腿可能已送出且為裸腿」的文字。
+- H3：已核准的腿缺校時偏移時不再退回本機時間：引擎在 `OpenPrepared` Ok 時已檢查**兩腿**的偏移（缺一即 nothing sent），executor 對已核准的腿再把缺偏移視為 `not_sent`。
+- H4：進行中的手動開倉單（帶槓桿）按 (交易所, 標的) 記錄；任一腿相符時配對不得進場（`start_entry` 拒絕）；另一個同交易所同標的的配對處於 ORDER_SUBMIT 時，第二個配對也不得進場。
+- H5：屏障有自己的期限 `PREPARE_DEADLINE_MS`（30 秒：每腿最多一次模式讀取與一次 set-leverage，各受 5 秒請求逾時限制，兩腿再加餘裕），與成交逾時 `order_timeout_seconds` 無關。
+- H6：`submit_prepared` 與 `submit_inner` 共用 `dispatch`（送單 + limiter 記帳，去掉不可達的錯誤分支）；`DemoKeysCadence` 去掉多餘的排序。

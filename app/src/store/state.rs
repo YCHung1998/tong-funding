@@ -485,6 +485,39 @@ impl Db {
         })
     }
 
+    /// Persist several orders as `SUBMITTED` in ONE transaction (both legs of a pair): either every intent
+    /// is landed or none is. Each row gets the same `ORDER_INTENT_STATE` event as the two-step path.
+    pub fn create_submitted_intents(&self, intents: &[NewIntent]) -> Result<(), StoreError> {
+        self.with_conn(|c| {
+            let now = self.now_ms();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            for intent in intents {
+                let r = tx.execute(
+                    "INSERT INTO order_intents (client_order_id, pair_uuid, leg, exchange, symbol, side, quantity, state, created_ms, updated_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+                    params![intent.client_order_id, intent.pair_uuid, intent.leg, intent.exchange, intent.symbol, intent.side, intent.quantity, IntentState::Submitted.as_str(), now],
+                );
+                match r {
+                    Ok(_) => {}
+                    Err(rusqlite::Error::SqliteFailure(f, _)) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => {
+                        return Err(StoreError::DuplicateClientOrderId(intent.client_order_id.clone()));
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                let payload = serde_json::json!({
+                    "client_order_id": intent.client_order_id,
+                    "from": IntentState::Intended.as_str(),
+                    "to": IntentState::Submitted.as_str(),
+                    "exchange_order_id": serde_json::Value::Null,
+                    "backfill": false,
+                });
+                insert_event_on(&tx, now, "ORDER_INTENT_STATE", Some(&intent.pair_uuid), &payload).map_err(|e| self.event_write_failed("ORDER_INTENT_STATE", &e))?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Change the state (and optionally record the exchange order id) and write an
     /// `ORDER_INTENT_STATE` event in the same transaction.
     pub fn update_intent_state(

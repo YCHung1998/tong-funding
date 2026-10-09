@@ -454,3 +454,44 @@ async fn a_latch_tripped_between_the_barrier_and_the_send_is_the_accepted_residu
     }
     assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0, "the hard stop still holds");
 }
+
+#[tokio::test]
+async fn any_non_success_of_a_prepared_leg_is_worded_as_a_possibly_naked_opposite_leg() {
+    // OKX answers 50101 to the order itself (a code other than not_sent)
+    let r = rig();
+    script_both_ok(&r);
+    let legs = prepared(pair_legs("5"));
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_50101")));
+    match r.ex.submit_classified(&legs[1]).await {
+        SubmitClass::Rejected { code, message } => {
+            assert_eq!(code, "50101");
+            assert!(message.contains("naked") && message.contains("barrier"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // Binance refuses the prepared order (insufficient margin)
+    let r = rig();
+    script_both_ok(&r);
+    let legs = prepared(pair_legs("5"));
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    r.t.on(Method::Post, BINANCE_ORDER_PATH, Reply::status(400, r#"{"code":-2019,"msg":"Margin is insufficient."}"#));
+    match r.ex.submit_classified(&legs[0]).await {
+        SubmitClass::Rejected { message, .. } => assert!(message.contains("naked"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_prepared_leg_without_a_calibrated_clock_is_not_sent_with_a_local_time_fallback() {
+    let r = super::executor_tests::rig_custom(None, Some(super::executor_tests::btc_limits()));
+    script_okx_mode(&r.t);
+    let mut legs = prepared(pair_legs("5"));
+    legs.remove(0); // only the OKX leg
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+    match r.ex.submit_classified(&legs[0]).await {
+        SubmitClass::Rejected { code, message } => assert!(code == "not_sent" && message.contains("not calibrated"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0);
+}

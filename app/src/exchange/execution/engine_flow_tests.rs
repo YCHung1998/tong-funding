@@ -66,3 +66,68 @@ async fn the_real_executor_sets_both_leverages_then_sends_both_legs_through_the_
     assert!(posts[2..].iter().all(|r| r.contains("order") && !r.contains("leverage")), "then both orders: {posts:?}");
     assert_eq!(t.count(Method::Get, "/api/v5/account/config"), 1, "the mode is read once, by the barrier");
 }
+
+// ---- skeptic round 3 repro: a store halt between the two legs' intent landings splits the pair ----
+use super::http::{OrderHttpRequest, OrderTransport};
+use crate::exchange::error::AdapterError;
+use crate::exchange::transport::HttpResponse;
+use crate::store::db::{Db, HaltReason};
+use std::sync::Mutex as StdMutex;
+
+#[derive(Clone)]
+struct HaltAfterBinanceOrder {
+    inner: FakeOrderTransport,
+    db: Arc<StdMutex<Option<Db>>>,
+}
+impl OrderTransport for HaltAfterBinanceOrder {
+    fn send(&self, req: OrderHttpRequest) -> impl std::future::Future<Output = Result<HttpResponse, AdapterError>> + Send {
+        if req.method() == Method::Post && req.full_url().contains("/fapi/v1/order") {
+            if let Some(db) = self.db.lock().unwrap().as_ref() {
+                // any concurrent write failure elsewhere (disk full, I/O error) halts the store here
+                db.halt(HaltReason::EventWriteFailed("simulated concurrent write failure".into()));
+            }
+        }
+        self.inner.send(req)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn skeptic_store_halt_between_leg_landings_sends_neither_leg() {
+    let t = FakeOrderTransport::new();
+    t.on(Method::Get, "/fapi/v1/positionSide/dual", Reply::ok(r#"{"dualSidePosition":false}"#));
+    t.on(Method::Post, "/fapi/v1/leverage", Reply::ok(r#"{"symbol":"BTCUSDT","leverage":5,"maxNotionalValue":"1000000"}"#));
+    t.on(Method::Post, "/fapi/v1/order", Reply::ok(r#"{"orderId":555,"clientOrderId":"x","status":"NEW","executedQty":"0","avgPrice":"0"}"#));
+    t.on(Method::Get, "/api/v5/account/config", Reply::ok(&fixture("signed/account_config_futures_net")));
+    t.on(Method::Post, "/api/v5/account/set-leverage", Reply::ok(&fixture("orders/set_leverage_ok")));
+    t.on(Method::Post, "/api/v5/trade/order", Reply::ok(&fixture("orders/place_accepted")));
+    let creds = |ex: Exchange| {
+        let m = MemorySecrets::default().with(ex, SecretName::ApiKey, "TEST_KEY_NOT_REAL").with(ex, SecretName::ApiSecret, "TEST_SECRET_NOT_REAL").with(ex, SecretName::Passphrase, "TEST_PASS_NOT_REAL");
+        Arc::new(load_credentials(&m, ex, ex == Exchange::Okx).unwrap())
+    };
+    let slot = Arc::new(StdMutex::new(None));
+    let w = HaltAfterBinanceOrder { inner: t.clone(), db: slot.clone() };
+    let db = run_okx_pair_with(move |p| {
+        *slot.lock().unwrap() = Some(p.db.clone());
+        let clock = Arc::new(p.clock.clone());
+        Arc::new(
+            DemoExecutor::new(
+                BinanceOrderClient::new(Arc::new(w.clone()), creds(Exchange::Binance), BinanceHost::Testnet),
+                BybitOrderClient::new(Arc::new(w.clone()), creds(Exchange::Bybit), BybitHost::Demo),
+                clock.clone(),
+                p.offsets,
+                Arc::new(p.db),
+                Arc::new(RateLimiter::new(clock)),
+            )
+            .with_okx(OkxOrderClient::new(Arc::new(w.clone()), creds(Exchange::Okx), OkxHost::Demo))
+            .with_okx_limits(Arc::new(FixedLimits)),
+        )
+    })
+    .await;
+    let reqs: Vec<String> = t.requests().iter().map(|r| format!("{:?} {}", r.method(), r.full_url())).collect();
+    assert_eq!(t.count(Method::Post, "/fapi/v1/leverage"), 1, "barrier: binance leverage");
+    assert_eq!(t.count(Method::Post, "/api/v5/account/set-leverage"), 1, "barrier: okx leverage");
+    let sent = t.count(Method::Post, "/fapi/v1/order") + t.count(Method::Post, "/api/v5/trade/order");
+    assert!(sent == 0 || sent == 2, "BOTH or NEITHER leg: a halt after the intents are landed must not split the pair (sent {sent})");
+    assert_eq!(db.halt_reason().is_some(), true);
+    assert!(!reqs.is_empty());
+}

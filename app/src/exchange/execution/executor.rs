@@ -262,49 +262,57 @@ impl<T: OrderTransport> DemoExecutor<T> {
         Ok(())
     }
 
-    /// A leg the barrier approved with its pair: only what cannot change its meaning is re-checked here
-    /// (the order is valid, the OKX client exists, the hard stops inside `OkxOrderClient::submit`: latch and
-    /// demo-key proof, and the transport's demo-flag rule). The soft, time-varying checks (mode re-read,
-    /// back-off, mark freshness, limits, leverage) were approved together with the other leg; repeating them
-    /// per leg could send one leg and refuse the other.
-    async fn submit_prepared(&self, req: &OrderRequest) -> SubmitClass {
-        let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
-        if req.exchange == Exchange::Okx
-            && let Err(reason) = self.okx()
-        {
-            return not_sent(reason);
-        }
-        let order = match ValidOrder::from_request(req) {
-            Ok(o) => o,
-            Err(e) => return not_sent(e),
-        };
-        let ts = self.timestamp(req.exchange).unwrap_or_else(|| self.clock.now_ms());
-        let class = match req.exchange {
-            Exchange::Binance => self.binance.submit(&order, ts).await,
-            Exchange::Bybit => self.bybit.submit(&order, ts).await,
+    /// Sends `order` on its exchange and does the shared limiter bookkeeping. The OKX client's own hard stops
+    /// (latch, demo-key proof) live inside `OkxOrderClient::submit`.
+    async fn dispatch(&self, exchange: Exchange, order: &ValidOrder, ts: i64) -> SubmitClass {
+        let class = match exchange {
+            Exchange::Binance => self.binance.submit(order, ts).await,
+            Exchange::Bybit => self.bybit.submit(order, ts).await,
             Exchange::Okx => match self.okx() {
-                Ok(okx) => okx.submit(&order, ts).await,
-                Err(reason) => not_sent(reason),
+                Ok(okx) => okx.submit(order, ts).await,
+                Err(reason) => SubmitClass::Rejected { code: "not_sent".into(), message: reason },
             },
         };
         match &class {
-            SubmitClass::RateLimited { retry_after_ms } => self.note_rate_limit(req.exchange, Some(*retry_after_ms)),
-            SubmitClass::Accepted(_) | SubmitClass::Rejected { .. } => self.limiter.on_success(req.exchange, RequestClass::Signed),
+            SubmitClass::RateLimited { retry_after_ms } => self.note_rate_limit(exchange, Some(*retry_after_ms)),
+            SubmitClass::Accepted(_) | SubmitClass::Rejected { .. } => self.limiter.on_success(exchange, RequestClass::Signed),
             SubmitClass::Unknown { .. } => {}
         }
         class
     }
 
+    /// A leg the barrier approved with its pair: only what cannot change its meaning is re-checked here
+    /// (the order is valid, the OKX client exists, the exchange clock is calibrated: the engine checked both
+    /// legs' offsets before sending either, the hard stops inside `OkxOrderClient::submit`: latch and demo-key
+    /// proof, and the transport's demo-flag rule). The soft, time-varying checks (mode re-read, back-off, mark
+    /// freshness, limits, leverage) were approved together with the other leg; repeating them per leg could
+    /// send one leg and refuse the other. ANY non-success here is worded as a possibly naked opposite leg.
+    async fn submit_prepared(&self, req: &OrderRequest) -> SubmitClass {
+        let naked = |code: String, message: String| SubmitClass::Rejected {
+            message: format!("{message}; the pre-send barrier had passed, so the opposite leg may already be sent and be naked: check it"),
+            code,
+        };
+        if req.exchange == Exchange::Okx
+            && let Err(reason) = self.okx()
+        {
+            return naked("not_sent".into(), reason);
+        }
+        let order = match ValidOrder::from_request(req) {
+            Ok(o) => o,
+            Err(e) => return naked("not_sent".into(), e),
+        };
+        let Some(ts) = self.timestamp(req.exchange) else {
+            return naked("not_sent".into(), format!("{} clock offset not calibrated", req.exchange.name()));
+        };
+        match self.dispatch(req.exchange, &order, ts).await {
+            SubmitClass::Rejected { code, message } => naked(code, message),
+            other => other,
+        }
+    }
+
     async fn submit_inner(&self, req: &OrderRequest) -> SubmitClass {
         if req.prepared && !req.reduce_only {
-            return match self.submit_prepared(req).await {
-                // the one accepted residual: a hard stop (latch, demo-key proof) after the barrier passed
-                SubmitClass::Rejected { code, message } if code == "not_sent" => SubmitClass::Rejected {
-                    message: format!("{message}; the pre-send barrier had passed, so the opposite leg may already be sent and be naked: check it"),
-                    code,
-                },
-                other => other,
-            };
+            return self.submit_prepared(req).await;
         }
         let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
         let order = match self.local_checks(req) {
@@ -319,20 +327,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
             return not_sent(e);
         }
         let ts = self.timestamp(req.exchange).unwrap_or(ts);
-        let class = match req.exchange {
-            Exchange::Binance => self.binance.submit(&order, ts).await,
-            Exchange::Bybit => self.bybit.submit(&order, ts).await,
-            Exchange::Okx => match self.okx() {
-                Ok(okx) => okx.submit(&order, ts).await,
-                Err(reason) => not_sent(reason),
-            },
-        };
-        match &class {
-            SubmitClass::RateLimited { retry_after_ms } => self.note_rate_limit(req.exchange, Some(*retry_after_ms)),
-            SubmitClass::Accepted(_) | SubmitClass::Rejected { .. } => self.limiter.on_success(req.exchange, RequestClass::Signed),
-            SubmitClass::Unknown { .. } => {}
-        }
-        class
+        self.dispatch(req.exchange, &order, ts).await
     }
 
     /// Look an order up by `client_order_id` or by the exchange's order id.
