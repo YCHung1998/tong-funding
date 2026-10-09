@@ -130,5 +130,11 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 ## 抗辯修正（enablement 第六輪）
 
 - K1：手動單的期限（`MANUAL_DEADLINE_MS` 20 秒）只涵蓋「尚無答案」的前段：模式 / 槓桿 / 送單（各 ≤ 5 秒，合計 ≤ 15 秒）。送單回 Unknown（或逾時）後的查單在期限之外執行，不被截斷。任務改為自行串起 `land_intent` → `executor.submit`（含期限）→ `record_submit_outcome` →（Unknown 時）`executor.query` → `record_query_outcome`。
-- K2：`ManualSubmitted` 新增 `resolved`：確定結果（Accepted / Rejected）或查單得到 Found / NotFound 並已記錄才為 resolved；Unknown 且查單失敗（或任務遺失）時，該 (交易所, 標的) 的 `manual_inflight` 保留到安全網到期（`MANUAL_DEADLINE_MS + 10 s`）。`ManualDoneGuard` 的說明與 Unknown 原因文字已更正：期內由查單決定，不是「交給對帳」。測試：查單失敗的 Unknown 手動開倉仍擋住進場；查單 NotFound 後放行；查單卡住超過期限時仍擋住且尚未回報。
+- K2：`ManualSubmitted` 新增 `resolved`：確定結果（Accepted / Rejected）或查單得到 Found 並已記錄才為 resolved；Unknown 且查單失敗（或任務遺失）時，該 (交易所, 標的) 的 `manual_inflight` 保留到安全網到期（`MANUAL_DEADLINE_MS + 10 s`）。`ManualDoneGuard` 的說明與 Unknown 原因文字已更正：期內由查單決定，不是「交給對帳」。測試：查單失敗的 Unknown 手動開倉仍擋住進場；（第七輪 L1 更正：NotFound 不是「從未存在」的證明，仍擋住直到安全網到期，只有 Found 放行）；查單卡住超過期限時仍擋住且尚未回報。
 - K3：`abort_stuck_preparing` 的說明與失敗文字改為 `PREPARE_DEADLINE_MS`（30 秒）。已知殘餘風險（既有）：客戶端逾時的 set-leverage，交易所之後仍可能套用（OKX set-leverage 沒有 `expTime`）；槓桿變更不產生曝險，且之後的送單前屏障會再設定一次。另注意兩種時鐘：tick 的期限用引擎注入時鐘，`tokio::time::timeout` 用 tokio 的時鐘，兩者在測試中可分別推進，正式環境同步前進。
+
+## 抗辯修正（enablement 第七輪）
+
+- L1：手動單 Unknown 之後只有查單 **Found 並已記錄**才算 resolved（與 `record_query_outcome` 一致：NotFound 不證明單從未存在）；NotFound 與失敗一樣保留 (交易所, 標的) 的 `manual_inflight` 直到安全網到期。
+- L2：Unknown 之後的查單以 `tokio::time::timeout(5 秒)` 限制，逾時視為未解決（不再讓查單掛住任務）。
+- L3：所有確定結果（含落地失敗的 Rejected）都回報 `resolved = true`，所以事件處理只看 `resolved`。

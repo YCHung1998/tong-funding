@@ -164,6 +164,8 @@ struct FakeDemo {
     hold_query: std::sync::atomic::AtomicBool,
     query_release: tokio::sync::Notify,
     query_fails: std::sync::atomic::AtomicBool,
+    /// `query` finds the order (any id) instead of answering NotFound.
+    query_found: std::sync::atomic::AtomicBool,
 }
 impl Executor for FakeDemo {
     fn prepare_open(&self, legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
@@ -202,6 +204,9 @@ impl Executor for FakeDemo {
             }
             if self.query_fails.load(Ordering::SeqCst) {
                 return QueryOutcome::Failed { reason: "lookup unavailable".into() };
+            }
+            if self.query_found.load(Ordering::SeqCst) {
+                return QueryOutcome::Found(OrderStatus { client_order_id: "x".into(), exchange_order_id: Some("e".into()), filled_quantity: dec("1"), avg_price: None, fee: None, fee_asset: None, state: OrderState::Filled });
             }
             o
         })
@@ -2656,6 +2661,8 @@ async fn a_manual_open_that_exceeds_its_own_deadline_reports_unknown_and_then_re
     run_until(&rig.clock, T - 20_000 + MANUAL_DEADLINE_MS + 1_000).await;
     let results = events(&rig.db).into_iter().filter(|(_, l, _)| l == "MANUAL_ORDER_RESULT").count();
     assert_eq!(results, 1, "the task reported by its deadline: {:?}", labels(&rig.db));
+    // its lookup says NotFound, which is not proof: the guard stays until the safety net
+    run_until(&rig.clock, T - 20_000 + MANUAL_DEADLINE_MS + 11_000).await;
     assert_eq!(ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await, CommandReply::Accepted);
 }
 
@@ -2693,21 +2700,6 @@ fn manual_results(db: &Db) -> usize {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_lookup_after_an_unknown_manual_open_is_not_cut_by_the_pre_send_deadline() {
-    let (rig, h) = unknown_manual_eth_open(true, false).await;
-    run_until(&rig.clock, T - 20_000 + MANUAL_DEADLINE_MS + 5_000).await; // past the deadline, before the safety net
-    assert_eq!(manual_results(&rig.db), 0, "still looking the order up: no result yet");
-    match ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await {
-        CommandReply::Rejected(why) => assert!(why.contains("in flight"), "{why}"),
-        other => panic!("{other:?}"),
-    }
-    rig.demo.hold_query.store(false, Ordering::SeqCst);
-    rig.demo.query_release.notify_waiters();
-    sleep(Duration::from_millis(100)).await;
-    assert_eq!(manual_results(&rig.db), 1, "reported once the lookup finished");
-}
-
-#[tokio::test(start_paused = true)]
 async fn an_unknown_manual_open_keeps_the_symbol_until_a_lookup_resolves_it() {
     let (rig, h) = unknown_manual_eth_open(false, true).await; // the lookup itself fails: still unresolved
     sleep(Duration::from_millis(100)).await;
@@ -2719,9 +2711,42 @@ async fn an_unknown_manual_open_keeps_the_symbol_until_a_lookup_resolves_it() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_resolved_unknown_manual_open_releases_the_symbol() {
-    let (rig, h) = unknown_manual_eth_open(false, false).await; // the lookup answers NotFound / Found: resolved
+async fn only_a_found_order_resolves_an_unknown_manual_open_and_releases_the_symbol() {
+    let (rig, h) = {
+        // the lookup finds the order
+        let (rig, h) = {
+            let (rig, h) = started(Opts { demo: true, trigger: "MANUAL", ..Opts::default() }).await;
+            rig.demo.query_found.store(true, Ordering::SeqCst);
+            (rig, h)
+        };
+        let mut later = pair_at("pair-0002", "ETHUSDT", T + 3_600_000);
+        later.pair_id = "pid-2".into();
+        assert_eq!(ask(&h, Command::AddPrepared(later)).await, CommandReply::Accepted);
+        rig.demo.submit_unknown.store(true, Ordering::SeqCst);
+        let manual = Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side: OrderSide::Sell, quantity: dec("1"), reduce_only: false, leverage: Some(dec("3")), intended_base_qty: None });
+        assert_eq!(ask(&h, manual).await, CommandReply::Accepted);
+        (rig, h)
+    };
     sleep(Duration::from_millis(100)).await;
     assert_eq!(manual_results(&rig.db), 1);
     assert_eq!(ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await, CommandReply::Accepted);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_not_found_lookup_is_not_proof_and_still_holds_the_symbol_until_the_safety_net() {
+    let (rig, h) = unknown_manual_eth_open(false, false).await; // the lookup answers NotFound
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(manual_results(&rig.db), 1);
+    match ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await {
+        CommandReply::Rejected(why) => assert!(why.contains("in flight"), "{why}"),
+        other => panic!("NotFound does not prove the order never existed: {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lookup_that_hangs_is_cut_after_five_seconds_and_counts_as_unresolved() {
+    let (rig, _h) = unknown_manual_eth_open(true, false).await; // the lookup never answers
+    run_until(&rig.clock, T - 20_000 + 8_000).await;
+    assert_eq!(manual_results(&rig.db), 1, "the task reported once the 5 s lookup bound passed");
+    assert!(matches!(ask(&_h, Command::ManualEnter { pair: "pair-0002".into() }).await, CommandReply::Rejected(_)), "a timed-out lookup is unresolved");
 }

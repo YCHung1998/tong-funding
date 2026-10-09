@@ -1779,8 +1779,13 @@ impl Actor {
                         Err(e) => (SubmitOutcome::Unknown { reason: format!("result not recorded: {e:?}") }, false),
                         Ok(_) if !matches!(outcome, SubmitOutcome::Unknown { .. }) => (outcome, true),
                         Ok(_) => {
-                            let q = executor.query(req.exchange, &req.symbol, &req.client_order_id).await;
-                            let settled = matches!(q, QueryOutcome::Found(_) | QueryOutcome::NotFound);
+                            // The lookup is bounded (5 s). Only Found settles an Unknown order: NotFound is not proof it
+                            // never existed (consistent with `record_query_outcome`), a timeout is no answer at all.
+                            let q = match tokio::time::timeout(Duration::from_secs(5), executor.query(req.exchange, &req.symbol, &req.client_order_id)).await {
+                                Ok(q) => q,
+                                Err(_) => QueryOutcome::Failed { reason: "lookup did not answer within 5 s".into() },
+                            };
+                            let settled = matches!(q, QueryOutcome::Found(_));
                             let recorded = intent::record_query_outcome(&db, &req.client_order_id, &q, simulated).is_ok();
                             (outcome, settled && recorded)
                         }
@@ -1955,7 +1960,8 @@ impl Actor {
             }
             Event::Queried { pair: None, .. } => {} // manual orders are not polled
             Event::ManualSubmitted { client_order_id, outcome, resolved } => {
-                if resolved || !matches!(outcome, SubmitOutcome::Unknown { .. }) {
+                // every definite outcome is reported as resolved; only an unsettled Unknown keeps its guard
+                if resolved {
                     self.manual_inflight.remove(&client_order_id);
                 }
                 let mut payload = outcome_json(&outcome);

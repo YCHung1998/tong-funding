@@ -45,3 +45,4 @@
 - [x] 5.7 第四輪 I1–I6：衝突窗口含 PRE_TRADE_CHECK、manual_inflight 衛生、文件更正、校時偏移快照、清理
 - [x] 5.8 第五輪 J1 / J2：手動單任務期限與固定安全網、PRE_TRADE_CHECK 逾時
 - [x] 5.9 第六輪 K1–K3：手動單期限只涵蓋送出前段、Unknown 保留標的直到查單解決、文件更正
+- [x] 5.10 第七輪 L1–L3：只有 Found 解決 Unknown 手動單、查單 5 秒上限
