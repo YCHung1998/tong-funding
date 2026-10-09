@@ -282,8 +282,8 @@ impl<T: OrderTransport> DemoExecutor<T> {
     }
 
     /// A leg the barrier approved with its pair: only what cannot change its meaning is re-checked here
-    /// (the order is valid, the OKX client exists, the exchange clock is calibrated: the engine checked both
-    /// legs' offsets before sending either, the hard stops inside `OkxOrderClient::submit`: latch and demo-key
+    /// (the order is valid, the OKX client exists, the signing time uses the offset the engine snapshotted for
+    /// both legs before sending either, the hard stops inside `OkxOrderClient::submit`: latch and demo-key
     /// proof, and the transport's demo-flag rule). The soft, time-varying checks (mode re-read, back-off, mark
     /// freshness, limits, leverage) were approved together with the other leg; repeating them per leg could
     /// send one leg and refuse the other. ANY non-success here is worded as a possibly naked opposite leg.
@@ -301,9 +301,9 @@ impl<T: OrderTransport> DemoExecutor<T> {
             Ok(o) => o,
             Err(e) => return naked("not_sent".into(), e),
         };
-        let Some(ts) = self.timestamp(req.exchange) else {
-            return naked("not_sent".into(), format!("{} clock offset not calibrated", req.exchange.name()));
-        };
+        // the offset the engine snapshotted for this leg when it released the pair (not re-read per leg)
+        let Some(prepared) = req.prepared else { return naked("not_sent".into(), "prepared leg without its barrier snapshot".into()) };
+        let ts = self.clock.now_ms().saturating_add(prepared.offset_ms);
         match self.dispatch(req.exchange, &order, ts).await {
             SubmitClass::Rejected { code, message } => naked(code, message),
             other => other,
@@ -311,7 +311,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
     }
 
     async fn submit_inner(&self, req: &OrderRequest) -> SubmitClass {
-        if req.prepared && !req.reduce_only {
+        if req.prepared.is_some() && !req.reduce_only {
             return self.submit_prepared(req).await;
         }
         let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };

@@ -456,33 +456,7 @@ impl Db {
 
     /// Persist an `INTENDED` order before it is sent. A reused `client_order_id` is rejected.
     pub fn create_intent(&self, intent: &NewIntent) -> Result<(), StoreError> {
-        self.with_conn(|c| {
-            let now = self.now_ms();
-            let r = c.execute(
-                "INSERT INTO order_intents (client_order_id, pair_uuid, leg, exchange, symbol, side, quantity, state, created_ms, updated_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-                params![
-                    intent.client_order_id,
-                    intent.pair_uuid,
-                    intent.leg,
-                    intent.exchange,
-                    intent.symbol,
-                    intent.side,
-                    intent.quantity,
-                    IntentState::Intended.as_str(),
-                    now
-                ],
-            );
-            match r {
-                Ok(_) => Ok(()),
-                Err(rusqlite::Error::SqliteFailure(f, _))
-                    if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY =>
-                {
-                    Err(StoreError::DuplicateClientOrderId(intent.client_order_id.clone()))
-                }
-                Err(e) => Err(e.into()),
-            }
-        })
+        self.with_conn(|c| insert_intent_row(c, intent, IntentState::Intended, self.now_ms()))
     }
 
     /// Persist several orders as `SUBMITTED` in ONE transaction (both legs of a pair): either every intent
@@ -492,18 +466,7 @@ impl Db {
             let now = self.now_ms();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for intent in intents {
-                let r = tx.execute(
-                    "INSERT INTO order_intents (client_order_id, pair_uuid, leg, exchange, symbol, side, quantity, state, created_ms, updated_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
-                    params![intent.client_order_id, intent.pair_uuid, intent.leg, intent.exchange, intent.symbol, intent.side, intent.quantity, IntentState::Submitted.as_str(), now],
-                );
-                match r {
-                    Ok(_) => {}
-                    Err(rusqlite::Error::SqliteFailure(f, _)) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => {
-                        return Err(StoreError::DuplicateClientOrderId(intent.client_order_id.clone()));
-                    }
-                    Err(e) => return Err(e.into()),
-                }
+                insert_intent_row(&tx, intent, IntentState::Submitted, now)?;
                 let payload = serde_json::json!({
                     "client_order_id": intent.client_order_id,
                     "from": IntentState::Intended.as_str(),
@@ -1523,5 +1486,19 @@ mod tests {
         assert!(db.set_flag_with_event(FLAG_TRIGGER_MODE, "MANUAL", "TRIGGER_MODE_CHANGED", &json!({})).is_err());
         assert!(db.is_halted());
         assert_eq!(plain_flag(&db, FLAG_TRIGGER_MODE), "AUTO", "flag rolls back with the event");
+    }
+}
+
+/// One `order_intents` row in `state`; a reused `client_order_id` is `DuplicateClientOrderId`.
+fn insert_intent_row(c: &rusqlite::Connection, intent: &NewIntent, state: IntentState, now: i64) -> Result<(), StoreError> {
+    let r = c.execute(
+        "INSERT INTO order_intents (client_order_id, pair_uuid, leg, exchange, symbol, side, quantity, state, created_ms, updated_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+        params![intent.client_order_id, intent.pair_uuid, intent.leg, intent.exchange, intent.symbol, intent.side, intent.quantity, state.as_str(), now],
+    );
+    match r {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(f, _)) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY => Err(StoreError::DuplicateClientOrderId(intent.client_order_id.clone())),
+        Err(e) => Err(e.into()),
     }
 }

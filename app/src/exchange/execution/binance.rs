@@ -232,7 +232,7 @@ mod tests {
 
     fn order(reduce_only: bool) -> ValidOrder {
         ValidOrder::from_request(&OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: id(),
             exchange: Exchange::Binance,

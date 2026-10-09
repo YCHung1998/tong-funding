@@ -80,11 +80,19 @@ pub struct OrderRequest {
     /// made (mode re-read, back-off, mark freshness, limits, leverage), so a transient failure between the
     /// barrier and the send cannot send one leg and not the other; only the hard stops (OKX latch, demo-key
     /// proof, the transport's demo-flag rule) remain.
-    pub prepared: bool,
+    pub prepared: Option<Prepared>,
     /// Leverage the exchange account must have on `symbol` before this order is sent. `Some` only
     /// on the opening legs of a pair (both legs carry the entry snapshot's value); close, reduce-only
     /// and manual orders carry `None` and leave the leverage alone.
     pub leverage: Option<Decimal>,
+}
+
+/// The barrier's approval of one opening leg (see `OrderRequest::prepared`): the exchange-time offset the
+/// engine read for this leg's exchange when it released the pair, so that an offset expiring between the two
+/// legs' sends cannot send one leg and refuse the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prepared {
+    pub offset_ms: i64,
 }
 
 /// What the exchange (or the simulation) says about one order.

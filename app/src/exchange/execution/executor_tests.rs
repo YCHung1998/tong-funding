@@ -61,7 +61,7 @@ pub(super) fn demo_id(leg: Leg, action: OrderAction, seq: u16) -> String {
 }
 
 pub(super) fn req(exchange: Exchange, id: &str, side: OrderSide, qty: &str, reduce_only: bool) -> OrderRequest {
-    OrderRequest { prepared: false, notional_usdt: None, client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None, leverage: None }
+    OrderRequest { prepared: None, notional_usdt: None, client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None, leverage: None }
 }
 
 /// An OKX order: contracts `qty`; an opening one intends `qty x 0.01` coins (the test instrument's ctVal).

@@ -111,7 +111,7 @@ mod tests {
 
     fn req(id: &str, qty: &str) -> OrderRequest {
         OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: id.into(),
             exchange: Exchange::Binance,

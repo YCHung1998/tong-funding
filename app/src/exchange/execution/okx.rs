@@ -484,7 +484,7 @@ mod tests {
 
     fn order(side: OrderSide, qty: &str, reduce_only: bool) -> ValidOrder {
         ValidOrder::from_request(&OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: id(),
             exchange: Exchange::Okx,
@@ -582,7 +582,7 @@ mod tests {
     fn a_symbol_that_is_not_base_usdt_is_not_built_into_a_request() {
         let t = FakeOrderTransport::new();
         let c = client(&t);
-        let bad = ValidOrder::from_request(&OrderRequest { prepared: false, notional_usdt: None, client_order_id: id(), exchange: Exchange::Okx, symbol: "BTCUSD".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap();
+        let bad = ValidOrder::from_request(&OrderRequest { prepared: None, notional_usdt: None, client_order_id: id(), exchange: Exchange::Okx, symbol: "BTCUSD".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap();
         assert!(c.submit_request(&bad, TS).is_err());
         assert!(c.query_request("BTCUSD", &OrderRef::Exchange("1".into()), TS).is_err());
     }
@@ -1001,7 +1001,7 @@ mod tests {
         t.on(Method::Post, "/api/v5/trade/order", ok("place_50004"));
         let order_n = |i: usize| {
             let id = client_order_id(IdPrefix::Demo, &format!("p{i}"), Leg::Long, OrderAction::Open, 0);
-            ValidOrder::from_request(&OrderRequest { prepared: false, notional_usdt: None, client_order_id: id, exchange: Exchange::Okx, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap()
+            ValidOrder::from_request(&OrderRequest { prepared: None, notional_usdt: None, client_order_id: id, exchange: Exchange::Okx, symbol: "BTCUSDT".into(), side: OrderSide::Buy, quantity: d("1"), reduce_only: false, intended_base_qty: None, leverage: None }).unwrap()
         };
         // an old unknown submit is dropped once a newer one is recorded 10+ minutes after its expTime
         c.submit(&order_n(0), TS).await;

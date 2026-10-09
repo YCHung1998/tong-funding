@@ -104,9 +104,9 @@ pub fn land_intent(db: &Db, pair_uuid: &str, leg: Leg, req: &OrderRequest) -> Re
 
 /// Land the intents of several orders (a pair's two legs) in ONE transaction, before any of them is sent.
 /// On any error the store is halted and NONE is landed: the caller must send none.
-pub fn land_intents(db: &Db, pair_uuid: &str, legs: &[(Leg, &OrderRequest)]) -> Result<(), IntentError> {
+pub fn land_intents(db: &Db, pair_uuid: &str, legs: &[(Leg, &OrderRequest)]) -> Result<(), StoreError> {
     let rows: Vec<NewIntent> = legs.iter().map(|(leg, req)| new_intent(pair_uuid, *leg, req)).collect();
-    db.create_submitted_intents(&rows).map_err(|e| IntentError::NotLanded(halt_on(db, "order intents (both legs)", e)))
+    db.create_submitted_intents(&rows).map_err(|e| halt_on(db, "order intents (both legs)", e))
 }
 
 /// The intent state an exchange-reported order state settles to.
@@ -230,7 +230,7 @@ mod tests {
 
     fn req(leg: Leg, seq: u16) -> OrderRequest {
         OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: client_order_id(IdPrefix::Sim, PAIR, leg, OrderAction::Open, seq),
             exchange: Exchange::Binance,

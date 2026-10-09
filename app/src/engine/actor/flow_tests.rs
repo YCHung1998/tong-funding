@@ -156,6 +156,9 @@ struct FakeDemo {
     /// While set, `submit` waits for `submit_release` (a manual order "in flight").
     hold_submit: std::sync::atomic::AtomicBool,
     submit_release: tokio::sync::Notify,
+    /// While set, `available_margin` waits for `margin_release` (the pair sits in PRE_TRADE_CHECK).
+    hold_margin: std::sync::atomic::AtomicBool,
+    margin_release: tokio::sync::Notify,
 }
 impl Executor for FakeDemo {
     fn prepare_open(&self, legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
@@ -222,7 +225,12 @@ impl AccountView for DemoAccount {
         Box::pin(std::future::ready(Ok(Listed { items: vec![], complete: true })))
     }
     fn available_margin(&self, _exchange: Exchange) -> BoxFut<'_, Result<Decimal, String>> {
-        Box::pin(std::future::ready(Ok(dec("10000"))))
+        Box::pin(async move {
+            if self.0.hold_margin.load(Ordering::SeqCst) {
+                self.0.margin_release.notified().await;
+            }
+            Ok(dec("10000"))
+        })
     }
     fn max_leverage(&self, exchange: Exchange, _symbol: &str, _notional: Decimal) -> BoxFut<'_, Result<Decimal, String>> {
         let cap = self.0.caps.lock().unwrap().get(&exchange).cloned().unwrap_or_else(|| Ok(dec("125")));
@@ -1038,7 +1046,7 @@ async fn a_manual_order_goes_through_the_simulator_with_an_intent() {
 async fn user_order(rig: &Rig, side: OrderSide, qty: &str, reduce_only: bool) {
     let action = if reduce_only { OrderAction::Close } else { OrderAction::Open };
     let req = OrderRequest {
-        prepared: false,
+        prepared: None,
         notional_usdt: None,
         client_order_id: client_order_id(IdPrefix::Sim, "user-own-position", Leg::Long, action, 0),
         exchange: Exchange::Binance,
@@ -2536,4 +2544,64 @@ async fn a_second_pair_cannot_enter_the_same_exchange_and_symbol_while_one_is_in
         CommandReply::Rejected(why) => assert!(why.contains("in flight") || why.contains("ORDER_SUBMIT"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+// ---- okx-trading-enablement round 4 (I1): the conflict window starts at PRE_TRADE_CHECK ----------------
+
+fn r4_manual_bybit() -> Command {
+    Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: SYM.into(), side: OrderSide::Sell, quantity: dec("1"), reduce_only: false, leverage: Some(dec("3")), intended_base_qty: None })
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_pairs_sharing_an_exchange_and_symbol_started_together_only_one_reaches_the_barrier() {
+    let (rig, h) = started(Opts { demo: true, trigger: "MANUAL", ..Opts::default() }).await; // Binance long / Bybit short
+    rig.demo.hold_margin.store(true, Ordering::SeqCst);
+    assert_eq!(ask(&h, Command::ManualEnter { pair: UUID.into() }).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(status(&rig.db, UUID), "PRE_TRADE_CHECK");
+    let mut second = pair_at("pair-0002", SYM, T);
+    second.pair_id = "pid-2".into();
+    rig.market.rules.lock().unwrap().insert(Exchange::Okx, okx_rules("0.01"));
+    second.short_exchange = Exchange::Okx; // shares Binance BTCUSDT
+    assert_eq!(ask(&h, Command::AddPrepared(second)).await, CommandReply::Accepted);
+    match ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await {
+        CommandReply::Rejected(why) => assert!(why.contains("pair-0001") || why.contains("pid-pair-0001") || why.contains("entering"), "{why}"),
+        other => panic!("a second pair may not start while the first is in PRE_TRADE_CHECK: {other:?}"),
+    }
+    rig.demo.hold_margin.store(false, Ordering::SeqCst);
+    rig.demo.margin_release.notify_waiters();
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(rig.demo.prepares.lock().unwrap().len(), 1, "only the first pair reached the barrier");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_leveraged_open_during_a_pairs_pre_trade_check_is_refused() {
+    let (rig, h) = started(Opts { demo: true, trigger: "MANUAL", ..Opts::default() }).await;
+    rig.demo.hold_margin.store(true, Ordering::SeqCst);
+    assert_eq!(ask(&h, Command::ManualEnter { pair: UUID.into() }).await, CommandReply::Accepted);
+    sleep(Duration::from_millis(20)).await;
+    assert_eq!(status(&rig.db, UUID), "PRE_TRADE_CHECK");
+    match ask(&h, r4_manual_bybit()).await {
+        CommandReply::Rejected(why) => assert!(why.contains("entering"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    rig.demo.hold_margin.store(false, Ordering::SeqCst);
+    rig.demo.margin_release.notify_waiters();
+    sleep(Duration::from_millis(100)).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_open_that_never_reports_back_stops_holding_entries_after_twice_the_order_timeout() {
+    let (rig, h) = started(Opts { demo: true, trigger: "MANUAL", ..Opts::default() }).await;
+    let mut later = pair_at("pair-0002", "ETHUSDT", T + 3_600_000);
+    later.pair_id = "pid-2".into();
+    assert_eq!(ask(&h, Command::AddPrepared(later)).await, CommandReply::Accepted);
+    rig.demo.hold_submit.store(true, Ordering::SeqCst); // the manual order never answers
+    assert_eq!(
+        ask(&h, Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side: OrderSide::Sell, quantity: dec("1"), reduce_only: false, leverage: Some(dec("3")), intended_base_qty: None })).await,
+        CommandReply::Accepted
+    );
+    sleep(Duration::from_millis(20)).await;
+    run_until(&rig.clock, T - 20_000 + 31_000).await; // order_timeout_seconds 15 x 2
+    assert_eq!(ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await, CommandReply::Accepted, "the lost manual order no longer holds the entry");
 }

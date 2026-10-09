@@ -370,7 +370,7 @@ async fn a_set_leverage_reply_must_echo_the_requested_lever_and_cross_margin() {
 
 fn prepared(mut legs: Vec<OrderRequest>) -> Vec<OrderRequest> {
     for l in &mut legs {
-        l.prepared = true; // what the engine does on `OpenPrepared` Ok
+        l.prepared = Some(crate::engine::ports::Prepared { offset_ms: 0 }); // what the engine does on `OpenPrepared` Ok
     }
     legs
 }
@@ -483,15 +483,17 @@ async fn any_non_success_of_a_prepared_leg_is_worded_as_a_possibly_naked_opposit
 }
 
 #[tokio::test]
-async fn a_prepared_leg_without_a_calibrated_clock_is_not_sent_with_a_local_time_fallback() {
-    let r = super::executor_tests::rig_custom(None, Some(super::executor_tests::btc_limits()));
-    script_okx_mode(&r.t);
+async fn a_prepared_leg_is_signed_with_the_offset_the_engine_snapshotted_not_one_read_per_leg() {
+    let r = rig(); // the executor's own offset source says 0
+    script_both_ok(&r);
     let mut legs = prepared(pair_legs("5"));
-    legs.remove(0); // only the OKX leg
-    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
-    match r.ex.submit_classified(&legs[0]).await {
-        SubmitClass::Rejected { code, message } => assert!(code == "not_sent" && message.contains("not calibrated"), "{message}"),
-        other => panic!("{other:?}"),
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    for l in &mut legs {
+        l.prepared = Some(crate::engine::ports::Prepared { offset_ms: 5_000 }); // what the engine snapshotted
     }
-    assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0);
+    let (b, o) = send_both(&r, &legs).await;
+    assert!(both_sent(&b, &o), "{b:?} / {o:?}");
+    let order = r.t.requests().into_iter().find(|q| q.full_url().contains(OKX_ORDER_PATH) && q.method() == Method::Post).unwrap();
+    let ts = order.headers().iter().find(|(n, _)| n.eq_ignore_ascii_case("OK-ACCESS-TIMESTAMP")).map(|(_, v)| v.clone()).unwrap();
+    assert_eq!(ts, crate::exchange::signed::signing::okx_timestamp(crate::ports::Clock::now_ms(&r.clock) + 5_000).unwrap(), "signed with the carried offset");
 }

@@ -57,7 +57,7 @@ use super::gate::{self, ModeSwitch};
 use super::ids::{self, IdPrefix, client_order_id};
 use super::intent::{self, IntentError};
 use super::node0::{self, EntrySnapshot, Node0Context, Node0Leg, Node0Verdict};
-use super::ports::{
+use super::ports::{Prepared,
     AccountView, Executor, ExecutorFactory, FreshQuote, Leg, MarketData, OrderAction, OrderRequest, OrderRules, OrderSide,
     OrderState, OrderStatus, QueryOutcome, ReconcileContext, ServerOffsets, StartupReconciler, SubmitOutcome,
 };
@@ -357,6 +357,22 @@ struct EntryContext {
 
 type QuotePair = (Result<FreshQuote, String>, Result<FreshQuote, String>);
 
+/// Reports a manual order whose task ended without an answer (a panic), so its in-flight entry is cleared.
+/// Unknown outcomes clear the entry too: what may exist on the exchange is left to the lookup / reconciliation
+/// (a pending reconciliation already blocks every entry).
+struct ManualDoneGuard {
+    tx: mpsc::Sender<Event>,
+    id: Option<String>,
+}
+
+impl Drop for ManualDoneGuard {
+    fn drop(&mut self) {
+        if let Some(client_order_id) = self.id.take() {
+            let _ = self.tx.try_send(Event::ManualSubmitted { client_order_id, outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() } });
+        }
+    }
+}
+
 /// How long the executor's pre-send barrier may take before the pair is aborted ("nothing sent"). It is
 /// independent of the fill timeout: per leg it may need a mode read and a set-leverage (each bounded by the
 /// 5 s order-request timeout), for two legs, plus margin.
@@ -434,7 +450,7 @@ struct Actor {
     manual_seq: u64,
     /// Manual OPENING orders with a leverage that are in flight, by `client_order_id` (a pair must not
     /// enter the same exchange and symbol meanwhile: its leverage could change under it).
-    manual_inflight: BTreeMap<String, (Exchange, String)>,
+    manual_inflight: BTreeMap<String, (Exchange, String, i64)>,
     /// Set at startup while unfinished intents / in-flight pairs await reconciliation; refuses
     /// exposure meanwhile (in EXCHANGE_DEMO only, decision 8; always shown in the Snapshot).
     reconciliation_pending: Option<String>,
@@ -757,6 +773,10 @@ impl Actor {
 
     fn on_tick(&mut self) -> CommandReply {
         let now = self.clock.now_ms();
+        // a manual open that never reported back (a lost task) must not hold entries forever: after twice the
+        // order timeout it is dropped (reconciliation-pending already blocks entries after a crash)
+        let max_age = i64::from(load_risk_config(&self.db).map_or(RiskConfig::default().order_timeout_seconds, |(r, _)| r.order_timeout_seconds)) * 2_000;
+        self.manual_inflight.retain(|_, (_, _, since)| now.saturating_sub(*since) < max_age);
         self.maybe_retry_reconciliation(now);
         let ids: Vec<PairUuid> = self.pairs.keys().cloned().collect();
         for id in ids {
@@ -1093,18 +1113,27 @@ impl Actor {
         }
     }
 
-    /// What keeps this pair from entering now: a manual opening order (with a leverage) in flight on either leg's
-    /// exchange and symbol, or another pair of the same exchange and symbol that is already in ORDER_SUBMIT. Both
-    /// could change the leverage the pair is approved with, or double the exposure, in the window.
+    /// A pair of `symbol` that is entering (PRE_TRADE_CHECK or ORDER_SUBMIT) on one of `exchanges`, other
+    /// than `except`. While one is, no other entry and no manual leveraged open may touch that exchange and
+    /// symbol: a leverage could change under the approved pair, or the exposure could double.
+    fn entering_pair(&self, symbol: &str, exchanges: &[Exchange], except: Option<&str>) -> Option<&PairView> {
+        self.pairs.values().find(|p| {
+            Some(p.internal_uuid.as_str()) != except
+                && matches!(p.state, PairState::PreTradeCheck | PairState::OrderSubmit)
+                && p.symbol == symbol
+                && (exchanges.contains(&p.long_exchange) || exchanges.contains(&p.short_exchange))
+        })
+    }
+
+    /// What keeps this pair from entering now: a manual opening order (with a leverage) in flight on either
+    /// leg's exchange and symbol, or another pair entering the same symbol on a shared exchange.
     fn entry_conflict(&self, view: &PairView) -> Option<String> {
         let legs = [view.long_exchange, view.short_exchange];
-        if let Some((ex, _)) = self.manual_inflight.values().find(|(ex, sym)| *sym == view.symbol && legs.contains(ex)) {
+        if let Some((ex, _, _)) = self.manual_inflight.values().find(|(ex, sym, _)| *sym == view.symbol && legs.contains(ex)) {
             return Some(format!("a manual opening order on {} {} is in flight: wait for it before entering", ex.name(), view.symbol));
         }
-        self.pairs
-            .values()
-            .find(|p| p.internal_uuid != view.internal_uuid && p.state == PairState::OrderSubmit && p.symbol == view.symbol && (legs.contains(&p.long_exchange) || legs.contains(&p.short_exchange)))
-            .map(|p| format!("pair {} is entering {} (ORDER_SUBMIT, orders in flight) on a shared exchange: wait for it", p.pair_id, view.symbol))
+        self.entering_pair(&view.symbol, &legs, Some(&view.internal_uuid))
+            .map(|p| format!("pair {} is entering {} (orders being checked or in flight) on a shared exchange: wait for it", p.pair_id, view.symbol))
     }
 
     /// Right before the legs are sent: no blocker refuses exposure and the entry window is still open.
@@ -1117,7 +1146,10 @@ impl Actor {
         match self.reading(&view, self.clock.now_ms()).exchange_now_range() {
             None => Err("serverTime offset unavailable: no entry (fail closed)".into()),
             Some((_, latest)) if latest >= view.settlement_ms => Err("entry window closed: settlement time reached".into()),
-            Some(_) => Ok(()),
+            Some(_) => match self.entry_conflict(&view) {
+                Some(why) => Err(why),
+                None => Ok(()),
+            },
         }
     }
 
@@ -1176,7 +1208,7 @@ impl Actor {
             [(Leg::Long, long, view.long_exchange, long_rules), (Leg::Short, short, view.short_exchange, short_rules)]
         {
             let req = OrderRequest {
-                prepared: false,
+                prepared: None,
                 client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Open),
                 exchange,
                 symbol: view.symbol.clone(),
@@ -1200,6 +1232,10 @@ impl Actor {
         let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs, cancel_started: false };
         // Nothing is sent before the executor has checked BOTH legs and set the leverage on BOTH.
         let reqs: Vec<OrderRequest> = Leg::BOTH.into_iter().filter_map(|l| set.legs[idx(l)].as_ref().map(|o| o.req.clone())).collect();
+        if let Some(why) = self.entry_conflict(view) {
+            let _ = self.land(pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": [why] }));
+            return;
+        }
         self.flows.entry(pair.to_string()).or_default().preparing = Some(set);
         let (executor, tx, pair) = (self.executor.clone(), self.event_tx.clone(), pair.to_string());
         tokio::spawn(async move {
@@ -1232,10 +1268,9 @@ impl Actor {
                     self.spawn_submit_inner(pair.to_string(), leg, action, req, triggered, true);
                 }
             }
-            Err(e) => {
-                let why = match e {
-                    IntentError::NotLanded(e) | IntentError::ResultNotRecorded(e) => e.to_string(),
-                };
+            Err(why) => {
+                // the store is halted by now (fail safe, including a duplicate id): the pair stays ORDER_SUBMIT with
+                // nothing sent, and recovery resolves it after a restart
                 for (leg, req) in reqs {
                     let (tx, pair) = (self.event_tx.clone(), pair.to_string());
                     let outcome = SubmitOutcome::Rejected { reason: format!("not sent: order intents not landed ({why}); neither leg was sent") };
@@ -1565,7 +1600,7 @@ impl Actor {
                 continue;
             }
             let req = OrderRequest {
-                prepared: false,
+                prepared: None,
                 notional_usdt: None,
                 client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Close),
                 exchange,
@@ -1671,14 +1706,12 @@ impl Actor {
         if leverage.is_some_and(|l| l <= Decimal::ZERO) {
             return CommandReply::Rejected("leverage must be > 0".into());
         }
-        // G5: while a pair's opening legs are being prepared / sent, a manual OPEN on the same exchange and symbol
-        // could change the leverage the pair was approved with. Closes are never held back.
+        // While a pair is entering this exchange and symbol (checks or orders in flight), a manual OPEN could change
+        // the leverage the pair was approved with. Closes are never held back.
         if !o.reduce_only
-            && let Some(p) = self.pairs.values().find(|p| {
-                p.state == PairState::OrderSubmit && p.symbol == o.symbol && (p.long_exchange == o.exchange || p.short_exchange == o.exchange)
-            })
+            && let Some(p) = self.entering_pair(&o.symbol, &[o.exchange], None)
         {
-            return CommandReply::Rejected(format!("pair {} is entering {} on {} (orders in flight): no manual opening order on it now", p.pair_id, o.symbol, o.exchange.name()));
+            return CommandReply::Rejected(format!("pair {} is entering {} on {} (orders being checked or in flight): no manual opening order on it now", p.pair_id, o.symbol, o.exchange.name()));
         }
         let prefix = self.id_prefix();
         let leg = match o.side {
@@ -1697,9 +1730,11 @@ impl Actor {
                 Err(e) => return CommandReply::Rejected(format!("cannot check order id: {e}")),
             }
         };
-        let (o_reduce_only, o_has_leverage, o_exchange, o_symbol) = (o.reduce_only, leverage.is_some(), o.exchange, o.symbol.clone());
+        if !o.reduce_only && leverage.is_some() {
+            self.manual_inflight.insert(id.clone(), (o.exchange, o.symbol.clone(), now));
+        }
         let req = OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: id.clone(),
             exchange: o.exchange,
@@ -1711,16 +1746,16 @@ impl Actor {
             intended_base_qty: if o.reduce_only { None } else { o.intended_base_qty },
             leverage,
         };
-        if !o_reduce_only && o_has_leverage {
-            self.manual_inflight.insert(id.clone(), (o_exchange, o_symbol));
-        }
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
         tokio::spawn(async move {
+            // if this task ends without reporting (a panic), the guard still tells the actor
+            let mut guard = ManualDoneGuard { tx: tx.clone(), id: Some(id.clone()) };
             let outcome = match intent::submit_with_intent(&db, executor.as_ref(), &key, leg, req).await {
                 Ok(report) => report.outcome,
                 Err(IntentError::NotLanded(e)) => SubmitOutcome::Rejected { reason: format!("not sent: {e}") },
                 Err(IntentError::ResultNotRecorded(e)) => SubmitOutcome::Unknown { reason: format!("result not recorded: {e}") },
             };
+            guard.id = None;
             let _ = tx.send(Event::ManualSubmitted { client_order_id: id, outcome }).await;
         });
         CommandReply::Accepted
@@ -1816,8 +1851,13 @@ impl Actor {
                 match result {
                     Ok(()) => {
                         set.sent_at_ms = self.clock.now_ms();
+                        // one snapshot of each leg's clock offset, taken now and carried on the request
                         for o in set.legs.iter_mut().flatten() {
-                            o.req.prepared = true;
+                            let Some(offset_ms) = self.offsets.offset_ms(o.req.exchange) else {
+                                let _ = self.land(&pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": [format!("{} serverTime offset unavailable", o.req.exchange.name())] }));
+                                return;
+                            };
+                            o.req.prepared = Some(Prepared { offset_ms });
                         }
                         self.send_set(&pair, OrderAction::Open, set);
                     }
@@ -2987,7 +3027,7 @@ mod tests {
         let (rig, deps) = rig();
         let (actor, h) = Actor::new(deps);
         let req = OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: "sim-hang".into(),
             exchange: Exchange::Binance,
@@ -3067,7 +3107,7 @@ mod tests {
         let (actor, _h) = Actor::new(deps);
         let id = |leg| client_order_id(IdPrefix::Demo, "pair-lat", leg, OrderAction::Open, 0);
         let req = |leg, exchange, side| OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: id(leg),
             exchange,

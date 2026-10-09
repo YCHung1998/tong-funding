@@ -136,7 +136,7 @@ mod tests {
 
     fn order() -> OrderRequest {
         OrderRequest {
-            prepared: false,
+            prepared: None,
             notional_usdt: None,
             client_order_id: "sim-x".into(),
             exchange: Exchange::Binance,
