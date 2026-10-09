@@ -75,6 +75,12 @@ pub struct OrderRequest {
     /// `None` on closes and manual orders. OKX's size guard derives the leg cap from it (a later change
     /// of the contract template must not strand a staged pair).
     pub notional_usdt: Option<Decimal>,
+    /// Set by the engine once the executor's pre-send barrier approved this leg together with its pair
+    /// (`Executor::prepare_open`). A prepared leg skips the soft, time-varying checks the barrier already
+    /// made (mode re-read, back-off, mark freshness, limits, leverage), so a transient failure between the
+    /// barrier and the send cannot send one leg and not the other; only the hard stops (OKX latch, demo-key
+    /// proof, the transport's demo-flag rule) remain.
+    pub prepared: bool,
     /// Leverage the exchange account must have on `symbol` before this order is sent. `Some` only
     /// on the opening legs of a pair (both legs carry the entry snapshot's value); close, reduce-only
     /// and manual orders carry `None` and leave the leverage alone.

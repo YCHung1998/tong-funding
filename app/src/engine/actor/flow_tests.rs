@@ -150,12 +150,20 @@ struct FakeDemo {
     /// The legs given to each `prepare_open`, and a scripted refusal (okx-trading-enablement F1 / F2).
     prepares: Mutex<Vec<Vec<OrderRequest>>>,
     prepare_error: Mutex<Option<String>>,
+    /// While set, `prepare_open` waits for `release` (the barrier is "in flight").
+    hold: std::sync::atomic::AtomicBool,
+    release: tokio::sync::Notify,
 }
 impl Executor for FakeDemo {
     fn prepare_open(&self, legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
         self.prepares.lock().unwrap().push(legs);
         let r = self.prepare_error.lock().unwrap().clone().map_or(Ok(()), Err);
-        Box::pin(std::future::ready(r))
+        Box::pin(async move {
+            if self.hold.load(Ordering::SeqCst) {
+                self.release.notified().await;
+            }
+            r
+        })
     }
     fn is_simulated(&self) -> bool {
         false
@@ -1017,6 +1025,7 @@ async fn a_manual_order_goes_through_the_simulator_with_an_intent() {
 async fn user_order(rig: &Rig, side: OrderSide, qty: &str, reduce_only: bool) {
     let action = if reduce_only { OrderAction::Close } else { OrderAction::Open };
     let req = OrderRequest {
+        prepared: false,
         notional_usdt: None,
         client_order_id: client_order_id(IdPrefix::Sim, "user-own-position", Leg::Long, action, 0),
         exchange: Exchange::Binance,
@@ -2371,4 +2380,99 @@ async fn a_refused_preparation_sends_no_leg_at_all_and_cancels_the_pair_with_the
     assert!(rig.demo.requests.lock().unwrap().is_empty(), "neither leg may be sent");
     let ev = events(&rig.db).into_iter().find(|(_, l, _)| l == "CANCELLED").unwrap().2;
     assert!(ev.to_string().contains("nothing sent") && ev.to_string().contains("OKX leverage 5x not set"), "{ev}");
+}
+
+// ---- okx-trading-enablement round 2 (G3 / G4 / G5): the window while the barrier is in flight -------
+
+async fn held_pair() -> (Rig, EngineHandle) {
+    let (rig, h) = okx_pair_demo(Some(Ok(dec("20")))).await;
+    rig.demo.hold.store(true, Ordering::SeqCst);
+    (rig, h)
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_kill_switch_pressed_while_the_barrier_is_in_flight_sends_nothing() {
+    let (rig, _h) = held_pair().await;
+    run_until(&rig.clock, T - 9_500).await;
+    assert_eq!(status(&rig.db, UUID), "ORDER_SUBMIT", "{:?}", labels(&rig.db));
+    rig.db.set_kill_switch(true).unwrap();
+    rig.demo.release.notify_one();
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(status(&rig.db, UUID), "CANCELLED", "{:?}", labels(&rig.db));
+    assert!(rig.demo.requests.lock().unwrap().is_empty());
+    let ev = events(&rig.db).into_iter().find(|(_, l, _)| l == "CANCELLED").unwrap().2;
+    assert!(ev.to_string().contains("nothing sent") && ev.to_string().to_lowercase().contains("kill"), "{ev}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_barrier_that_finishes_after_settlement_sends_nothing() {
+    let (rig, _h) = held_pair().await;
+    run_until(&rig.clock, T - 9_500).await;
+    rig.demo.hold.store(false, Ordering::SeqCst);
+    rig.clock.advance(20_000); // now past the settlement time
+    rig.demo.release.notify_one();
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(status(&rig.db, UUID), "CANCELLED", "{:?}", labels(&rig.db));
+    assert!(rig.demo.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_barrier_stuck_longer_than_the_order_timeout_is_aborted_by_the_tick_with_a_reason() {
+    let (rig, _h) = held_pair().await;
+    run_until(&rig.clock, T - 9_500 + 16_000).await; // order_timeout_seconds is 15
+    assert_eq!(status(&rig.db, UUID), "CANCELLED", "{:?}", labels(&rig.db));
+    let ev = events(&rig.db).into_iter().find(|(_, l, _)| l == "CANCELLED").unwrap().2;
+    assert!(ev.to_string().contains("nothing sent") && ev.to_string().contains("pre-send barrier timed out"), "{ev}");
+    // a barrier answering later changes nothing
+    rig.demo.release.notify_one();
+    sleep(Duration::from_millis(50)).await;
+    assert!(rig.demo.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_opening_order_on_an_in_flight_pairs_exchange_and_symbol_is_refused() {
+    let (rig, h) = held_pair().await;
+    run_until(&rig.clock, T - 9_500).await;
+    assert_eq!(status(&rig.db, UUID), "ORDER_SUBMIT");
+    let manual = |exchange: Exchange, symbol: &str, reduce_only: bool| {
+        Command::ManualOrder(crate::engine::command::ManualOrder {
+            exchange,
+            symbol: symbol.into(),
+            side: OrderSide::Sell,
+            quantity: dec("1"),
+            reduce_only,
+            leverage: if reduce_only { None } else { Some(dec("3")) },
+            intended_base_qty: None,
+        })
+    };
+    match ask(&h, manual(Exchange::Okx, SYM, false)).await {
+        CommandReply::Rejected(why) => assert!(why.contains("in flight") && why.contains("OKX"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(ask(&h, manual(Exchange::Bybit, SYM, false)).await, CommandReply::Accepted), "an exchange the pair does not use");
+    assert!(matches!(ask(&h, manual(Exchange::Okx, "ETHUSDT", false)).await, CommandReply::Accepted), "another symbol");
+    assert!(matches!(ask(&h, manual(Exchange::Okx, SYM, true)).await, CommandReply::Accepted), "a close is never held back");
+}
+
+// ---- okx-trading-enablement round 2 (G2): a hook to run a REAL executor through the engine -----------
+
+/// What a test outside the engine needs to build an executor on the engine's store and clock.
+pub(crate) struct EngineParts {
+    pub db: Db,
+    pub clock: ManualClock,
+    pub offsets: Arc<dyn ServerOffsets>,
+}
+
+/// Runs a Binance long / OKX short pair (1000 USDT, 5x, price 100, OKX ctVal 0.01) in EXCHANGE_DEMO with the
+/// executor `make` builds, up to just before the entry window ends. Returns the engine's database.
+pub(crate) async fn run_okx_pair_with(make: impl FnOnce(EngineParts) -> Arc<dyn Executor>) -> Db {
+    let (rig, mut deps) = rig(Opts { trigger: "AUTO", demo: true, ..Opts::default() });
+    rig.market.rules.lock().unwrap().insert(Exchange::Okx, okx_rules("0.01"));
+    deps.factory = Arc::new(CountingFactory::returning(make(EngineParts { db: rig.db.clone(), clock: rig.clock.clone(), offsets: rig.offsets.clone() })));
+    let h = start(deps);
+    let mut p = pair_at(UUID, SYM, T);
+    p.short_exchange = Exchange::Okx;
+    assert_eq!(ask(&h, Command::AddPrepared(p)).await, CommandReply::Accepted);
+    run_until(&rig.clock, T - 9_000).await;
+    rig.db.clone()
 }

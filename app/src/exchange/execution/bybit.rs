@@ -219,6 +219,7 @@ mod tests {
 
     fn order(side: OrderSide, reduce_only: bool) -> ValidOrder {
         ValidOrder::from_request(&OrderRequest {
+            prepared: false,
             notional_usdt: None,
             client_order_id: id(),
             exchange: Exchange::Bybit,

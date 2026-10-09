@@ -412,6 +412,7 @@ mod tests {
 
     fn req(id: &str, exchange: Exchange, side: OrderSide, qty: &str) -> OrderRequest {
         OrderRequest {
+            prepared: false,
             notional_usdt: None,
             client_order_id: id.to_string(),
             exchange,

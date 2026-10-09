@@ -71,7 +71,7 @@ use crate::store::events::EventStore;
 use crate::store::state::{AddPairOutcome, ConfigChange, FLAG_EXECUTION_MODE, IntentState, NewPair};
 
 #[cfg(test)]
-mod flow_tests;
+pub(crate) mod flow_tests;
 mod pnl_gate;
 
 /// Command queue bound: a UI that floods commands waits (backpressure) instead of growing memory.
@@ -735,6 +735,17 @@ impl Actor {
 
     // ---- scheduler ----
 
+    /// A pair whose pre-send barrier has not answered within the order timeout is aborted: nothing was sent.
+    /// Returns whether it was handled here (still waiting counts as handled: there are no orders to check yet).
+    fn abort_stuck_preparing(&mut self, pair: &str, now: i64) -> bool {
+        let Some(set) = self.flows.get(pair).and_then(|f| f.preparing.as_ref()) else { return false };
+        if set.timed_out(now) {
+            self.flows.entry(pair.to_string()).or_default().preparing = None;
+            let _ = self.land(pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": ["pre-send barrier timed out (the executor did not answer within the order timeout)"] }));
+        }
+        true
+    }
+
     fn on_tick(&mut self) -> CommandReply {
         let now = self.clock.now_ms();
         self.maybe_retry_reconciliation(now);
@@ -745,6 +756,7 @@ impl Actor {
             match view.state {
                 PairState::Prepared => self.tick_prepared(&view, now),
                 PairState::Reconciled if !orphan => self.tick_reconciled(&view, now),
+                PairState::OrderSubmit if !orphan && self.abort_stuck_preparing(&id, now) => {}
                 PairState::OrderSubmit if !orphan => self.check_submitted(&id, now),
                 PairState::FillMonitor if !orphan => {
                     self.poll(&id, OrderAction::Open);
@@ -1069,6 +1081,20 @@ impl Actor {
         }
     }
 
+    /// Right before the legs are sent: no blocker refuses exposure and the entry window is still open.
+    fn entry_still_allowed(&self, pair: &str) -> Result<(), String> {
+        let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
+        if let Some(b) = gate::refusing(&blockers, self.execution_mode).first() {
+            return Err(format!("refused while the pre-send barrier ran: {b:?}"));
+        }
+        let Some(view) = self.pairs.get(pair).cloned() else { return Err("pair vanished".into()) };
+        match self.reading(&view, self.clock.now_ms()).exchange_now_range() {
+            None => Err("serverTime offset unavailable: no entry (fail closed)".into()),
+            Some((_, latest)) if latest >= view.settlement_ms => Err("entry window closed: settlement time reached".into()),
+            Some(_) => Ok(()),
+        }
+    }
+
     /// Node 1 + the two intent-first submits. Any sizing failure sends nothing (wave-1 decision).
     fn submit_entry(
         &mut self,
@@ -1124,6 +1150,7 @@ impl Actor {
             [(Leg::Long, long, view.long_exchange, long_rules), (Leg::Short, short, view.short_exchange, short_rules)]
         {
             let req = OrderRequest {
+                prepared: false,
                 client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Open),
                 exchange,
                 symbol: view.symbol.clone(),
@@ -1492,6 +1519,7 @@ impl Actor {
                 continue;
             }
             let req = OrderRequest {
+                prepared: false,
                 notional_usdt: None,
                 client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Close),
                 exchange,
@@ -1597,6 +1625,15 @@ impl Actor {
         if leverage.is_some_and(|l| l <= Decimal::ZERO) {
             return CommandReply::Rejected("leverage must be > 0".into());
         }
+        // G5: while a pair's opening legs are being prepared / sent, a manual OPEN on the same exchange and symbol
+        // could change the leverage the pair was approved with. Closes are never held back.
+        if !o.reduce_only
+            && let Some(p) = self.pairs.values().find(|p| {
+                p.state == PairState::OrderSubmit && p.symbol == o.symbol && (p.long_exchange == o.exchange || p.short_exchange == o.exchange)
+            })
+        {
+            return CommandReply::Rejected(format!("pair {} is entering {} on {} (orders in flight): no manual opening order on it now", p.pair_id, o.symbol, o.exchange.name()));
+        }
         let prefix = self.id_prefix();
         let leg = match o.side {
             OrderSide::Buy => Leg::Long,
@@ -1615,6 +1652,7 @@ impl Actor {
             }
         };
         let req = OrderRequest {
+            prepared: false,
             notional_usdt: None,
             client_order_id: id.clone(),
             exchange: o.exchange,
@@ -1722,9 +1760,15 @@ impl Actor {
                 if self.pairs.get(&pair).map(|v| v.state) != Some(PairState::OrderSubmit) {
                     return;
                 }
+                // The window moved while the barrier ran: the kill switch / a halted store, and the entry
+                // window, are checked again before anything is sent.
+                let result = result.and_then(|()| self.entry_still_allowed(&pair));
                 match result {
                     Ok(()) => {
                         set.sent_at_ms = self.clock.now_ms();
+                        for o in set.legs.iter_mut().flatten() {
+                            o.req.prepared = true;
+                        }
                         self.send_set(&pair, OrderAction::Open, set);
                     }
                     Err(why) => {
@@ -2883,6 +2927,7 @@ mod tests {
         let (rig, deps) = rig();
         let (actor, h) = Actor::new(deps);
         let req = OrderRequest {
+            prepared: false,
             notional_usdt: None,
             client_order_id: "sim-hang".into(),
             exchange: Exchange::Binance,
@@ -2962,6 +3007,7 @@ mod tests {
         let (actor, _h) = Actor::new(deps);
         let id = |leg| client_order_id(IdPrefix::Demo, "pair-lat", leg, OrderAction::Open, 0);
         let req = |leg, exchange, side| OrderRequest {
+            prepared: false,
             notional_usdt: None,
             client_order_id: id(leg),
             exchange,

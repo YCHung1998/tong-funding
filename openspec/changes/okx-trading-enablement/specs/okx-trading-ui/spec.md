@@ -97,3 +97,13 @@ OKX 開倉單帶 `leverage` 時，executor SHALL 在帳戶模式讀取（示範�
 
 - **WHEN** 配對加入後合約範本 notional 被調低
 - **THEN** OKX 腿的上限仍依該配對自己的 notional，配對不因此被擋
+
+#### Scenario: 屏障通過後的暫時性失敗
+
+- **WHEN** 兩腿通過送前屏障後，OKX 模式快取過期且重讀失敗（或 back-off 開始、limits 消失）
+- **THEN** 兩腿仍都送出（已核准的腿不再重做軟性檢查）；僅閂鎖與示範金鑰證明這類硬性停止仍可擋下，並在原因中點名對側可能為裸腿
+
+#### Scenario: 屏障進行中的視窗
+
+- **WHEN** 屏障進行中 kill switch 被按下、進場視窗結束、或屏障逾時
+- **THEN** 不送任何一腿，配對以 nothing sent 取消；同交易所同標的的手動開倉單在此期間被拒絕

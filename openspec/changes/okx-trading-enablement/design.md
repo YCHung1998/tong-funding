@@ -93,3 +93,13 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 - F6：掃幣頁每列依自己的配對設定判斷；缺 OKX 手續費只讓含 OKX 的列顯示「未設定」，Binance–Bybit 列不受影響（全域 `decidable` 旗標與排序仍以全部配對為準，行為不變）。
 - F7：OKX 帳戶不顯示合約權益列（與 live 一致，避免與錢包資產重複計入）；測試固定值已對齊。
 - 簡化（無行為變更）：`UiSnapshot::okx_ct_val`、`PositionRow` 去掉重複欄位、刪除未使用的 `close_prefill(&AccountPosition)`、`OkxOrderClient::order_gate`、`okx_account_data` 接收 `incomplete`、帳戶輪詢沿用市場迴圈的 limits 表、`TRADABLE/ACCOUNT_EXCHANGES = Exchange::ALL`。
+
+## 抗辯修正（enablement 第二輪）
+
+- G1：被屏障核准的腿以 `OrderRequest.prepared = true` 標記（引擎在 `OpenPrepared` Ok 時設定；取代 executor 內共享的 `prepared` 集合，沒有可洩漏的共享可變狀態）。已核准的腿送單時**略過**會隨時間改變的軟性檢查：模式重讀 / TTL、back-off、標記價新鮮度、limits / 範本上限、槓桿；只保留硬性停止：OKX 閂鎖、示範金鑰證明、傳輸層的示範旗標規則（無條件）。這修掉「屏障通過後模式快取過期且重讀 503，Binance 已成交而 OKX 不送」的裸腿重現。唯一接受的殘餘風險：屏障與送單之間閂鎖跳脫（代表環境不符，OKX 本來就會拒絕）；此時該腿以 `not_sent` 回覆，原因明說「屏障已通過，對側腿可能已送出且為裸腿」，引擎將該配對落入 PARTIAL_FAILURE，既有的人工處理警示會點名它。
+- G2：回歸測試涵蓋模式 TTL 過期 + 503、屏障後開始 back-off、limits 消失（標記價過期 / 範本不可讀）皆兩腿都送出；閂鎖殘餘有文字測試；另有以真實 `DemoExecutor`（假傳輸）經真實引擎跑完屏障 + 送單的流程測試（`exchange/execution/engine_flow_tests.rs`，引擎目錄不得出現網路層名稱，故測試放在 exchange 側）。
+- G3：`OpenPrepared` Ok 時再檢查 kill switch / 停機 / 對帳未完成與進場視窗，失敗即 `nothing sent`。
+- G4：`on_tick` 對卡在屏障超過 `order_timeout_seconds` 的配對以「pre-send barrier timed out」取消（nothing sent）；之後才回來的屏障結果被忽略。
+- G5：配對處於 ORDER_SUBMIT（含屏障）時，引擎拒絕同交易所同標的的手動**開倉**單（避免手動 set-leverage 改掉配對核准的槓桿）；平倉永不被擋。
+- G6：set-leverage 回覆必須帶 `instId` 且吻合（OKX 文件的回覆資料含 `instId`、`lever`、`mgnMode`、`posSide`；仍屬依文件、未實機驗證，列入 4.2）。
+- G7：`demo_keys` 在 `allowed_exchanges` 改變時於下一個 2 秒的設定讀取就重算（`DemoKeysCadence`），其餘維持每 15 次的慢節奏。

@@ -2,6 +2,8 @@
 //! opening order and sends nothing when that fails. No network: scripted `FakeOrderTransport`.
 #![cfg(test)]
 
+use std::sync::Arc;
+
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::classify::SubmitClass;
@@ -282,7 +284,7 @@ fn script_both_ok(r: &super::executor_tests::Rig) {
 async fn a_pair_is_prepared_with_the_leverage_on_both_legs_and_the_orders_do_not_set_it_again() {
     let r = rig();
     script_both_ok(&r);
-    let legs = pair_legs("5");
+    let legs = prepared(pair_legs("5"));
     assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
     assert_eq!((r.t.count(Method::Post, BINANCE_LEVERAGE_PATH), r.t.count(Method::Post, OKX_SET_LEVERAGE_PATH)), (1, 1));
     assert_eq!(r.t.count(Method::Post, BINANCE_ORDER_PATH) + r.t.count(Method::Post, OKX_ORDER_PATH), 0, "preparing sends no order");
@@ -349,6 +351,7 @@ async fn a_set_leverage_reply_must_echo_the_requested_lever_and_cross_margin() {
         ("other lever", r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","lever":"3","mgnMode":"cross","posSide":""}]}"#),
         ("isolated", r#"{"code":"0","msg":"","data":[{"instId":"BTC-USDT-SWAP","lever":"5","mgnMode":"isolated","posSide":""}]}"#),
         ("no data", r#"{"code":"0","msg":"","data":[]}"#),
+        ("no instId", r#"{"code":"0","msg":"","data":[{"lever":"5","mgnMode":"cross","posSide":""}]}"#),
         ("other instrument", r#"{"code":"0","msg":"","data":[{"instId":"ETH-USDT-SWAP","lever":"5","mgnMode":"cross","posSide":""}]}"#),
     ] {
         let r = rig();
@@ -361,4 +364,93 @@ async fn a_set_leverage_reply_must_echo_the_requested_lever_and_cross_margin() {
         }
         assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0, "{what}");
     }
+}
+
+// ---- okx-trading-enablement round 2 (G1 / G2): a prepared pair is sent as a pair -----------------------
+
+fn prepared(mut legs: Vec<OrderRequest>) -> Vec<OrderRequest> {
+    for l in &mut legs {
+        l.prepared = true; // what the engine does on `OpenPrepared` Ok
+    }
+    legs
+}
+
+async fn send_both(r: &super::executor_tests::Rig, legs: &[OrderRequest]) -> (SubmitClass, SubmitClass) {
+    r.t.on(Method::Post, BINANCE_ORDER_PATH, Reply::ok(&binance_ack(&legs[0].client_order_id, "FILLED", "0.019")));
+    r.t.on(Method::Post, OKX_ORDER_PATH, Reply::ok(&okx_order_fx("place_accepted")));
+    (r.ex.submit_classified(&legs[0]).await, r.ex.submit_classified(&legs[1]).await)
+}
+
+fn both_sent(b: &SubmitClass, o: &SubmitClass) -> bool {
+    matches!(b, SubmitClass::Accepted(_)) && matches!(o, SubmitClass::Accepted(_))
+}
+
+#[tokio::test]
+async fn skeptic_mode_ttl_expiry_with_a_failing_reread_still_sends_both_prepared_legs() {
+    let r = rig();
+    script_both_ok(&r);
+    let legs = prepared(pair_legs("5"));
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    // the cached OKX mode reading ages past its TTL and a re-read would fail (5xx / timeout)
+    r.clock.advance(crate::exchange::signed::okx::POSITION_MODE_TTL_MS + 1);
+    r.t.replace(Method::Get, "/api/v5/account/config", Reply::status(503, "unavailable"));
+    let (b, o) = send_both(&r, &legs).await;
+    assert!(both_sent(&b, &o), "BOTH or NEITHER: {b:?} / {o:?}");
+    assert_eq!(r.t.count(Method::Get, "/api/v5/account/config"), 1, "the barrier read it once; the sends do not read it again");
+}
+
+#[tokio::test]
+async fn a_backoff_started_after_the_barrier_does_not_split_the_pair() {
+    let r = rig();
+    script_both_ok(&r);
+    let legs = prepared(pair_legs("5"));
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    for ex in [Exchange::Binance, Exchange::Okx] {
+        r.limiter.on_rate_limited(ex, crate::exchange::health::ratelimit::RequestClass::Signed, Some(5_000));
+    }
+    let (b, o) = send_both(&r, &legs).await;
+    assert!(both_sent(&b, &o), "{b:?} / {o:?}");
+}
+
+#[tokio::test]
+async fn limits_that_vanish_after_the_barrier_a_stale_mark_or_an_unreadable_template_do_not_split_the_pair() {
+    use std::sync::atomic::Ordering;
+    let toggle = Arc::new(super::executor_tests::ToggleLimits { on: true.into(), inner: super::executor_tests::btc_limits() });
+    let r = super::executor_tests::rig_custom(Some(0), Some(toggle.clone()));
+    super::executor_tests::script_one_way(&r.t);
+    script_both_ok(&r);
+    let legs = prepared(pair_legs("5"));
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    toggle.on.store(false, Ordering::SeqCst);
+    r.clock.advance(61_000);
+    let (b, o) = send_both(&r, &legs).await;
+    assert!(both_sent(&b, &o), "{b:?} / {o:?}");
+    // an UNPREPARED opening leg is still refused in the same situation (the executor's own guard stands)
+    let r2 = super::executor_tests::rig_custom(Some(0), Some(Arc::new(super::executor_tests::ToggleLimits { on: false.into(), inner: super::executor_tests::btc_limits() })));
+    super::executor_tests::script_one_way(&r2.t);
+    script_both_ok(&r2);
+    assert!(matches!(r2.ex.submit_classified(&pair_legs("5")[1]).await, SubmitClass::Rejected { .. }));
+}
+
+#[tokio::test]
+async fn a_latch_tripped_between_the_barrier_and_the_send_is_the_accepted_residual_and_names_the_naked_leg() {
+    let r = rig();
+    script_both_ok(&r);
+    let legs = prepared(pair_legs("5"));
+    assert_eq!(r.ex.prepare_open(legs.clone()).await, Ok(()));
+    // the hard stop: an environment mismatch seen after the barrier (here through a leg that already went)
+    r.t.on(Method::Post, BINANCE_ORDER_PATH, Reply::ok(&binance_ack(&legs[0].client_order_id, "FILLED", "0.019")));
+    assert!(matches!(r.ex.submit_classified(&legs[0]).await, SubmitClass::Accepted(_)));
+    r.t.replace(Method::Get, "/api/v5/account/config", Reply::ok(&okx_order_fx("place_50101")));
+    // trip the latch with a lookup that sees 50101
+    r.t.on(Method::Get, "/api/v5/trade/order?", Reply::ok(&okx_order_fx("place_50101")));
+    let _ = r.ex.query(Exchange::Okx, SYM, &legs[1].client_order_id).await;
+    match r.ex.submit_classified(&legs[1]).await {
+        SubmitClass::Rejected { code, message } => {
+            assert_eq!(code, "not_sent");
+            assert!(message.contains("OKX disabled") && message.contains("naked") && message.contains("barrier"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(r.t.count(Method::Post, OKX_ORDER_PATH), 0, "the hard stop still holds");
 }

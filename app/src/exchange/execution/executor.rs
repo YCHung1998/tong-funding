@@ -58,8 +58,6 @@ pub struct DemoExecutor<T> {
     limiter: Arc<RateLimiter>,
     /// (exchange, symbol or "*") → local ms of the last confirmed one-way reading.
     one_way_at: Mutex<HashMap<(Exchange, String), i64>>,
-    /// Client order ids whose leverage the pre-send barrier already set.
-    prepared: Mutex<std::collections::HashSet<String>>,
 }
 
 impl<T: OrderTransport> DemoExecutor<T> {
@@ -71,7 +69,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
         intents: Arc<dyn IntentLedger>,
         limiter: Arc<RateLimiter>,
     ) -> Self {
-        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()), prepared: Mutex::new(Default::default()) }
+        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
     }
 
     /// Adds the OKX client. Its latch is the client's own: production attaches the factory's single
@@ -260,12 +258,54 @@ impl<T: OrderTransport> DemoExecutor<T> {
         }
         for ((req, order), ts) in checked.iter().zip(stamped) {
             self.apply_leverage(req, order, ts).await?;
-            self.prepared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(req.client_order_id.clone());
         }
         Ok(())
     }
 
+    /// A leg the barrier approved with its pair: only what cannot change its meaning is re-checked here
+    /// (the order is valid, the OKX client exists, the hard stops inside `OkxOrderClient::submit`: latch and
+    /// demo-key proof, and the transport's demo-flag rule). The soft, time-varying checks (mode re-read,
+    /// back-off, mark freshness, limits, leverage) were approved together with the other leg; repeating them
+    /// per leg could send one leg and refuse the other.
+    async fn submit_prepared(&self, req: &OrderRequest) -> SubmitClass {
+        let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
+        if req.exchange == Exchange::Okx
+            && let Err(reason) = self.okx()
+        {
+            return not_sent(reason);
+        }
+        let order = match ValidOrder::from_request(req) {
+            Ok(o) => o,
+            Err(e) => return not_sent(e),
+        };
+        let ts = self.timestamp(req.exchange).unwrap_or_else(|| self.clock.now_ms());
+        let class = match req.exchange {
+            Exchange::Binance => self.binance.submit(&order, ts).await,
+            Exchange::Bybit => self.bybit.submit(&order, ts).await,
+            Exchange::Okx => match self.okx() {
+                Ok(okx) => okx.submit(&order, ts).await,
+                Err(reason) => not_sent(reason),
+            },
+        };
+        match &class {
+            SubmitClass::RateLimited { retry_after_ms } => self.note_rate_limit(req.exchange, Some(*retry_after_ms)),
+            SubmitClass::Accepted(_) | SubmitClass::Rejected { .. } => self.limiter.on_success(req.exchange, RequestClass::Signed),
+            SubmitClass::Unknown { .. } => {}
+        }
+        class
+    }
+
     async fn submit_inner(&self, req: &OrderRequest) -> SubmitClass {
+        if req.prepared && !req.reduce_only {
+            return match self.submit_prepared(req).await {
+                // the one accepted residual: a hard stop (latch, demo-key proof) after the barrier passed
+                SubmitClass::Rejected { code, message } if code == "not_sent" => SubmitClass::Rejected {
+                    message: format!("{message}; the pre-send barrier had passed, so the opposite leg may already be sent and be naked: check it"),
+                    code,
+                },
+                other => other,
+            };
+        }
         let not_sent = |message: String| SubmitClass::Rejected { code: "not_sent".into(), message };
         let order = match self.local_checks(req) {
             Ok(o) => o,
@@ -275,9 +315,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
             Ok(ts) => ts,
             Err(e) => return not_sent(e),
         };
-        // the barrier already set this leg's leverage: not again
-        let prepared = self.prepared.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&req.client_order_id);
-        if !prepared && let Err(e) = self.apply_leverage(req, &order, ts).await {
+        if let Err(e) = self.apply_leverage(req, &order, ts).await {
             return not_sent(e);
         }
         let ts = self.timestamp(req.exchange).unwrap_or(ts);

@@ -26,6 +26,8 @@ pub mod order;
 #[cfg(test)]
 mod contract_tests;
 #[cfg(test)]
+mod engine_flow_tests;
+#[cfg(test)]
 mod executor_tests;
 #[cfg(test)]
 mod leverage_tests;

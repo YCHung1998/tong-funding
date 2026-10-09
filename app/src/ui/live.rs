@@ -676,8 +676,8 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         let secrets = secrets.clone();
         let (okx_limits, okx_latch) = (okx_limits.clone(), okx_latch.clone());
         tokio::spawn(async move {
-            let mut ticks: u64 = 0;
             let mut latch_reported = false;
+            let mut keys_cadence = DemoKeysCadence::default();
             loop {
                 if let Some(db) = &db {
                     let settings = load_settings(db);
@@ -705,11 +705,10 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                         ctx.shared.push(SourceUpdate::TradeEvents(page.rows));
                     }
                 }
-                if ticks % 15 == 0 {
-                    let allowed: Vec<Exchange> = ctx.enabled.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().copied().collect();
+                let allowed: Vec<Exchange> = ctx.enabled.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().copied().collect();
+                if keys_cadence.due(&allowed) {
                     ctx.shared.push(SourceUpdate::DemoKeys(demo_keys_for(secrets.as_ref(), &allowed)));
                 }
-                ticks += 1;
                 if !latch_reported && let Some(reason) = okx_latch.reason() {
                     latch_reported = true;
                     ctx.shared.push(SourceUpdate::OkxDisabled(reason));
@@ -770,6 +769,29 @@ fn trade_events_query() -> EventQuery {
 /// `pairs.entry_json.scan` by internal uuid (the engine's envelope keeps the scan snapshot there).
 pub fn pair_entries(rows: &[PairRow]) -> BTreeMap<String, serde_json::Value> {
     rows.iter().map(|r| (r.internal_uuid.clone(), r.entry.get("scan").cloned().unwrap_or(serde_json::Value::Null))).collect()
+}
+
+/// How often the Keychain is read for the demo-keys check (store ticks), unless the allowed exchanges change.
+const DEMO_KEYS_EVERY_TICKS: u64 = 15;
+
+/// When the demo-keys check runs: the first time, every [`DEMO_KEYS_EVERY_TICKS`] ticks, and at once when
+/// the set of allowed exchanges changed (OKX added: its keys are suddenly required, and the other way).
+#[derive(Default)]
+struct DemoKeysCadence {
+    ticks: u64,
+    last_allowed: Option<Vec<Exchange>>,
+}
+
+impl DemoKeysCadence {
+    fn due(&mut self, allowed: &[Exchange]) -> bool {
+        let mut now: Vec<Exchange> = allowed.to_vec();
+        now.sort();
+        let changed = self.last_allowed.as_ref() != Some(&now);
+        let slow = self.ticks % DEMO_KEYS_EVERY_TICKS == 0;
+        self.ticks += 1;
+        self.last_allowed = Some(now);
+        changed || slow
+    }
 }
 
 /// Binance AND Bybit demo keys readable, and OKX's (key, secret, passphrase) while OKX is in
@@ -1276,6 +1298,21 @@ mod tests {
         assert_eq!(demo_keys_for(&full, &all), Ok(()));
         // Binance / Bybit stay required whatever is allowed
         assert!(demo_keys_for(&keys(&[(Exchange::Okx, true)]), &all).unwrap_err().contains("Binance"));
+    }
+
+    #[test]
+    fn the_demo_keys_are_rechecked_at_once_when_the_allowed_exchanges_change_and_otherwise_on_a_slow_cadence() {
+        let all = vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx];
+        let two = vec![Exchange::Binance, Exchange::Bybit];
+        let mut g = DemoKeysCadence::default();
+        assert!(g.due(&all), "the first check");
+        for _ in 0..(DEMO_KEYS_EVERY_TICKS - 1) {
+            assert!(!g.due(&all), "Keychain reads are not repeated every tick");
+        }
+        assert!(g.due(&all), "slow cadence");
+        assert!(g.due(&two), "OKX taken out of allowed_exchanges: re-evaluated immediately");
+        assert!(!g.due(&two));
+        assert!(g.due(&all), "and put back");
     }
 
     fn row(status: &str, entry: serde_json::Value) -> PairRow {

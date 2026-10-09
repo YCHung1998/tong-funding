@@ -40,3 +40,4 @@
 - [x] 5.2 F3 set-leverage 回覆驗證；F4 ctVal 缺失為錯誤
 - [x] 5.3 F5 OKX 警示與 demo 金鑰依 `allowed_exchanges`；F6 掃幣頁每列判斷測試；F7 儀表板固定值對齊
 - [x] 5.4 簡化項目（見 design）
+- [x] 5.5 第二輪 G1–G7：`prepared` 標記、送前窗口（kill switch / 視窗 / 逾時 / 手動單）、instId 必填、demo 金鑰即時重算；骨架回歸與真實 executor 流程測試

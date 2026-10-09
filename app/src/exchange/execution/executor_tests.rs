@@ -61,7 +61,7 @@ pub(super) fn demo_id(leg: Leg, action: OrderAction, seq: u16) -> String {
 }
 
 pub(super) fn req(exchange: Exchange, id: &str, side: OrderSide, qty: &str, reduce_only: bool) -> OrderRequest {
-    OrderRequest { notional_usdt: None, client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None, leverage: None }
+    OrderRequest { prepared: false, notional_usdt: None, client_order_id: id.into(), exchange, symbol: SYM.into(), side, quantity: d(qty), reduce_only, intended_base_qty: None, leverage: None }
 }
 
 /// An OKX order: contracts `qty`; an opening one intends `qty x 0.01` coins (the test instrument's ctVal).
@@ -114,7 +114,19 @@ pub(super) fn script_one_way(t: &FakeOrderTransport) {
     t.on(Method::Get, BYBIT_POSITION_PATH, Reply::ok(r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"BTCUSDT","positionIdx":0,"size":"0"}]}}"#));
 }
 
+/// Limits that can be switched off after the barrier (a template that became unreadable, a mark that aged).
+pub(super) struct ToggleLimits {
+    pub on: std::sync::atomic::AtomicBool,
+    pub inner: Arc<StubLimits>,
+}
+impl OkxLimitsSource for ToggleLimits {
+    fn limits(&self, symbol: &str) -> Option<OkxLimits> {
+        self.on.load(std::sync::atomic::Ordering::SeqCst).then(|| self.inner.limits(symbol)).flatten()
+    }
+}
+
 pub(super) struct Rig {
+    pub limiter: Arc<RateLimiter>,
     pub t: FakeOrderTransport,
     pub ex: Arc<DemoExecutor<FakeOrderTransport>>,
     pub clock: ManualClock,
@@ -134,11 +146,12 @@ pub(super) fn rig_with(offset: Option<i64>) -> Rig {
     rig_custom(offset, Some(btc_limits()))
 }
 
-fn rig_custom(offset: Option<i64>, limits: Option<Arc<StubLimits>>) -> Rig {
+pub(super) fn rig_custom(offset: Option<i64>, limits: Option<Arc<dyn OkxLimitsSource>>) -> Rig {
     let t = FakeOrderTransport::new();
     let clock = ManualClock::new(NOW);
     let ledger = Arc::new(Ledger::default());
     let limiter = Arc::new(RateLimiter::new(Arc::new(clock.clone())));
+    let rig_limiter = limiter.clone();
     let ex = DemoExecutor::new(
         BinanceOrderClient::new(Arc::new(t.clone()), creds(), BinanceHost::Testnet),
         BybitOrderClient::new(Arc::new(t.clone()), creds(), BybitHost::Demo),
@@ -152,7 +165,7 @@ fn rig_custom(offset: Option<i64>, limits: Option<Arc<StubLimits>>) -> Rig {
         Some(l) => ex.with_okx_limits(l),
         None => ex,
     };
-    Rig { t, ex: Arc::new(ex), clock, ledger }
+    Rig { limiter: rig_limiter, t, ex: Arc::new(ex), clock, ledger }
 }
 
 pub(super) fn rig() -> Rig {
