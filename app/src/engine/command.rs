@@ -122,7 +122,13 @@ pub enum Event {
     OpenPrepared { pair: PairUuid, result: Result<(), String> },
     Queried { pair: Option<PairUuid>, client_order_id: String, outcome: QueryOutcome },
     /// Manual order (not part of a pair) finished.
-    ManualSubmitted { client_order_id: String, outcome: SubmitOutcome },
+    ManualSubmitted {
+        client_order_id: String,
+        outcome: SubmitOutcome,
+        /// `false` only for an Unknown outcome whose lookup did not settle it (or whose task was lost): the order
+        /// may exist, so the in-flight guard of its exchange and symbol stays until the safety-net expiry.
+        resolved: bool,
+    },
     /// Manual cancel finished: what the executor of the current mode said, unchanged.
     ManualCancelled { exchange: Exchange, symbol: String, client_order_id: String, outcome: QueryOutcome },
     /// Node 0 / Node 1 context fetched with the pre-trade prices: order rules per leg and whether

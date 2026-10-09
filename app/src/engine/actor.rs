@@ -358,8 +358,8 @@ struct EntryContext {
 type QuotePair = (Result<FreshQuote, String>, Result<FreshQuote, String>);
 
 /// Reports a manual order whose task ended without an answer (a panic), so its in-flight entry is cleared.
-/// Unknown outcomes clear the entry too: what may exist on the exchange is left to the lookup / reconciliation
-/// (a pending reconciliation already blocks every entry).
+/// The entry is cleared by a definite outcome or a lookup that settled an Unknown one (`resolved`); a lost task
+/// (this guard) leaves it to the safety-net expiry, like an Unknown outcome whose lookup failed.
 struct ManualDoneGuard {
     tx: mpsc::Sender<Event>,
     id: Option<String>,
@@ -368,7 +368,7 @@ struct ManualDoneGuard {
 impl Drop for ManualDoneGuard {
     fn drop(&mut self) {
         if let Some(client_order_id) = self.id.take() {
-            let _ = self.tx.try_send(Event::ManualSubmitted { client_order_id, outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() } });
+            let _ = self.tx.try_send(Event::ManualSubmitted { client_order_id, outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() }, resolved: false });
         }
     }
 }
@@ -377,7 +377,8 @@ impl Drop for ManualDoneGuard {
 /// independent of the fill timeout: per leg it may need a mode read and a set-leverage (each bounded by the
 /// 5 s order-request timeout), for two legs, plus margin.
 pub(crate) const PREPARE_DEADLINE_MS: i64 = 30_000;
-/// A manual order task is cut off after this long and reports an Unknown result.
+/// The part of a manual order before an answer exists (gate + leverage + submit, each <= 5 s) is cut off after
+/// this long and reports Unknown; the lookup that follows an Unknown answer is not cut.
 pub(crate) const MANUAL_DEADLINE_MS: i64 = 20_000;
 /// Safety net for a manual order that never reported (a lost event): its in-flight guard is dropped this long
 /// after the start. Strictly above `MANUAL_DEADLINE_MS`, independent of `order_timeout_seconds`.
@@ -774,13 +775,13 @@ impl Actor {
         }
     }
 
-    /// A pair whose pre-send barrier has not answered within the order timeout is aborted: nothing was sent.
+    /// A pair whose pre-send barrier has not answered within PREPARE_DEADLINE_MS (30 s) is aborted: nothing was sent.
     /// Returns whether it was handled here (still waiting counts as handled: there are no orders to check yet).
     fn abort_stuck_preparing(&mut self, pair: &str, now: i64) -> bool {
         let Some(set) = self.flows.get(pair).and_then(|f| f.preparing.as_ref()) else { return false };
         if now.saturating_sub(set.sent_at_ms) >= PREPARE_DEADLINE_MS {
             self.flows.entry(pair.to_string()).or_default().preparing = None;
-            let _ = self.land(pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": ["pre-send barrier timed out (the executor did not answer within the order timeout)"] }));
+            let _ = self.land(pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": ["pre-send barrier timed out (the executor did not answer within PREPARE_DEADLINE_MS, 30 s)"] }));
         }
         true
     }
@@ -1764,16 +1765,30 @@ impl Actor {
         tokio::spawn(async move {
             // if this task ends without reporting (a panic), the guard still tells the actor
             let mut guard = ManualDoneGuard { tx: tx.clone(), id: Some(id.clone()) };
-            // worst case of the executor: mode read + set-leverage + submit, each bounded by a 5 s request timeout
-            let run = intent::submit_with_intent(&db, executor.as_ref(), &key, leg, req);
-            let outcome = match tokio::time::timeout(Duration::from_millis(MANUAL_DEADLINE_MS as u64), run).await {
-                Ok(Ok(report)) => report.outcome,
-                Ok(Err(IntentError::NotLanded(e))) => SubmitOutcome::Rejected { reason: format!("not sent: {e}") },
-                Ok(Err(IntentError::ResultNotRecorded(e))) => SubmitOutcome::Unknown { reason: format!("result not recorded: {e}") },
-                Err(_) => SubmitOutcome::Unknown { reason: "manual order did not finish within its deadline; it may still exist on the exchange (left to the lookup / reconciliation)".into() },
+            // The deadline covers only the part before an answer exists: gate + leverage + submit, each bounded by
+            // a 5 s request timeout (<= 15 s, MANUAL_DEADLINE_MS 20 s). The lookup after an Unknown answer is NOT cut.
+            let (outcome, resolved) = match intent::land_intent(&db, &key, leg, &req) {
+                Err(IntentError::NotLanded(e) | IntentError::ResultNotRecorded(e)) => (SubmitOutcome::Rejected { reason: format!("not sent: {e}") }, true),
+                Ok(()) => {
+                    let simulated = executor.is_simulated();
+                    let outcome = match tokio::time::timeout(Duration::from_millis(MANUAL_DEADLINE_MS as u64), executor.submit(req.clone())).await {
+                        Ok(o) => o,
+                        Err(_) => SubmitOutcome::Unknown { reason: "manual order got no answer within its deadline; it may exist on the exchange (looked up by id)".into() },
+                    };
+                    match intent::record_submit_outcome(&db, &req, &outcome, simulated) {
+                        Err(e) => (SubmitOutcome::Unknown { reason: format!("result not recorded: {e:?}") }, false),
+                        Ok(_) if !matches!(outcome, SubmitOutcome::Unknown { .. }) => (outcome, true),
+                        Ok(_) => {
+                            let q = executor.query(req.exchange, &req.symbol, &req.client_order_id).await;
+                            let settled = matches!(q, QueryOutcome::Found(_) | QueryOutcome::NotFound);
+                            let recorded = intent::record_query_outcome(&db, &req.client_order_id, &q, simulated).is_ok();
+                            (outcome, settled && recorded)
+                        }
+                    }
+                }
             };
             guard.id = None;
-            let _ = tx.send(Event::ManualSubmitted { client_order_id: id, outcome }).await;
+            let _ = tx.send(Event::ManualSubmitted { client_order_id: id, outcome, resolved }).await;
         });
         CommandReply::Accepted
     }
@@ -1939,8 +1954,10 @@ impl Actor {
                 }
             }
             Event::Queried { pair: None, .. } => {} // manual orders are not polled
-            Event::ManualSubmitted { client_order_id, outcome } => {
-                self.manual_inflight.remove(&client_order_id);
+            Event::ManualSubmitted { client_order_id, outcome, resolved } => {
+                if resolved || !matches!(outcome, SubmitOutcome::Unknown { .. }) {
+                    self.manual_inflight.remove(&client_order_id);
+                }
                 let mut payload = outcome_json(&outcome);
                 payload["client_order_id"] = json!(client_order_id);
                 payload["simulated"] = json!(self.executor.is_simulated());

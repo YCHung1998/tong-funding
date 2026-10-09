@@ -99,7 +99,7 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 - G1：被屏障核准的腿以 `OrderRequest.prepared = true` 標記（引擎在 `OpenPrepared` Ok 時設定；取代 executor 內共享的 `prepared` 集合，沒有可洩漏的共享可變狀態）。已核准的腿送單時**略過**會隨時間改變的軟性檢查：模式重讀 / TTL、back-off、標記價新鮮度、limits / 範本上限、槓桿；只保留硬性停止：OKX 閂鎖、示範金鑰證明、傳輸層的示範旗標規則（無條件）。這修掉「屏障通過後模式快取過期且重讀 503，Binance 已成交而 OKX 不送」的裸腿重現。唯一接受的殘餘風險：屏障與送單之間閂鎖跳脫（代表環境不符，OKX 本來就會拒絕）；此時該腿以 `not_sent` 回覆，原因明說「屏障已通過，對側腿可能已送出且為裸腿」，引擎將該配對落入 PARTIAL_FAILURE，既有的人工處理警示會點名它。
 - G2：回歸測試涵蓋模式 TTL 過期 + 503、屏障後開始 back-off、limits 消失（標記價過期 / 範本不可讀）皆兩腿都送出；閂鎖殘餘有文字測試；另有以真實 `DemoExecutor`（假傳輸）經真實引擎跑完屏障 + 送單的流程測試（`exchange/execution/engine_flow_tests.rs`，引擎目錄不得出現網路層名稱，故測試放在 exchange 側）。
 - G3：`OpenPrepared` Ok 時再檢查 kill switch / 停機 / 對帳未完成與進場視窗，失敗即 `nothing sent`。
-- G4：`on_tick` 對卡在屏障超過 `order_timeout_seconds` 的配對以「pre-send barrier timed out」取消（nothing sent）；之後才回來的屏障結果被忽略。
+- G4：`on_tick` 對卡在屏障超過 `PREPARE_DEADLINE_MS`（30 秒，第三輪 H5 起；原文誤作 `order_timeout_seconds`）的配對以「pre-send barrier timed out」取消（nothing sent）；之後才回來的屏障結果被忽略。
 - G5：配對處於 ORDER_SUBMIT（含屏障）時，引擎拒絕同交易所同標的的手動**開倉**單（避免手動 set-leverage 改掉配對核准的槓桿）；平倉永不被擋。
 - G6：set-leverage 回覆必須帶 `instId` 且吻合（OKX 文件的回覆資料含 `instId`、`lever`、`mgnMode`、`posSide`；仍屬依文件、未實機驗證，列入 4.2）。
 - G7：`demo_keys` 在 `allowed_exchanges` 改變時於下一個 2 秒的設定讀取就重算（`DemoKeysCadence`），其餘維持每 15 次的慢節奏。
@@ -124,5 +124,11 @@ OKX 掛單量 × `ctVal` 後才與 `q` 比較；`ctVal` 未知時不顯示「會
 
 ## 抗辯修正（enablement 第五輪）
 
-- J1：手動單任務本體包在 `tokio::time::timeout(MANUAL_DEADLINE_MS = 20 s)` 內（高於 executor 最壞情況：模式讀取 + set-leverage + 送單，各 ≤ 5 秒），逾時回報 Unknown（交易所端是否有單交給查詢 / 對帳），因此活著的手動任務一定在期限內經 `ManualSubmitted` / `ManualDoneGuard` 回報。`manual_inflight` 的 tick 到期只是安全網：`MANUAL_DEADLINE_MS + 10 s`，與 `order_timeout_seconds` 無關。`order_timeout_seconds = 1` 時，仍在飛行中的手動帶槓桿開倉不再於 2 秒後被放行（測試：3 秒後 `ManualEnter` 仍被拒）。
+- J1：手動單任務本體包在 `tokio::time::timeout(MANUAL_DEADLINE_MS = 20 s)` 內（高於 executor 最壞情況：模式讀取 + set-leverage + 送單，各 ≤ 5 秒，合計 ≤ 15 秒；更正見第六輪 K1：期限只涵蓋送出前段，Unknown 之後的查單不被截斷），逾時回報 Unknown。`manual_inflight` 的 tick 到期只是安全網：`MANUAL_DEADLINE_MS + 10 s`，與 `order_timeout_seconds` 無關。`order_timeout_seconds = 1` 時，仍在飛行中的手動帶槓桿開倉不再於 2 秒後被放行（測試：3 秒後 `ManualEnter` 仍被拒）。
 - J2：`on_tick` 對停在 PRE_TRADE_CHECK 超過 `PREPARE_DEADLINE_MS` 的配對落 `CheckFailed`（「pre-trade check timed out」，nothing sent，配對 BLOCKED），遺失的事件不會讓該交易所 / 標的在整個執行期間被占用。
+
+## 抗辯修正（enablement 第六輪）
+
+- K1：手動單的期限（`MANUAL_DEADLINE_MS` 20 秒）只涵蓋「尚無答案」的前段：模式 / 槓桿 / 送單（各 ≤ 5 秒，合計 ≤ 15 秒）。送單回 Unknown（或逾時）後的查單在期限之外執行，不被截斷。任務改為自行串起 `land_intent` → `executor.submit`（含期限）→ `record_submit_outcome` →（Unknown 時）`executor.query` → `record_query_outcome`。
+- K2：`ManualSubmitted` 新增 `resolved`：確定結果（Accepted / Rejected）或查單得到 Found / NotFound 並已記錄才為 resolved；Unknown 且查單失敗（或任務遺失）時，該 (交易所, 標的) 的 `manual_inflight` 保留到安全網到期（`MANUAL_DEADLINE_MS + 10 s`）。`ManualDoneGuard` 的說明與 Unknown 原因文字已更正：期內由查單決定，不是「交給對帳」。測試：查單失敗的 Unknown 手動開倉仍擋住進場；查單 NotFound 後放行；查單卡住超過期限時仍擋住且尚未回報。
+- K3：`abort_stuck_preparing` 的說明與失敗文字改為 `PREPARE_DEADLINE_MS`（30 秒）。已知殘餘風險（既有）：客戶端逾時的 set-leverage，交易所之後仍可能套用（OKX set-leverage 沒有 `expTime`）；槓桿變更不產生曝險，且之後的送單前屏障會再設定一次。另注意兩種時鐘：tick 的期限用引擎注入時鐘，`tokio::time::timeout` 用 tokio 的時鐘，兩者在測試中可分別推進，正式環境同步前進。

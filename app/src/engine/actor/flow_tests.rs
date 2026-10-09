@@ -159,6 +159,11 @@ struct FakeDemo {
     /// While set, `available_margin` waits for `margin_release` (the pair sits in PRE_TRADE_CHECK).
     hold_margin: std::sync::atomic::AtomicBool,
     margin_release: tokio::sync::Notify,
+    /// `submit` answers Unknown; `query` waits for `query_release` while `hold_query`, then says `query_result`.
+    submit_unknown: std::sync::atomic::AtomicBool,
+    hold_query: std::sync::atomic::AtomicBool,
+    query_release: tokio::sync::Notify,
+    query_fails: std::sync::atomic::AtomicBool,
 }
 impl Executor for FakeDemo {
     fn prepare_open(&self, legs: Vec<OrderRequest>) -> BoxFut<'_, Result<(), String>> {
@@ -179,6 +184,10 @@ impl Executor for FakeDemo {
             if self.hold_submit.load(Ordering::SeqCst) {
                 self.submit_release.notified().await;
             }
+            if self.submit_unknown.load(Ordering::SeqCst) {
+                self.requests.lock().unwrap().push(req);
+                return SubmitOutcome::Unknown { reason: "timeout".into() };
+            }
             self.submit_now(req)
         })
     }
@@ -187,7 +196,15 @@ impl Executor for FakeDemo {
     }
     fn query(&self, _: Exchange, _: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
         let o = self.orders.lock().unwrap().get(id).cloned().map_or(QueryOutcome::NotFound, QueryOutcome::Found);
-        Box::pin(std::future::ready(o))
+        Box::pin(async move {
+            if self.hold_query.load(Ordering::SeqCst) {
+                self.query_release.notified().await;
+            }
+            if self.query_fails.load(Ordering::SeqCst) {
+                return QueryOutcome::Failed { reason: "lookup unavailable".into() };
+            }
+            o
+        })
     }
 }
 impl FakeDemo {
@@ -2654,4 +2671,57 @@ async fn a_lost_pre_trade_check_is_blocked_by_the_tick_and_stops_holding_the_sym
     let ev = events(&rig.db).into_iter().find(|(_, l, _)| l == "BLOCKED").unwrap().2;
     assert!(ev.to_string().contains("pre-trade check timed out"), "{ev}");
     assert!(rig.demo.requests.lock().unwrap().is_empty() && rig.demo.prepares.lock().unwrap().is_empty());
+}
+
+// ---- okx-trading-enablement round 6 (K1 / K2): an Unknown manual open keeps its guard until resolved ------
+
+async fn unknown_manual_eth_open(hold_query: bool, query_fails: bool) -> (Rig, EngineHandle) {
+    let (rig, h) = started(Opts { demo: true, trigger: "MANUAL", ..Opts::default() }).await;
+    let mut later = pair_at("pair-0002", "ETHUSDT", T + 3_600_000);
+    later.pair_id = "pid-2".into();
+    assert_eq!(ask(&h, Command::AddPrepared(later)).await, CommandReply::Accepted);
+    rig.demo.submit_unknown.store(true, Ordering::SeqCst);
+    rig.demo.hold_query.store(hold_query, Ordering::SeqCst);
+    rig.demo.query_fails.store(query_fails, Ordering::SeqCst);
+    let manual = Command::ManualOrder(crate::engine::command::ManualOrder { exchange: Exchange::Bybit, symbol: "ETHUSDT".into(), side: OrderSide::Sell, quantity: dec("1"), reduce_only: false, leverage: Some(dec("3")), intended_base_qty: None });
+    assert_eq!(ask(&h, manual).await, CommandReply::Accepted);
+    (rig, h)
+}
+
+fn manual_results(db: &Db) -> usize {
+    events(db).into_iter().filter(|(_, l, _)| l == "MANUAL_ORDER_RESULT").count()
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_lookup_after_an_unknown_manual_open_is_not_cut_by_the_pre_send_deadline() {
+    let (rig, h) = unknown_manual_eth_open(true, false).await;
+    run_until(&rig.clock, T - 20_000 + MANUAL_DEADLINE_MS + 5_000).await; // past the deadline, before the safety net
+    assert_eq!(manual_results(&rig.db), 0, "still looking the order up: no result yet");
+    match ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await {
+        CommandReply::Rejected(why) => assert!(why.contains("in flight"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    rig.demo.hold_query.store(false, Ordering::SeqCst);
+    rig.demo.query_release.notify_waiters();
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(manual_results(&rig.db), 1, "reported once the lookup finished");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_manual_open_keeps_the_symbol_until_a_lookup_resolves_it() {
+    let (rig, h) = unknown_manual_eth_open(false, true).await; // the lookup itself fails: still unresolved
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(manual_results(&rig.db), 1);
+    match ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await {
+        CommandReply::Rejected(why) => assert!(why.contains("in flight"), "an unresolved Unknown still holds the symbol: {why}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_resolved_unknown_manual_open_releases_the_symbol() {
+    let (rig, h) = unknown_manual_eth_open(false, false).await; // the lookup answers NotFound / Found: resolved
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(manual_results(&rig.db), 1);
+    assert_eq!(ask(&h, Command::ManualEnter { pair: "pair-0002".into() }).await, CommandReply::Accepted);
 }
