@@ -598,6 +598,11 @@ pub trait ReadOnlyDataSource: Send + Sync {
     fn request_rules(&self, _exchange: Exchange, _symbol: &str) {}
     /// Ask for the leverage cap of `symbol` at `notional` (answered with [`SourceUpdate::LeverageCap`]).
     fn request_leverage_cap(&self, _exchange: Exchange, _symbol: &str, _notional: Decimal) {}
+    /// funding-slot-tracing: "重新查詢" — the pair's unsettled funding slots are checked at the next tick.
+    /// Returns how many slots were made due.
+    fn recheck_funding(&self, _pair_id: &str) -> Result<usize, String> {
+        Err("資金費查詢不可用".into())
+    }
     /// `config.ui_prefs` (ui-font-zoom); `Ok(None)` = never saved.
     fn load_ui_prefs(&self) -> Result<Option<Value>, String> {
         Ok(None)

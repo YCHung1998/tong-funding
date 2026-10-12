@@ -27,6 +27,7 @@ const OKX_CONFIG_PATH: &str = "/api/v5/account/config";
 const OKX_BALANCE_PATH: &str = "/api/v5/account/balance";
 const OKX_POSITIONS_PATH: &str = "/api/v5/account/positions";
 const OKX_PENDING_ORDERS_PATH: &str = "/api/v5/trade/orders-pending";
+const OKX_FUNDING_RATE_HISTORY_PATH: &str = "/api/v5/public/funding-rate-history";
 /// Page size of `orders-pending` (documented maximum 100; UNVERIFIED against a real account).
 const OKX_ORDERS_PAGE_LIMIT: usize = 100;
 /// OKX codes meaning "slow down" (request too frequent, sub-account rate limit). ONE list for the
@@ -222,6 +223,15 @@ impl<T: HttpTransport> OkxSignedClient<T> {
             }
         }
         Ok(incomplete(items, format!("page cap of {MAX_PAGES} reached")))
+    }
+
+    /// `GET /api/v5/public/funding-rate-history`: the rate that applied at `settle_ms` (`None` = no row).
+    /// `after` = records older than that time, newest first, so the settlement row comes first.
+    pub async fn get_funding_rate_at(&self, symbol: &str, settle_ms: i64) -> Result<Option<Decimal>, AdapterError> {
+        let inst_id = super::endpoints::okx_inst_id(symbol).ok_or_else(|| AdapterError::parse(format!("{symbol} is not a BASEUSDT symbol")))?;
+        let query = format!("instId={inst_id}&after={}&limit=3", settle_ms + 1_000);
+        let (body, _) = self.signed_get(OKX_FUNDING_RATE_HISTORY_PATH, &query).await?;
+        super::funding_rate::okx_rate_at(&body, settle_ms)
     }
 
     /// One attempt; if the exchange rejects the timestamp (`50102`), re-sync the clock once and send

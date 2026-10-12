@@ -7,8 +7,13 @@
 
 pub mod fetch;
 pub mod pnl_record;
+#[cfg(test)]
+mod live_slot_probe;
+pub mod rate_source;
 pub mod reconcile;
 pub mod runner;
+pub mod slot_runner;
+pub mod slots;
 
 /// First ledger fetch after an expected settlement (design D9, provisional).
 pub const FETCH_DELAY_MS: i64 = 60_000;

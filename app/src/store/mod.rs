@@ -8,6 +8,7 @@ pub mod db;
 pub mod event_query;
 pub mod events;
 pub mod funding_ledger;
+pub mod funding_slots;
 pub mod import_cli;
 pub mod legacy_import;
 pub mod scan_buffer;

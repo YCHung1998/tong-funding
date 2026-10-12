@@ -15,7 +15,7 @@ use crate::ui::testkit::{loaded, pair, position};
 const H4: i64 = 4 * 3_600_000;
 
 fn funding(legs: [LegFunding; 2], slots: Vec<TimelineSlot>) -> PairFunding {
-    PairFunding { simulated: false, legs, opening_fee: Some(d("0.48")), updated_at_ms: Some(T + 70_000), slots, pnl: None, alerts: Vec::new() }
+    PairFunding { simulated: false, legs, opening_fee: Some(d("0.48")), updated_at_ms: Some(T + 70_000), slots, pnl: None, alerts: Vec::new(), trace: Vec::new() }
 }
 
 fn slot(t: i64, side: Side, exchange: Exchange, amount: Option<&str>, state: SlotState) -> TimelineSlot {
@@ -112,7 +112,7 @@ fn funding_vm_panel_incomplete_lists_reasons_on_top_and_dashes_missing_parts() {
 
 #[test]
 fn funding_vm_simulated_pairs_show_simulated_and_no_actual_column() {
-    let f = PairFunding { simulated: true, legs: [LegFunding::Simulated, LegFunding::Simulated], opening_fee: None, updated_at_ms: None, slots: vec![], pnl: None, alerts: vec![] };
+    let f = PairFunding { simulated: true, legs: [LegFunding::Simulated, LegFunding::Simulated], opening_fee: None, updated_at_ms: None, slots: vec![], pnl: None, alerts: vec![], trace: vec![] };
     assert_eq!(pair_funding_text(&f).0, "Funding 收到 模擬");
     let p = pnl_panel(&f).unwrap();
     assert_eq!((p.mode.as_str(), p.status_line.as_deref()), ("SIMULATION", Some("模擬，無實際 PnL")));
@@ -191,4 +191,44 @@ fn funding_vm_loader_without_a_fetch_shows_not_fetched() {
     let f = &load_pair_funding(&fx.db, &rows, T + 80_000)["pid-p1"];
     assert_eq!(f.legs[0], LegFunding::Unavailable("尚未取得".into()));
     assert_eq!(leg_cell(Some(&f.legs[0])).0, "—（尚未取得）");
+}
+
+// ---- funding-slot-tracing: lines of the positions page --------------------------------------
+
+fn trace(leg: &'static str, ex: Exchange, state: crate::store::funding_slots::SlotState) -> SlotTrace {
+    SlotTrace { time_ms: T, leg, exchange: ex, state, manual_reason: None, resolution: None, amount: None, last_error: None }
+}
+
+#[test]
+fn funding_slot_tracing_lines_name_the_state_of_every_slot() {
+    use crate::store::funding_slots::{ManualReason, Resolution, SlotState as S};
+    let mut settled = trace("long", Exchange::Binance, S::Settled);
+    settled.resolution = Some(Resolution::Ledger);
+    settled.amount = Some(d("11.58677324"));
+    let mut zero = trace("short", Exchange::Bybit, S::Settled);
+    zero.resolution = Some(Resolution::ZeroRate);
+    zero.amount = Some(d("0"));
+    let mut manual = trace("short", Exchange::Okx, S::ManualCheck);
+    manual.manual_reason = Some(ManualReason::FetchFailed);
+    manual.last_error = Some("timeout".into());
+    let mut f = funding([LegFunding::Simulated, LegFunding::Simulated], vec![]);
+    f.trace = vec![settled, zero, trace("long", Exchange::Binance, S::Tracing1), trace("short", Exchange::Bybit, S::Tracing2), manual];
+    let lines = tracing_lines(&f);
+    assert!(lines[0].contains("Binance long") && lines[0].contains("已入帳 +11.5868 USDT"), "{}", lines[0]);
+    assert!(lines[1].contains("已入帳 0（費率為 0，無流水）"), "{}", lines[1]);
+    assert!(lines[2].contains("追蹤中（第一階段"), "{}", lines[2]);
+    assert!(lines[3].contains("追蹤中（第二階段"), "{}", lines[3]);
+    assert!(lines[4].contains("需人工檢查（查詢失敗，無法判斷）") && lines[4].contains("timeout"), "{}", lines[4]);
+    assert!(recheckable(&f));
+}
+
+#[test]
+fn funding_slot_tracing_recheck_applies_only_while_a_slot_is_unsettled() {
+    use crate::store::funding_slots::SlotState as S;
+    let mut f = funding([LegFunding::Simulated, LegFunding::Simulated], vec![]);
+    assert!(!recheckable(&f), "no slots: nothing to re-query");
+    f.trace = vec![trace("long", Exchange::Binance, S::Settled)];
+    assert!(!recheckable(&f));
+    f.trace.push(trace("short", Exchange::Bybit, S::ManualCheck));
+    assert!(recheckable(&f));
 }

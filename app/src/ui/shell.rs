@@ -581,7 +581,17 @@ impl Shell {
                 cx.notify();
             }))
         };
-        pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin)
+        let on_recheck = |pair_id: String| -> ClickFn {
+            Box::new(cx.listener(move |this: &mut Shell, _, _, cx| {
+                // The next slot tick checks the pair's unsettled funding slots; nothing is assumed here.
+                match this.source.recheck_funding(&pair_id) {
+                    Ok(n) => eprintln!("funding re-query: {n} slot(s) due for {pair_id}"),
+                    Err(e) => eprintln!("funding re-query failed for {pair_id}: {e}"),
+                }
+                cx.notify();
+            }))
+        };
+        pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin, &on_recheck)
     }
 
     fn system_log_page(&self, cx: &mut Context<Self>) -> Div {

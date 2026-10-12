@@ -4,6 +4,10 @@
 pub const SCHEMA_V1: &str = include_str!("schema_v1.sql");
 /// funding-pnl: unique dedupe key of `FUNDING_LEDGER_ENTRY` events (partial expression index).
 pub const SCHEMA_V2: &str = include_str!("schema_v2.sql");
+/// funding-slot-tracing: the `funding_slots` table.
+pub const SCHEMA_V3: &str = include_str!("schema_v3.sql");
+/// Name of the table created by [`SCHEMA_V3`] (required from schema v3 on).
+pub const FUNDING_SLOTS_TABLE: &str = "funding_slots";
 /// Name of the index created by [`SCHEMA_V2`] (required from schema v2 on).
 pub const FUNDING_LEDGER_INDEX: &str = "uniq_funding_ledger_dedupe";
 

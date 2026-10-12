@@ -94,6 +94,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
             short: Some(short),
             state_warning: None,
             funding,
+            pair_id: info.pair_id.clone(),
         });
     }
     for p in &snap.pairs {
@@ -107,7 +108,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
         let pnl = long.as_ref().zip(short.as_ref()).map(|(l, s)| pnl_text(l, s));
         let spread = long.as_ref().and_then(|l| l.pnl).zip(short.as_ref().and_then(|s| s.pnl)).map(|(l, s)| l + s);
         let funding = FundingView::of(snap.funding.get(&p.pair_id), spread);
-        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding });
+        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding, pair_id: p.pair_id.clone() });
     }
     cards
 }
@@ -186,6 +187,8 @@ pub struct PairCard {
     pub state_warning: Option<String>,
     /// funding-pnl: funding received, running total, timeline, PnL panel, alerts.
     pub funding: FundingView,
+    /// The pair this card shows (the re-query action targets it).
+    pub pair_id: String,
 }
 
 /// The funding part of a pair card (settlement-timeline).
@@ -200,6 +203,9 @@ pub struct FundingView {
     pub panel: Option<PnlPanel>,
     /// Data problems (event id, text), shown with a link to the system log.
     pub alerts: Vec<(i64, String)>,
+    /// funding-slot-tracing: one line per slot, and whether "重新查詢" applies.
+    pub tracing: Vec<String>,
+    pub recheckable: bool,
 }
 
 impl FundingView {
@@ -212,6 +218,8 @@ impl FundingView {
                 timeline: Vec::new(),
                 panel: None,
                 alerts: Vec::new(),
+                tracing: Vec::new(),
+                recheckable: false,
             },
             Some(f) => {
                 let (text, tone) = fv::pair_funding_text(f);
@@ -222,6 +230,8 @@ impl FundingView {
                     timeline: fv::timeline_rows(f),
                     panel: fv::pnl_panel(f),
                     alerts: f.alerts.iter().map(|a| (a.event_id, format!("{}（事件 #{}）", a.text, a.event_id))).collect(),
+                    tracing: fv::tracing_lines(f),
+                    recheckable: fv::recheckable(f),
                 }
             }
         }

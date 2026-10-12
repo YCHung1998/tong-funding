@@ -246,7 +246,7 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
 
 // ---- positions ------------------------------------------------------------------------------
 
-fn pair_card(c: &PairCard) -> Div {
+fn pair_card(c: &PairCard, on_recheck: &dyn Fn(String) -> ClickFn) -> Div {
     let mut out = card().w(rx(360.0)).child(
         div()
             .flex()
@@ -306,12 +306,36 @@ fn pair_card(c: &PairCard) -> Div {
     for (_, a) in &f.alerts {
         out = out.child(small(a.clone(), theme::WARNING));
     }
+    // funding-slot-tracing: where each settlement's funding stands, and a re-query while unsettled.
+    for line in &f.tracing {
+        out = out.child(small(line.clone(), if line.contains("需人工檢查") { theme::WARNING } else { theme::TEXT_SECONDARY }));
+    }
+    if f.recheckable {
+        out = out.child(
+            div()
+                .id(SharedString::from(format!("recheck-{}", c.pair_id)))
+                .px_2()
+                .rounded_sm()
+                .cursor_pointer()
+                .border_1()
+                .border_color(rgb(theme::BORDER))
+                .on_click(on_recheck(c.pair_id.clone()))
+                .child(small("重新查詢資金費", theme::TEXT_SECONDARY)),
+        );
+    }
     out
 }
 
 pub type ClickFn = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
-pub fn positions_page(vm: &PositionsVm, selected_ex: &dyn Fn(Exchange) -> bool, selected_coin: &dyn Fn(&str) -> bool, on_ex: &dyn Fn(Exchange) -> ClickFn, on_coin: &dyn Fn(String) -> ClickFn) -> Div {
+pub fn positions_page(
+    vm: &PositionsVm,
+    selected_ex: &dyn Fn(Exchange) -> bool,
+    selected_coin: &dyn Fn(&str) -> bool,
+    on_ex: &dyn Fn(Exchange) -> ClickFn,
+    on_coin: &dyn Fn(String) -> ClickFn,
+    on_recheck: &dyn Fn(String) -> ClickFn,
+) -> Div {
     let chip = |id: SharedString, label: String, on: bool, f: ClickFn| {
         div()
             .id(id)
@@ -389,7 +413,7 @@ pub fn positions_page(vm: &PositionsVm, selected_ex: &dyn Fn(Exchange) -> bool, 
         .child(cards)
         .child(notices)
         .child(card().child(table))
-        .child(div().flex().flex_wrap().gap_3().children(vm.pair_cards.iter().map(pair_card)))
+        .child(div().flex().flex_wrap().gap_3().children(vm.pair_cards.iter().map(|c| pair_card(c, on_recheck))))
 }
 
 // ---- system log -----------------------------------------------------------------------------

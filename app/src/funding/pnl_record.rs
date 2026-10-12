@@ -49,6 +49,8 @@ pub struct PairPnlInput {
     pub windows: [Option<LegWindow>; 2],
     pub ledger_keys: Vec<String>,
     pub fill_ids: Vec<String>,
+    /// funding-slot-tracing: slots of this pair that are not settled yet (state, reason), for the reasons.
+    pub funding_tracing: Vec<Value>,
 }
 
 /// The newest PnL event of a pair.
@@ -305,6 +307,27 @@ pub fn assemble(db: &Db, pair: &str, now_ms: i64) -> Result<PairPnlInput, String
         }
     }
 
+    // funding-slot-tracing: a slot settled as ZERO_RATE has no ledger row; it counts as a received
+    // settlement of amount 0. Slots not settled yet are listed for the reasons.
+    let mut funding_tracing = Vec::new();
+    for s in db.slots_of_pair(pair).map_err(|e| e.to_string())? {
+        let i = usize::from(s.leg == crate::store::funding_slots::SlotLeg::Short);
+        match (s.state, s.resolution) {
+            (crate::store::funding_slots::SlotState::Settled, Some(crate::store::funding_slots::Resolution::ZeroRate)) => {
+                leg_entries[i].push(tong_funding_core::pnl::FundingLedgerEntry::new(s.exchange, &s.symbol, Decimal::ZERO, "USDT", s.settle_ms, &format!("zero-rate:{pair}:{}:{}", s.leg.as_str(), s.settle_ms), "ZERO_RATE", json!({ "source": s.zero_rate_source })));
+            }
+            (crate::store::funding_slots::SlotState::Settled, _) => {}
+            (state, _) => funding_tracing.push(json!({
+                "leg": s.leg.as_str(),
+                "exchange": s.exchange.name(),
+                "settle_ms": s.settle_ms,
+                "state": state.as_str(),
+                "manual_reason": s.manual_reason.map(|r| r.as_str()),
+                "last_error": s.last_error,
+            })),
+        }
+    }
+
     let fetches = events_of_type(db, FUNDING_LEDGER_FETCHED)?;
     let mut legs = Vec::new();
     let mut slots: [Vec<i64>; 2] = [Vec::new(), Vec::new()];
@@ -357,6 +380,7 @@ pub fn assemble(db: &Db, pair: &str, now_ms: i64) -> Result<PairPnlInput, String
         windows,
         ledger_keys,
         fill_ids,
+        funding_tracing,
     })
 }
 
@@ -380,9 +404,18 @@ fn waiting_helps(r: &IncompleteReason) -> bool {
 /// The event payload of a computed result.
 pub fn pnl_payload(a: &PairPnlInput, b: &PnlBreakdown, now_ms: i64) -> Value {
     let comparison = compare_expected(a.expected.as_ref(), b, a.actual_settlements);
+    let mut reasons: Vec<String> = b.status.reasons().iter().map(|r| r.label()).collect();
+    for t in &a.funding_tracing {
+        let (exchange, leg) = (t["exchange"].as_str().unwrap_or("?"), t["leg"].as_str().unwrap_or("?"));
+        reasons.push(match t["state"].as_str() {
+            Some("MANUAL_CHECK") => format!("資金費需人工檢查（{exchange} {leg}：{}）", t["manual_reason"].as_str().unwrap_or("?")),
+            _ => format!("資金費追蹤中（{exchange} {leg}：{}）", t["state"].as_str().unwrap_or("?")),
+        });
+    }
     json!({
         "status": b.status.as_str(),
-        "reasons": b.status.reasons().iter().map(|r| r.label()).collect::<Vec<_>>(),
+        "reasons": reasons,
+        "funding_tracing": a.funding_tracing,
         "breakdown": b,
         "slippage": slippage_summary(b),
         "expected_vs_actual": comparison,
@@ -402,6 +435,7 @@ fn record(db: &Db, a: &PairPnlInput, b: &PnlBreakdown, now_ms: i64) -> Result<(i
     if let Some(l) = &latest
         && l.payload["breakdown"] == payload["breakdown"]
         && l.payload["status"] == payload["status"]
+        && l.payload["reasons"] == payload["reasons"]
         && l.payload["expected_vs_actual"] == payload["expected_vs_actual"]
     {
         return Ok((l.event_id, false));

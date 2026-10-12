@@ -14,6 +14,7 @@ use crate::funding::pnl_record::{assemble, latest_pnl, pair_events};
 use crate::funding::{FETCH_ERROR, FUNDING_LEDGER_FETCHED, PNL_RECONCILIATION, PNL_RETRY_WINDOW_MS};
 use crate::store::db::Db;
 use crate::store::funding_ledger::FUNDING_LEDGER_CONFLICT;
+use crate::store::funding_slots::{ManualReason, Resolution, SlotRow, SlotState as TraceState};
 use crate::store::state::PairRow;
 use crate::ui::theme::{Tone, funding_tone};
 
@@ -42,6 +43,34 @@ pub struct TimelineSlot {
     pub exchange: Exchange,
     pub amount: Option<Decimal>,
     pub state: SlotState,
+}
+
+/// One funding slot as the positions page shows it (funding-slot-tracing).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlotTrace {
+    pub time_ms: i64,
+    pub leg: &'static str,
+    pub exchange: Exchange,
+    pub state: TraceState,
+    pub manual_reason: Option<ManualReason>,
+    pub resolution: Option<Resolution>,
+    pub amount: Option<Decimal>,
+    pub last_error: Option<String>,
+}
+
+impl SlotTrace {
+    fn of(s: &SlotRow) -> SlotTrace {
+        SlotTrace {
+            time_ms: s.settle_ms,
+            leg: s.leg.as_str(),
+            exchange: s.exchange,
+            state: s.state,
+            manual_reason: s.manual_reason,
+            resolution: s.resolution,
+            amount: s.amount,
+            last_error: s.last_error.clone(),
+        }
+    }
 }
 
 /// The newest PnL event of a pair, decoded.
@@ -75,6 +104,8 @@ pub struct PairFunding {
     pub slots: Vec<TimelineSlot>,
     pub pnl: Option<PnlSummary>,
     pub alerts: Vec<FundingAlert>,
+    /// funding-slot-tracing: the pair's slots (empty before the first slot tick).
+    pub trace: Vec<SlotTrace>,
 }
 
 // ---- loading (read-only) ----------------------------------------------------------------------
@@ -177,12 +208,48 @@ pub fn load_pair_funding(db: &Db, rows: &[PairRow], now_ms: i64) -> BTreeMap<Str
                 }
             }
         }
-        out.insert(row.pair_id.clone(), PairFunding { simulated: a.simulated, legs, opening_fee, updated_at_ms, slots, pnl, alerts });
+        out.insert(row.pair_id.clone(), PairFunding { simulated: a.simulated, legs, opening_fee, updated_at_ms, slots, pnl, alerts, trace: db.slots_of_pair(&row.internal_uuid).unwrap_or_default().iter().map(SlotTrace::of).collect() });
     }
     out
 }
 
 // ---- view builders ------------------------------------------------------------------------------
+
+/// One line per funding slot: when, which leg, and where the tracing stands. Never a bare number
+/// for an unsettled slot; a zero-rate settlement says so.
+pub fn tracing_lines(f: &PairFunding) -> Vec<String> {
+    f.trace
+        .iter()
+        .map(|t| {
+            let head = format!("資金費追蹤 · {} UTC · {} {}", format::utc_hms(t.time_ms), t.exchange.name(), t.leg);
+            let state = match (t.state, t.resolution) {
+                (TraceState::Settled, Some(Resolution::ZeroRate)) => "已入帳 0（費率為 0，無流水）".to_string(),
+                (TraceState::Settled, _) => format!("已入帳 {} USDT", t.amount.map_or_else(|| DASH.to_string(), |a| format::signed(a, 4))),
+                (TraceState::Tracing1, _) => "追蹤中（第一階段，每 5 分鐘）".to_string(),
+                (TraceState::Tracing2, _) => "追蹤中（第二階段，每 10 分鐘）".to_string(),
+                (TraceState::ManualCheck, _) => format!(
+                    "需人工檢查（{}）",
+                    match t.manual_reason {
+                        Some(ManualReason::NotFound) => "查詢成功但沒有流水",
+                        Some(ManualReason::FetchFailed) => "查詢失敗，無法判斷",
+                        Some(ManualReason::Backfill) => "舊配對補查中",
+                        Some(ManualReason::Ambiguous) => "歸屬不明",
+                        None => "原因未記錄",
+                    }
+                ),
+            };
+            match &t.last_error {
+                Some(e) if t.state != TraceState::Settled => format!("{head} · {state} · {e}"),
+                _ => format!("{head} · {state}"),
+            }
+        })
+        .collect()
+}
+
+/// Whether the "重新查詢" action applies: some slot is not settled.
+pub fn recheckable(f: &PairFunding) -> bool {
+    f.trace.iter().any(|t| t.state != TraceState::Settled)
+}
 
 /// The "Funding 收到" cell: value and tone (theme's funding colour function), or "—" with a reason.
 pub fn leg_cell(f: Option<&LegFunding>) -> (String, Tone) {

@@ -9,7 +9,7 @@ use tong_funding_core::redact::redact_secrets;
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::endpoints::{
-    BYBIT_BALANCE_PATH, BYBIT_INSTRUMENTS_PATH, BYBIT_OPEN_ORDERS_PATH, BYBIT_ORDERS_PAGE_LIMIT, BYBIT_POSITIONS_PAGE_LIMIT, BYBIT_POSITIONS_PATH, BybitHost, MAX_PAGES,
+    BYBIT_BALANCE_PATH, BYBIT_FUNDING_HISTORY_PATH, BYBIT_INSTRUMENTS_PATH, BYBIT_OPEN_ORDERS_PATH, BYBIT_ORDERS_PAGE_LIMIT, BYBIT_POSITIONS_PAGE_LIMIT, BYBIT_POSITIONS_PATH, BybitHost, MAX_PAGES,
 };
 use super::models::{Balance, Completeness, Listing, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
@@ -85,6 +85,19 @@ impl<T: HttpTransport> BybitSignedClient<T> {
     pub async fn get_available_margin(&self) -> Result<Decimal, AdapterError> {
         let (body, _) = self.signed_get(BYBIT_BALANCE_PATH, &encode_query(&[("accountType", self.account_type_param().to_string())])).await?;
         available_margin_from(&body, self.account_type)
+    }
+
+    /// `GET /v5/market/funding/history` (linear): the rate that applied at `settle_ms` (`None` = no row).
+    pub async fn get_funding_rate_at(&self, symbol: &str, settle_ms: i64) -> Result<Option<Decimal>, AdapterError> {
+        let query = encode_query(&[
+            ("category", "linear".to_string()),
+            ("symbol", symbol.to_string()),
+            ("startTime", (settle_ms - 60_000).to_string()),
+            ("endTime", (settle_ms + 60_000).to_string()),
+            ("limit", "5".to_string()),
+        ]);
+        let (body, _) = self.signed_get(BYBIT_FUNDING_HISTORY_PATH, &query).await?;
+        super::funding_rate::bybit_rate_at(&body, settle_ms)
     }
 
     /// `GET /v5/market/instruments-info` (linear) of one symbol: its maximum leverage. The endpoint

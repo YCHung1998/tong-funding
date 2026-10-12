@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
-use super::endpoints::{BINANCE_BALANCE_PATH, BINANCE_LEVERAGE_BRACKET_PATH, BINANCE_OPEN_ORDERS_PATH, BINANCE_POSITIONS_PATH, BinanceHost};
+use super::endpoints::{BINANCE_BALANCE_PATH, BINANCE_FUNDING_RATE_PATH, BINANCE_LEVERAGE_BRACKET_PATH, BINANCE_OPEN_ORDERS_PATH, BINANCE_POSITIONS_PATH, BinanceHost};
 use super::models::{Balance, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
     ClockOffsetSource, NotConnectedReason, RECV_WINDOW_MS, Resync, SIGNED_TIMEOUT, binance_signature, check_status, encode_query, load_credentials, parse_json, sanitize_error,
@@ -87,6 +87,13 @@ impl<T: HttpTransport> BinanceSignedClient<T> {
             }
             other => other,
         }
+    }
+
+    /// `GET /fapi/v1/fundingRate`: the rate that applied at `settle_ms` (`None` = no row for that time).
+    pub async fn get_funding_rate_at(&self, symbol: &str, settle_ms: i64) -> Result<Option<Decimal>, AdapterError> {
+        let params = [("symbol", symbol.to_string()), ("startTime", (settle_ms - 60_000).to_string()), ("endTime", (settle_ms + 60_000).to_string()), ("limit", "5".to_string())];
+        let (body, _) = self.signed_get_with(BINANCE_FUNDING_RATE_PATH, &params).await?;
+        super::funding_rate::binance_rate_at(&body, settle_ms)
     }
 
     /// `GET /fapi/v1/leverageBracket` of one symbol: the maximum leverage for a position of
