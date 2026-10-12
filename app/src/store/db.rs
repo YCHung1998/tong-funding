@@ -28,7 +28,7 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tong_funding_core::redact::redact_secrets;
 
 use super::events::insert_event_on;
-use super::schema::{FUNDING_LEDGER_INDEX, FUNDING_SLOTS_TABLE, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
+use super::schema::{FUNDING_LEDGER_INDEX, FUNDING_SLOTS_TABLE, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4};
 use crate::ports::Clock;
 
 /// One schema migration step. `version` must be strictly increasing within a list.
@@ -38,10 +38,10 @@ pub struct Migration {
 }
 
 /// Every migration this build knows about; the last version is the highest supported schema.
-pub const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }];
+pub const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }, Migration { version: 4, sql: SCHEMA_V4 }];
 
 /// The highest schema version this build writes.
-pub const LATEST_SCHEMA_VERSION: i64 = 3;
+pub const LATEST_SCHEMA_VERSION: i64 = 4;
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
@@ -757,7 +757,7 @@ mod tests {
         }
         assert!(index_exists(&db, crate::store::schema::FUNDING_LEDGER_INDEX));
         drop(db);
-        assert_eq!(schema_version(&dir.path().join("funding.db")), 3);
+        assert_eq!(schema_version(&dir.path().join("funding.db")), 4);
     }
 
     fn index_exists(db: &Db, name: &str) -> bool {
@@ -793,7 +793,7 @@ mod tests {
         });
         assert!(dup.is_err(), "{dup:?}");
         drop(db);
-        assert_eq!(schema_version(&p), 3);
+        assert_eq!(schema_version(&p), 4);
     }
 
     #[test]
@@ -937,15 +937,15 @@ mod tests {
         let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
-        // funding-pnl: this build supports v2, so "newer" is now 4 (v3 = funding_slots).
-        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 4", []).unwrap();
+        // funding-pnl: this build supports v2, so "newer" is now 5 (v3 = funding_slots, v4 = its NO_SETTLEMENT resolution).
+        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 5", []).unwrap();
         let before = std::fs::read(&p).unwrap();
         let (c, _) = clock(9);
         let db = Db::open(&p, c);
-        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 4, supported: 3 }));
+        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 5, supported: 4 }));
         drop(db);
         assert_eq!(std::fs::read(&p).unwrap(), before, "file must not be modified");
-        assert_eq!(schema_version(&p), 4, "no downgrade");
+        assert_eq!(schema_version(&p), 5, "no downgrade");
     }
 
     #[test]
@@ -1004,12 +1004,12 @@ mod tests {
     }
 
     // The generic framework tests add a hypothetical next migration on top of this build's list
-    // (funding-pnl made the real list v1 + v2 + v3, so "next" is v4).
+    // (funding-pnl made the real list v1 + v2 + v3 + v4, so "next" is v5).
     const GOOD_NEXT: &str = "CREATE TABLE next_added (x INTEGER);";
     const BAD_NEXT: &str = "CREATE TABLE half_applied (x INTEGER); THIS IS NOT SQL;";
 
     fn migrations(next: &'static str) -> Vec<Migration> {
-        vec![Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }, Migration { version: 4, sql: next }]
+        vec![Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }, Migration { version: 4, sql: SCHEMA_V4 }, Migration { version: 5, sql: next }]
     }
 
     #[test]
@@ -1024,7 +1024,7 @@ mod tests {
         let n: i64 = db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM events WHERE event_type='X'", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 400, "existing data preserved");
         drop(db);
-        assert_eq!(schema_version(&p), 4);
+        assert_eq!(schema_version(&p), 5);
     }
 
     #[test]
@@ -1037,7 +1037,7 @@ mod tests {
         let db = Db::open_with(&p, c, &migrations(BAD_NEXT));
         assert!(matches!(db.halt_reason(), Some(HaltReason::MigrationFailed(_))), "{:?}", db.halt_reason());
         drop(db);
-        assert_eq!(schema_version(&p), 3);
+        assert_eq!(schema_version(&p), 4);
         let c = Connection::open(&p).unwrap();
         let n: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='half_applied'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "no half-applied migration");
@@ -1078,13 +1078,13 @@ mod tests {
     }
 
     /// A database whose newest data sits only in the `-wal` (as after a crash), schema bumped to 3
-    /// (newer than this build's v3; funding-pnl).
+    /// (newer than this build's v4; funding-pnl).
     fn crashed_v2_with_wal(p: &Path) {
         populated(p);
         let c = Connection::open(p).unwrap();
         c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
         c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)).unwrap();
-        c.execute("UPDATE schema_version SET version = 4", []).unwrap();
+        c.execute("UPDATE schema_version SET version = 5", []).unwrap();
         drop(c);
         assert!(std::fs::metadata(sidecar(p, "-wal")).unwrap().len() > 0, "fixture must leave a -wal behind");
     }
@@ -1097,7 +1097,7 @@ mod tests {
         let (main_before, wal_before) = (bytes_of(&p), bytes_of(&sidecar(&p, "-wal")));
         let (c, _) = clock(9);
         let db = Db::open(&p, c);
-        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 4, supported: 3 }));
+        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 5, supported: 4 }));
         drop(db);
         assert!(bytes_of(&p) == main_before, "main file must be byte-identical");
         assert!(bytes_of(&sidecar(&p, "-wal")) == wal_before, "-wal must be byte-identical (and still exist)");
@@ -1280,7 +1280,7 @@ mod tests {
         let db = Db::open_with(&p, c, &migrations("ALTER TABLE events ADD COLUMN extra TEXT;"));
         assert!(!db.is_halted(), "{:?}", db.halt_reason());
         drop(db);
-        assert_eq!(schema_version(&p), 4, "the migration really ran");
+        assert_eq!(schema_version(&p), 5, "the migration really ran");
     }
 
     #[test]

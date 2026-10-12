@@ -208,6 +208,12 @@ fn funding_slot_tracing_lines_name_the_state_of_every_slot() {
     let mut zero = trace("short", Exchange::Bybit, S::Settled);
     zero.resolution = Some(Resolution::ZeroRate);
     zero.amount = Some(d("0"));
+    let mut none = trace("long", Exchange::Binance, S::Settled);
+    none.resolution = Some(Resolution::NoSettlement);
+    none.amount = Some(d("0"));
+    let mut only_none = funding([LegFunding::Simulated, LegFunding::Simulated], vec![]);
+    only_none.trace = vec![none];
+    assert!(tracing_lines(&only_none)[0].contains("已確認無結算"), "{:?}", tracing_lines(&only_none));
     let mut manual = trace("short", Exchange::Okx, S::ManualCheck);
     manual.manual_reason = Some(ManualReason::FetchFailed);
     manual.last_error = Some("timeout".into());

@@ -32,7 +32,10 @@ pub enum RateCheck {
     /// The rate at the settlement time is exactly 0 (`source` names the endpoint).
     Zero { source: String },
     NonZero,
-    /// Not asked, failed, or no rate for that time: changes nothing.
+    /// The public history was read successfully and has NO funding at that time: the exchange did
+    /// not settle then. Only counts once the tracing period is over (design: the ledger may lag).
+    NoRow { source: String },
+    /// Not asked, failed, or not available: changes nothing.
     Unknown,
 }
 
@@ -124,7 +127,22 @@ pub fn step(row: &SlotRow, now_ms: i64, outcome: CheckOutcome) -> Step {
             next.last_error = None;
             return Step::Settled(next);
         }
-        CheckOutcome::NotFound { rate: _ } => {
+        CheckOutcome::NotFound { rate } => {
+            // The exchange published no funding for that time and the whole tracing period has passed
+            // without a ledger row: it did not settle there. Settled as zero, with the reason kept.
+            if let RateCheck::NoRow { source } = rate
+                && stage_at(row.settle_ms, now_ms) == SlotState::ManualCheck
+            {
+                next.checks_ok += 1;
+                next.resolution = Some(Resolution::NoSettlement);
+                next.amount = Some(Decimal::ZERO);
+                next.zero_rate_source = Some(source);
+                next.first_seen_ms = Some(now_ms);
+                next.state = SlotState::Settled;
+                next.manual_reason = None;
+                next.last_error = None;
+                return Step::Settled(next);
+            }
             next.checks_ok += 1;
             next.last_error = None;
         }

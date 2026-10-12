@@ -80,6 +80,9 @@ pub enum Resolution {
     Ledger,
     /// No row, and the exchange's public history shows a funding rate of exactly 0.
     ZeroRate,
+    /// No row, and the exchange's public history has no funding at that time either (the expected
+    /// settlement did not happen on that exchange): settled with amount 0 after the tracing period.
+    NoSettlement,
 }
 
 impl Resolution {
@@ -87,12 +90,14 @@ impl Resolution {
         match self {
             Resolution::Ledger => "LEDGER",
             Resolution::ZeroRate => "ZERO_RATE",
+            Resolution::NoSettlement => "NO_SETTLEMENT",
         }
     }
     pub fn parse(s: &str) -> Option<Resolution> {
         Some(match s {
             "LEDGER" => Resolution::Ledger,
             "ZERO_RATE" => Resolution::ZeroRate,
+            "NO_SETTLEMENT" => Resolution::NoSettlement,
             _ => return None,
         })
     }

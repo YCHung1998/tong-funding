@@ -189,3 +189,26 @@ fn funding_slots_tracing_delay_percentiles_use_the_nearest_rank() {
     let shuffled = [30, 10, 20].map(|n| n * 1_000);
     assert_eq!(delay_percentiles(&shuffled), Some((20_000, 30_000, 30_000)));
 }
+
+#[test]
+fn funding_slots_tracing_no_row_settles_as_no_settlement_only_after_the_tracing_period() {
+    let no_row = || CheckOutcome::NotFound { rate: RateCheck::NoRow { source: "binance public funding-rate history".into() } };
+    // Inside the period (up to +59 min) the slot keeps tracing: the ledger may still lag.
+    for m in [5, 30, 40, 59] {
+        assert!(matches!(step(&row(), T + m * M, no_row()), Step::Progress(_)), "+{m} min");
+    }
+    let Step::Settled(r) = step(&row(), T + 60 * M, no_row()) else { panic!("not settled at +60 min") };
+    assert_eq!((r.state, r.resolution, r.amount, r.ledger_dedupe_key), (SlotState::Settled, Some(Resolution::NoSettlement), Some(Decimal::ZERO), None));
+    assert_eq!(r.zero_rate_source.as_deref(), Some("binance public funding-rate history"));
+    // A late check (the machine slept) is judged by when it ran.
+    assert!(matches!(step(&row(), T + 80 * M, no_row()), Step::Settled(_)));
+}
+
+#[test]
+fn funding_slots_tracing_a_ledger_row_beats_no_row_and_failures_never_mean_no_settlement() {
+    assert!(matches!(step(&row(), T + 70 * M, found()), Step::Settled(r) if r.resolution == Some(Resolution::Ledger)));
+    let r = progress(step(&row(), T + 70 * M, failed()));
+    assert_eq!((r.state, r.manual_reason), (SlotState::ManualCheck, Some(ManualReason::FetchFailed)));
+    let r = progress(step(&row(), T + 70 * M, CheckOutcome::NotFound { rate: RateCheck::Unknown }));
+    assert_eq!((r.state, r.manual_reason), (SlotState::ManualCheck, Some(ManualReason::NotFound)));
+}

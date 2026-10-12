@@ -313,8 +313,10 @@ pub fn assemble(db: &Db, pair: &str, now_ms: i64) -> Result<PairPnlInput, String
     for s in db.slots_of_pair(pair).map_err(|e| e.to_string())? {
         let i = usize::from(s.leg == crate::store::funding_slots::SlotLeg::Short);
         match (s.state, s.resolution) {
-            (crate::store::funding_slots::SlotState::Settled, Some(crate::store::funding_slots::Resolution::ZeroRate)) => {
-                leg_entries[i].push(tong_funding_core::pnl::FundingLedgerEntry::new(s.exchange, &s.symbol, Decimal::ZERO, "USDT", s.settle_ms, &format!("zero-rate:{pair}:{}:{}", s.leg.as_str(), s.settle_ms), "ZERO_RATE", json!({ "source": s.zero_rate_source })));
+            (crate::store::funding_slots::SlotState::Settled, Some(r @ (crate::store::funding_slots::Resolution::ZeroRate | crate::store::funding_slots::Resolution::NoSettlement))) => {
+                // No ledger row exists for these: a settlement of amount 0 (rate 0, or the exchange did not settle then).
+                let kind = r.as_str();
+                leg_entries[i].push(tong_funding_core::pnl::FundingLedgerEntry::new(s.exchange, &s.symbol, Decimal::ZERO, "USDT", s.settle_ms, &format!("{}:{pair}:{}:{}", kind.to_lowercase(), s.leg.as_str(), s.settle_ms), kind, json!({ "source": s.zero_rate_source })));
             }
             (crate::store::funding_slots::SlotState::Settled, _) => {}
             (state, _) => funding_tracing.push(json!({

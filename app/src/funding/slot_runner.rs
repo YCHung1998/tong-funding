@@ -19,16 +19,18 @@ use crate::store::funding_ledger::StoredLedgerEntry;
 use crate::store::funding_slots::{ManualReason, SlotLeg, SlotRow, SlotState};
 
 /// The exchange's public funding-rate history: the rate that applied at a settlement time.
-/// `Ok(None)` = the history has no rate for that time; `Err` = the lookup failed.
+/// `Ok(None)` = the history was read and has NO row for that time (no settlement then); `Err` = the
+/// lookup failed or is not available (the rate is then unknown, never "no row").
 pub trait RateSource: Send + Sync {
     fn rate_at<'a>(&'a self, exchange: Exchange, symbol: &'a str, settle_ms: i64) -> BoxFut<'a, Result<Option<Decimal>, String>>;
 }
 
-/// No rate lookups (the rate stays unknown, so nothing is ever settled as zero).
+/// No rate lookups: always `Err`, so the rate stays unknown and nothing is ever settled as zero or
+/// as "no settlement" (an unavailable source must not look like "the exchange has no row").
 pub struct NoRates;
 impl RateSource for NoRates {
     fn rate_at<'a>(&'a self, _: Exchange, _: &'a str, _: i64) -> BoxFut<'a, Result<Option<Decimal>, String>> {
-        Box::pin(std::future::ready(Ok(None)))
+        Box::pin(std::future::ready(Err("funding-rate history is not available".to_string())))
     }
 }
 
@@ -93,6 +95,7 @@ fn outcome_label(o: &CheckOutcome) -> &'static str {
     match o {
         CheckOutcome::Found { .. } => "found",
         CheckOutcome::NotFound { rate: RateCheck::Zero { .. } } => "zero_rate",
+        CheckOutcome::NotFound { rate: RateCheck::NoRow { .. } } => "no_row",
         CheckOutcome::NotFound { .. } => "not_found",
         CheckOutcome::Failed { .. } => "failed",
         CheckOutcome::Ambiguous { .. } => "ambiguous",
@@ -178,7 +181,8 @@ pub async fn check_due_slots(db: &Db, sources: &[&dyn LedgerSource], rates: &dyn
                             let rate = match rates.rate_at(slot.exchange, &slot.symbol, slot.settle_ms).await {
                                 Ok(Some(r)) if r.is_zero() => RateCheck::Zero { source: format!("{} public funding-rate history", slot.exchange.name()) },
                                 Ok(Some(_)) => RateCheck::NonZero,
-                                Ok(None) | Err(_) => RateCheck::Unknown,
+                                Ok(None) => RateCheck::NoRow { source: format!("{} public funding-rate history", slot.exchange.name()) },
+                                Err(_) => RateCheck::Unknown,
                             };
                             CheckOutcome::NotFound { rate }
                         }
@@ -208,19 +212,43 @@ pub async fn check_due_slots(db: &Db, sources: &[&dyn LedgerSource], rates: &dyn
     }
 }
 
-/// Per exchange: how many settled-by-ledger slots, and the p50/p95/p99 of `first_seen − t` (ms).
-/// Calibrates the 5/10/30/60 minute constants (design D9).
-pub fn delay_report(db: &Db) -> Result<BTreeMap<Exchange, (usize, (i64, i64, i64))>, String> {
-    let mut by: BTreeMap<Exchange, Vec<i64>> = BTreeMap::new();
+/// Publication delay of one exchange's ledger rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DelayStats {
+    /// Rows first seen inside the tracing period (these measure the exchange's publication delay).
+    pub observed: usize,
+    /// p50 / p95 / p99 of `first_seen − t` (ms) over the observed rows.
+    pub percentiles: (i64, i64, i64),
+    /// Rows found only after the tracing period (the app was not checking, e.g. asleep): `first_seen`
+    /// is then when WE looked, not when the exchange published, so they are kept out of the percentiles.
+    pub late: usize,
+}
+
+/// Per exchange: the publication delay of ledger rows (design D9: calibrates the 5/10/30/60 minute
+/// constants). Rows first seen after `t + 60 min` are counted as `late`, not measured.
+pub fn delay_report(db: &Db) -> Result<BTreeMap<Exchange, DelayStats>, String> {
+    let mut by: BTreeMap<Exchange, (Vec<i64>, usize)> = BTreeMap::new();
     for s in db.all_slots().map_err(|e| e.to_string())? {
         if s.state == SlotState::Settled
             && s.resolution == Some(crate::store::funding_slots::Resolution::Ledger)
             && let Some(seen) = s.first_seen_ms
         {
-            by.entry(s.exchange).or_default().push(seen - s.settle_ms);
+            let entry = by.entry(s.exchange).or_default();
+            let delay = seen - s.settle_ms;
+            if delay <= STAGE2_END_MS {
+                entry.0.push(delay);
+            } else {
+                entry.1 += 1;
+            }
         }
     }
-    Ok(by.into_iter().filter_map(|(ex, d)| super::slots::delay_percentiles(&d).map(|p| (ex, (d.len(), p)))).collect())
+    Ok(by
+        .into_iter()
+        .map(|(ex, (d, late))| {
+            let percentiles = super::slots::delay_percentiles(&d).unwrap_or((0, 0, 0));
+            (ex, DelayStats { observed: d.len(), percentiles, late })
+        })
+        .collect())
 }
 
 /// One pass: create the slots, then check the due ones.

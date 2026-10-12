@@ -224,6 +224,7 @@ pub fn tracing_lines(f: &PairFunding) -> Vec<String> {
             let head = format!("資金費追蹤 · {} UTC · {} {}", format::utc_hms(t.time_ms), t.exchange.name(), t.leg);
             let state = match (t.state, t.resolution) {
                 (TraceState::Settled, Some(Resolution::ZeroRate)) => "已入帳 0（費率為 0，無流水）".to_string(),
+                (TraceState::Settled, Some(Resolution::NoSettlement)) => "已確認無結算（該交易所此時間沒有資金費，記為 0）".to_string(),
                 (TraceState::Settled, _) => format!("已入帳 {} USDT", t.amount.map_or_else(|| DASH.to_string(), |a| format::signed(a, 4))),
                 (TraceState::Tracing1, _) => "追蹤中（第一階段，每 5 分鐘）".to_string(),
                 (TraceState::Tracing2, _) => "追蹤中（第二階段，每 10 分鐘）".to_string(),

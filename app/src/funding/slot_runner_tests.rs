@@ -301,5 +301,104 @@ fn funding_slot_runner_the_delay_report_lists_percentiles_per_exchange() {
     tick_at(&fx, &b, &y, &Rate(Ok(None)), &ready, T + 5 * M);
     let report = delay_report(&fx.db).unwrap();
     assert_eq!(report.keys().copied().collect::<Vec<_>>(), vec![Exchange::Binance, Exchange::Bybit]);
-    assert_eq!(report[&Exchange::Binance].0, 1);
+    assert_eq!((report[&Exchange::Binance].observed, report[&Exchange::Binance].late), (1, 0));
+}
+
+// ---- NO_SETTLEMENT: the exchange published no funding for that time ---------------------------------
+
+/// Runs the whole tracing period with nothing on the ledger.
+fn trace_to_the_end(fx: &Fx, b: &Src, y: &Src, rates: &dyn RateSource) {
+    tick_at(fx, b, y, rates, &ready, T + 20_000);
+    for m in [5, 10, 15, 20, 25, 30, 40, 50, 60] {
+        tick_at(fx, b, y, rates, &ready, T + m * M);
+    }
+}
+
+#[test]
+fn funding_slot_runner_no_ledger_row_and_no_published_rate_ends_as_no_settlement() {
+    // The recorded NMR/KAIA/SKL case: Binance testnet has no funding at a time the snapshot expected.
+    let fx = scenario(true);
+    let (b, y) = (Src::new(Exchange::Binance, vec![]), Src::new(Exchange::Bybit, vec![]));
+    trace_to_the_end(&fx, &b, &y, &Rate(Ok(None)));
+    for leg in [SlotLeg::Long, SlotLeg::Short] {
+        let s = slot(&fx, leg);
+        assert_eq!((s.state, s.resolution, s.amount, s.ledger_dedupe_key), (SlotState::Settled, Some(Resolution::NoSettlement), Some(Decimal::ZERO), None), "{leg:?}");
+        assert!(s.zero_rate_source.unwrap().contains("public funding-rate history"));
+    }
+    assert_eq!(linked_events(&fx), 2);
+}
+
+#[test]
+fn funding_slot_runner_no_settlement_waits_for_the_whole_tracing_period() {
+    let fx = scenario(true);
+    let (b, y) = (Src::new(Exchange::Binance, vec![]), Src::new(Exchange::Bybit, vec![]));
+    tick_at(&fx, &b, &y, &Rate(Ok(None)), &ready, T + 20_000);
+    for m in [5, 10, 15, 20, 25, 30, 40, 50] {
+        tick_at(&fx, &b, &y, &Rate(Ok(None)), &ready, T + m * M);
+        assert_ne!(slot(&fx, SlotLeg::Long).state, SlotState::Settled, "not settled at +{m} min: the ledger may still lag");
+    }
+}
+
+#[test]
+fn funding_slot_runner_an_unavailable_rate_source_is_not_no_row() {
+    // No rate source (or a failing one): the rate is unknown, so the slot ends in a manual check.
+    let fx = scenario(true);
+    let (b, y) = (Src::new(Exchange::Binance, vec![]), Src::new(Exchange::Bybit, vec![]));
+    trace_to_the_end(&fx, &b, &y, &NoRates);
+    let s = slot(&fx, SlotLeg::Long);
+    assert_eq!((s.state, s.manual_reason), (SlotState::ManualCheck, Some(ManualReason::NotFound)));
+    let failing = Rate(Err("down".into()));
+    tick_at(&fx, &b, &y, &failing, &ready, T + 120 * M);
+    assert_eq!(slot(&fx, SlotLeg::Long).state, SlotState::ManualCheck);
+}
+
+#[test]
+fn funding_slot_runner_a_manual_check_slot_becomes_no_settlement_at_the_next_sweep() {
+    // The state of the real database today: MANUAL_CHECK / NOT_FOUND from before this resolution existed.
+    let fx = scenario(true);
+    let (b, y) = (Src::new(Exchange::Binance, vec![]), Src::new(Exchange::Bybit, vec![]));
+    trace_to_the_end(&fx, &b, &y, &NoRates);
+    assert_eq!(slot(&fx, SlotLeg::Long).state, SlotState::ManualCheck);
+    let r = tick_at(&fx, &b, &y, &Rate(Ok(None)), &ready, T + 120 * M);
+    assert_eq!(r.settled.len(), 2, "{r:?}");
+    assert_eq!(slot(&fx, SlotLeg::Long).resolution, Some(Resolution::NoSettlement));
+}
+
+#[test]
+fn funding_slot_runner_a_ledger_row_found_in_the_period_wins_over_no_settlement() {
+    let fx = scenario(true);
+    let (bin, byb) = rows_both();
+    let (b, y) = (Src::new(Exchange::Binance, bin), Src::new(Exchange::Bybit, byb));
+    trace_to_the_end(&fx, &b, &y, &Rate(Ok(None)));
+    assert_eq!(slot(&fx, SlotLeg::Long).resolution, Some(Resolution::Ledger));
+}
+
+#[test]
+fn funding_slot_runner_pnl_counts_no_settlement_as_an_amount_of_zero_not_a_gap() {
+    let fx = scenario(true);
+    let (_, byb) = rows_both();
+    let (b, y) = (Src::new(Exchange::Binance, vec![]), Src::new(Exchange::Bybit, byb));
+    trace_to_the_end(&fx, &b, &y, &Rate(Ok(None)));
+    let p = pnl(&fx, T + 61 * M);
+    assert_eq!(p["funding_tracing"], serde_json::json!([]));
+    assert_eq!(p["breakdown"]["total"]["funding"], serde_json::json!("0.36"), "only the Bybit leg paid");
+    assert!(!p["reasons"].to_string().contains("缺少結算流水") && !p["reasons"].to_string().contains("資金費"), "{}", p["reasons"]);
+}
+
+#[test]
+fn funding_slot_runner_delay_report_keeps_late_observations_out_of_the_percentiles() {
+    let fx = scenario(true);
+    // One row first seen 206 s after the settlement (measured), one found 12 h later (the app was off).
+    let mut quick = SlotRow::new("pq", SlotLeg::Long, Exchange::Binance, "NMRUSDT", T, T + 5 * M, T);
+    let mut late = SlotRow::new("pl", SlotLeg::Long, Exchange::Binance, "NMRUSDT", T + 100, T + 5 * M, T);
+    for (s, seen, key) in [(&mut quick, T + 206_000, "binance:1"), (&mut late, T + 100 + 43_200_000, "binance:2")] {
+        fx.db.insert_slot_if_absent(s).unwrap();
+        s.resolution = Some(Resolution::Ledger);
+        s.amount = Some(Decimal::ONE);
+        s.ledger_dedupe_key = Some(key.into());
+        s.first_seen_ms = Some(seen);
+        assert!(fx.db.settle_slot(s).unwrap());
+    }
+    let stats = &delay_report(&fx.db).unwrap()[&Exchange::Binance];
+    assert_eq!((stats.observed, stats.late, stats.percentiles), (1, 1, (206_000, 206_000, 206_000)));
 }

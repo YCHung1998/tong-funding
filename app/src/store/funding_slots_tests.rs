@@ -172,3 +172,43 @@ fn funding_slots_store_a_recheck_makes_only_the_unsettled_slots_of_that_pair_due
     assert_eq!(db.get_slot("p2", SlotLeg::Long, T).unwrap().unwrap().next_check_ms, T + 300_000, "another pair is untouched");
     assert_eq!(db.due_slots(now).unwrap().iter().map(|s| s.pair_id.as_str()).collect::<Vec<_>>(), vec!["p1"]);
 }
+
+#[test]
+fn funding_slots_store_v4_keeps_the_v3_rows_and_accepts_no_settlement() {
+    use crate::store::db::{MIGRATIONS, Migration};
+    use crate::store::schema::{SCHEMA_V1, SCHEMA_V2, SCHEMA_V3};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("funding.db");
+    let clock: std::sync::Arc<dyn crate::ports::Clock> = std::sync::Arc::new(crate::ports::ManualClock::new(T));
+    let v3 = [Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }];
+    let mut manual = slot("p1", SlotLeg::Long, Exchange::Binance);
+    manual.state = SlotState::ManualCheck;
+    manual.manual_reason = Some(ManualReason::NotFound);
+    manual.checks_ok = 9;
+    let done = settled(slot("p1", SlotLeg::Short, Exchange::Bybit), "bybit:1", "-1.6997898");
+    {
+        let db = Db::open_with(&path, clock.clone(), &v3);
+        assert!(!db.is_halted(), "{:?}", db.halt_reason());
+        db.insert_slot_if_absent(&manual).unwrap();
+        db.insert_slot_if_absent(&slot("p1", SlotLeg::Short, Exchange::Bybit)).unwrap();
+        db.settle_slot(&done).unwrap();
+        // v3 cannot hold NO_SETTLEMENT.
+        assert!(db.with_conn(|c| Ok(c.execute("UPDATE funding_slots SET resolution = 'NO_SETTLEMENT' WHERE leg = 'long'", [])?)).is_err());
+    }
+    let db = Db::open(&path, clock);
+    assert!(!db.is_halted(), "{:?}", db.halt_reason());
+    assert_eq!(MIGRATIONS.last().unwrap().version, 4);
+    let rows = db.slots_of_pair("p1").unwrap();
+    assert_eq!(rows.len(), 2, "both rows survive the rebuild");
+    assert_eq!(db.get_slot("p1", SlotLeg::Long, T).unwrap().unwrap(), manual);
+    let kept = db.get_slot("p1", SlotLeg::Short, T).unwrap().unwrap();
+    assert_eq!((kept.state, kept.amount, kept.ledger_dedupe_key.as_deref()), (SlotState::Settled, Some("-1.6997898".parse().unwrap()), Some("bybit:1")));
+    // The unique ledger key, the due index and the new resolution all work after the rebuild.
+    let mut n = manual.clone();
+    n.resolution = Some(Resolution::NoSettlement);
+    n.amount = Some(Decimal::ZERO);
+    n.first_seen_ms = Some(T + 4_000_000);
+    assert!(db.settle_slot(&n).unwrap());
+    assert_eq!(db.get_slot("p1", SlotLeg::Long, T).unwrap().unwrap().resolution, Some(Resolution::NoSettlement));
+    assert!(db.due_slots(T + 10_000_000).unwrap().is_empty());
+}
