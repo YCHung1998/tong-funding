@@ -9,7 +9,7 @@ use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::*;
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::banner::{BannerVm, Freshness, LoadView};
+use super::banner::{BadgeVm, BannerItem, BannerVm, DrawerVm, Freshness, LoadView};
 use super::bridge::ClockState;
 use super::dashboard::{self, ConnectedCard, DashboardVm, ExchangeCard, MarginDistribution};
 use super::format::{self, DASH};
@@ -100,6 +100,102 @@ where
         col = col.child(row);
     }
     Some(col)
+}
+
+/// The header indicator of the notifications that are not in the banner (takes a few words of space).
+pub fn badge(vm: &BadgeVm, open: bool, on_click: ClickFn) -> Stateful<Div> {
+    div()
+        .id("alert-badge")
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .cursor_pointer()
+        .bg(rgb(if open { theme::BG_BASE } else { theme::BG_CARD }))
+        .border_1()
+        .border_color(rgb(if vm.reviews > 0 { theme::WARNING } else { theme::BORDER }))
+        .on_click(on_click)
+        .child(small(format!("{} {}", vm.text, if open { "▴" } else { "▾" }), theme::WARNING))
+}
+
+fn drawer_row<F, G>(i: usize, item: &BannerItem, ack: &mut F, link: &mut G) -> Div
+where
+    F: FnMut(usize) -> ClickFn,
+    G: FnMut(usize) -> ClickFn,
+{
+    let mut row = div()
+        .flex()
+        .items_start()
+        .gap_2()
+        .child(div().px_2().rounded_sm().bg(rgb(theme::BG_CARD)).child(small(item.category, theme::WARNING)))
+        .child(small(item.message.clone(), theme::TEXT_PRIMARY).flex_1());
+    if let Some(age) = &item.age_text {
+        row = row.child(small(age.clone(), theme::TEXT_MUTED));
+    }
+    if let Some((label, _)) = item.link {
+        row = row.child(div().id(("drawer-link", i)).cursor_pointer().on_click(link(i)).child(small(format!("{label} →"), theme::ACCENT)));
+    }
+    if item.closable {
+        row = row.child(div().id(("drawer-ack", i)).px_2().rounded_sm().cursor_pointer().border_1().border_color(rgb(theme::BORDER)).on_click(ack(i)).child(small("已確認", theme::TEXT_SECONDARY)));
+    }
+    row
+}
+
+/// The floating list behind the badge: notices and data findings, each with "已確認". Item indexes
+/// run over the notices first, then the findings. `ack_all(true)` = findings, `ack_all(false)` = notices.
+pub fn drawer<F, G, H>(d: &DrawerVm, mut ack: F, mut link: G, mut ack_all: H, close: ClickFn) -> Div
+where
+    F: FnMut(usize) -> ClickFn,
+    G: FnMut(usize) -> ClickFn,
+    H: FnMut(bool) -> ClickFn,
+{
+    let mut col = div()
+        .absolute()
+        .top(rx(46.0))
+        .right(rx(16.0))
+        .w(rx(760.0))
+        .max_h(rx(520.0))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .rounded_md()
+        .bg(rgb(theme::BG_SURFACE))
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .occlude()
+        .child(
+            div()
+                .flex()
+                .justify_between()
+                .child(small("通知", theme::TEXT_MUTED))
+                .child(div().id("drawer-close").cursor_pointer().on_click(close).child(small("收合 ▴", theme::TEXT_MUTED))),
+        );
+    let n = d.notices.len();
+    if !d.notices.is_empty() {
+        col = col.child(
+            div()
+                .flex()
+                .justify_between()
+                .child(small(format!("注意 {n}"), theme::TEXT_SECONDARY))
+                .child(div().id("drawer-ack-notices").cursor_pointer().on_click(ack_all(false)).child(small("全部確認", theme::TEXT_MUTED))),
+        );
+        for (i, item) in d.notices.iter().enumerate() {
+            col = col.child(drawer_row(i, item, &mut ack, &mut link));
+        }
+    }
+    if !d.reviews.is_empty() {
+        col = col.child(
+            div()
+                .flex()
+                .justify_between()
+                .child(small(format!("資料問題 {}（已結案超過 3 天的不再列出）", d.reviews.len()), theme::TEXT_SECONDARY))
+                .child(div().id("drawer-ack-reviews").cursor_pointer().on_click(ack_all(true)).child(small("全部確認", theme::TEXT_MUTED))),
+        );
+        for (i, item) in d.reviews.iter().enumerate() {
+            col = col.child(drawer_row(n + i, item, &mut ack, &mut link));
+        }
+    }
+    col
 }
 
 // ---- dashboard ------------------------------------------------------------------------------

@@ -143,15 +143,18 @@ fn funding_vm_positions_rows_and_card_show_funding_received() {
 }
 
 #[test]
-fn funding_vm_alerts_reach_the_banner_with_a_link_and_cannot_be_dismissed() {
+fn funding_vm_alerts_become_review_notifications_with_a_link_bound_to_their_event() {
     let mut f = funding([LegFunding::Received(d("-0.12")), LegFunding::Received(d("0.36"))], vec![]);
-    f.alerts.push(FundingAlert { event_id: 42, event_type: PNL_RECONCILIATION.into(), text: "BTCUSDT 對帳 MISMATCH".into() });
+    f.alerts.push(FundingAlert { event_id: 42, ts_ms: T, event_type: PNL_RECONCILIATION.into(), text: "BTCUSDT 對帳 MISMATCH".into() });
     let snap = positions_snapshot(f);
     let a: Vec<_> = alerts(&snap, T).into_iter().filter(|a| a.category == Category::FundingData).collect();
     assert_eq!(a.len(), 1);
     assert!(a[0].message.contains("事件 #42"), "{}", a[0].message);
     assert_eq!(a[0].link, Some(Page::SystemLogs));
-    assert!(!a[0].dismissible());
+    // A data finding is a review notification: it can be acknowledged, bound to its event, and
+    // it is not a banner item.
+    assert!(a[0].dismissible());
+    assert_eq!((a[0].category.tier(), a[0].fingerprint.as_str(), a[0].event_ms), (crate::ui::alerts::Tier::Review, "42", Some(T)));
     // Without data problems there is no such alert.
     let clean = positions_snapshot(funding([LegFunding::Received(d("0")), LegFunding::Received(d("0"))], vec![]));
     assert!(alerts(&clean, T).iter().all(|a| a.category != Category::FundingData));

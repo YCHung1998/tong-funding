@@ -68,6 +68,8 @@ mod testkit;
 #[cfg(test)]
 mod risk_help_ui_tests;
 #[cfg(test)]
+mod notifications_ui_tests;
+#[cfg(test)]
 mod scan_table_ui_tests;
 #[cfg(test)]
 mod shell_tests;

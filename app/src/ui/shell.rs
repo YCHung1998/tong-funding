@@ -12,7 +12,7 @@ use gpui_kit::*;
 use tong_funding_core::types::Exchange;
 
 use super::alerts::{self, Alert, FreshStatus};
-use super::banner::{self, AlertKey, LoadView, Region};
+use super::banner::{self, Acks, LoadView, Region};
 use super::bridge::{Bridge, CommandSink, KillSwitchState, ReadOnlyDataSource, SourceId, SourceUpdate, UiSnapshot};
 use super::trading_pages::TradingState;
 use super::clock::{now_unix_secs, read_clock};
@@ -51,7 +51,10 @@ pub struct Shell {
     positions: PositionsVm,
     pos_filter: positions::Filter,
     alerts: Vec<Alert>,
-    dismissed: BTreeSet<AlertKey>,
+    /// Acknowledged notifications (persisted in `config.alert_acks`).
+    acks: Acks,
+    /// The notification drawer behind the header badge is open.
+    drawer_open: bool,
     only_qualified: bool,
     /// The "達標計算" block on the scanner page is expanded (default).
     breakdown_open: bool,
@@ -128,6 +131,7 @@ impl Shell {
         let trading = TradingState::new(window, cx);
         let scan_events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let table = cx.new(|cx| TableState::new(ScannerTable::new(now_ms, trading.toggles.clone(), scan_events.clone()), window, cx).col_movable(false).col_resizable(false).col_selectable(false));
+        let acks = banner::decode_acks(&source.load_alert_acks().ok().flatten().unwrap_or(serde_json::Value::Null));
         let mut shell = Shell {
             page: Page::default_page(),
             now_secs: now_unix_secs(),
@@ -143,7 +147,8 @@ impl Shell {
             alerts: alerts::alerts(&snap, now_ms),
             snap,
             pos_filter: positions::Filter::default(),
-            dismissed: BTreeSet::new(),
+            acks,
+            drawer_open: false,
             only_qualified: false,
             breakdown_open: true,
             view: ScanViewState::default(),
@@ -192,7 +197,7 @@ impl Shell {
         if secs != self.now_secs {
             self.now_secs = secs;
             self.alerts = alerts::alerts(&self.snap, self.now_ms);
-            banner::prune_dismissed(&mut self.dismissed, &self.alerts);
+            self.prune_acks();
             let now = self.now_ms;
             self.table.update(cx, |t, cx| {
                 t.delegate_mut().now_ms = now;
@@ -210,7 +215,7 @@ impl Shell {
         self.dashboard = dashboard::build(&self.snap, self.now_ms);
         self.positions = positions::build(&self.snap, &self.pos_filter);
         self.alerts = alerts::alerts(&self.snap, self.now_ms);
-        banner::prune_dismissed(&mut self.dismissed, &self.alerts);
+        self.prune_acks();
         self.status = self.status_model();
         self.sync_table(cx);
     }
@@ -292,7 +297,7 @@ impl Shell {
 
     // ---- layout ---------------------------------------------------------------------------
 
-    fn header(&self) -> Div {
+    fn header(&self, cx: &mut Context<Self>) -> Div {
         let c = read_clock(self.now_secs);
         let clock = |label: &str, date: String, time: String| {
             div()
@@ -320,19 +325,125 @@ impl Shell {
                     .child(div().text_color(rgb(theme::ACCENT)).text_size(fs(14.0)).child("◈ Funding Monitor"))
                     .child(div().px_2().py_1().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::WARNING)).child(ENVIRONMENT_LABEL)),
             )
-            .child(div().flex().gap_6().child(clock("UTC", c.utc_date, c.utc_time)).child(clock("TAIPEI · UTC+8", c.taipei_date, c.taipei_time)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_6()
+                    .children(banner::badge(&self.attention()).map(|b| {
+                        pages::badge(&b, self.drawer_open, Box::new(cx.listener(|this: &mut Shell, _, _, cx| {
+                            this.toggle_drawer();
+                            cx.notify();
+                        })))
+                    }))
+                    .child(clock("UTC", c.utc_date, c.utc_time))
+                    .child(clock("TAIPEI · UTC+8", c.taipei_date, c.taipei_time)),
+            )
+    }
+
+    /// Test view of the notifications: (banner rows, notices, data findings, drawer open, stored acknowledgements).
+    #[cfg(test)]
+    pub(crate) fn notification_state(&self) -> (usize, usize, usize, bool, usize) {
+        let a = self.attention();
+        (a.critical.len(), a.notices.len(), a.reviews.len(), self.drawer_open, self.acks.len())
+    }
+
+    pub(crate) fn toggle_drawer(&mut self) {
+        self.drawer_open = !self.drawer_open;
+    }
+
+    /// "已確認" on item `i` of the drawer (notices first, then data findings); stores the result.
+    pub(crate) fn acknowledge_drawer_item(&mut self, i: usize) {
+        if let Some(alert) = self.drawer_alerts().get(i).cloned() {
+            banner::acknowledge(&mut self.acks, &alert);
+            self.save_acks();
+        }
+    }
+
+    /// "全部確認" of one drawer group (`reviews` = the data findings, else the notices).
+    pub(crate) fn acknowledge_drawer_group(&mut self, reviews: bool) {
+        let attn = self.attention();
+        let chosen = if reviews { attn.reviews } else { attn.notices };
+        banner::acknowledge_all(&mut self.acks, &chosen);
+        self.save_acks();
+    }
+
+    fn attention(&self) -> banner::Attention {
+        banner::attention(&self.alerts, &self.acks, self.now_ms)
+    }
+
+    /// Forgets acknowledgements whose condition ended or whose finding changed, and stores the result.
+    fn prune_acks(&mut self) {
+        if banner::prune_acks(&mut self.acks, &self.alerts) {
+            self.save_acks();
+        }
+    }
+
+    fn save_acks(&self) {
+        if let Err(e) = self.source.save_alert_acks(&banner::encode_acks(&self.acks)) {
+            eprintln!("could not store the acknowledged notifications: {e}");
+        }
+    }
+
+    /// The notifications of the drawer in item order: notices first, then data findings.
+    fn drawer_alerts(&self) -> Vec<Alert> {
+        let a = self.attention();
+        a.notices.into_iter().chain(a.reviews).collect()
+    }
+
+    /// The floating notification list (only while the badge is open and there is something in it).
+    fn drawer(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if !self.drawer_open {
+            return None;
+        }
+        let attn = self.attention();
+        let vm = banner::drawer(&attn);
+        if vm.notices.is_empty() && vm.reviews.is_empty() {
+            return None;
+        }
+        let links: Vec<Option<Page>> = vm.notices.iter().chain(&vm.reviews).map(|i| i.link.map(|l| l.1)).collect();
+        Some(pages::drawer(
+            &vm,
+            |i| {
+                Box::new(cx.listener(move |this: &mut Shell, _, _, cx| {
+                    this.acknowledge_drawer_item(i);
+                    cx.notify();
+                }))
+            },
+            |i| {
+                let target = links[i].unwrap_or(Page::SystemLogs);
+                Box::new(cx.listener(move |this: &mut Shell, _, _, cx| {
+                    this.drawer_open = false;
+                    this.go(target);
+                    cx.notify();
+                }))
+            },
+            |reviews| {
+                Box::new(cx.listener(move |this: &mut Shell, _, _, cx| {
+                    this.acknowledge_drawer_group(reviews);
+                    cx.notify();
+                }))
+            },
+            Box::new(cx.listener(|this: &mut Shell, _, _, cx| {
+                this.drawer_open = false;
+                cx.notify();
+            })),
+        ))
     }
 
     fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let vm = banner::banner(&self.alerts, &self.dismissed);
-        let keys: Vec<AlertKey> = vm.items.iter().map(|i| i.key.clone()).collect();
+        let vm = banner::banner(&self.alerts, &self.acks, self.now_ms);
+        let keys: Vec<banner::AlertKey> = vm.items.iter().map(|i| i.key.clone()).collect();
         let links: Vec<Option<Page>> = vm.items.iter().map(|i| i.link.map(|l| l.1)).collect();
         pages::banner(
             &vm,
             |i| {
                 let key = keys[i].clone();
                 Box::new(cx.listener(move |this: &mut Shell, _, _, cx| {
-                    this.dismissed.insert(key.clone());
+                    if let Some(alert) = this.alerts.iter().find(|a| (a.category, a.source.clone()) == key).cloned() {
+                        banner::acknowledge(&mut this.acks, &alert);
+                        this.save_acks();
+                    }
                     cx.notify();
                 }))
             },
@@ -698,7 +809,7 @@ impl Render for Shell {
         // Region order comes from the tested `banner::layout`: the banner is on every page.
         for region in banner::layout(self.page) {
             root = match region {
-                Region::Header => root.child(self.header()),
+                Region::Header => root.child(self.header(cx)),
                 Region::Banner => match self.banner(cx) {
                     Some(b) => root.child(b),
                     None => root,
@@ -710,6 +821,10 @@ impl Render for Shell {
                 Region::StatusBar => root.child(self.status_bar(super::zoom_ui::current(cx).status_label())),
             };
         }
-        root
+        // The notification drawer floats over the page (it takes no layout space).
+        match self.drawer(cx) {
+            Some(d) => root.relative().child(d),
+            None => root,
+        }
     }
 }

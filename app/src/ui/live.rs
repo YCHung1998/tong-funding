@@ -365,21 +365,19 @@ impl ReadOnlyDataSource for LiveSource {
     }
 
     fn load_ui_prefs(&self) -> Result<Option<serde_json::Value>, String> {
-        let db = self.db.as_ref().ok_or("資料庫不可用")?;
-        db.config_get(super::zoom::KEY_UI_PREFS).map(|e| e.map(|e| e.value)).map_err(|e| e.to_string())
+        self.load_config(super::zoom::KEY_UI_PREFS)
     }
 
-    /// Optimistic version: on a conflict re-read the latest version once and overwrite.
     fn save_ui_prefs(&self, prefs: &serde_json::Value) -> Result<(), String> {
-        use crate::store::db::StoreError;
-        let db = self.db.as_ref().ok_or("資料庫不可用")?;
-        let key = super::zoom::KEY_UI_PREFS;
-        let version = |db: &Db| db.config_get(key).map(|e| e.map(|e| e.version)).map_err(|e| e.to_string());
-        match db.config_set(key, prefs, version(db)?) {
-            Ok(_) => Ok(()),
-            Err(StoreError::VersionConflict { .. }) => db.config_set(key, prefs, version(db)?).map(|_| ()).map_err(|e| e.to_string()),
-            Err(e) => Err(e.to_string()),
-        }
+        self.save_config(super::zoom::KEY_UI_PREFS, prefs)
+    }
+
+    fn load_alert_acks(&self) -> Result<Option<serde_json::Value>, String> {
+        self.load_config(KEY_ALERT_ACKS)
+    }
+
+    fn save_alert_acks(&self, acks: &serde_json::Value) -> Result<(), String> {
+        self.save_config(KEY_ALERT_ACKS, acks)
     }
 }
 
@@ -420,7 +418,27 @@ impl Resync for ClockResync {
     }
 }
 
+/// `config` key of the acknowledged notifications (header badge).
+const KEY_ALERT_ACKS: &str = "alert_acks";
+
 impl LiveSource {
+    fn load_config(&self, key: &str) -> Result<Option<serde_json::Value>, String> {
+        let db = self.db.as_ref().ok_or("資料庫不可用")?;
+        db.config_get(key).map(|e| e.map(|e| e.value)).map_err(|e| e.to_string())
+    }
+
+    /// Optimistic version: on a conflict re-read the latest version once and overwrite.
+    fn save_config(&self, key: &str, value: &serde_json::Value) -> Result<(), String> {
+        use crate::store::db::StoreError;
+        let db = self.db.as_ref().ok_or("資料庫不可用")?;
+        let version = |db: &Db| db.config_get(key).map(|e| e.map(|e| e.version)).map_err(|e| e.to_string());
+        match db.config_set(key, value, version(db)?) {
+            Ok(_) => Ok(()),
+            Err(StoreError::VersionConflict { .. }) => db.config_set(key, value, version(db)?).map(|_| ()).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// Starts every feed and the engine on a background runtime over the ONE store instance the
     /// composition root opened (`None` = no store: the engine does not start). Never blocks the UI.
     pub fn start(db: Option<Db>) -> Arc<LiveSource> {

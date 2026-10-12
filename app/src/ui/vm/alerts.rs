@@ -28,7 +28,21 @@ pub enum Category {
     /// funding-pnl: reconciliation MISMATCH / FAILED, ledger conflict, ledger fetch error,
     /// INCOMPLETE PnL. Not dismissible: it stays until the data changes (settlement-timeline).
     FundingData,
+    /// An account setting the system cannot work with (e.g. OKX account mode): not a connection
+    /// problem, so it is a notice, not a banner.
+    Setting,
     RateLimitOrClock,
+}
+
+/// Where an alert is shown (design: the banner is only for what must not be missed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Tier {
+    /// The banner: halts, locked pairs, lost connections.
+    Critical,
+    /// The header badge and its drawer: stale data, rate limits, clocks, settings.
+    Notice,
+    /// The header badge and its drawer: data-quality findings about pairs (funding / PnL).
+    Review,
 }
 
 impl Category {
@@ -39,12 +53,37 @@ impl Category {
             Category::Disconnected => "斷線",
             Category::Stale => "資料過期",
             Category::FundingData => "資料問題",
+            Category::Setting => "設定問題",
             Category::RateLimitOrClock => "限流 / 時鐘",
         }
     }
-    /// Manual-attention and halt alerts have no close control.
+    /// Manual-attention and halt alerts cannot be acknowledged: they stay until the condition ends.
     pub fn dismissible(self) -> bool {
-        !matches!(self, Category::ManualAttention | Category::Halted | Category::FundingData)
+        !matches!(self, Category::ManualAttention | Category::Halted)
+    }
+    pub fn tier(self) -> Tier {
+        match self {
+            Category::ManualAttention | Category::Halted | Category::Disconnected => Tier::Critical,
+            Category::Stale | Category::Setting | Category::RateLimitOrClock => Tier::Notice,
+            Category::FundingData => Tier::Review,
+        }
+    }
+    /// Stable text used to store an acknowledgement.
+    pub fn code(self) -> &'static str {
+        match self {
+            Category::ManualAttention => "manual",
+            Category::Halted => "halted",
+            Category::Disconnected => "disconnected",
+            Category::Stale => "stale",
+            Category::FundingData => "funding",
+            Category::Setting => "setting",
+            Category::RateLimitOrClock => "limit",
+        }
+    }
+    pub fn from_code(code: &str) -> Option<Category> {
+        [Category::ManualAttention, Category::Halted, Category::Disconnected, Category::Stale, Category::FundingData, Category::Setting, Category::RateLimitOrClock]
+            .into_iter()
+            .find(|c| c.code() == code)
     }
 }
 
@@ -58,6 +97,12 @@ pub struct Alert {
     pub age_ms: Option<i64>,
     /// Navigation only (never an action that changes state).
     pub link: Option<Page>,
+    /// What an acknowledgement is bound to: a finding about an event carries that event's id, so a
+    /// new finding (another event) has another fingerprint and shows again; a plain condition has an
+    /// empty one (its acknowledgement lasts while it is active).
+    pub fingerprint: String,
+    /// When the underlying event happened, if it is an event (used to age old findings out).
+    pub event_ms: Option<i64>,
 }
 
 impl Alert {
@@ -117,8 +162,10 @@ pub fn source_age_ms(h: &SourceHealth, now_ms: i64) -> Option<i64> {
 /// Builds every active alert, ordered by severity then source; one per (category, source).
 pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
     let mut out: Vec<Alert> = Vec::new();
+    let mut funding_alerts: Vec<Alert> = Vec::new();
     let mut push = |category: Category, source: String, message: String, age_ms: Option<i64>, link: Option<Page>| {
-        out.push(Alert { category, source, message, age_ms, link });
+        // A condition (stale, disconnected, ...) has no event: its acknowledgement lasts while it is active.
+        out.push(Alert { category, source, message, age_ms, link, fingerprint: String::new(), event_ms: None });
     };
 
     // 1. Manual attention: locked pair states (and unreadable ones: unknown is an anomaly).
@@ -153,6 +200,8 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
         let source = SourceId::Account(e).label();
         match snap.account(e) {
             AccountState::NotConnected { reason } => push(Category::Disconnected, source, format!("{} 帳戶未連線：{reason}", e.name()), None, None),
+            // An account the system cannot use by its own setting (not a lost connection).
+            AccountState::Failed { error, at } if error.contains("unsupported") => push(Category::Setting, source, format!("{} 帳戶設定不支援：{error}", e.name()), Some((now_ms - at).max(0)), None),
             AccountState::Failed { error, at } => push(Category::Disconnected, source, format!("{} 帳戶讀取失敗：{error}", e.name()), Some((now_ms - at).max(0)), None),
             _ => {}
         }
@@ -199,7 +248,16 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
     for (pair_id, f) in &snap.funding {
         for al in &f.alerts {
             let msg = format!("{}（事件 #{}，見系統日誌）· 不會自動修正", al.text, al.event_id);
-            push(Category::FundingData, format!("{pair_id} {}", al.event_type), msg, None, Some(Page::SystemLogs));
+            // Bound to its event: an acknowledgement holds only for this finding (a new event shows again).
+            funding_alerts.push(Alert {
+                category: Category::FundingData,
+                source: format!("{pair_id} {}", al.event_type),
+                message: msg,
+                age_ms: None,
+                link: Some(Page::SystemLogs),
+                fingerprint: al.event_id.to_string(),
+                event_ms: Some(al.ts_ms),
+            });
         }
     }
 
@@ -216,6 +274,7 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
         }
     }
 
+    out.extend(funding_alerts);
     out.sort_by(|a, b| (a.category, &a.source, &a.message).cmp(&(b.category, &b.source, &b.message)));
     out.dedup_by(|b, a| a.category == b.category && a.source == b.source);
     out

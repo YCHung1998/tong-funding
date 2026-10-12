@@ -87,6 +87,8 @@ pub struct PnlSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FundingAlert {
     pub event_id: i64,
+    /// When that event was written (old findings age out of the notification badge).
+    pub ts_ms: i64,
     pub event_type: String,
     pub text: String,
 }
@@ -148,7 +150,9 @@ pub fn load_pair_funding(db: &Db, rows: &[PairRow], now_ms: i64) -> BTreeMap<Str
     let mut out = BTreeMap::new();
     for row in rows {
         let Ok(a) = assemble(db, &row.internal_uuid, now_ms) else { continue };
-        let pnl = latest_pnl(db, &row.internal_uuid).ok().flatten().map(|p| decode_pnl(&p));
+        let stored_pnl = latest_pnl(db, &row.internal_uuid).ok().flatten();
+        let pnl_ts_ms = stored_pnl.as_ref().map(|p| p.ts_ms);
+        let pnl = stored_pnl.as_ref().map(decode_pnl);
         let mut legs = [LegFunding::Simulated, LegFunding::Simulated];
         let mut slots = Vec::new();
         let mut updated_at_ms = None;
@@ -176,12 +180,12 @@ pub fn load_pair_funding(db: &Db, rows: &[PairRow], now_ms: i64) -> BTreeMap<Str
             && r.payload["result"].as_str() != Some("OK")
         {
             let result = r.payload["result"].as_str().unwrap_or("FAILED");
-            alerts.push(FundingAlert { event_id: r.id, event_type: PNL_RECONCILIATION.into(), text: format!("{} 對帳 {result}", row.symbol) });
+            alerts.push(FundingAlert { event_id: r.id, ts_ms: r.ts_ms, event_type: PNL_RECONCILIATION.into(), text: format!("{} 對帳 {result}", row.symbol) });
         }
         if let Some(p) = &pnl
             && p.status != "COMPLETE"
         {
-            alerts.push(FundingAlert { event_id: p.event_id, event_type: "PNL".into(), text: format!("{} PnL INCOMPLETE：{}", row.symbol, p.reasons.join("；")) });
+            alerts.push(FundingAlert { event_id: p.event_id, ts_ms: pnl_ts_ms.unwrap_or(now_ms), event_type: "PNL".into(), text: format!("{} PnL INCOMPLETE：{}", row.symbol, p.reasons.join("；")) });
         }
         if !a.simulated {
             let exchanges: Vec<Exchange> = a.input.legs.iter().filter(|l| !l.fills.is_empty()).map(|l| l.exchange).collect();
@@ -196,14 +200,14 @@ pub fn load_pair_funding(db: &Db, rows: &[PairRow], now_ms: i64) -> BTreeMap<Str
                     updated_at_ms = Some(updated_at_ms.map_or(*ts, |u: i64| u.max(*ts)));
                 }
                 if ty == FUNDING_LEDGER_CONFLICT {
-                    alerts.push(FundingAlert { event_id: *id, event_type: ty.clone(), text: format!("{} funding 流水衝突（{}）", row.symbol, v["dedupe_key"].as_str().unwrap_or("")) });
+                    alerts.push(FundingAlert { event_id: *id, ts_ms: *ts, event_type: ty.clone(), text: format!("{} funding 流水衝突（{}）", row.symbol, v["dedupe_key"].as_str().unwrap_or("")) });
                 }
                 if ty == FETCH_ERROR {
                     let resolved = global.iter().any(|(_, t2, ty2, v2)| {
                         ty2 == FUNDING_LEDGER_FETCHED && t2 > ts && v2["outcome"].as_str() == Some("complete") && v2["exchange"] == v["exchange"]
                     });
                     if !resolved {
-                        alerts.push(FundingAlert { event_id: *id, event_type: ty.clone(), text: format!("{} funding 流水取得失敗", v["exchange"].as_str().unwrap_or("")) });
+                        alerts.push(FundingAlert { event_id: *id, ts_ms: *ts, event_type: ty.clone(), text: format!("{} funding 流水取得失敗", v["exchange"].as_str().unwrap_or("")) });
                     }
                 }
             }

@@ -244,3 +244,31 @@ fn okx_is_alerted_like_the_other_exchanges_while_it_is_allowed_and_silent_when_i
     let msgs: Vec<_> = alerts(&s, NOW).into_iter().map(|a| a.message).collect();
     assert!(msgs.iter().all(|m| !m.contains("OKX")), "{msgs:?}");
 }
+
+#[test]
+fn an_account_the_system_cannot_use_by_its_setting_is_a_notice_not_a_disconnect() {
+    // The OKX account is in spot mode (acctLv 1): not a lost connection, nothing the banner can fix.
+    let mut s = healthy();
+    s.accounts.insert(Okx, AccountState::Failed { error: "exchange error acct_mode_unsupported: 帳戶模式不支援 (acctLv 1, posMode net_mode)".into(), at: NOW - 5_000 });
+    let a = alerts(&s, NOW);
+    let okx = a.iter().find(|a| a.message.contains("acct_mode_unsupported")).expect("an OKX alert");
+    assert_eq!(okx.category, Category::Setting);
+    assert_eq!(okx.category.tier(), Tier::Notice);
+    assert!(okx.dismissible());
+    assert!(a.iter().all(|a| !(a.category == Category::Disconnected && a.message.contains("OKX 帳戶讀取失敗"))));
+    // A genuine read failure stays a disconnect (critical).
+    s.accounts.insert(Okx, AccountState::Failed { error: "timeout".into(), at: NOW });
+    let a = alerts(&s, NOW);
+    assert!(a.iter().any(|a| a.category == Category::Disconnected && a.message.contains("OKX 帳戶讀取失敗")));
+}
+
+#[test]
+fn every_category_has_a_tier_and_a_code_that_reads_back() {
+    use Category::*;
+    for c in [ManualAttention, Halted, Disconnected, Stale, FundingData, Setting, RateLimitOrClock] {
+        assert_eq!(Category::from_code(c.code()), Some(c), "{c:?}");
+    }
+    assert_eq!(Category::from_code("nope"), None);
+    let tiers: Vec<_> = [ManualAttention, Halted, Disconnected, Stale, RateLimitOrClock, Setting, FundingData].map(Category::tier).to_vec();
+    assert_eq!(tiers, [Tier::Critical, Tier::Critical, Tier::Critical, Tier::Notice, Tier::Notice, Tier::Notice, Tier::Review]);
+}
