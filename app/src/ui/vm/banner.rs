@@ -2,9 +2,9 @@
 //! between the header and the content on every page and depends only on the alert list, never on
 //! the current page's data (it still shows when the database cannot be opened).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
-use super::alerts::{Alert, Category, FreshStatus, source_age_ms, source_status};
+use super::alerts::{Alert, Category, FreshStatus, Tier, source_age_ms, source_status};
 use super::bridge::{KillSwitchState, SourceId, SystemFlags, UiSnapshot};
 use super::format;
 use crate::store::db::Db;
@@ -34,8 +34,15 @@ fn age_text(category: Category, ms: i64) -> String {
     }
 }
 
-/// Key of a dismissed alert: it stays hidden only while the same condition is active.
+/// Key of an acknowledged alert (category + source).
 pub type AlertKey = (Category, String);
+
+/// Acknowledged alerts: key → the fingerprint that was acknowledged. An acknowledgement holds only
+/// while the alert has that same fingerprint (a new finding shows again).
+pub type Acks = BTreeMap<AlertKey, String>;
+
+/// Findings about pairs older than this leave the notification badge (they stay in the system log).
+pub const REVIEW_MAX_AGE_MS: i64 = 3 * 24 * 3_600_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BannerItem {
@@ -43,6 +50,7 @@ pub struct BannerItem {
     pub message: String,
     /// `持續 1 分 5 秒` / `31 秒前`.
     pub age_text: Option<String>,
+    /// Can be acknowledged ("已確認"); halts and locked pairs cannot.
     pub closable: bool,
     /// Navigation link (label, page).
     pub link: Option<(&'static str, Page)>,
@@ -62,27 +70,151 @@ impl BannerVm {
     }
 }
 
-/// Banner items; dismissed keys hide only dismissible alerts.
-pub fn banner(alerts: &[Alert], dismissed: &BTreeSet<AlertKey>) -> BannerVm {
-    let items = alerts
-        .iter()
-        .filter(|a| !(a.dismissible() && dismissed.contains(&(a.category, a.source.clone()))))
-        .map(|a| BannerItem {
-            category: a.category.label(),
-            message: a.message.clone(),
-            age_text: a.age_ms.map(|ms| age_text(a.category, ms)),
-            closable: a.dismissible(),
-            link: a.link.map(|p| (if p == Page::Positions { "前往持倉" } else { "前往" }, p)),
-            key: (a.category, a.source.clone()),
-            severe: !a.dismissible(),
-        })
-        .collect();
-    BannerVm { items }
+fn item_of(a: &Alert) -> BannerItem {
+    BannerItem {
+        category: a.category.label(),
+        message: a.message.clone(),
+        age_text: a.age_ms.map(|ms| age_text(a.category, ms)),
+        closable: a.dismissible(),
+        link: a.link.map(|p| (if p == Page::Positions { "前往持倉" } else { "前往" }, p)),
+        key: (a.category, a.source.clone()),
+        severe: !a.dismissible(),
+    }
 }
 
-/// Forget dismissals whose condition has gone, so the alert shows again if it comes back.
-pub fn prune_dismissed(dismissed: &mut BTreeSet<AlertKey>, alerts: &[Alert]) {
-    dismissed.retain(|k| alerts.iter().any(|a| a.category == k.0 && a.source == k.1));
+fn acknowledged(a: &Alert, acks: &Acks) -> bool {
+    a.dismissible() && acks.get(&(a.category, a.source.clone())).is_some_and(|f| *f == a.fingerprint)
+}
+
+fn aged_out(a: &Alert, now_ms: i64) -> bool {
+    a.category.tier() == Tier::Review && a.event_ms.is_some_and(|t| now_ms.saturating_sub(t) > REVIEW_MAX_AGE_MS)
+}
+
+/// What needs attention now, by where it is shown.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Attention {
+    /// The banner.
+    pub critical: Vec<Alert>,
+    /// The badge's drawer, "注意".
+    pub notices: Vec<Alert>,
+    /// The badge's drawer, "資料問題".
+    pub reviews: Vec<Alert>,
+    /// Hidden because they were acknowledged.
+    pub acknowledged: usize,
+    /// Hidden because the finding is older than [`REVIEW_MAX_AGE_MS`].
+    pub aged_out: usize,
+}
+
+/// Splits the active alerts by tier; acknowledged ones (same fingerprint) and old findings are left out.
+pub fn attention(alerts: &[Alert], acks: &Acks, now_ms: i64) -> Attention {
+    let mut out = Attention::default();
+    for a in alerts {
+        if acknowledged(a, acks) {
+            out.acknowledged += 1;
+        } else if aged_out(a, now_ms) {
+            out.aged_out += 1;
+        } else {
+            match a.category.tier() {
+                Tier::Critical => out.critical.push(a.clone()),
+                Tier::Notice => out.notices.push(a.clone()),
+                Tier::Review => out.reviews.push(a.clone()),
+            }
+        }
+    }
+    out
+}
+
+/// The banner: only the critical tier.
+pub fn banner(alerts: &[Alert], acks: &Acks, now_ms: i64) -> BannerVm {
+    BannerVm { items: attention(alerts, acks, now_ms).critical.iter().map(item_of).collect() }
+}
+
+/// The drawer behind the header badge.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DrawerVm {
+    pub notices: Vec<BannerItem>,
+    pub reviews: Vec<BannerItem>,
+}
+
+pub fn drawer(attn: &Attention) -> DrawerVm {
+    DrawerVm { notices: attn.notices.iter().map(item_of).collect(), reviews: attn.reviews.iter().map(item_of).collect() }
+}
+
+/// The small header indicator; `None` when there is nothing to review (it takes no space).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadgeVm {
+    pub text: String,
+    pub notices: usize,
+    pub reviews: usize,
+}
+
+pub fn badge(attn: &Attention) -> Option<BadgeVm> {
+    let (n, r) = (attn.notices.len(), attn.reviews.len());
+    if n + r == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if r > 0 {
+        parts.push(format!("資料問題 {r}"));
+    }
+    if n > 0 {
+        parts.push(format!("注意 {n}"));
+    }
+    Some(BadgeVm { text: format!("⚠ {}", parts.join(" · ")), notices: n, reviews: r })
+}
+
+/// Records the acknowledgement of `alert` (only acknowledgeable alerts).
+pub fn acknowledge(acks: &mut Acks, alert: &Alert) {
+    if alert.dismissible() {
+        acks.insert((alert.category, alert.source.clone()), alert.fingerprint.clone());
+    }
+}
+
+/// Acknowledges every alert of the drawer (one tier or both). Returns how many were recorded.
+pub fn acknowledge_all(acks: &mut Acks, alerts: &[Alert]) -> usize {
+    let before = acks.len();
+    for a in alerts {
+        acknowledge(acks, a);
+    }
+    acks.len().saturating_sub(before)
+}
+
+/// Only an acknowledgement of a finding about an event is kept across restarts (it stays valid for
+/// that event); one of a plain condition lasts while the condition is active.
+fn persistent(category: Category) -> bool {
+    category == Category::FundingData
+}
+
+/// Forget acknowledgements that no longer hold. `true` = the set changed (store it):
+/// - a finding whose event changed (the same key now has another fingerprint) shows again;
+/// - an acknowledged condition that has ended is forgotten (it shows if it comes back);
+/// - an acknowledged finding that is not listed right now is KEPT (the data may not be loaded
+///   yet, and the same event stays acknowledged when it is listed again).
+pub fn prune_acks(acks: &mut Acks, alerts: &[Alert]) -> bool {
+    let before = acks.len();
+    acks.retain(|k, f| match alerts.iter().find(|a| a.category == k.0 && a.source == k.1) {
+        Some(a) => a.fingerprint == *f,
+        None => persistent(k.0),
+    });
+    acks.len() != before
+}
+
+/// The stored form: `{"<category code>|<source>": "<fingerprint>"}`, findings only.
+pub fn encode_acks(acks: &Acks) -> serde_json::Value {
+    serde_json::Value::Object(acks.iter().filter(|((c, _), _)| persistent(*c)).map(|((c, s), f)| (format!("{}|{s}", c.code()), serde_json::Value::String(f.clone()))).collect())
+}
+
+/// Reads the stored form; entries it cannot read are dropped (an unreadable ack just shows the
+/// alert again), and so is anything that is not a finding.
+pub fn decode_acks(v: &serde_json::Value) -> Acks {
+    let Some(map) = v.as_object() else { return Acks::new() };
+    map.iter()
+        .filter_map(|(k, f)| {
+            let (code, source) = k.split_once('|')?;
+            let category = Category::from_code(code).filter(|c| persistent(*c))?;
+            Some(((category, source.to_string()), f.as_str()?.to_string()))
+        })
+        .collect()
 }
 
 /// A block's freshness indicator.

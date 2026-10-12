@@ -610,6 +610,14 @@ pub trait ReadOnlyDataSource: Send + Sync {
     fn recheck_funding(&self, _pair_id: &str) -> Result<usize, String> {
         Err("資金費查詢不可用".into())
     }
+    /// The acknowledged notifications (`config.alert_acks`); `Ok(None)` = none stored.
+    fn load_alert_acks(&self) -> Result<Option<Value>, String> {
+        Ok(None)
+    }
+    /// Overwrites `config.alert_acks`.
+    fn save_alert_acks(&self, _acks: &Value) -> Result<(), String> {
+        Ok(())
+    }
     /// `config.ui_prefs` (ui-font-zoom); `Ok(None)` = never saved.
     fn load_ui_prefs(&self) -> Result<Option<Value>, String> {
         Ok(None)
