@@ -333,3 +333,139 @@ fn an_okx_pair_is_an_ordinary_candidate_under_the_general_rules() {
     let vm = scanner::build(&s, NOW);
     assert_eq!(eligibility(row(&vm, "SOLUSDT"), &s, NOW), Err(CandidateBlock::StaleData(Exchange::Okx)));
 }
+
+// ---- automatic adding ------------------------------------------------------------------------------------
+
+fn auto_on() -> AutoAddState {
+    let mut a = AutoAddState::default();
+    a.request_enable();
+    a.confirm_enable();
+    assert!(a.enabled);
+    a
+}
+
+fn auto_run(state: &mut AutoAddState, s: &UiSnapshot, now: i64) -> (usize, Vec<Command>) {
+    let vm = scanner::build(s, now);
+    let sink = Sink::default();
+    let n = auto_add_tick(state, &vm, s, now, &sink);
+    (n, sink.0.borrow().clone())
+}
+
+fn added_symbols(cmds: &[Command]) -> Vec<String> {
+    cmds.iter().filter_map(|c| if let Command::AddPrepared(p) = c { Some(p.symbol.clone()) } else { None }).collect()
+}
+
+#[test]
+fn auto_add_is_off_until_it_is_confirmed_and_never_stored() {
+    let s = snap();
+    let mut off = AutoAddState::default();
+    assert_eq!(auto_run(&mut off, &s, NOW).0, 0, "off by default");
+    off.request_enable();
+    assert!(off.confirming && !off.enabled, "the first click only asks");
+    assert_eq!(auto_run(&mut off, &s, NOW).0, 0, "still nothing while the confirmation is open");
+    off.cancel_confirm();
+    off.confirm_enable();
+    assert!(!off.enabled, "no confirmation was open: confirm does nothing");
+    off.request_enable();
+    off.confirm_enable();
+    assert!(off.enabled && !off.confirming);
+    off.disable();
+    assert!(!off.enabled && !off.confirming);
+    assert_eq!(AutoAddState::default(), AutoAddState { ..Default::default() }, "a fresh state (a restart) is off");
+}
+
+#[test]
+fn auto_add_sends_only_the_qualified_row_once_and_marks_its_origin() {
+    let s = snap();
+    let mut a = auto_on();
+    let (n, cmds) = auto_run(&mut a, &s, NOW);
+    assert_eq!((n, added_symbols(&cmds)), (1, vec!["BTCUSDT".to_string()]), "ETH does not qualify");
+    let Command::AddPrepared(p) = &cmds[0] else { panic!() };
+    assert_eq!(p.entry["source"], serde_json::json!("auto_add"));
+    assert_eq!((p.settlement_ms, p.long_exchange, p.short_exchange), (T, Exchange::Binance, Exchange::Bybit));
+    assert_eq!((a.added_total, a.last_added_ms, a.last_symbols.clone()), (1, Some(NOW), vec!["BTCUSDT".to_string()]));
+    assert_eq!(auto_run(&mut a, &s, NOW + 1_000).0, 0, "not again for the same settlement");
+}
+
+#[test]
+fn auto_add_does_not_add_a_cancelled_pair_again_for_the_same_settlement() {
+    let mut s = snap();
+    let mut a = auto_on();
+    assert_eq!(auto_run(&mut a, &s, NOW).0, 1);
+    // The engine auto-cancelled it (net edge fell below the threshold): no add → cancel → add loop.
+    pair_in(&mut s, "u1", PairState::Cancelled, false);
+    assert_eq!(auto_run(&mut a, &s, NOW + 30_000).0, 0);
+    // After a restart the memory is gone, but the engine still lists the pair for that settlement.
+    let mut fresh = auto_on();
+    assert_eq!(auto_run(&mut fresh, &s, NOW + 60_000).0, 0, "a pair of any state for this settlement blocks it");
+}
+
+#[test]
+fn auto_add_needs_enough_time_before_the_entry() {
+    let s = snap();
+    let mut a = auto_on();
+    assert_eq!(auto_run(&mut a, &s, T - AUTO_ADD_MIN_LEAD_MS + 1_000).0, 0, "too close to the settlement");
+    assert_eq!(auto_run(&mut a, &s, T - AUTO_ADD_MIN_LEAD_MS - 1_000).0, 1);
+}
+
+#[test]
+fn auto_add_adds_nothing_while_the_engine_refuses_or_is_not_running() {
+    let mut s = snap();
+    let mut a = auto_on();
+    s.engine.as_mut().unwrap().blockers = vec![crate::engine::command::Blocker::KillSwitch];
+    assert_eq!(auto_run(&mut a, &s, NOW).0, 0, "kill switch");
+    assert!(auto_add_blocked(&s).unwrap().contains("緊急停止"));
+    s.engine = None;
+    assert_eq!(auto_run(&mut a, &s, NOW).0, 0, "no engine");
+    assert_eq!(auto_add_blocked(&s).as_deref(), Some("引擎未啟動"));
+    let mut bad = snap();
+    bad.settings.contract_error = Some("x".into());
+    assert!(auto_add_blocked(&bad).unwrap().contains("合約模板無效"));
+}
+
+#[test]
+fn auto_add_never_exceeds_the_free_pair_slots_and_takes_the_best_net_edge_first() {
+    let mut s = snap();
+    // A second qualifying symbol with a wider spread (a better Net Edge).
+    for (ex, rate, price) in [(Exchange::Binance, "-0.004", "1.2"), (Exchange::Bybit, "0.004", "1.2")] {
+        let mut o = obs(ex, "XRPUSDT", rate, 28_800, T, NOW - 100);
+        o.mark_price = d(price);
+        s.market.get_mut(&ex).unwrap().observations.push(o);
+    }
+    let vm = scanner::build(&s, NOW);
+    assert_eq!(row(&vm, "XRPUSDT").qualified, Qualified::Yes);
+    assert!(row(&vm, "XRPUSDT").net_edge.value() > row(&vm, "BTCUSDT").net_edge.value(), "XRP has the better edge");
+    s.settings.risk.max_concurrent_pairs = 1;
+    let mut a = auto_on();
+    let (n, cmds) = auto_run(&mut a, &s, NOW);
+    assert_eq!((n, added_symbols(&cmds)), (1, vec!["XRPUSDT".to_string()]), "one free slot: the better edge");
+    // A slot taken by another pair (PREPARED) leaves no room at all.
+    let mut full = snap();
+    full.settings.risk.max_concurrent_pairs = 1;
+    pair_in(&mut full, "u1", PairState::Prepared, false);
+    full.engine.as_mut().unwrap().pairs[0].symbol = "SOLUSDT".into();
+    assert_eq!(auto_run(&mut auto_on(), &full, NOW).0, 0);
+    // A flat-confirmed CLOSING pair (waiting only for its funding PnL) holds no slot.
+    let mut closing = snap();
+    closing.settings.risk.max_concurrent_pairs = 1;
+    pair_in(&mut closing, "u2", PairState::Closing, true);
+    closing.engine.as_mut().unwrap().pairs[0].symbol = "SOLUSDT".into();
+    assert_eq!(auto_run(&mut auto_on(), &closing, NOW).0, 1);
+}
+
+#[test]
+fn auto_add_respects_the_leverage_cap_check() {
+    let mut s = snap(); // contract leverage 3x
+    put_caps(&mut s, "BTCUSDT", "20", "2");
+    assert_eq!(auto_run(&mut auto_on(), &s, NOW).0, 0, "a known cap below the leverage: never added");
+    let mut ok = snap();
+    put_caps(&mut ok, "BTCUSDT", "20", "10");
+    assert_eq!(auto_run(&mut auto_on(), &ok, NOW).0, 1);
+}
+
+#[test]
+fn auto_add_does_not_touch_a_symbol_that_is_already_staged() {
+    let mut s = snap();
+    pair_in(&mut s, "u1", PairState::Prepared, false);
+    assert_eq!(auto_run(&mut auto_on(), &s, NOW).0, 0, "already staged (by hand or by an earlier pass)");
+}

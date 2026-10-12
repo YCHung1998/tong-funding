@@ -198,6 +198,7 @@ impl Shell {
             self.now_secs = secs;
             self.alerts = alerts::alerts(&self.snap, self.now_ms);
             self.prune_acks();
+            self.auto_add_now();
             let now = self.now_ms;
             self.table.update(cx, |t, cx| {
                 t.delegate_mut().now_ms = now;
@@ -208,6 +209,12 @@ impl Shell {
         if repaint {
             cx.notify();
         }
+    }
+
+    /// One pass of the automatic adding of qualified rows (once a second; does nothing unless the
+    /// user turned it on, see `AutoAddState`). Sends plans (`AddPrepared`) only, never an order.
+    pub(crate) fn auto_add_now(&mut self) -> usize {
+        super::candidates::auto_add_tick(&mut self.trading.auto_add, &self.scanner, &self.snap, self.now_ms, self.sink.as_ref())
     }
 
     fn recompute(&mut self, cx: &mut Context<Self>) {

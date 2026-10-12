@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
-use tong_funding_core::risk::ExecutionMode;
+use tong_funding_core::risk::{ExecutionMode, TriggerMode};
 use tong_funding_core::types::Exchange;
 
 use super::bridge::{Settings, SourceUpdate, UiSnapshot};
@@ -46,6 +46,8 @@ type In = Entity<InputState>;
 pub struct TradingState {
     pub toggles: Rc<RefCell<Vec<String>>>,
     pub candidates: CandidateList,
+    /// The automatic adding of qualified rows to the staged orders (off at every start).
+    pub auto_add: candidates::AutoAddState,
     pub settings_seen: bool,
     pub staged_sel: BTreeSet<String>,
     pub staged_confirm: Option<PendingConfirm>,
@@ -112,6 +114,7 @@ impl TradingState {
         TradingState {
             toggles: Rc::new(RefCell::new(Vec::new())),
             candidates: CandidateList::default(),
+            auto_add: candidates::AutoAddState::default(),
             settings_seen: false,
             staged_sel: BTreeSet::new(),
             staged_confirm: None,
@@ -439,9 +442,51 @@ impl Shell {
         changed
     }
 
+    /// The switch of the automatic adding: off → (confirm) → on. Turning it on needs a second click.
+    fn auto_add_control(&self, cx: &mut Context<Self>) -> Div {
+        let a = &self.trading.auto_add;
+        let mode = self.snap.engine.as_ref().map(|e| (e.trigger_mode, e.execution_mode));
+        let consequence = match mode {
+            Some((TriggerMode::Auto, ExecutionMode::ExchangeDemo)) => "觸發模式 AUTO + EXCHANGE_DEMO：達標配對會自動加入，並依排程自動進場、真實下單到 demo / testnet 帳戶",
+            Some((TriggerMode::Auto, ExecutionMode::Simulation)) => "觸發模式 AUTO + SIMULATION：達標配對會自動加入並由模擬器自動進場",
+            Some((TriggerMode::Manual, _)) => "觸發模式 MANUAL：只會自動加入交易單，進場仍需到交易單頁手動按下",
+            None => "引擎未啟動",
+        };
+        let mut row = div().flex().flex_wrap().gap_2().items_center();
+        if a.enabled {
+            row = row
+                .child(btn("auto-add-off", "● 自動加入：開（按此關閉）", true, self.click(cx, |this, _| this.trading.auto_add.disable())))
+                .child(small(
+                    match (a.last_added_ms, a.added_total) {
+                        (Some(t), n) => format!("本次已自動加入 {n} 筆 · 最近 {} UTC：{}", format::utc_hms(t), a.last_symbols.join("、")),
+                        (None, _) => "尚未有達標配對可加入".to_string(),
+                    },
+                    theme::TEXT_SECONDARY,
+                ));
+            if let Some(why) = candidates::auto_add_blocked(&self.snap) {
+                row = row.child(small(format!("暫停：{why}"), theme::WARNING));
+            }
+        } else if a.confirming {
+            row = row
+                .child(small("確認開啟自動加入？", theme::WARNING))
+                .child(btn("auto-add-confirm", "確認開啟", true, self.click(cx, |this, _| this.trading.auto_add.confirm_enable())))
+                .child(btn("auto-add-cancel", "取消", true, self.click(cx, |this, _| this.trading.auto_add.cancel_confirm())));
+        } else {
+            row = row.child(btn("auto-add-on", "○ 自動加入：關（按此開啟）", true, self.click(cx, |this, _| this.trading.auto_add.request_enable())));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(row)
+            .child(small(consequence, if a.enabled || a.confirming { theme::WARNING } else { theme::TEXT_MUTED }))
+            .child(small("條件：達標、行情新鮮、結算前至少 90 秒、槓桿符合上限、未超過同時配對數；同一標的同一結算只加入一次（被取消後不再重加）；每次重新啟動都是關閉。", theme::TEXT_MUTED))
+    }
+
     pub(crate) fn candidate_panel(&self, cx: &mut Context<Self>) -> Div {
         let views = candidates::views(&self.trading.candidates, &self.scanner, &self.snap, self.now_ms);
         let mut panel = card().child(text("Candidate List · 待加入交易單", theme::TEXT_PRIMARY)).child(small("勾選表格的「加入交易單」欄；只存在本次執行的記憶體中，重啟後清空。加入只建立 PREPARED 配對，不送出任何訂單。", theme::TEXT_MUTED));
+        panel = panel.child(self.auto_add_control(cx));
         if views.is_empty() {
             return panel.child(small("尚未勾選任何候選", theme::TEXT_MUTED));
         }

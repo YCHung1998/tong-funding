@@ -207,6 +207,12 @@ pub fn views(list: &CandidateList, scanner: &ScannerVm, snap: &UiSnapshot, now_m
 /// "加入並前往交易單": one `AddPrepared` per valid candidate (scan snapshot in `entry`, read by
 /// Node 0 as `EntrySnapshot`). Returns how many were sent. Never an order.
 pub fn add_to_staged(list: &CandidateList, scanner: &ScannerVm, snap: &UiSnapshot, now_ms: i64, sink: &dyn CommandSink) -> usize {
+    add_to_staged_from(list, scanner, snap, now_ms, sink, "manual")
+}
+
+/// [`add_to_staged`] with the origin recorded in the pair's entry (`"manual"` = the button,
+/// `"auto_add"` = the automatic adding).
+pub fn add_to_staged_from(list: &CandidateList, scanner: &ScannerVm, snap: &UiSnapshot, now_ms: i64, sink: &dyn CommandSink, source: &str) -> usize {
     let mut n = 0;
     for (i, v) in views(list, scanner, snap, now_ms).into_iter().enumerate() {
         let (Ok(()), Some(lp), Some(sp), Some(t)) = (&v.valid, v.long_price, v.short_price, v.settlement_ms) else { continue };
@@ -219,9 +225,10 @@ pub fn add_to_staged(list: &CandidateList, scanner: &ScannerVm, snap: &UiSnapsho
             "gross_spread": v.gross_spread.map(|g| g.normalize().to_string()),
             "net_edge_pct": v.net_edge_pct.map(|g| g.normalize().to_string()),
             "scanned_at_ms": now_ms,
+            "source": source,
         });
         sink.send(
-            format!("加入交易單 {}", v.symbol),
+            format!("{} {}", if source == "auto_add" { "自動加入交易單" } else { "加入交易單" }, v.symbol),
             Command::AddPrepared(NewPreparedPair {
                 internal_uuid: uuid,
                 pair_id: format!("{}-{now_ms}", v.symbol),
@@ -233,6 +240,130 @@ pub fn add_to_staged(list: &CandidateList, scanner: &ScannerVm, snap: &UiSnapsho
             }),
         );
         n += 1;
+    }
+    n
+}
+
+// ---- automatic adding --------------------------------------------------------------------------------
+
+/// A row is only added automatically with at least this long before its entry trigger (the entry
+/// lead is 10 s): a pair added too close to the settlement would only miss its window.
+pub const AUTO_ADD_MIN_LEAD_MS: i64 = 90_000;
+
+/// The automatic adding of qualified scanner rows to the staged orders. Off at every start (never
+/// stored: after a restart nothing trades by itself until the user turns it on again).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AutoAddState {
+    pub enabled: bool,
+    /// The first click on "開啟" asked for confirmation.
+    pub confirming: bool,
+    /// (symbol, settlement time) already auto-added in this run: a pair that was cancelled or
+    /// blocked is not added again for the same settlement (no add → cancel → add loop).
+    attempted: BTreeSet<(String, i64)>,
+    pub added_total: usize,
+    pub last_added_ms: Option<i64>,
+    pub last_symbols: Vec<String>,
+}
+
+impl AutoAddState {
+    /// First click: ask for confirmation (nothing is turned on yet).
+    pub fn request_enable(&mut self) {
+        if !self.enabled {
+            self.confirming = true;
+        }
+    }
+    /// Second click: turn it on.
+    pub fn confirm_enable(&mut self) {
+        if self.confirming {
+            self.enabled = true;
+            self.confirming = false;
+        }
+    }
+    pub fn cancel_confirm(&mut self) {
+        self.confirming = false;
+    }
+    pub fn disable(&mut self) {
+        self.enabled = false;
+        self.confirming = false;
+    }
+}
+
+/// Why nothing is added automatically right now, if so (shown next to the button).
+pub fn auto_add_blocked(snap: &UiSnapshot) -> Option<String> {
+    let Some(engine) = &snap.engine else { return Some("引擎未啟動".into()) };
+    if let Some(e) = &snap.settings.error {
+        return Some(format!("設定不完整（{e}）"));
+    }
+    if let Some(e) = &snap.settings.contract_error {
+        return Some(format!("合約模板無效（{e}）"));
+    }
+    let refusing = super::engine_view::refusing_blockers(engine);
+    refusing.first().map(super::engine_view::blocker_text)
+}
+
+/// Pairs that occupy a slot of `max_concurrent_pairs` (the same rule as the engine's Node 0).
+fn active_pairs(snap: &UiSnapshot) -> usize {
+    snap.engine.as_ref().map_or(0, |e| {
+        e.pairs
+            .iter()
+            .filter(|p| !matches!(p.state, PairState::Finalized | PairState::Cancelled | PairState::Blocked) && !(p.state == PairState::Closing && p.flat_confirmed))
+            .count()
+    })
+}
+
+/// The symbols to add now, best Net Edge first, at most as many as free pair slots remain. A row
+/// qualifies when it could be ticked by hand AND its candidate is valid (known leverage caps),
+/// has at least [`AUTO_ADD_MIN_LEAD_MS`] left, was not auto-added for this settlement before and
+/// has no pair of any state for this settlement.
+pub fn auto_add_symbols(scanner: &ScannerVm, snap: &UiSnapshot, state: &AutoAddState, now_ms: i64) -> Vec<String> {
+    if !state.enabled || auto_add_blocked(snap).is_some() {
+        return Vec::new();
+    }
+    let room = (snap.settings.risk.max_concurrent_pairs as usize).saturating_sub(active_pairs(snap));
+    if room == 0 {
+        return Vec::new();
+    }
+    let engine_pairs = snap.engine.as_ref().map(|e| e.pairs.as_slice()).unwrap_or(&[]);
+    let mut picks: Vec<(String, Option<Decimal>)> = Vec::new();
+    for row in &scanner.rows {
+        let Some((t, _)) = row.countdown_target else { continue };
+        if eligibility(row, snap, now_ms).is_err()
+            || t - now_ms < AUTO_ADD_MIN_LEAD_MS
+            || state.attempted.contains(&(row.symbol.clone(), t))
+            || engine_pairs.iter().any(|p| p.symbol == row.symbol && p.settlement_ms == t)
+        {
+            continue;
+        }
+        picks.push((row.symbol.clone(), row.net_edge.value()));
+    }
+    // Best Net Edge first (a row without a value last).
+    picks.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut list = CandidateList::default();
+    list.symbols = picks.iter().map(|p| p.0.clone()).collect();
+    let valid: BTreeSet<String> = views(&list, scanner, snap, now_ms).into_iter().filter(|v| v.valid.is_ok()).map(|v| v.symbol).collect();
+    picks.into_iter().map(|p| p.0).filter(|s| valid.contains(s)).take(room).collect()
+}
+
+/// One pass of the automatic adding: sends one `AddPrepared` per symbol of [`auto_add_symbols`] and
+/// remembers them. Never an order (a PREPARED pair is only a plan; the entry still goes through
+/// the engine's trigger mode and its pre-trade check). Returns how many were sent.
+pub fn auto_add_tick(state: &mut AutoAddState, scanner: &ScannerVm, snap: &UiSnapshot, now_ms: i64, sink: &dyn CommandSink) -> usize {
+    let symbols = auto_add_symbols(scanner, snap, state, now_ms);
+    if symbols.is_empty() {
+        return 0;
+    }
+    let mut list = CandidateList::default();
+    list.symbols = symbols.iter().cloned().collect();
+    let n = add_to_staged_from(&list, scanner, snap, now_ms, sink, "auto_add");
+    for s in &symbols {
+        if let Some(t) = scanner.rows.iter().find(|r| &r.symbol == s).and_then(|r| r.countdown_target).map(|(t, _)| t) {
+            state.attempted.insert((s.clone(), t));
+        }
+    }
+    if n > 0 {
+        state.added_total += n;
+        state.last_added_ms = Some(now_ms);
+        state.last_symbols = symbols;
     }
     n
 }
