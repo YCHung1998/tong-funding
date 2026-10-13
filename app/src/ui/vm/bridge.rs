@@ -118,6 +118,7 @@ pub enum AccountState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SourceId {
     BinanceWs,
+    BybitWs,
     MarketPoll(Exchange),
     Account(Exchange),
 }
@@ -126,6 +127,7 @@ impl SourceId {
     pub fn label(self) -> String {
         match self {
             SourceId::BinanceWs => "Binance WebSocket".into(),
+            SourceId::BybitWs => "Bybit WebSocket".into(),
             SourceId::MarketPoll(e) => format!("{} 行情", e.name()),
             SourceId::Account(e) => format!("{} 帳戶", e.name()),
         }
@@ -133,6 +135,7 @@ impl SourceId {
     pub fn exchange(self) -> Exchange {
         match self {
             SourceId::BinanceWs => Exchange::Binance,
+            SourceId::BybitWs => Exchange::Bybit,
             SourceId::MarketPoll(e) | SourceId::Account(e) => e,
         }
     }
@@ -341,6 +344,9 @@ pub struct UiSnapshot {
     pub funding: BTreeMap<String, crate::ui::funding::PairFunding>,
     /// `OkxLatch::reason()` once an environment mismatch (`50101`) disabled OKX for the rest of the run.
     pub okx_disabled: Option<String>,
+    /// The Bybit WebSocket is switched off on purpose (`TONG_FUNDING_BYBIT_FEED=rest`): its health is
+    /// then not expected and no notice is raised.
+    pub bybit_ws_disabled: bool,
 }
 
 impl UiSnapshot {
@@ -395,6 +401,8 @@ pub enum SourceUpdate {
     Funding(BTreeMap<String, crate::ui::funding::PairFunding>),
     /// The OKX latch tripped (the one shared `OkxLatch`): why OKX is disabled until restart.
     OkxDisabled(String),
+    /// The Bybit WebSocket feed is off by the roll-back switch (sent once at start).
+    BybitWsDisabled,
 }
 
 impl SourceUpdate {
@@ -491,6 +499,7 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         }
         SourceUpdate::Funding(f) => snap.funding = f,
         SourceUpdate::OkxDisabled(why) => snap.okx_disabled = Some(why),
+        SourceUpdate::BybitWsDisabled => snap.bybit_ws_disabled = true,
     }
 }
 

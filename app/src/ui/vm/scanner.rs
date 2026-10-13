@@ -582,8 +582,11 @@ pub fn countdown(target: Option<(i64, Exchange)>, clock: ClockState, now_ms: i64
     if remaining <= 0 { Countdown::Settling } else { Countdown::Remaining { ms: remaining, calibrated } }
 }
 
-/// The sources shown in the scanner header: Binance WebSocket, Bybit and OKX polls.
-pub const HEADER_SOURCES: [SourceId; 3] = [SourceId::BinanceWs, SourceId::MarketPoll(Exchange::Bybit), SourceId::MarketPoll(Exchange::Okx)];
+/// The sources shown in the scanner header: the Binance and Bybit WebSockets, Bybit and OKX polls.
+pub const HEADER_SOURCES: [SourceId; 4] = [SourceId::BinanceWs, SourceId::BybitWs, SourceId::MarketPoll(Exchange::Bybit), SourceId::MarketPoll(Exchange::Okx)];
+
+/// Text of the Bybit WebSocket indicator when the roll-back switch turned it off.
+pub const BYBIT_WS_DISABLED_TEXT: &str = "已停用（TONG_FUNDING_BYBIT_FEED=rest）";
 
 #[cfg(test)]
 #[path = "scanner_tests.rs"]

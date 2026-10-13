@@ -135,3 +135,11 @@ fn the_okx_disabled_reason_is_kept_until_it_changes() {
     apply_update(&mut s, SourceUpdate::OkxDisabled("OKX 50101: ...".into()));
     assert_eq!(s.okx_disabled.as_deref(), Some("OKX 50101: ..."));
 }
+
+#[test]
+fn the_bybit_websocket_switch_is_kept() {
+    let mut s = UiSnapshot::default();
+    assert!(!s.bybit_ws_disabled);
+    apply_update(&mut s, SourceUpdate::BybitWsDisabled);
+    assert!(s.bybit_ws_disabled);
+}

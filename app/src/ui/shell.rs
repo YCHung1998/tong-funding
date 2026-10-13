@@ -506,7 +506,11 @@ impl Shell {
             let mut f = banner::freshness(&self.snap, s, self.now_ms);
             let label = s.label();
             let mut chip = pages::freshness_chip(&label, &f);
-            if s == SourceId::BinanceWs {
+            if s == SourceId::BybitWs && self.snap.bybit_ws_disabled {
+                sources = sources.child(div().flex().gap_1().child(small(label, theme::TEXT_SECONDARY)).child(small(scanner::BYBIT_WS_DISABLED_TEXT, theme::TEXT_MUTED)));
+                continue;
+            }
+            if matches!(s, SourceId::BinanceWs | SourceId::BybitWs) {
                 // The WebSocket header uses ONLINE / RECONNECTING / OFFLINE.
                 let word = match f.status {
                     FreshStatus::Online => "ONLINE",

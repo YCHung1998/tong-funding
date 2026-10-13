@@ -33,6 +33,7 @@ fn healthy() -> UiSnapshot {
     let mut s = UiSnapshot::default();
     s.health = vec![
         hs(SourceId::BinanceWs, true, Some(500), 1_000),
+        hs(SourceId::BybitWs, true, Some(500), 1_000),
         hs(SourceId::MarketPoll(Binance), true, Some(1_000), 10_000),
         hs(SourceId::MarketPoll(Bybit), true, Some(1_000), 10_000),
         hs(SourceId::MarketPoll(Okx), true, Some(1_000), 10_000),
@@ -271,4 +272,46 @@ fn every_category_has_a_tier_and_a_code_that_reads_back() {
     assert_eq!(Category::from_code("nope"), None);
     let tiers: Vec<_> = [ManualAttention, Halted, Disconnected, Stale, RateLimitOrClock, Setting, FundingData].map(Category::tier).to_vec();
     assert_eq!(tiers, [Tier::Critical, Tier::Critical, Tier::Critical, Tier::Notice, Tier::Notice, Tier::Notice, Tier::Review]);
+}
+
+// ---- bybit-ws-feed: the Bybit WebSocket is a notice, never a banner row --------------------------
+
+const BYBIT_WS_DOWN: &str = "Bybit WebSocket 已斷線，行情退回 REST 輪詢（約每 10 秒更新）";
+
+#[test]
+fn a_down_bybit_websocket_is_one_notice_that_says_the_rest_poll_took_over() {
+    for h in [hs(SourceId::BybitWs, false, Some(200), 1_000), hs(SourceId::BybitWs, true, Some(5_000), 1_000), hs(SourceId::BybitWs, true, None, 1_000)] {
+        let mut s = healthy();
+        set_health(&mut s, h);
+        let a = alerts(&s, NOW);
+        assert_eq!(a.len(), 1, "{a:?}");
+        assert_eq!((a[0].category, a[0].message.as_str()), (Category::Stale, BYBIT_WS_DOWN));
+        let attn = crate::ui::banner::attention(&a, &Default::default(), NOW);
+        assert!(attn.critical.is_empty(), "not a banner row");
+        assert_eq!(attn.notices.len(), 1);
+    }
+    let mut unknown = healthy();
+    unknown.health.retain(|h| h.source != SourceId::BybitWs);
+    let a = alerts(&unknown, NOW);
+    assert_eq!(a.len(), 1);
+    assert_eq!(a[0].message, BYBIT_WS_DOWN);
+}
+
+#[test]
+fn a_healthy_disabled_or_not_allowed_bybit_websocket_has_no_alert() {
+    assert_eq!(alerts(&healthy(), NOW), vec![]);
+    let mut off = healthy();
+    off.health.retain(|h| h.source != SourceId::BybitWs);
+    off.bybit_ws_disabled = true;
+    assert_eq!(alerts(&off, NOW), vec![], "switched to rest on purpose");
+    let mut not_allowed = healthy();
+    not_allowed.health.retain(|h| h.source != SourceId::BybitWs);
+    not_allowed.settings.risk.allowed_exchanges = vec![Binance, Okx];
+    assert_eq!(alerts(&not_allowed, NOW), vec![]);
+}
+
+#[test]
+fn the_bybit_websocket_has_its_own_source_id_and_belongs_to_bybit() {
+    assert_eq!(SourceId::BybitWs.label(), "Bybit WebSocket");
+    assert_eq!(SourceId::BybitWs.exchange(), Bybit);
 }

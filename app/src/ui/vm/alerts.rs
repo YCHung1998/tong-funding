@@ -219,6 +219,15 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
             expected.push(SourceId::Account(e));
         }
     }
+    // The Bybit WebSocket only overlays the REST poll: down means slower data, not no data, so it is a
+    // notice (never a banner row) whatever the reason (offline, stale, unknown).
+    if enabled.contains(&Exchange::Bybit) && !snap.bybit_ws_disabled {
+        let up = snap.health_of(SourceId::BybitWs).is_some_and(|h| source_status(h, now_ms) == FreshStatus::Online);
+        if !up {
+            let age = snap.health_of(SourceId::BybitWs).and_then(|h| source_age_ms(h, now_ms));
+            push(Category::Stale, SourceId::BybitWs.label(), "Bybit WebSocket 已斷線，行情退回 REST 輪詢（約每 10 秒更新）".into(), age, None);
+        }
+    }
     for id in expected {
         let label = id.label();
         let Some(h) = snap.health.iter().find(|h| h.source == id) else {
