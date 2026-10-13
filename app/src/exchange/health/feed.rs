@@ -265,6 +265,11 @@ pub enum FeedEvent {
 pub trait MessageSource: Send {
     fn connect(&mut self) -> impl Future<Output = Result<(), AdapterError>> + Send;
     fn next_event(&mut self, wait: Duration) -> impl Future<Output = FeedEvent> + Send;
+    /// Send one text frame (a public subscribe / ping request). The default does nothing, so sources that
+    /// only listen (Binance's URL-subscribed stream, the scripted test sources) need no implementation.
+    fn send(&mut self, _text: String) -> impl Future<Output = Result<(), AdapterError>> + Send {
+        async { Ok(()) }
+    }
 }
 
 pub trait Sleeper: Send + Sync {
@@ -279,8 +284,8 @@ impl Sleeper for TokioSleeper {
     }
 }
 
-/// Real WebSocket source (`tokio-tungstenite`, rustls). Read-only: nothing is ever sent but
-/// protocol pongs.
+/// Real WebSocket source (`tokio-tungstenite`, rustls). Besides protocol pongs, only public subscribe /
+/// ping text is ever sent (through [`MessageSource::send`]); no credentials pass through here.
 pub struct TungsteniteSource {
     url: String,
     stream: Option<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
@@ -312,6 +317,15 @@ impl MessageSource for TungsteniteSource {
                 Ok(())
             }
         }
+    }
+
+    async fn send(&mut self, text: String) -> Result<(), AdapterError> {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let Some(stream) = self.stream.as_mut() else {
+            return Err(AdapterError::network("not connected"));
+        };
+        stream.send(Message::Text(text.into())).await.map_err(|e| AdapterError::network(e.to_string()))
     }
 
     async fn next_event(&mut self, wait: Duration) -> FeedEvent {
@@ -696,11 +710,12 @@ mod tests {
         connects: VecDeque<Result<(), AdapterError>>,
         steps: VecDeque<Step>,
         connect_count: usize,
+        sent: Vec<String>,
     }
 
     impl Scripted {
         fn new(clock: &ManualClock, connects: Vec<Result<(), AdapterError>>, steps: Vec<Step>) -> Self {
-            Self { clock: clock.clone(), connects: connects.into(), steps: steps.into(), connect_count: 0 }
+            Self { clock: clock.clone(), connects: connects.into(), steps: steps.into(), connect_count: 0, sent: Vec::new() }
         }
     }
 
@@ -708,6 +723,10 @@ mod tests {
         async fn connect(&mut self) -> Result<(), AdapterError> {
             self.connect_count += 1;
             self.connects.pop_front().unwrap_or(Ok(()))
+        }
+        async fn send(&mut self, text: String) -> Result<(), AdapterError> {
+            self.sent.push(text);
+            Ok(())
         }
         async fn next_event(&mut self, _wait: Duration) -> FeedEvent {
             loop {
@@ -1044,6 +1063,54 @@ mod tests {
                 FeedEvent::Text(t) => panic!("a {} byte message was accepted", t.len()),
                 other => panic!("expected an error for the 9 MiB message, got {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn send_before_connect_is_an_error_not_a_panic() {
+        block_on(async {
+            let mut src = TungsteniteSource::new("ws://127.0.0.1:1");
+            assert!(src.send("{\"op\":\"ping\"}".into()).await.is_err());
+        });
+    }
+
+    #[test]
+    fn a_scripted_source_records_what_is_sent_and_the_default_send_is_a_no_op() {
+        struct Silent;
+        impl MessageSource for Silent {
+            async fn connect(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn next_event(&mut self, _wait: Duration) -> FeedEvent {
+                FeedEvent::Idle
+            }
+        }
+        block_on(async {
+            let clock = ManualClock::new(0);
+            let mut src = Scripted::new(&clock, vec![], vec![]);
+            src.send("a".into()).await.unwrap();
+            src.send("b".into()).await.unwrap();
+            assert_eq!(src.sent, vec!["a".to_string(), "b".to_string()]);
+            assert!(Silent.send("ignored".into()).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn a_text_frame_sent_through_tungstenite_source_reaches_the_server() {
+        use futures_util::StreamExt;
+        block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let got = tokio::spawn(async move {
+                let (sock, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(sock).await.unwrap();
+                ws.next().await.unwrap().unwrap().into_text().unwrap().as_str().to_string()
+            });
+            let frame = "{\"op\":\"subscribe\",\"args\":[\"tickers.BTCUSDT\"]}";
+            let mut src = TungsteniteSource::new(format!("ws://127.0.0.1:{port}"));
+            src.connect().await.unwrap();
+            src.send(frame.into()).await.unwrap();
+            assert_eq!(got.await.unwrap(), frame);
         });
     }
 }
