@@ -489,3 +489,84 @@ fn a_mass_rollover_is_spread_over_several_passes() {
     // No pass handles more than MAX_REFRESH_PER_PASS symbols: more than 2 passes for 250 symbols.
     assert!(per_request.len() >= 3, "{per_request:?}");
 }
+
+// ---- live comparison (ignored: network, read-only, public data only) --------------------------------
+
+/// Ends the run after `secs` and keeps the real source otherwise.
+struct Deadline {
+    inner: super::super::feed::TungsteniteSource,
+    started: std::time::Instant,
+    secs: u64,
+}
+
+impl MessageSource for Deadline {
+    async fn connect(&mut self) -> Result<(), AdapterError> {
+        self.inner.connect().await
+    }
+    async fn send(&mut self, text: String) -> Result<(), AdapterError> {
+        self.inner.send(text).await
+    }
+    async fn next_event(&mut self, wait: Duration) -> FeedEvent {
+        if self.started.elapsed().as_secs() >= self.secs {
+            return FeedEvent::Shutdown;
+        }
+        self.inner.next_event(wait).await
+    }
+}
+
+/// Run: `cargo test -p tong-funding live_bybit_ws_vs_rest -- --ignored --nocapture`
+/// Public, read-only: the real `BybitTickerFeed::run` for 60 s over every linear USDT symbol of the REST
+/// listing, compared with a REST snapshot taken at the end. Fails only on structural errors.
+#[test]
+#[ignore = "network: connects to the public Bybit stream for 60 seconds"]
+fn live_bybit_ws_vs_rest() {
+    use crate::exchange::public::adapter::ExchangeAdapter;
+    use crate::exchange::public::bybit::BybitAdapter;
+    use crate::exchange::reqwest_transport::ReqwestTransport;
+    let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+    rt.block_on(async {
+        let clock: Arc<dyn TimeSource> = Arc::new(crate::ports::SystemClock);
+        let sink = Arc::new(MemoryEventSink::default());
+        let adapter = BybitAdapter::new(Arc::new(ReqwestTransport::public_production().unwrap()), Arc::new(crate::ports::SystemClock));
+        let first: HashMap<String, FundingObservation> = adapter.fetch_snapshot().await.unwrap().into_iter().map(|o| (o.symbol.clone(), o)).collect();
+        let list: Vec<String> = first.keys().filter(|s| s.ends_with("USDT") && !s.contains('-')).cloned().collect();
+        println!("REST symbols: {}, subscribed: {}", first.len(), list.len());
+        let feed = BybitTickerFeed::new(clock.clone(), sink.clone(), 5_000);
+        let mut src = Deadline { inner: super::super::feed::TungsteniteSource::new(crate::exchange::public::feed_endpoints::BYBIT_TICKERS_WS_URL), started: std::time::Instant::now(), secs: 60 };
+        let l2 = list.clone();
+        feed.run(&mut src, move || l2.clone(), &super::super::feed::TokioSleeper).await;
+
+        let rest: HashMap<String, FundingObservation> = adapter.fetch_snapshot().await.unwrap().into_iter().map(|o| (o.symbol.clone(), o)).collect();
+        let entries = feed.cache().entries();
+        let now = clock.now_ms();
+        let (mut worst_age, mut differing, mut rate_differs, mut nft_differs, mut compared) = (0_i64, 0, 0, 0, 0);
+        let mut worst: Vec<(String, Decimal, Decimal)> = Vec::new();
+        for e in &entries {
+            let Some(r) = rest.get(&e.symbol) else { continue };
+            compared += 1;
+            worst_age = worst_age.max(now - e.observed_at);
+            let diff = if r.mark_price.is_zero() { Decimal::ZERO } else { ((e.mark_price - r.mark_price) / r.mark_price).abs() };
+            if diff > dec("0.005") {
+                differing += 1;
+                worst.push((e.symbol.clone(), e.mark_price, r.mark_price));
+            }
+            if e.funding_rate != r.funding_rate {
+                rate_differs += 1;
+            }
+            if e.next_funding_time != r.next_funding_time {
+                nft_differs += 1;
+            }
+        }
+        println!("complete WS entries: {} (cache size {}), compared with REST: {compared}", entries.len(), feed.cache().len());
+        println!("max age of a cached entry at the end: {worst_age} ms (quiet symbols are old by nature)");
+        println!("mark price differs > 0.5%: {differing}; funding rate differs: {rate_differs}; next settlement differs: {nft_differs}");
+        for (s, ws, rs) in worst.iter().take(10) {
+            println!("  {s}: ws {ws} vs rest {rs}");
+        }
+        println!("rollover pending (not seen): {:?}", feed.cache().needs_snapshot(now, ROLLOVER_GRACE_MS));
+        println!("health: {:?}", feed.health_snapshot());
+        println!("events: {:?}", sink.events().iter().map(|e| (e.event_type.clone(), e.payload.to_string())).collect::<Vec<_>>());
+        assert!(entries.len() > 100, "far fewer complete tickers than subscribed symbols");
+        assert!(compared > 100);
+    });
+}

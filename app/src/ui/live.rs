@@ -55,6 +55,7 @@ use crate::funding::runner::{self as funding_runner, FundingLoop};
 use crate::funding::slot_runner;
 use super::scanner_refresh::{RefreshGate, RefreshGuard, RefreshOutcome, refresh_sources};
 use crate::exchange::error::AdapterError;
+use crate::exchange::health::bybit_feed::{overlay_bybit, BybitTickerFeed, TickerCache};
 use crate::exchange::health::cache::MarkPriceCache;
 use crate::exchange::health::clock_sync::{ClockStatus, ClockSync, RESYNC_INTERVAL_MS};
 use crate::exchange::health::feed::{FeedHealth, MarkPriceFeed, TokioSleeper, TungsteniteSource};
@@ -63,7 +64,7 @@ use crate::exchange::health::ratelimit::{BackoffState, RateLimiter, RequestClass
 use crate::exchange::public::binance::BinanceAdapter;
 use crate::exchange::public::bybit::BybitAdapter;
 use crate::exchange::public::endpoints::OKX_HOST;
-use crate::exchange::public::feed_endpoints::BINANCE_MARK_PRICE_WS_URL;
+use crate::exchange::public::feed_endpoints::{BybitFeedMode, BINANCE_MARK_PRICE_WS_URL, BYBIT_FEED_ENV, BYBIT_TICKERS_WS_URL};
 use crate::exchange::public::okx::OkxAdapter;
 use crate::exchange::reqwest_transport::ReqwestTransport;
 use crate::exchange::signed::binance::BinanceSignedClient;
@@ -473,6 +474,8 @@ struct Ctx {
     next_account_poll: Mutex<i64>,
     /// Latest Binance REST observations (the WebSocket overlays rate / mark / next time on them).
     binance_rest: Mutex<HashMap<String, FundingObservation>>,
+    /// Latest Bybit REST observations (the ticker WebSocket overlays rate / mark / next time on them).
+    bybit_rest: Mutex<HashMap<String, FundingObservation>>,
     marks: Mutex<BTreeMap<Exchange, HashMap<String, Decimal>>>,
     enabled: Mutex<BTreeSet<Exchange>>,
     last_accounts: Mutex<BTreeMap<Exchange, (AccountData, i64)>>,
@@ -515,6 +518,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         next_market_poll: Mutex::new(0),
         next_account_poll: Mutex::new(0),
         binance_rest: Mutex::new(HashMap::new()),
+        bybit_rest: Mutex::new(HashMap::new()),
         marks: Mutex::new(BTreeMap::new()),
         enabled: Mutex::new(settings.risk.allowed_exchanges.iter().copied().collect()),
         last_accounts: Mutex::new(BTreeMap::new()),
@@ -560,6 +564,34 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
             }
         });
     }
+
+    // Bybit ticker WebSocket: overlays the REST poll unless the roll-back switch says `rest`.
+    let bybit_mode = BybitFeedMode::from_env_value(std::env::var(BYBIT_FEED_ENV).ok().as_deref());
+    let bybit_feed = Arc::new(BybitTickerFeed::new(time.clone(), sink.clone(), stale_ms));
+    if start_bybit_feed(bybit_mode) {
+        {
+            let (feed, ctx) = (bybit_feed.clone(), ctx.clone());
+            tokio::spawn(async move {
+                let mut src = TungsteniteSource::new(BYBIT_TICKERS_WS_URL);
+                let symbols = move || bybit_ws_symbols(&ctx.bybit_rest.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+                feed.run(&mut src, symbols, &TokioSleeper).await;
+            });
+        }
+        {
+            let (ctx, feed) = (ctx.clone(), bybit_feed.clone());
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if !feed.health_snapshot().stale {
+                        overlay_bybit_prices(&ctx, &feed.cache());
+                    }
+                }
+            });
+        }
+    } else {
+        shared.push(SourceUpdate::BybitWsDisabled);
+    }
+    let bybit_health = start_bybit_feed(bybit_mode).then(|| bybit_feed.health());
 
     // Clock sync (signing hosts for Binance / Bybit, the public host for OKX: countdowns and, since
     // okx-trading-enablement, the OKX signing offset).
@@ -690,7 +722,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
 
     // Store + health refresher.
     {
-        let (ctx, db, feed_health) = (ctx.clone(), db.clone(), feed.health());
+        let (ctx, db, feed_health, bybit_health) = (ctx.clone(), db.clone(), feed.health(), bybit_health.clone());
         let secrets = secrets.clone();
         let (okx_limits, okx_latch) = (okx_limits.clone(), okx_latch.clone());
         tokio::spawn(async move {
@@ -731,7 +763,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                     latch_reported = true;
                     ctx.shared.push(SourceUpdate::OkxDisabled(reason));
                 }
-                push_health(&ctx, &feed_health);
+                push_health(&ctx, &feed_health, bybit_health.as_deref());
                 tokio::time::sleep(Duration::from_millis(STORE_POLL_MS)).await;
             }
         });
@@ -1013,6 +1045,9 @@ fn apply_outcome(ctx: &Ctx, out: &RefreshOutcome, trigger: &str) {
                 if *ex == Exchange::Binance {
                     *ctx.binance_rest.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = obs.iter().map(|o| (o.symbol.clone(), o.clone())).collect();
                 }
+                if *ex == Exchange::Bybit {
+                    *ctx.bybit_rest.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = obs.iter().map(|o| (o.symbol.clone(), o.clone())).collect();
+                }
                 summary.insert(ex.name().into(), json!({ "observations": obs.len() }));
             }
             Err(e) => {
@@ -1059,7 +1094,34 @@ fn overlay_mark_prices(ctx: &Ctx, cache: &MarkPriceCache) {
     }
 }
 
-fn push_health(ctx: &Ctx, ws: &FeedHealth) {
+/// Whether the Bybit ticker WebSocket runs at all (`TONG_FUNDING_BYBIT_FEED=rest` turns it off).
+fn start_bybit_feed(mode: BybitFeedMode) -> bool {
+    mode == BybitFeedMode::Ws
+}
+
+/// The symbols to subscribe: the linear USDT perpetuals of the REST listing (dated futures are
+/// not part of the scan and are not subscribed).
+fn bybit_ws_symbols(rest: &HashMap<String, FundingObservation>) -> Vec<String> {
+    let mut v: Vec<String> = rest.keys().filter(|s| s.ends_with("USDT") && !s.contains('-')).cloned().collect();
+    v.sort();
+    v
+}
+
+/// Applies the Bybit WebSocket entries on top of the Bybit poll (listing and rules from the poll).
+fn overlay_bybit_prices(ctx: &Ctx, cache: &TickerCache) {
+    let rest = ctx.bybit_rest.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let changed = overlay_bybit(&rest, &cache.entries());
+    if changed.is_empty() {
+        return;
+    }
+    let latest = changed.iter().map(|o| o.observed_at).max().unwrap_or(0);
+    if let Some((book, market)) = ctx.feed.get() {
+        wiring::feed_prices(book, market, &changed);
+    }
+    ctx.shared.push(SourceUpdate::MarketPartial { exchange: Exchange::Bybit, observations: changed, at: latest });
+}
+
+fn push_health(ctx: &Ctx, ws: &FeedHealth, bybit_ws: Option<&FeedHealth>) {
     let now = clock_now(&ctx.clock);
     let backoff = |ex: Exchange, class: RequestClass| match ctx.limiter.state(ex, class) {
         BackoffState::Waiting { until_ms, .. } => Some(until_ms),
@@ -1068,6 +1130,9 @@ fn push_health(ctx: &Ctx, ws: &FeedHealth) {
     let next_market = *ctx.next_market_poll.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let next_account = *ctx.next_account_poll.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut list = vec![SourceHealth { source: SourceId::BinanceWs, health: Some(ws.snapshot()), next_poll_at: None, rate_limited_until: None }];
+    if let Some(b) = bybit_ws {
+        list.push(SourceHealth { source: SourceId::BybitWs, health: Some(b.snapshot()), next_poll_at: None, rate_limited_until: None });
+    }
     for (ex, h) in &ctx.market_health {
         list.push(SourceHealth {
             source: SourceId::MarketPoll(*ex),
@@ -1176,6 +1241,27 @@ fn proxy_env_warning(get: impl Fn(&str) -> Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_rest_switch_starts_no_bybit_websocket_and_only_usdt_perpetuals_are_subscribed() {
+        assert!(start_bybit_feed(BybitFeedMode::from_env_value(None)));
+        assert!(start_bybit_feed(BybitFeedMode::from_env_value(Some("ws"))));
+        assert!(!start_bybit_feed(BybitFeedMode::from_env_value(Some("rest"))));
+        let obs = |s: &str| FundingObservation {
+            exchange: Exchange::Bybit,
+            symbol: s.into(),
+            funding_rate: Decimal::ZERO,
+            funding_interval_secs: None,
+            next_funding_time: 0,
+            mark_price: Decimal::ONE,
+            volume_24h_quote: None,
+            exchange_timestamp: 0,
+            observed_at: 0,
+            data_status: tong_funding_core::funding::DataStatus::Listed,
+        };
+        let rest: HashMap<String, FundingObservation> = ["ETHUSDT", "BTCUSDT", "BTCUSDT-09OCT26", "BTCPERP"].into_iter().map(|s| (s.to_string(), obs(s))).collect();
+        assert_eq!(bybit_ws_symbols(&rest), vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
+    }
+
     #[test]
     fn a_proxy_variable_gets_a_one_line_warning_and_nothing_else_does() {
         let env = |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
