@@ -2,6 +2,7 @@
 //! Owned by the feed/health work.
 #![allow(dead_code)]
 
+pub mod bybit_feed;
 pub mod cache;
 pub mod clock_sync;
 pub mod feed;

@@ -1,0 +1,2 @@
+Recorded 2026-10-14 from the PUBLIC Bybit v5 linear WebSocket (wss://stream.bybit.com/v5/public/linear), no API key.
+Command: node scratchpad/capture_fixtures.mjs (subscribe tickers.BTCUSDT + a bogus topic + ping); frames unmodified, whitespace trimmed.
