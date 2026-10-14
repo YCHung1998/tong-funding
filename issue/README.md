@@ -4,4 +4,4 @@
 
 | # | 標題 | 狀態 | 處置 |
 |---|---|---|---|
-| [001](001-binance-demo-funding-rate.md) | Binance demo 模擬倉的資金費率與正式環境不一致 | 原因已確認；處置待實作 | `openspec/changes/binance-prod-equivalent-funding` |
+| [001](001-binance-demo-funding-rate.md) | Binance demo 模擬倉的資金費率與正式環境不一致 | 原因已確認；不實作（demo 環境限制） | 不修改程式 |

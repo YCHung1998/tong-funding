@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| 狀態 | 原因已確認（機制部分為推論）；處置方案已提 proposal，**尚未實作** |
+| 狀態 | 原因已確認（機制部分為推論）；**不實作**（視為 Binance demo 的環境限制） |
 | 發現日期 | 2026-10-14 |
 | 範圍 | Binance demo（`demo-fapi.binance.com` / `testnet.binancefuture.com`）；Bybit demo 作對照 |
 | 資料來源 | 2026-10-06 ~ 10-14 的 `funding.db`（9 筆有下單的配對，7 筆持倉跨過結算）＋兩所公開 API。**原始資料庫已於 10-14 清除**，下方數字取自清除前的查詢。 |
-| 處置 | `openspec/changes/binance-prod-equivalent-funding`（分支 `feat/binance-prod-equivalent-funding`） |
+| 處置 | 不修改程式 |
 
 ## 摘要
 
@@ -145,17 +145,13 @@ BLUR：Bybit −1.329%/8h ＝ −0.166%/h，Binance −0.653%/4h ＝ −0.163%/h
 |---|---|
 | 掃幣、進場時間、送單前檢查**維持使用正式環境費率** | 已驗證準確 |
 | **不**改用 demo 的 Binance 費率掃幣 | 預期與實際會吻合，但價差會是兩個不同市場的差額，在 demo 看似賺錢、換到正式環境不一定成立 |
-| Binance 腿的資金費改以「**正式環境等值**」記帳：正式公開費率 × 持倉量 × 結算標記價，demo 實收只留作稽核 | 讓損益與判斷同一個市場 |
-| Bybit 不改，新增**費率一致性監控** | 保護「Bybit demo = 正式」這個假設 |
 | **不做**預估費率 | `lastFundingRate` 已是即時費率，進場判斷準確 |
-
-proposal：`openspec/changes/binance-prod-equivalent-funding`（約 10 項 task，已通過 `openspec validate --strict`，**尚未實作**）。
+| **不修改程式** | 這是 Binance demo 的環境限制，不是程式錯誤 |
 
 ## 未解／待驗證
 
 - **成本模型是否偏樂觀**：BLUR 以正式環境資金費 +6.80 計，扣價差損益 −2.94、手續費 −1.89，淨約 **+1.97**；進場預估淨收益是 +4.07。價差損益（實際成交價的差）比預留的滑價 0.6 大很多，原因是進場時兩所成交價就逆向約 0.56%。只看過這一筆，尚未逐筆檢查。
 - **樣本小**：7 筆、5 個幣種、8 天。一致性很高，但不是統計證明。
-- **標記價格取法**：等值記帳打算用 1 分鐘標記價格 K 線開盤價，與交易所實際結算價的微小差距待驗收時用流水比對。
 - **OKX**：demo 與正式環境的資金費是否一致尚未驗證（目前也還不能交易：帳戶是現貨模式，`acctLv 1`）。開放 OKX 自動進場前要先用同樣方法核對。
 - **Binance 為什麼這樣設計**：沒有官方說明。
 
@@ -192,4 +188,3 @@ sqlite3 -readonly ~/Library/Application\ Support/tong-funding/funding.db \
 - 資金費追蹤使用 demo 主機的費率：`app/src/funding/rate_source.rs`（`DemoRateSource`）
 - 流水解析：`app/src/exchange/signed/ledger.rs`；費率歷史解析：`app/src/exchange/signed/funding_rate.rs`
 - 進場檢查快照與淨邊際：`app/src/engine/node0.rs`
-- 處置 proposal：`openspec/changes/binance-prod-equivalent-funding/`
