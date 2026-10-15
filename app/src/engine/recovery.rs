@@ -1398,6 +1398,35 @@ mod tests {
         assert_eq!(events(&db, SIMULATION_INTERRUPTED).len(), 1);
     }
 
+    /// leg-early-exit 3.4: a demo pair that is RECONCILED although its long leg was already closed
+    /// early (open filled both legs, close filled on the long leg only) is not in flight and has no
+    /// unfinished intent: the restart reads nothing, queries nothing, raises no alert and does not
+    /// treat the flat long leg as an imbalance. The scheduled close later sizes itself from the
+    /// intents (`recorded_fill`), so the flat leg gets no second order.
+    #[test]
+    fn a_reconciled_demo_pair_with_one_leg_already_closed_early_is_left_alone() {
+        let (_d, db, _) = open_tmp();
+        seed_pair(&db, PAIR, PairState::Reconciled, false);
+        seed_intent(&db, IdPrefix::Demo, Leg::Long, OrderAction::Open, "0.01", IntentState::Filled);
+        seed_intent(&db, IdPrefix::Demo, Leg::Short, OrderAction::Open, "0.01", IntentState::Filled);
+        seed_intent(&db, IdPrefix::Demo, Leg::Long, OrderAction::Close, "0.01", IntentState::Filled);
+        let fx = FakeExchange::default();
+        // the exchange shows exactly that: the long leg flat, the short leg still open
+        fx.positions.lock().unwrap().insert(
+            SHORT_EX,
+            Ok(Listed { items: vec![AccountPosition { exchange: SHORT_EX, symbol: SYM.into(), quantity: "-0.01".parse().unwrap() }], complete: true }),
+        );
+        let before = transitions(&db);
+        let r = run(&db, &fx);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert!(r.pairs.is_empty(), "a RECONCILED demo pair is not a restart candidate: {r:?}");
+        assert_eq!(pair_state(&db), "RECONCILED");
+        assert_eq!(transitions(&db), before, "no transition");
+        assert!(events(&db, RECONCILE_ALERT).is_empty(), "no imbalance alert");
+        assert!(fx.queries().is_empty(), "nothing finished is queried again");
+        fx.assert_read_only();
+    }
+
     #[test]
     fn a_sim_prefixed_intent_marks_the_pair_simulated_even_if_the_envelope_says_otherwise() {
         let (_d, db, _) = open_tmp();

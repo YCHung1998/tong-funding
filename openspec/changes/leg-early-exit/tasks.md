@@ -10,10 +10,10 @@
 
 ## 3. 引擎：單腿平倉
 
-- [ ] 3.1 在 `app/src/engine/actor.rs` 的 `tick_reconciled` 於窗內對尚未平倉的腿抓最新價格（`refetch`），僅在 `AUTO` 且 kill switch 未啟用時呼叫 2.1；先寫紅色測試（用既有的 flow_tests 腳本化交易所）：只平達標的一腿、另一腿不動、配對仍為 `RECONCILED`、寫入 `LEG_EARLY_EXIT` 事件
-- [ ] 3.2 實作單腿 `OrderSet`（重用 `on_close_positions` 的數量與不平衡檢查）；單腿被拒或逾時只寫事件、不改配對狀態；補測試
-- [ ] 3.3 兩腿都已平倉時直接進入既有「確認已平倉」流程且 T+15 不再送單；只有一腿提早平倉時 T+15 只平另一腿；補測試
-- [ ] 3.4 重啟對帳：配對為 `RECONCILED` 但一腿已平時不誤判為不平衡；先寫測試確認現況，若會誤判則在此修正
+- [x] 3.1 在 `app/src/engine/actor.rs` 的 `tick_reconciled` 於窗內對尚未平倉的腿抓最新價格（`refetch`），僅在 `AUTO` 且 kill switch 未啟用時呼叫 2.1；先寫紅色測試（用既有的 flow_tests 腳本化交易所）：只平達標的一腿、另一腿不動、配對仍為 `RECONCILED`、寫入 `LEG_EARLY_EXIT` 事件
+- [x] 3.2 實作單腿 `OrderSet`（重用 `on_close_positions` 的數量與不平衡檢查）；單腿被拒或逾時只寫事件、不改配對狀態；補測試
+- [x] 3.3 兩腿都已平倉時直接進入既有「確認已平倉」流程且 T+15 不再送單；只有一腿提早平倉時 T+15 只平另一腿；補測試
+- [x] 3.4 重啟對帳：配對為 `RECONCILED` 但一腿已平時不誤判為不平衡；先寫測試確認現況，若會誤判則在此修正
 
 ## 4. 損益與驗證
 

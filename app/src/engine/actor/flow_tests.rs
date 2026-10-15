@@ -53,6 +53,8 @@ struct FakeMarket {
     /// gap 2: a price that later (unfrozen) fetches return instead of 100, and a forced failure.
     price: Mutex<Option<Decimal>>,
     fail: Mutex<Option<String>>,
+    /// leg-early-exit: a price per exchange (wins over `price`).
+    prices: Mutex<HashMap<Exchange, Decimal>>,
 }
 
 impl FakeMarket {
@@ -66,6 +68,7 @@ impl FakeMarket {
             rules: Mutex::new(Exchange::ALL.into_iter().map(|e| (e, lot)).collect()),
             price: Mutex::default(),
             fail: Mutex::default(),
+            prices: Mutex::default(),
         })
     }
     fn calls(&self) -> Vec<(Exchange, String, i64)> {
@@ -104,6 +107,9 @@ impl MarketData for FakeMarket {
         let mut fresh = FakeMarket::quote(exchange, symbol, now);
         if let Some(p) = *self.price.lock().unwrap() {
             fresh.price = p;
+        }
+        if let Some(p) = self.prices.lock().unwrap().get(&exchange) {
+            fresh.price = *p;
         }
         let mut first = self.first.lock().unwrap();
         let q = if *self.frozen.lock().unwrap() { first.entry(exchange).or_insert(fresh).clone() } else {
@@ -392,6 +398,10 @@ fn risk() -> RiskConfig {
         net_edge_threshold_pct: Some(dec("0.05")),
         est_slippage_pct: Some(dec("0.01")),
         taker_fee_pct: Exchange::ALL.into_iter().map(|e| (e, dec("0.02"))).collect(),
+        // leg-early-exit: the production default is 0.3; the flows written before it existed
+        // assert exact fetch counts and a T+15 close of both legs, so they run with it off. The
+        // `leg-early-exit` tests below switch it on explicitly (`early_on`).
+        early_exit_min_move_pct: Decimal::ZERO,
         ..RiskConfig::default()
     }
 }
@@ -2237,6 +2247,10 @@ async fn a_failed_close_reference_fetch_never_holds_the_close_back_and_is_record
 // cancel, settings saves).
 #[path = "ui_command_tests.rs"]
 mod ui_command_tests;
+
+// leg-early-exit: a RECONCILED leg closes alone in T+5..T+15.
+#[path = "early_exit_tests.rs"]
+mod early_exit_tests;
 
 // ---- candidate-readd-after-close: engine side ---------------------------------------------
 

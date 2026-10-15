@@ -48,7 +48,7 @@ use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::alert::{self, AlertNotice, AlertReason, Notifier, PAIR_ALERT};
 use super::command::{
-    Alert, Blocker, CONTRACT_SETTINGS_UPDATED, Command, CommandReply, Event, FlatReport, ManualOrder, NewPreparedPair, Notice, PairUuid,
+    Alert, Blocker, CONTRACT_SETTINGS_UPDATED, Command, CommandReply, EarlyTrigger, Event, FlatReport, ManualOrder, NewPreparedPair, Notice, PairUuid,
     PairView, RISK_CONFIG_UPDATED, Snapshot,
 };
 use super::latency::{self, ORDER_LATENCY};
@@ -98,6 +98,14 @@ pub const CLOSE_REFERENCE_SOURCE: &str = "refetch_before_close";
 /// Alert: a leg's actual position differs from the pair's recorded fill by more than the
 /// effective `max_leg_imbalance_pct` (or the recorded fill is unknown); nothing is closed.
 pub const CLOSE_QUANTITY_MISMATCH: &str = "CLOSE_QUANTITY_MISMATCH";
+/// leg-early-exit: one RECONCILED leg is being closed alone in the T+5..T+15 window (written right
+/// before its reduce-only order is sent): leg, exchange, open average, trigger price and its time,
+/// move %, threshold %, and the time after settlement.
+pub const LEG_EARLY_EXIT: &str = "LEG_EARLY_EXIT";
+/// leg-early-exit: an early exit that did not happen or did not complete (price unavailable,
+/// quantity mismatch, order rejected, not confirmed in time). The pair state is untouched; the
+/// scheduled T+15 exit handles whatever is still open.
+pub const LEG_EARLY_EXIT_ABORTED: &str = "LEG_EARLY_EXIT_ABORTED";
 /// Both legs verified flat (positions 0, no open order); written right before FINALIZED.
 pub const CLOSE_CONFIRMED: &str = "CLOSE_CONFIRMED";
 /// Result of a manual order (not part of a pair).
@@ -417,6 +425,28 @@ struct Flow {
     /// funding-pnl gap 2: per leg, the close reference (price, local observed time) fetched right
     /// before the reduce-only closes were sent, or why there is none. Written on the close events.
     close_reference: [Option<Result<(Decimal, i64), String>>; 2],
+    /// leg-early-exit: per-leg progress of the T+5..T+15 single-leg close (memory only). The early
+    /// order lives in `close` (same lookup / fill-detail path as a scheduled close) until the
+    /// scheduled close replaces it.
+    early: [EarlyLeg; 2],
+    /// A price fetch for the early exit is in flight (at most one at a time).
+    early_fetch_inflight: bool,
+}
+
+/// Progress of one leg's early exit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum EarlyLeg {
+    /// Nothing started: the leg is priced each tick while the window is open.
+    #[default]
+    Idle,
+    /// The threshold was reached; position and recorded fill are being read.
+    Planning,
+    /// The reduce-only order was sent at this local time and is awaited.
+    Sent { at_ms: i64 },
+    /// Flat by its early order (or nothing was left to close).
+    Done,
+    /// Given up (price, quantity, order problem): the scheduled exit handles the leg.
+    Abandoned,
 }
 
 impl Flow {
@@ -924,17 +954,311 @@ impl Actor {
     }
 
     fn tick_reconciled(&mut self, view: &PairView, now: i64) {
+        // leg-early-exit: settle what the early orders did first (both legs flat -> the closed
+        // confirmation starts here, which moves the pair out of RECONCILED).
+        self.resolve_early(view, now);
+        if self.pairs.get(&view.internal_uuid).map(|v| v.state) != Some(PairState::Reconciled) {
+            return;
+        }
         let timing = PairTiming { state: view.state, settlement_ms: view.settlement_ms, baseline_requested: true };
         match schedule::decide(&timing, &self.timings, &self.reading(view, now)) {
             // Exit in either trigger mode (late beats never); not gated (reduces exposure only).
             ScheduleAction::Exit { .. } => {
-                let _ = self.dispatch(Command::AutoExit { pair: view.internal_uuid.clone() });
+                // An early order still in flight is waited for (bounded by the order timeout in
+                // `resolve_early`): the scheduled close sizes itself from what was filled.
+                if !self.early_order_pending(&view.internal_uuid) {
+                    let _ = self.dispatch(Command::AutoExit { pair: view.internal_uuid.clone() });
+                }
             }
-            ScheduleAction::Nothing
-            | ScheduleAction::FetchBaseline
+            ScheduleAction::Nothing => self.maybe_early_exit(view, now),
+            ScheduleAction::FetchBaseline
             | ScheduleAction::Enter
             | ScheduleAction::EntryBlocked(_)
             | ScheduleAction::EntryWindowMissed { .. } => {}
+        }
+    }
+
+    // ---- leg-early-exit: a RECONCILED leg closes alone in T+5..T+15 ----
+    //
+    // The pair stays RECONCILED (no new state). The early order is a normal reduce-only order of
+    // the pair: its intent is landed first, its fills are looked up like any close, and the
+    // scheduled close later sizes itself from "open fills minus close fills", so a leg that is
+    // already flat gets no second order. Everything uncertain (price, quantity, kill switch,
+    // clock) means no early order; the scheduled T+15 exit is never held back by it for longer
+    // than the order timeout.
+
+    /// `(threshold %, effective settings)` when an early exit may run for this pair now: AUTO
+    /// trigger mode, no blocker that refuses new exposure (kill switch, halted store, pending
+    /// reconciliation in EXCHANGE_DEMO), the pair's executor available, and a non-zero threshold.
+    fn early_exit_gate(&self, view: &PairView) -> Option<(Decimal, EffectiveConfig)> {
+        if self.trigger_mode != TriggerMode::Auto {
+            return None;
+        }
+        let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
+        if !gate::refusing(&blockers, self.execution_mode).is_empty() || self.executor_mismatch(view).is_some() {
+            return None;
+        }
+        // Unreadable settings: no early exit (it is optional), the scheduled exit is unaffected.
+        let (risk, overrides) = self.load_risk().ok()?;
+        if risk.early_exit_min_move_pct <= Decimal::ZERO {
+            return None;
+        }
+        Some((risk.early_exit_min_move_pct, effective_for_pair(&risk, &overrides, view.long_exchange, view.short_exchange)))
+    }
+
+    /// The leg's open fill average from this run's own open order; `None` after a restart.
+    fn open_avg_of(&self, pair: &str, leg: Leg) -> Option<Decimal> {
+        let o = self.flows.get(pair)?.open.as_ref()?.legs[idx(leg)].as_ref()?;
+        o.status.as_ref()?.avg_price.filter(|p| *p > Decimal::ZERO)
+    }
+
+    fn early_order_pending(&self, pair: &str) -> bool {
+        self.flows.get(pair).is_some_and(|f| f.early.iter().any(|l| matches!(l, EarlyLeg::Sent { .. })))
+    }
+
+    fn early_leg_info(&self, view: &PairView, leg: Leg) -> (Exchange, Value) {
+        let exchange = match leg {
+            Leg::Long => view.long_exchange,
+            Leg::Short => view.short_exchange,
+        };
+        (exchange, json!({ "leg": leg.as_str(), "exchange": exchange.name(), "symbol": view.symbol, "simulated": view.simulated }))
+    }
+
+    /// Gives the leg up (the scheduled exit handles it) and says why.
+    fn abort_early(&mut self, view: &PairView, leg: Leg, reason: String, extra: Option<Value>) {
+        let (_, mut payload) = self.early_leg_info(view, leg);
+        payload["reason"] = json!(reason);
+        if let Some(extra) = extra {
+            payload["detail"] = extra;
+        }
+        if let Some(flow) = self.flows.get_mut(&view.internal_uuid) {
+            flow.early[idx(leg)] = EarlyLeg::Abandoned;
+        }
+        self.note(LEG_EARLY_EXIT_ABORTED, Some(&view.internal_uuid), payload);
+    }
+
+    /// Inside the window, starts one price fetch for the legs not yet handled.
+    fn maybe_early_exit(&mut self, view: &PairView, now: i64) {
+        let id = view.internal_uuid.clone();
+        if self.flows.get(&id).is_none_or(|f| f.orphan || f.early_fetch_inflight) {
+            return;
+        }
+        if schedule::early_exit_elapsed_ms(view.settlement_ms, &self.timings, &self.reading(view, now)).is_none() {
+            return;
+        }
+        if self.early_exit_gate(view).is_none() {
+            return;
+        }
+        let mut want = [false; 2];
+        for leg in Leg::BOTH {
+            if self.flows.get(&id).is_none_or(|f| f.early[idx(leg)] != EarlyLeg::Idle) {
+                continue;
+            }
+            if self.open_avg_of(&id, leg).is_some() {
+                want[idx(leg)] = true;
+            } else {
+                // After a restart the open average is not in memory: no basis, no early exit.
+                self.abort_early(view, leg, "open average price not known in this run (restart); no early exit for this leg".into(), None);
+            }
+        }
+        if !want.iter().any(|w| *w) {
+            return;
+        }
+        if let Some(flow) = self.flows.get_mut(&id) {
+            flow.early_fetch_inflight = true;
+        }
+        let (market, tx) = (self.market.clone(), self.event_tx.clone());
+        let (le, se, sym) = (view.long_exchange, view.short_exchange, view.symbol.clone());
+        tokio::spawn(async move {
+            let long = async {
+                if want[0] { Some(market.refetch(le, &sym).await) } else { None }
+            };
+            let short = async {
+                if want[1] { Some(market.refetch(se, &sym).await) } else { None }
+            };
+            let (long, short) = tokio::join!(long, short);
+            let _ = tx.send(Event::EarlyExitFetched { pair: id, long, short }).await;
+        });
+    }
+
+    /// Fresh prices are in: decide per leg, and for a leg that reached the threshold read its
+    /// position and recorded fill.
+    fn on_early_exit_fetched(&mut self, pair: &str, long: Option<Result<FreshQuote, String>>, short: Option<Result<FreshQuote, String>>) {
+        if let Some(flow) = self.flows.get_mut(pair) {
+            flow.early_fetch_inflight = false;
+        }
+        let Some(view) = self.pairs.get(pair).cloned() else { return };
+        if view.state != PairState::Reconciled {
+            return;
+        }
+        let Some((min_move_pct, eff)) = self.early_exit_gate(&view) else { return };
+        let now = self.clock.now_ms();
+        let mut inputs: [Option<schedule::EarlyExitInput>; 2] = [None, None];
+        for (leg, quote) in [(Leg::Long, long), (Leg::Short, short)] {
+            let Some(quote) = quote else { continue };
+            if self.flows.get(pair).is_none_or(|f| f.early[idx(leg)] != EarlyLeg::Idle) {
+                continue;
+            }
+            match quote {
+                // This tick has no data for the leg; the next tick asks again (one event per leg).
+                Err(e) => {
+                    let (_, mut payload) = self.early_leg_info(&view, leg);
+                    payload["reason"] = json!(format!("price refetch failed: {e}"));
+                    self.report_once(pair, format!("EARLY_FETCH:{}", leg.as_str()), LEG_EARLY_EXIT_ABORTED, payload);
+                }
+                Ok(q) => {
+                    if let Some(open_avg) = self.open_avg_of(pair, leg) {
+                        inputs[idx(leg)] = Some(schedule::EarlyExitInput { open_avg, price: q.price, price_observed_at_ms: q.price_observed_at_ms });
+                    }
+                }
+            }
+        }
+        let hits = schedule::decide_early_exit(view.settlement_ms, &self.timings, &self.reading(&view, now), min_move_pct, eff.stale_data_threshold_ms, inputs);
+        for leg in Leg::BOTH {
+            let (Some(hit), Some(input)) = (hits[idx(leg)], inputs[idx(leg)]) else { continue };
+            let trigger = EarlyTrigger {
+                open_avg: input.open_avg,
+                price: input.price,
+                price_observed_at_ms: input.price_observed_at_ms,
+                move_pct: hit.move_pct,
+                threshold_pct: min_move_pct,
+            };
+            // The pair's own orders on this leg (open fills minus earlier close fills = what it holds).
+            let orders: Vec<PairOrder> = match self.db.list_intents_for_pair(pair) {
+                Ok(rows) => rows
+                    .into_iter()
+                    .filter_map(|row| {
+                        let (l, action) = ids::leg_action_of(&row.client_order_id)?;
+                        let rejected = IntentState::parse(&row.state) == Some(IntentState::Failed);
+                        (l == leg).then_some(PairOrder { client_order_id: row.client_order_id, action, rejected })
+                    })
+                    .collect(),
+                Err(e) => {
+                    self.abort_early(&view, leg, format!("order intents unreadable: {e}"), None);
+                    continue;
+                }
+            };
+            let (exchange, _) = self.early_leg_info(&view, leg);
+            if let Some(flow) = self.flows.get_mut(pair) {
+                flow.early[idx(leg)] = EarlyLeg::Planning;
+                // the price just fetched is this order's reference (funding-pnl close slippage)
+                flow.close_reference[idx(leg)] = Some(Ok((input.price, input.price_observed_at_ms)));
+            }
+            let (account, executor, tx) = (self.account_for(view.simulated), self.executor.clone(), self.event_tx.clone());
+            let (sym, pair) = (view.symbol.clone(), pair.to_string());
+            tokio::spawn(async move {
+                let (position, recorded) =
+                    tokio::join!(signed_position(account.as_ref(), exchange, &sym), recorded_fill(executor.as_ref(), exchange, &sym, &orders));
+                let _ = tx.send(Event::EarlyPositionFetched { pair, leg, position, recorded, trigger }).await;
+            });
+        }
+    }
+
+    /// Size the early close like the scheduled one (`plan_leg_close`) and send it for this leg only.
+    fn on_early_position(&mut self, pair: &str, leg: Leg, position: Result<Decimal, String>, recorded: Result<Decimal, String>, trigger: EarlyTrigger) {
+        let Some(view) = self.pairs.get(pair).cloned() else { return };
+        // The scheduled close (or a manual one) took over meanwhile: nothing is sent.
+        if view.state != PairState::Reconciled || self.flows.get(pair).is_none_or(|f| f.early[idx(leg)] != EarlyLeg::Planning) {
+            return;
+        }
+        let now = self.clock.now_ms();
+        let Some((_, eff)) = self.early_exit_gate(&view) else {
+            return self.abort_early(&view, leg, "early exit no longer allowed (mode, kill switch or settings changed); nothing sent".into(), None);
+        };
+        let Some(elapsed_ms) = schedule::early_exit_elapsed_ms(view.settlement_ms, &self.timings, &self.reading(&view, now)) else {
+            return self.abort_early(&view, leg, "the early-exit window closed before the order could be sent; nothing sent".into(), None);
+        };
+        let position = match position {
+            Ok(p) => p,
+            Err(e) => return self.abort_early(&view, leg, format!("position unreadable: {e}; nothing sent"), None),
+        };
+        let (exchange, mut payload) = self.early_leg_info(&view, leg);
+        let qty = match plan_leg_close(leg, exchange, &view.symbol, view.simulated, eff.max_leg_imbalance_pct, position, recorded) {
+            Ok((qty, _residual)) => qty,
+            Err(LegClosePlanError::WrongSide(reason)) => return self.abort_early(&view, leg, format!("{reason}; nothing sent"), None),
+            Err(LegClosePlanError::Mismatch(alert)) => {
+                let reason = alert["reason"].as_str().unwrap_or("position and recorded fill disagree").to_string();
+                return self.abort_early(&view, leg, format!("{reason}; nothing sent"), Some(alert));
+            }
+        };
+        if qty.is_zero() {
+            // nothing of the pair is held on this leg: it counts as closed
+            if let Some(flow) = self.flows.get_mut(pair) {
+                flow.early[idx(leg)] = EarlyLeg::Done;
+            }
+            payload["reason"] = json!("nothing to close on this leg (already flat)");
+            self.note(LEG_EARLY_EXIT_ABORTED, Some(pair), payload);
+            return;
+        }
+        let prefix = self.id_prefix();
+        let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, qty);
+        // intent first: if it cannot be landed nothing is sent
+        if let Err(why) = intent::land_intents(&self.db, pair, &[(leg, &req)]) {
+            return self.abort_early(&view, leg, format!("order intent not landed ({why}); nothing sent"), None);
+        }
+        payload["client_order_id"] = json!(req.client_order_id);
+        payload["quantity"] = json!(dstr(qty));
+        payload["open_avg_price"] = json!(dstr(trigger.open_avg));
+        payload["trigger_price"] = json!(dstr(trigger.price));
+        payload["price_observed_at_ms"] = json!(trigger.price_observed_at_ms);
+        payload["move_pct"] = json!(dstr(trigger.move_pct));
+        payload["threshold_pct"] = json!(dstr(trigger.threshold_pct));
+        payload["t_plus_ms"] = json!(elapsed_ms);
+        self.note(LEG_EARLY_EXIT, Some(pair), payload);
+        let flow = self.flows.entry(pair.to_string()).or_default();
+        flow.close_triggered_ms = Some(now);
+        flow.early[idx(leg)] = EarlyLeg::Sent { at_ms: now };
+        let set = flow.close.get_or_insert_with(|| OrderSet { sent_at_ms: now, eff: eff.clone(), legs: [None, None], cancel_started: false });
+        set.legs[idx(leg)] = Some(LegOrder::new(req.clone(), Decimal::ONE));
+        self.spawn_submit_inner(pair.to_string(), leg, OrderAction::Close, req, Some(now), true);
+    }
+
+    /// Settles the early orders of a RECONCILED pair: a rejected / not-filled / unconfirmed one
+    /// gives its leg up (event, pair state untouched); a filled one marks the leg done. When both
+    /// legs are done the closed confirmation starts at once instead of waiting for T+15.
+    fn resolve_early(&mut self, view: &PairView, now: i64) {
+        let id = view.internal_uuid.clone();
+        let Some(flow) = self.flows.get(&id) else { return };
+        if flow.early.iter().any(|l| matches!(l, EarlyLeg::Sent { .. })) {
+            self.poll(&id, OrderAction::Close);
+        }
+        let Some(flow) = self.flows.get(&id) else { return };
+        let mut settled: Vec<(Leg, Result<(), String>)> = Vec::new();
+        for leg in Leg::BOTH {
+            let EarlyLeg::Sent { at_ms } = flow.early[idx(leg)] else { continue };
+            let Some(set) = flow.close.as_ref() else { continue };
+            let Some(o) = set.legs[idx(leg)].as_ref() else { continue };
+            let result = if let Some(reason) = o.submit_rejected() {
+                Err(format!("early close order rejected: {reason}"))
+            } else if o.is_over() && !o.query_inflight {
+                match &o.status {
+                    Some(s) if s.state == OrderState::Filled && s.filled_quantity >= o.req.quantity => Ok(()),
+                    Some(s) => Err(format!("early close order ended {:?} with {} of {} filled", s.state, dstr(s.filled_quantity), dstr(o.req.quantity))),
+                    None => Err("early close order ended without a status".to_string()),
+                }
+            } else if now >= fill::timeout_at_ms(&set.eff, at_ms) {
+                Err("early close order not confirmed within the order timeout".to_string())
+            } else {
+                continue; // still in flight
+            };
+            settled.push((leg, result));
+        }
+        for (leg, result) in settled {
+            match result {
+                Ok(()) => {
+                    if let Some(flow) = self.flows.get_mut(&id) {
+                        flow.early[idx(leg)] = EarlyLeg::Done;
+                    }
+                }
+                Err(reason) => {
+                    let client_order_id = self.flows.get(&id).and_then(|f| f.close.as_ref()).and_then(|s| s.legs[idx(leg)].as_ref()).map(|o| o.req.client_order_id.clone());
+                    self.abort_early(view, leg, reason, client_order_id.map(|c| json!({ "client_order_id": c })));
+                }
+            }
+        }
+        if self.flows.get(&id).is_some_and(|f| f.early.iter().all(|l| *l == EarlyLeg::Done)) {
+            // Both legs are flat: straight to the closed confirmation (no order is left to send).
+            let _ = self.dispatch(Command::AutoExit { pair: id });
         }
     }
 
@@ -1548,56 +1872,14 @@ impl Actor {
                     return;
                 }
             };
-            let expected_sign_ok = match leg {
-                Leg::Long => pos >= Decimal::ZERO,
-                Leg::Short => pos <= Decimal::ZERO,
-            };
-            if !expected_sign_ok {
-                let reason = format!("{}: position {pos} is on the wrong side; left for the user", leg.as_str());
-                let _ = self.land(pair, SystemEvent::CloseFailed, json!({ "reason": reason }));
-                return;
+            match plan_leg_close(leg, exchange, &view.symbol, view.simulated, tolerance, pos, rec) {
+                Ok(p) => plan[idx(leg)] = p,
+                Err(LegClosePlanError::WrongSide(reason)) => {
+                    let _ = self.land(pair, SystemEvent::CloseFailed, json!({ "reason": reason }));
+                    return;
+                }
+                Err(LegClosePlanError::Mismatch(alert)) => mismatches.push(alert),
             }
-            let actual = pos.abs();
-            let alert = |recorded: Option<Decimal>, diff_pct: Option<Decimal>, reason: String| {
-                json!({
-                    "leg": leg.as_str(),
-                    "exchange": exchange.name(),
-                    "symbol": view.symbol,
-                    "recorded_quantity": recorded.map(dstr),
-                    "position_quantity": dstr(actual),
-                    "diff_pct": diff_pct.map(dstr),
-                    "tolerance_pct": dstr(tolerance),
-                    "reason": reason,
-                    "simulated": view.simulated,
-                })
-            };
-            // Both quantities are in the leg's order unit, so the relative difference is the same
-            // as in base coin (contracts x ct_val on OKX).
-            let close_qty = match rec {
-                // Nothing held and nothing known (e.g. a simulated pair after a restart: its
-                // ledger is gone): nothing to close.
-                Err(_) if actual.is_zero() => Decimal::ZERO,
-                Err(e) => {
-                    mismatches.push(alert(None, None, format!("recorded fill unknown ({e}); the position may not be the pair's")));
-                    continue;
-                }
-                // Nothing filled and nothing held (e.g. the rejected leg of a PARTIAL_FAILURE).
-                Ok(recorded) if recorded.is_zero() && actual.is_zero() => Decimal::ZERO,
-                Ok(recorded) => {
-                    // Larger of the two is > 0 here.
-                    let diff_pct = (actual - recorded).abs() * Decimal::ONE_HUNDRED / actual.max(recorded);
-                    if diff_pct > tolerance {
-                        mismatches.push(alert(Some(recorded), Some(diff_pct), "position differs from the pair's recorded fill".into()));
-                        continue;
-                    }
-                    actual.min(recorded)
-                }
-            };
-            let residual = match leg {
-                Leg::Long => pos - close_qty,
-                Leg::Short => pos + close_qty,
-            };
-            plan[idx(leg)] = (close_qty, residual);
         }
         if !mismatches.is_empty() {
             for a in &mismatches {
@@ -1614,24 +1896,29 @@ impl Actor {
             if close_qty.is_zero() {
                 continue;
             }
-            let req = OrderRequest {
-                prepared: None,
-                notional_usdt: None,
-                client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Close),
-                exchange,
-                symbol: view.symbol.clone(),
-                side: OrderSide::for_leg(side_of(leg), OrderAction::Close),
-                quantity: close_qty,
-                reduce_only: true,
-                intended_base_qty: None,
-                leverage: None,
-            };
+            let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, close_qty);
             legs[idx(leg)] = Some(LegOrder::new(req, Decimal::ONE));
         }
         self.flows.entry(pair.to_string()).or_default().close_residual = [plan[0].1, plan[1].1];
         let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs, cancel_started: false };
         self.send_set(pair, OrderAction::Close, set);
         self.check_close(pair, self.clock.now_ms());
+    }
+
+    /// The reduce-only market order that closes `quantity` of one leg (scheduled close and early exit).
+    fn close_request(&self, prefix: IdPrefix, pair: &str, leg: Leg, exchange: Exchange, symbol: &str, quantity: Decimal) -> OrderRequest {
+        OrderRequest {
+            prepared: None,
+            notional_usdt: None,
+            client_order_id: self.next_client_order_id(prefix, pair, leg, OrderAction::Close),
+            exchange,
+            symbol: symbol.to_string(),
+            side: OrderSide::for_leg(side_of(leg), OrderAction::Close),
+            quantity,
+            reduce_only: true,
+            intended_base_qty: None,
+            leverage: None,
+        }
     }
 
     /// CLOSING: a rejected close → PARTIAL_FAILURE; all closes over (or timed out) → flat check.
@@ -1990,6 +2277,8 @@ impl Actor {
             Event::ReconciliationDone { result } => self.on_reconciliation_done(result),
             Event::CancelChecked { pair, client_order_id, cancel, after } => self.on_cancel_checked(&pair, &client_order_id, cancel, after),
             Event::ConfirmChecked { pair, result } => self.on_confirm_checked(&pair, result),
+            Event::EarlyExitFetched { pair, long, short } => self.on_early_exit_fetched(&pair, long, short),
+            Event::EarlyPositionFetched { pair, leg, position, recorded, trigger } => self.on_early_position(&pair, leg, position, recorded, trigger),
         }
     }
 
@@ -2709,6 +2998,73 @@ struct PairOrder {
     action: OrderAction,
     /// Intent FAILED: the order never existed on the exchange.
     rejected: bool,
+}
+
+/// Why a leg cannot be closed on the strength of its position and the pair's recorded fill.
+#[derive(Debug, Clone, PartialEq)]
+enum LegClosePlanError {
+    /// The position is on the wrong side of the leg (reason text); left for the user.
+    WrongSide(String),
+    /// Position and recorded fill disagree (or the fill is unknown): the `CLOSE_QUANTITY_MISMATCH` payload.
+    Mismatch(Value),
+}
+
+/// Close quantity of one leg = min(the pair's recorded fill, |actual position|), plus the signed
+/// position expected to remain (exposure that is not the pair's). Shared by the scheduled close
+/// and the early exit (decision 2026-10-05 evening). `pos` is signed (long positive).
+fn plan_leg_close(
+    leg: Leg,
+    exchange: Exchange,
+    symbol: &str,
+    simulated: bool,
+    tolerance: Decimal,
+    pos: Decimal,
+    rec: Result<Decimal, String>,
+) -> Result<(Decimal, Decimal), LegClosePlanError> {
+    let expected_sign_ok = match leg {
+        Leg::Long => pos >= Decimal::ZERO,
+        Leg::Short => pos <= Decimal::ZERO,
+    };
+    if !expected_sign_ok {
+        return Err(LegClosePlanError::WrongSide(format!("{}: position {pos} is on the wrong side; left for the user", leg.as_str())));
+    }
+    let actual = pos.abs();
+    let alert = |recorded: Option<Decimal>, diff_pct: Option<Decimal>, reason: String| {
+        LegClosePlanError::Mismatch(json!({
+            "leg": leg.as_str(),
+            "exchange": exchange.name(),
+            "symbol": symbol,
+            "recorded_quantity": recorded.map(dstr),
+            "position_quantity": dstr(actual),
+            "diff_pct": diff_pct.map(dstr),
+            "tolerance_pct": dstr(tolerance),
+            "reason": reason,
+            "simulated": simulated,
+        }))
+    };
+    // Both quantities are in the leg's order unit, so the relative difference is the same
+    // as in base coin (contracts x ct_val on OKX).
+    let close_qty = match rec {
+        // Nothing held and nothing known (e.g. a simulated pair after a restart: its
+        // ledger is gone): nothing to close.
+        Err(_) if actual.is_zero() => Decimal::ZERO,
+        Err(e) => return Err(alert(None, None, format!("recorded fill unknown ({e}); the position may not be the pair's"))),
+        // Nothing filled and nothing held (e.g. the rejected leg of a PARTIAL_FAILURE).
+        Ok(recorded) if recorded.is_zero() && actual.is_zero() => Decimal::ZERO,
+        Ok(recorded) => {
+            // Larger of the two is > 0 here.
+            let diff_pct = (actual - recorded).abs() * Decimal::ONE_HUNDRED / actual.max(recorded);
+            if diff_pct > tolerance {
+                return Err(alert(Some(recorded), Some(diff_pct), "position differs from the pair's recorded fill".into()));
+            }
+            actual.min(recorded)
+        }
+    };
+    let residual = match leg {
+        Leg::Long => pos - close_qty,
+        Leg::Short => pos + close_qty,
+    };
+    Ok((close_qty, residual))
 }
 
 /// The pair's recorded fill on one leg (exchange order unit): the `filled_quantity` of its open
