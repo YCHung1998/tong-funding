@@ -8,8 +8,9 @@
 //! through (fail closed).
 
 use tong_funding_core::pair::PairState;
-use tong_funding_core::types::Exchange;
+use tong_funding_core::types::{Decimal, Exchange};
 
+use super::ports::Leg;
 use super::timings::{EngineTimings, MissedWindowPolicy};
 
 /// Name of the warning event written before a missed-window cancel.
@@ -145,6 +146,72 @@ fn decide_exit(settlement_ms: i64, timings: &EngineTimings, clock: &ClockReading
     } else {
         ScheduleAction::Nothing
     }
+}
+
+/// One leg's facts for the early-exit decision: its own open fill average and the freshly
+/// fetched price (mark price, same source as the close reference) with its local receive time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyExitInput {
+    pub open_avg: Decimal,
+    pub price: Decimal,
+    pub price_observed_at_ms: i64,
+}
+
+/// A leg that reached the early-exit threshold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EarlyExitHit {
+    /// Favourable move in percent (long: up, short: down) relative to the open average.
+    pub move_pct: Decimal,
+}
+
+/// Milliseconds after `T` (corrected clock, the earlier of the two exchanges) when `now` lies in
+/// the early-exit window `[T + early_exit_start, T + exit_delay)`; `None` outside it or when an
+/// offset is missing (fail closed: early exit is optional, so no calibration means no action).
+pub fn early_exit_elapsed_ms(settlement_ms: i64, timings: &EngineTimings, clock: &ClockReading) -> Option<i64> {
+    let (earliest, _) = clock.exchange_now_range()?;
+    (earliest >= timings.early_exit_at(settlement_ms) && earliest < timings.exit_at(settlement_ms)).then(|| earliest - settlement_ms)
+}
+
+/// Favourable move of one leg in percent, all `Decimal`; `None` when the open average is not
+/// positive (cannot be a basis) or the price is not positive.
+pub fn favourable_move_pct(leg: Leg, open_avg: Decimal, price: Decimal) -> Option<Decimal> {
+    if open_avg <= Decimal::ZERO || price <= Decimal::ZERO {
+        return None;
+    }
+    let diff = match leg {
+        Leg::Long => price - open_avg,
+        Leg::Short => open_avg - price,
+    };
+    Some(diff * Decimal::ONE_HUNDRED / open_avg)
+}
+
+/// Which legs reach `min_move_pct` (equal passes). Nothing when: the threshold is 0, outside the
+/// window, an offset is missing, or a leg's price is older than `stale_threshold_ms`.
+pub fn decide_early_exit(
+    settlement_ms: i64,
+    timings: &EngineTimings,
+    clock: &ClockReading,
+    min_move_pct: Decimal,
+    stale_threshold_ms: u64,
+    inputs: [Option<EarlyExitInput>; 2],
+) -> [Option<EarlyExitHit>; 2] {
+    if min_move_pct <= Decimal::ZERO || early_exit_elapsed_ms(settlement_ms, timings, clock).is_none() {
+        return [None, None];
+    }
+    let mut out = [None, None];
+    for (i, leg) in Leg::BOTH.into_iter().enumerate() {
+        let Some(input) = inputs[i] else { continue };
+        let age = clock.local_now_ms.saturating_sub(input.price_observed_at_ms);
+        if age < 0 || age as u64 > stale_threshold_ms {
+            continue; // an old (or future-stamped) price is not used
+        }
+        if let Some(move_pct) = favourable_move_pct(leg, input.open_avg, input.price)
+            && move_pct >= min_move_pct
+        {
+            out[i] = Some(EarlyExitHit { move_pct });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -302,6 +369,113 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ---- leg-early-exit ----
+
+    fn d(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    fn input(open: &str, price: &str, observed: i64) -> Option<EarlyExitInput> {
+        Some(EarlyExitInput { open_avg: d(open), price: d(price), price_observed_at_ms: observed })
+    }
+
+    /// Both legs at `now`, long up 0.06 %, short up 0.06 % (adverse for the short).
+    fn run(now: i64, c: ClockReading, min: &str, stale: u64, legs: [Option<EarlyExitInput>; 2]) -> [Option<EarlyExitHit>; 2] {
+        let _ = now;
+        decide_early_exit(T, &EngineTimings::default(), &c, d(min), stale, legs)
+    }
+
+    #[test]
+    fn long_up_hits_and_short_up_does_not() {
+        let now = T + 8_000;
+        let legs = [input("100", "100.06", now), input("100", "100.06", now)];
+        let r = run(now, both(now, 0), "0.05", 3_000, legs);
+        assert_eq!(r[0], Some(EarlyExitHit { move_pct: d("0.06") }));
+        assert_eq!(r[1], None);
+    }
+
+    #[test]
+    fn short_down_hits_and_long_down_does_not() {
+        let now = T + 10_000;
+        let legs = [input("100", "99.94", now), input("100", "99.94", now)];
+        let r = run(now, both(now, 0), "0.05", 3_000, legs);
+        assert_eq!(r[0], None);
+        assert_eq!(r[1], Some(EarlyExitHit { move_pct: d("0.06") }));
+    }
+
+    #[test]
+    fn equal_to_the_threshold_passes_and_just_below_does_not() {
+        let now = T + 8_000;
+        let at = run(now, both(now, 0), "0.05", 3_000, [input("100", "100.05", now), None]);
+        assert!(at[0].is_some());
+        let below = run(now, both(now, 0), "0.05", 3_000, [input("100", "100.0499", now), None]);
+        assert!(below[0].is_none());
+        // 0.03 % move vs 0.05 % threshold: no action
+        assert!(run(now, both(now, 0), "0.05", 3_000, [input("100", "100.03", now), None])[0].is_none());
+    }
+
+    #[test]
+    fn window_is_t_plus_5_inclusive_to_t_plus_15_exclusive() {
+        let legs = |n| [input("100", "100.06", n), input("100", "99.94", n)];
+        let hit = |n: i64| run(n, both(n, 0), "0.05", 3_000, legs(n));
+        assert_eq!(hit(T + 4_999), [None, None]);
+        assert!(hit(T + 5_000)[0].is_some() && hit(T + 5_000)[1].is_some());
+        assert!(hit(T + 14_999)[0].is_some());
+        assert_eq!(hit(T + 15_000), [None, None]);
+        assert_eq!(hit(T + 3_000), [None, None]);
+    }
+
+    #[test]
+    fn window_uses_the_earlier_corrected_clock() {
+        // long exchange +2 s ahead, short exchange -1 s behind local: earliest = local - 1 s
+        let c = |n| clock(n, Some(2_000), Some(-1_000));
+        let legs = |n| [input("100", "100.06", n), None];
+        assert_eq!(run(T + 5_999, c(T + 5_999), "0.05", 3_000, legs(T + 5_999)), [None, None]);
+        assert!(run(T + 6_000, c(T + 6_000), "0.05", 3_000, legs(T + 6_000))[0].is_some());
+        assert!(run(T + 15_999, c(T + 15_999), "0.05", 3_000, legs(T + 15_999))[0].is_some());
+        assert_eq!(run(T + 16_000, c(T + 16_000), "0.05", 3_000, legs(T + 16_000)), [None, None]);
+    }
+
+    #[test]
+    fn a_missing_offset_never_triggers() {
+        let now = T + 8_000;
+        let legs = [input("100", "100.06", now), input("100", "99.94", now)];
+        assert_eq!(run(now, clock(now, Some(0), None), "0.05", 3_000, legs), [None, None]);
+        assert_eq!(run(now, clock(now, None, None), "0.05", 3_000, legs), [None, None]);
+        assert_eq!(early_exit_elapsed_ms(T, &EngineTimings::default(), &clock(now, Some(0), None)), None);
+    }
+
+    #[test]
+    fn a_stale_price_is_not_used_but_the_other_leg_still_is() {
+        let now = T + 8_000;
+        let legs = [input("100", "100.06", now - 3_001), input("100", "99.94", now - 3_000)];
+        let r = run(now, both(now, 0), "0.05", 3_000, legs);
+        assert_eq!(r[0], None, "3001 ms old > 3000 ms threshold");
+        assert!(r[1].is_some(), "exactly the threshold is still fresh");
+    }
+
+    #[test]
+    fn a_zero_threshold_disables_it() {
+        let now = T + 8_000;
+        let legs = [input("100", "150", now), input("100", "50", now)];
+        assert_eq!(run(now, both(now, 0), "0", 3_000, legs), [None, None]);
+    }
+
+    #[test]
+    fn missing_input_or_unusable_basis_gives_no_hit() {
+        let now = T + 8_000;
+        assert_eq!(run(now, both(now, 0), "0.05", 3_000, [None, None]), [None, None]);
+        let bad = [input("0", "100.06", now), input("-1", "99.94", now)];
+        assert_eq!(run(now, both(now, 0), "0.05", 3_000, bad), [None, None]);
+    }
+
+    #[test]
+    fn move_pct_is_exact_decimal() {
+        assert_eq!(favourable_move_pct(Leg::Long, d("100"), d("100.3")), Some(d("0.3")));
+        assert_eq!(favourable_move_pct(Leg::Short, d("100"), d("99.7")), Some(d("0.3")));
+        assert_eq!(favourable_move_pct(Leg::Long, d("100"), d("99")), Some(d("-1")));
     }
 
     /// Engine code must take time from the injected clock only (scheduler-and-nodes spec).

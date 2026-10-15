@@ -103,6 +103,10 @@ pub struct RiskConfig {
     /// `net_edge_threshold_pct` (ui-trading-pages, user decision 2026-10-05 evening). Global only,
     /// documented default 0.03 (Python `risk_config.py`), so it never makes the config incomplete.
     pub min_expected_net_pnl_pct: Pct,
+    /// leg-early-exit: in T+5s..T+15s a RECONCILED leg whose price moved in its favour by at least
+    /// this percentage (vs its own open fill average) is closed alone. Global only, default 0.3
+    /// (user decision 2026-10-15), 0 = disabled; never makes the config incomplete.
+    pub early_exit_min_move_pct: Pct,
 }
 
 impl Default for RiskConfig {
@@ -124,6 +128,7 @@ impl Default for RiskConfig {
             est_slippage_pct: None,
             taker_fee_pct: BTreeMap::new(),
             min_expected_net_pnl_pct: Decimal::new(3, 2),
+            early_exit_min_move_pct: Decimal::new(3, 1),
         }
     }
 }
@@ -166,6 +171,7 @@ impl RiskConfig {
             non_negative("taker_fee_pct", *v)?;
         }
         non_negative("min_expected_net_pnl_pct", self.min_expected_net_pnl_pct)?;
+        non_negative("early_exit_min_move_pct", self.early_exit_min_move_pct)?;
         Ok(())
     }
 

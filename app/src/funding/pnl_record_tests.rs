@@ -437,3 +437,44 @@ fn pnl_record_a_later_pair_on_the_same_symbol_does_not_change_the_earlier_pairs_
     assert_eq!(tong_funding_core::pnl::compute_pnl(&after.input).total.funding, total_before);
     assert_eq!(total_before, d("0.24"));
 }
+
+/// leg-early-exit 4.1: the long leg is closed early (T+6 s), the short leg at T+15 s. Each leg's
+/// holding window ends at its OWN last closing fill: the funding fetch coverage and the funding
+/// rows of a leg are judged against that leg's window, and both legs' fills and fees are counted.
+#[test]
+fn pnl_record_legs_closed_at_different_times_use_their_own_windows() {
+    let (dir, db, clock) = open_tmp();
+    let fx = Fx { events: EventStore::new(db.clone()), _dir: dir, db, clock };
+    add_pair(&fx.db, "p1", "BTCUSDT", false);
+    at(&fx, T - 10_000, |es| {
+        es.append("PAIR_TRANSITION", Some("p1"), json!({ "from": "PRE_TRADE_CHECK", "to": "ORDER_SUBMIT", "detail": { "checks": "pass", "entry_snapshot": snapshot() } })).unwrap();
+    });
+    order(&fx, T - 10_000, "p1", "long", "open", Exchange::Binance, "60002.5", "0.24");
+    order(&fx, T - 10_000, "p1", "short", "open", Exchange::Bybit, "60000", "0.24");
+    order(&fx, T + 6_000, "p1", "long", "close", Exchange::Binance, "60180", "0.24"); // early, in profit
+    order(&fx, T + 15_000, "p1", "short", "close", Exchange::Bybit, "60150", "0.24"); // scheduled
+    // Funding at T for both legs; a later Binance row at T+10 s lies after the long leg's window.
+    fx.db
+        .write_funding_ledger(&[
+            ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T),
+            ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T),
+            ledger(Exchange::Binance, "BTCUSDT", "3", "9.99", T + 10_000),
+        ])
+        .unwrap();
+    // Binance was fetched only up to the long leg's close; Bybit up to the short leg's close.
+    fetched(&fx, Exchange::Binance, Some("BTCUSDT"), T - 10_000, T + 6_000);
+    fetched(&fx, Exchange::Bybit, None, T - 10_000, T + 15_000);
+
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    assert_eq!(a.windows[0].as_ref().unwrap().closed_at_ms, Some(T + 6_000));
+    assert_eq!(a.windows[1].as_ref().unwrap().closed_at_ms, Some(T + 15_000));
+    assert_eq!(a.slots, [vec![T], vec![T]], "the settlement at T lies in both windows");
+    assert_eq!(a.input.legs[0].funding_fetch, FundingFetchState::Fetched, "the long leg is covered up to ITS close, not T+15 s");
+    assert_eq!(a.input.legs[1].funding_fetch, FundingFetchState::Fetched);
+    assert_eq!(a.input.legs[0].funding.len(), 1, "the row after the long leg's close is not its funding: {:?}", a.input.legs[0].funding);
+    assert_eq!(a.input.legs[1].funding.len(), 1);
+    assert_eq!(a.input.legs.iter().map(|l| l.fills.len()).collect::<Vec<_>>(), vec![2, 2]);
+    let b = tong_funding_core::pnl::compute_pnl(&a.input);
+    assert_eq!(b.total.funding, d("0.24"));
+    assert_eq!(b.total.opening_fee + b.total.closing_fee, d("0.96"), "four fills, each fee counted once");
+}

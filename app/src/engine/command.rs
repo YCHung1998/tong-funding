@@ -172,6 +172,23 @@ pub enum Event {
     /// "Confirm closed" re-query of both legs (partial-failure-alerting spec): positions and
     /// open orders on the pair's symbol, read again from the account (never the user's word).
     ConfirmChecked { pair: PairUuid, result: Result<FlatReport, String> },
+    /// leg-early-exit: the fresh price (never cached) of each leg that was asked for (`None` = not
+    /// asked), fetched in the T+5..T+15 window of a RECONCILED pair.
+    EarlyExitFetched { pair: PairUuid, long: Option<Result<FreshQuote, String>>, short: Option<Result<FreshQuote, String>> },
+    /// leg-early-exit: for a leg that reached the threshold, its signed position and the pair's
+    /// recorded fill (open fills minus earlier close fills; `Err` = unknown), read before its
+    /// reduce-only order is sized.
+    EarlyPositionFetched { pair: PairUuid, leg: Leg, position: Result<Decimal, String>, recorded: Result<Decimal, String>, trigger: EarlyTrigger },
+}
+
+/// What made a leg reach the early-exit threshold (recorded with the `LEG_EARLY_EXIT` event).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EarlyTrigger {
+    pub open_avg: Decimal,
+    pub price: Decimal,
+    pub price_observed_at_ms: i64,
+    pub move_pct: Decimal,
+    pub threshold_pct: Decimal,
 }
 
 /// Both legs' signed positions and open-order counts on the pair's symbol (complete lists only).
