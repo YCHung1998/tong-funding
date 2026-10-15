@@ -255,6 +255,59 @@ async fn a_rejected_early_close_leaves_the_leg_open_the_pair_reconciled_and_t_pl
     assert_eq!(count(&rig.db, LEG_EARLY_EXIT), 1, "the rejected leg is not retried within the window");
 }
 
+/// The exchange never answers the early close (outage / lost response): after the order timeout the
+/// leg is given up with a reason, the pair state is untouched, the pair does not hang, and the leg is
+/// not closed twice behind our back (any later close is reduce-only and sized from the recorded fills).
+#[tokio::test(start_paused = true)]
+async fn an_early_close_that_is_never_confirmed_is_given_up_after_the_order_timeout_and_the_pair_does_not_hang() {
+    let (rig, _h) = reconciled("0.3").await;
+    rig.sim.script_prefix(&sim_id(Leg::Long, OrderAction::Close), SimBehavior::Hang { executed: false });
+    set_price(&rig, Exchange::Binance, "100.5");
+    run_until(&rig.clock, T + 9_000).await;
+    assert_eq!(count(&rig.db, LEG_EARLY_EXIT), 1, "the early close was attempted once");
+    assert!(of(&rig.db, LEG_EARLY_EXIT_ABORTED).is_empty(), "not given up before the timeout");
+    assert_eq!(status(&rig.db, UUID), "RECONCILED");
+
+    // order_timeout_seconds after the send (T+5 s + the effective timeout) the leg is given up.
+    run_until(&rig.clock, T + 60_000).await;
+    let a = of(&rig.db, LEG_EARLY_EXIT_ABORTED);
+    assert_eq!(a.len(), 1, "given up exactly once: {a:?}");
+    assert_eq!(a[0]["leg"], json!("long"), "{a:?}");
+    assert!(a[0]["reason"].as_str().unwrap().contains("not confirmed within the order timeout"), "{a:?}");
+    assert_eq!(count(&rig.db, LEG_EARLY_EXIT), 1, "never retried");
+    let st = status(&rig.db, UUID);
+    assert!(st == "FINALIZED" || st == "PARTIAL_FAILURE", "the pair must not hang after the give-up: {st}");
+    // the short leg was handled by the scheduled exit; the unconfirmed leg is never over-closed
+    let long_close_orders: Vec<String> = closes_sent(&rig).into_iter().filter(|r| r.side == OrderSide::Sell).map(|r| r.client_order_id).collect();
+    assert!(long_close_orders.len() <= 2, "at most the early order plus one scheduled follow-up: {long_close_orders:?}");
+    assert!(rig.sim.position(Exchange::Binance, SYM) >= Decimal::ZERO, "reduce-only never flips the position");
+}
+
+/// The app was restarted while a (demo) pair was held: the open fill averages lived in memory and are
+/// gone. Early exit has no basis to compare against, so it must not guess one: no early order, a
+/// reason per leg, and the pair stays RECONCILED for the scheduled exit.
+#[tokio::test(start_paused = true)]
+async fn after_a_restart_there_is_no_open_average_so_no_early_close_is_sent_and_each_leg_says_why() {
+    let (rig, deps) = rig(Opts { start_ms: T + 1_000, demo: true, ..Opts::default() });
+    early_on(&rig, "0.3");
+    let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: T, simulated: false, scan: pair_at(UUID, SYM, T).entry };
+    let row = NewPair { internal_uuid: UUID.into(), pair_id: "pid".into(), symbol: SYM.into(), status: PairState::Reconciled, entry: serde_json::to_value(env).unwrap() };
+    rig.db.add_pair_if_not_pending(&row).unwrap();
+    let _h = start(deps);
+    set_price(&rig, Exchange::Binance, "101"); // a +1 % move that WOULD trigger if an open average were known
+    set_price(&rig, Exchange::Bybit, "99");
+    run_until(&rig.clock, T + 12_000).await;
+
+    assert_eq!(status(&rig.db, UUID), "RECONCILED", "no state change from the early-exit logic");
+    assert_eq!(count(&rig.db, LEG_EARLY_EXIT), 0, "no early close event");
+    assert!(rig.demo.requests.lock().unwrap().is_empty(), "no order of any kind was sent: {:?}", rig.demo.requests.lock().unwrap());
+    assert!(rig.sim.submitted().is_empty());
+    let a = of(&rig.db, LEG_EARLY_EXIT_ABORTED);
+    let legs: Vec<&str> = a.iter().map(|p| p["leg"].as_str().unwrap()).collect();
+    assert_eq!(legs, vec!["long", "short"], "one reason per leg: {a:?}");
+    assert!(a.iter().all(|p| p["reason"].as_str().unwrap().contains("restart")), "{a:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_position_far_from_the_recorded_fill_blocks_the_early_close_and_sends_nothing() {
     let (rig, _h) = reconciled("0.3").await;
