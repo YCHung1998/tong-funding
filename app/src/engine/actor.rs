@@ -106,6 +106,10 @@ pub const LEG_EARLY_EXIT: &str = "LEG_EARLY_EXIT";
 /// quantity mismatch, order rejected, not confirmed in time). The pair state is untouched; the
 /// scheduled T+15 exit handles whatever is still open.
 pub const LEG_EARLY_EXIT_ABORTED: &str = "LEG_EARLY_EXIT_ABORTED";
+/// spread-position-tag (record only, never a decision input): the positive / negative / neutral /
+/// unknown tag of the two legs' prices, written when the pair enters RECONCILED (`phase` ENTRY, the
+/// T-10 entry-check prices) and when its closes start (`phase` CLOSE, the close reference prices).
+pub const SPREAD_TAG: &str = "SPREAD_TAG";
 /// Both legs verified flat (positions 0, no open order); written right before FINALIZED.
 pub const CLOSE_CONFIRMED: &str = "CLOSE_CONFIRMED";
 /// Result of a manual order (not part of a pair).
@@ -404,6 +408,9 @@ struct Flow {
     baseline_requested: bool,
     baseline: Option<QuotePair>,
     pretrade: Option<QuotePair>,
+    /// spread-position-tag: the two legs' entry-check prices (price, local observed time), kept when
+    /// the pre-trade check ran so the ENTRY record can be written once the pair is RECONCILED.
+    entry_prices: Option<[(Decimal, i64); 2]>,
     margins: Option<(Result<Decimal, String>, Result<Decimal, String>)>,
     context: Option<EntryContext>,
     recheck_inflight: bool,
@@ -1302,6 +1309,7 @@ impl Actor {
         let flow = self.flows.entry(pair.to_string()).or_default();
         flow.open_triggered_ms = Some(now);
         flow.pretrade = None;
+        flow.entry_prices = None;
         flow.margins = None;
         flow.context = None;
         let (market, account, tx) = (self.market.clone(), self.account_for(view.simulated), self.event_tx.clone());
@@ -1378,6 +1386,10 @@ impl Actor {
                 return fail(self, json!({ "block": format!("pre-trade fetch failed: {why}") }));
             }
         };
+        // spread-position-tag: keep the entry-check prices for the ENTRY record written at RECONCILED.
+        if let Some(flow) = self.flows.get_mut(pair) {
+            flow.entry_prices = Some([(pre_l.price, pre_l.price_observed_at_ms), (pre_s.price, pre_s.price_observed_at_ms)]);
+        }
         let (base_l, base_s) = match &baseline {
             Some((l, s)) => (l.as_ref().ok(), s.as_ref().ok()),
             None => (None, None),
@@ -1686,7 +1698,16 @@ impl Actor {
                     let reason = if submit_unknown { AlertReason::SubmitUnknown } else { AlertReason::FillUnconfirmed };
                     detail["alert_reason"] = json!(reason.as_str());
                 }
-                let _ = self.land(pair, event, detail);
+                let landed = self.land(pair, event, detail).is_ok();
+                if landed && event == SystemEvent::FillsWithinTolerance {
+                    // spread-position-tag: the entry-check (T-10) prices of the two legs.
+                    if let Some([l, s]) = self.flows.get(pair).and_then(|f| f.entry_prices) {
+                        self.note_spread_tag(pair, "ENTRY", &Ok(l), &Ok(s));
+                    } else {
+                        let none = Err("no entry-check prices recorded".to_string());
+                        self.note_spread_tag(pair, "ENTRY", &none, &none);
+                    }
+                }
             }
         }
     }
@@ -2270,6 +2291,11 @@ impl Actor {
                 {
                     let keep = |q: Result<FreshQuote, String>| Some(q.map(|q| (q.price, q.price_observed_at_ms)));
                     flow.close_reference = [keep(long_reference), keep(short_reference)];
+                    // spread-position-tag: the close reference prices (fetched right before the closes).
+                    let no_ref = || Err("no close reference price".to_string());
+                    let refs = self.flows.get(&pair).map(|f| f.close_reference.clone()).unwrap_or([None, None]);
+                    let [l, s] = refs.map(|r| r.unwrap_or_else(no_ref));
+                    self.note_spread_tag(&pair, "CLOSE", &l, &s);
                 }
                 self.on_close_positions(&pair, [long, short], [long_recorded, short_recorded]);
             }
@@ -2641,6 +2667,29 @@ impl Actor {
     /// Best-effort event (a halted store cannot write; the halt is the record).
     fn note(&self, event_type: &str, pair: Option<&str>, payload: Value) {
         let _ = self.events.append(event_type, pair, payload);
+    }
+
+    /// Writes one `SPREAD_TAG` record (spread-position-tag): each leg's price and the time it was
+    /// observed, or why there is none (then the tag is `unknown`). Record only: nothing reads it back.
+    fn note_spread_tag(&self, pair: &str, phase: &str, long: &Result<(Decimal, i64), String>, short: &Result<(Decimal, i64), String>) {
+        let Some(view) = self.pairs.get(pair) else { return };
+        let leg_json = |exchange: Exchange, q: &Result<(Decimal, i64), String>| match q {
+            Ok((price, at)) => json!({ "exchange": exchange.name(), "price": price.normalize().to_string(), "observed_at_ms": at }),
+            Err(e) => json!({ "exchange": exchange.name(), "error": e }),
+        };
+        let tag = tong_funding_core::spread_tag::spread_tag(long.as_ref().ok().map(|q| q.0), short.as_ref().ok().map(|q| q.0));
+        self.note(
+            SPREAD_TAG,
+            Some(pair),
+            json!({
+                "phase": phase,
+                "tag": tag.kind.as_str(),
+                "pct": tag.pct.map(|p| p.normalize().to_string()),
+                "symbol": view.symbol,
+                "long": leg_json(view.long_exchange, long),
+                "short": leg_json(view.short_exchange, short),
+            }),
+        );
     }
 
     /// Write `event_type` once per `(pair, key)`.

@@ -1,4 +1,4 @@
-# 005 套用「兩腿結算時間必須相同」規則重放 2026-10-14／15 八筆實單
+# 006 套用「兩腿結算時間必須相同」規則重放 2026-10-14／15 八筆實單
 
 - 變更：`openspec/changes/require-synchronized-settlement`（task 4.3）
 - 指令（唯讀）：`python3 issue/tools/check_sync_rule.py`

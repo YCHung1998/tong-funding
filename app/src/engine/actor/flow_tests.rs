@@ -2252,6 +2252,10 @@ mod ui_command_tests;
 #[path = "early_exit_tests.rs"]
 mod early_exit_tests;
 
+// spread-position-tag: SPREAD_TAG records at entry and before the close.
+#[path = "spread_tag_tests.rs"]
+mod spread_tag_tests;
+
 // ---- candidate-readd-after-close: engine side ---------------------------------------------
 
 /// Recorded case NMRUSDT: flat confirmed, CLOSING while the funding PnL waits. The snapshot says so

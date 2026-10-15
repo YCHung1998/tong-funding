@@ -19,4 +19,4 @@
 - [x] 4.1 `openspec validate spread-position-tag` 通過；`cargo test -p tong-funding-core -p tong-funding` 全綠，記錄指令與通過數量
 - [x] 4.2 用實際資料核對（唯讀）：對 `funding.db` 的 8 筆實單，依進場快照／成交價推算當時的標籤，與價差損益並列於 `issue/`（只呈現，不推論因果）
 
-- [ ] 3.4 （整合階段由主流程完成，避免與 `leg-early-exit` 同時改 `actor.rs`）引擎在進入 `RECONCILED` 與平倉單送出前各寫一筆 `SPREAD_TAG` 事件，沿用 1.1 的純函式；補引擎測試
+- [x] 3.4 （整合階段由主流程完成，避免與 `leg-early-exit` 同時改 `actor.rs`）引擎在進入 `RECONCILED` 與平倉單送出前各寫一筆 `SPREAD_TAG` 事件，沿用 1.1 的純函式；補引擎測試
