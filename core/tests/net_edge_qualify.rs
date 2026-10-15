@@ -147,3 +147,58 @@ fn best_opportunity_reports_qualification_of_best() {
     assert_eq!((best.edge.long, best.edge.short), (Exchange::Binance, Exchange::Bybit));
     assert!(best.qualifies);
 }
+
+#[test]
+fn unsynchronized_settlement_never_qualifies_but_edge_is_still_computed() {
+    // long settles at 8h, short at 4h: only the short leg earns (0.0004 * 1000 = 0.4 -> 0.04 pct).
+    let (a, mut b) = good_pair();
+    b.next_funding_time = 4 * H;
+    let o = evaluate_pair(&a, &b, d("1000"), &params("0.01")).unwrap();
+    assert_eq!(o.edge.net_edge_pct, d("0.04"), "single-settlement model still computes");
+    assert!(!o.qualifies, "net edge far above threshold but legs settle at different times");
+    // swapped inputs give the same verdict (both orientations are evaluated)
+    let o = evaluate_pair(&b, &a, d("1000"), &params("0.01")).unwrap();
+    assert!(!o.qualifies);
+}
+
+#[test]
+fn synchronized_settlement_qualifies() {
+    let (a, b) = good_pair();
+    assert_eq!(a.next_funding_time, b.next_funding_time);
+    assert!(qualifies(&a, &b, &params("0.06")));
+}
+
+#[test]
+fn missing_settlement_time_is_not_synchronized() {
+    let (mut a, b) = good_pair();
+    a.next_funding_time = 0;
+    assert!(!qualifies(&a, &b, &params("0")));
+    let (a, mut b) = good_pair();
+    b.next_funding_time = 0;
+    assert!(!qualifies(&a, &b, &params("0")));
+    let (mut a, mut b) = good_pair();
+    a.next_funding_time = 0;
+    b.next_funding_time = 0;
+    assert!(!qualifies(&a, &b, &params("0")), "both missing is not 'equal'");
+}
+
+#[test]
+fn legs_settle_together_helper() {
+    let (a, mut b) = good_pair();
+    assert!(legs_settle_together(&a, &b));
+    b.next_funding_time = 4 * H;
+    assert!(!legs_settle_together(&a, &b));
+    b.next_funding_time = 0;
+    assert!(!legs_settle_together(&a, &b));
+}
+
+#[test]
+fn best_opportunity_unsynchronized_pair_does_not_qualify() {
+    let mut obs = vec![
+        ob(Exchange::Binance, "BTCUSDT", "-0.0002", Some("2000000"), DataStatus::Listed),
+        ob(Exchange::Bybit, "BTCUSDT", "0.0004", Some("2000000"), DataStatus::Listed),
+    ];
+    obs[1].next_funding_time = 4 * H;
+    let best = best_opportunity(&obs, d("1000"), &params("0.01")).unwrap().unwrap();
+    assert!(!best.qualifies);
+}

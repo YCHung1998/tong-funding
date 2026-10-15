@@ -122,6 +122,13 @@ pub fn meets_min_expected_net_pnl(edge: &NetEdge, notional: Notional, min: Pct) 
     notional > Decimal::ZERO && expected_net_pnl_pct(edge, notional) >= min
 }
 
+/// require-synchronized-settlement: both legs must settle at the same next funding time. A missing
+/// time (0) counts as "different" (fail closed), so two missing times are NOT equal. Shared by the
+/// scanner's qualification and the pre-trade `NetEdgeQualified` check.
+pub fn legs_settle_together(long: &FundingObservation, short: &FundingObservation) -> bool {
+    long.next_funding_time > 0 && long.next_funding_time == short.next_funding_time
+}
+
 /// Evaluates one fixed orientation (`long` / `short`) and applies the qualification rules.
 fn evaluate_oriented(
     long: &FundingObservation,
@@ -135,6 +142,7 @@ fn evaluate_oriented(
         o.volume_24h_quote.unwrap_or(Decimal::ZERO) >= params.min_24h_volume_usdt
     };
     let qualifies = edge.net_edge_pct >= threshold
+        && legs_settle_together(long, short)
         && is_consistent_listed(long)
         && is_consistent_listed(short)
         && volume_ok(long)
