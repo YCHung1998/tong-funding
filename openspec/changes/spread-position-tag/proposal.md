@@ -29,7 +29,7 @@
 
 ## Impact
 
-- 程式：新增 `app/src/ui/vm/spread_tag.rs`（純函式與測試）；`app/src/ui/vm/positions.rs` 的 `PairCard` 增加標籤欄位；`app/src/ui/vm/staged_orders.rs` 的 `RunningRow` 增加標籤欄位；`app/src/ui/trading_pages.rs`／持倉頁畫面顯示。
+- 程式：新增 `core/src/spread_tag.rs`（純函式與測試，UI 與引擎共用）；`app/src/ui/vm/positions.rs` 的 `PairCard` 增加標籤欄位；`app/src/ui/vm/staged_orders.rs` 的 `RunningRow` 增加標籤欄位；`app/src/ui/trading_pages.rs`／持倉頁畫面顯示。
 - 資料來源：`UiSnapshot.market` 的各所最新觀測價格（REST 輪詢，Binance 與 Bybit 另有 WebSocket 每秒覆蓋）；無新的網路請求。
 - 無資料庫結構變更、無設定；新增事件類型 `SPREAD_TAG`（寫入既有 events 表）。
 - 相依：與 `leg-early-exit`、`require-synchronized-settlement` 兩個提案互相獨立。
