@@ -17,5 +17,5 @@
 
 ## 4. 損益與驗證
 
-- [ ] 4.1 `app/src/funding/pnl_record.rs`：兩腿平倉時間不同時損益拆解與資金費視窗正確，補測試（`pnl_record_tests.rs`）
-- [ ] 4.2 `openspec validate leg-early-exit` 通過；`cargo test -p tong-funding-core -p tong-funding` 全綠，記錄指令與通過數量
+- [x] 4.1 `app/src/funding/pnl_record.rs`：兩腿平倉時間不同時損益拆解與資金費視窗正確，補測試（`pnl_record_tests.rs`）
+- [x] 4.2 `openspec validate leg-early-exit` 通過；`cargo test -p tong-funding-core -p tong-funding` 全綠，記錄指令與通過數量
