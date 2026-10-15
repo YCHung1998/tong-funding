@@ -143,7 +143,7 @@ impl Shell {
             bridge: Bridge::default(),
             scanner: scanner::build(&snap, now_ms),
             dashboard: dashboard::build(&snap, now_ms),
-            positions: positions::build(&snap, &positions::Filter::default()),
+            positions: positions::build(&snap, &positions::Filter::default(), now_ms),
             alerts: alerts::alerts(&snap, now_ms),
             snap,
             pos_filter: positions::Filter::default(),
@@ -220,7 +220,7 @@ impl Shell {
     fn recompute(&mut self, cx: &mut Context<Self>) {
         self.scanner = scanner::build(&self.snap, self.now_ms);
         self.dashboard = dashboard::build(&self.snap, self.now_ms);
-        self.positions = positions::build(&self.snap, &self.pos_filter);
+        self.positions = positions::build(&self.snap, &self.pos_filter, self.now_ms);
         self.alerts = alerts::alerts(&self.snap, self.now_ms);
         self.prune_acks();
         self.status = self.status_model();
@@ -687,7 +687,7 @@ impl Shell {
                     set.insert(e);
                 }
                 this.pos_filter.exchanges = Some(set);
-                this.positions = positions::build(&this.snap, &this.pos_filter);
+                this.positions = positions::build(&this.snap, &this.pos_filter, this.now_ms);
                 cx.notify();
             }))
         };
@@ -699,7 +699,7 @@ impl Shell {
                     set.insert(c.clone());
                 }
                 this.pos_filter.coins = Some(set);
-                this.positions = positions::build(&this.snap, &this.pos_filter);
+                this.positions = positions::build(&this.snap, &this.pos_filter, this.now_ms);
                 cx.notify();
             }))
         };
