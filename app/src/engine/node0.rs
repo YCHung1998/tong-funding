@@ -12,7 +12,7 @@
 use rust_decimal::Decimal;
 use serde::Deserialize;
 use tong_funding_core::funding::{is_consistent_listed, FundingObservation};
-use tong_funding_core::net_edge::{compute_net_edge, expected_net_pnl_pct, meets_min_expected_net_pnl, NetEdge, NetEdgeParams};
+use tong_funding_core::net_edge::{compute_net_edge, legs_settle_together, expected_net_pnl_pct, meets_min_expected_net_pnl, NetEdge, NetEdgeParams};
 use tong_funding_core::pair::PairState;
 use tong_funding_core::pretrade::{evaluate_pretrade, Check, LegInput, PretradeInput, PretradeLimits, PretradeVerdict};
 use tong_funding_core::risk::EffectiveConfig;
@@ -259,7 +259,15 @@ pub fn build_input(
                         min.normalize()
                     ));
                 }
-                edge.net_edge_pct >= threshold && pnl_ok
+                // require-synchronized-settlement: same rule as the scanner's 達標 (core's helper).
+                let synced = legs_settle_together(&long.pretrade.funding, &short.pretrade.funding);
+                if !synced {
+                    notes.push(format!(
+                        "legs do not settle together: long next settlement {} vs short {} (0 = missing)",
+                        long.pretrade.funding.next_funding_time, short.pretrade.funding.next_funding_time
+                    ));
+                }
+                edge.net_edge_pct >= threshold && pnl_ok && synced
             }
             Err(why) => {
                 notes.push(format!("net edge not computable: {}", why.join(", ")));
@@ -620,6 +628,51 @@ mod tests {
         let mut fx = Fx::new();
         fx.pre_s = quote(Exchange::Bybit, "0.0002", "100.01", 6_000);
         assert_eq!(fx.failed(), vec![Check::NetEdgeQualified]);
+    }
+
+    /// require-synchronized-settlement: everything else passes and Net Edge clears, but the
+    /// pre-trade data shows the legs settling at different times -> BLOCK on NetEdgeQualified only.
+    /// Rates so large that each single leg alone still clears the threshold and the min expected
+    /// PnL (income 2.5 per leg vs ~1.2 costs): the settlement time is the only thing that can fail.
+    fn rich() -> Fx {
+        let mut fx = Fx::new();
+        fx.pre_l = quote(Exchange::Binance, "-0.0025", "100.02", 6_000);
+        fx.pre_s = quote(Exchange::Bybit, "0.0025", "100.01", 6_000);
+        assert_eq!(fx.verdict(), Node0Verdict::Pass);
+        fx
+    }
+
+    #[test]
+    fn unsynchronized_settlement_blocks_net_edge_qualified_with_a_note() {
+        let mut fx = rich();
+        fx.pre_l.funding.next_funding_time = SETTLE + 4 * 3_600_000;
+        assert_eq!(fx.failed(), vec![Check::NetEdgeQualified]);
+        let notes = match fx.verdict() {
+            Node0Verdict::Block(Node0Block::Checks { notes, .. }) => notes,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            notes.iter().any(|n| n.contains("settlement") && n.contains(&SETTLE.to_string())),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn missing_settlement_time_on_either_leg_blocks_net_edge_qualified() {
+        let mut fx = rich();
+        fx.pre_s.funding.next_funding_time = 0;
+        assert_eq!(fx.failed(), vec![Check::NetEdgeQualified]);
+        let mut fx = rich();
+        fx.pre_l.funding.next_funding_time = 0;
+        assert_eq!(fx.failed(), vec![Check::NetEdgeQualified]);
+    }
+
+    #[test]
+    fn synchronized_settlement_still_passes() {
+        let mut fx = rich();
+        fx.pre_l.funding.next_funding_time = SETTLE + 1;
+        fx.pre_s.funding.next_funding_time = SETTLE + 1;
+        assert_eq!(fx.verdict(), Node0Verdict::Pass);
     }
 
     /// ui-trading-pages (MODIFIED pretrade-validation): Net Edge 0.07 % clears the 0.05 threshold;
