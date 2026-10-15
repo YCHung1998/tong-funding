@@ -28,6 +28,8 @@ pub enum Field {
     EstSlippagePct,
     SafetyMarginPct,
     TakerFee(Exchange),
+    /// leg-early-exit: global only, 0 = disabled.
+    EarlyExitMinMovePct,
 }
 
 /// Which way a field tightens the risk gate. The source of truth is the conservative merge in
@@ -91,7 +93,7 @@ pub const STALE_NOTE: &str = "建議 3000 ms：送單前檢查用的是送單前
 
 /// Global Limits, Layer 1 and Net Edge fields, in page order. Funding Threshold, Max Concurrent
 /// Trades (legs), Hedge Threshold and a single Max Slippage do not exist.
-pub const GLOBAL_FIELDS: [Field; 14] = [
+pub const GLOBAL_FIELDS: [Field; 15] = [
     Field::MaxLeverage,
     Field::MaxPriceDriftPct,
     Field::StaleDataThresholdMs,
@@ -106,6 +108,7 @@ pub const GLOBAL_FIELDS: [Field; 14] = [
     Field::TakerFee(Exchange::Binance),
     Field::TakerFee(Exchange::Bybit),
     Field::TakerFee(Exchange::Okx),
+    Field::EarlyExitMinMovePct,
 ];
 
 /// Exactly the nine overridable fields of `risk-config` (`min_expected_net_pnl_pct` is global only).
@@ -136,6 +139,7 @@ impl Field {
             Field::EstSlippagePct => "est_slippage_pct".into(),
             Field::SafetyMarginPct => "safety_margin_pct".into(),
             Field::TakerFee(e) => format!("{} taker_fee_pct", e.name()),
+            Field::EarlyExitMinMovePct => "early_exit_min_move_pct".into(),
         }
     }
 
@@ -153,6 +157,7 @@ impl Field {
             Field::EstSlippagePct => "估計滑價（每筆成交）",
             Field::SafetyMarginPct => "安全邊際",
             Field::TakerFee(_) => "Taker 費率",
+            Field::EarlyExitMinMovePct => "提早平倉最小有利幅度（0 = 停用）",
         }
     }
 
@@ -169,13 +174,14 @@ impl Field {
             | Field::NetEdgeThresholdPct
             | Field::EstSlippagePct
             | Field::SafetyMarginPct
+            | Field::EarlyExitMinMovePct
             | Field::TakerFee(_) => "%",
         }
     }
 
     pub fn strictness(self) -> Strictness {
         match self {
-            Field::NetEdgeThresholdPct | Field::MinExpectedNetPnlPct | Field::SafetyMarginPct | Field::EstSlippagePct | Field::Min24hVolumeUsdt => Strictness::HigherStricter,
+            Field::NetEdgeThresholdPct | Field::MinExpectedNetPnlPct | Field::SafetyMarginPct | Field::EstSlippagePct | Field::Min24hVolumeUsdt | Field::EarlyExitMinMovePct => Strictness::HigherStricter,
             Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs => Strictness::LowerStricter,
             Field::TakerFee(_) => Strictness::Fact,
         }
@@ -205,6 +211,11 @@ impl Field {
             },
             Field::SafetyMarginPct => FieldHelp { meaning: "從 Net Edge 額外扣掉的緩衝；越大越保守。", formula: NE, affects: &[Qualify, Pretrade] },
             Field::TakerFee(_) => FieldHelp { meaning: "該交易所的 taker 手續費率；請依帳戶手續費等級實填，不是調嚴調鬆的旋鈕。", formula: NE, affects: &[Qualify, Pretrade] },
+            Field::EarlyExitMinMovePct => FieldHelp {
+                meaning: "已對沖（RECONCILED）的配對在結算後 T+5 秒起、T+15 秒前，某一腿的價格相對自己的開倉成交均價往有利方向（多單漲、空單跌）移動達此百分比，就只平那一腿（reduce-only 市價單）、另一腿 T+15 照常平。僅 AUTO 且 kill switch 未啟用時動作；0 = 停用；等於門檻即觸發。單腿先平會暫時留下單邊曝險。",
+                formula: Some("多單：(目前價 − 開倉均價) ÷ 開倉均價 × 100 ≥ 門檻；空單：(開倉均價 − 目前價) ÷ 開倉均價 × 100 ≥ 門檻"),
+                affects: &[Execution],
+            },
         }
     }
 
@@ -233,6 +244,7 @@ pub fn field_text(cfg: &RiskConfig, f: Field) -> String {
         Field::EstSlippagePct => cfg.est_slippage_pct.map(dtext).unwrap_or_default(),
         Field::SafetyMarginPct => dtext(cfg.safety_margin_pct),
         Field::TakerFee(e) => cfg.taker_fee_pct.get(&e).copied().map(dtext).unwrap_or_default(),
+        Field::EarlyExitMinMovePct => dtext(cfg.early_exit_min_move_pct),
     }
 }
 
@@ -304,7 +316,7 @@ fn override_value_of(o: &RiskOverride, f: Field) -> Option<String> {
         Field::NetEdgeThresholdPct => o.net_edge_threshold_pct.map(dtext),
         Field::EstSlippagePct => o.est_slippage_pct.map(dtext),
         Field::SafetyMarginPct => o.safety_margin_pct.map(dtext),
-        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::TakerFee(_) => None,
+        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) => None,
     }
 }
 
@@ -422,6 +434,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                         (Field::Min24hVolumeUsdt, Some(v)) => cfg.min_24h_volume_usdt = v,
                         (Field::MinExpectedNetPnlPct, Some(v)) => cfg.min_expected_net_pnl_pct = v,
                         (Field::SafetyMarginPct, Some(v)) => cfg.safety_margin_pct = v,
+                        (Field::EarlyExitMinMovePct, Some(v)) => cfg.early_exit_min_move_pct = v,
                         (Field::NetEdgeThresholdPct, v) => cfg.net_edge_threshold_pct = v,
                         (Field::EstSlippagePct, v) => cfg.est_slippage_pct = v,
                         (Field::TakerFee(e), Some(v)) => {
@@ -468,7 +481,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                     Field::NetEdgeThresholdPct => o.net_edge_threshold_pct = v,
                     Field::EstSlippagePct => o.est_slippage_pct = v,
                     Field::SafetyMarginPct => o.safety_margin_pct = v,
-                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::TakerFee(_) => {}
+                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) => {}
                 }
             }
         }

@@ -341,3 +341,59 @@ fn guidance_texts_carry_the_spec_formulas_and_note() {
     assert!(STALE_NOTE.starts_with("建議 3000 ms：送單前檢查用的是送單前剛抓的價格與費率"));
     assert!(STALE_NOTE.ends_with("另有 max_price_drift_pct 把關價格變動）。"));
 }
+
+// ---- leg-early-exit: early_exit_min_move_pct --------------------------------------------------
+
+#[test]
+fn early_exit_field_defaults_to_0_3_is_global_only_and_has_help() {
+    let f = RiskForm::from_settings(&Settings::default());
+    assert_eq!(f.value(Field::EarlyExitMinMovePct), "0.3");
+    assert_eq!(Field::EarlyExitMinMovePct.key(), "early_exit_min_move_pct");
+    assert_eq!(Field::EarlyExitMinMovePct.unit(), "%");
+    assert!(GLOBAL_FIELDS.contains(&Field::EarlyExitMinMovePct));
+    assert!(!OVERRIDE_FIELDS.contains(&Field::EarlyExitMinMovePct), "global only");
+    let h = Field::EarlyExitMinMovePct.help();
+    assert!(h.meaning.contains("T+5") && h.meaning.contains("0 = 停用"), "{}", h.meaning);
+    assert!(!h.affects.is_empty());
+    // a global-only field cannot be switched on per exchange
+    let s = complete_settings("0.01");
+    let mut f = RiskForm::from_settings(&s);
+    f.set_override(Exchange::Bybit, Field::EarlyExitMinMovePct, true, &s);
+    assert_eq!(f.override_value(Exchange::Bybit, Field::EarlyExitMinMovePct), None);
+}
+
+#[test]
+fn early_exit_value_is_saved_as_decimal_and_zero_disables() {
+    let s = complete_settings("0.01");
+    for (text, want) in [("0.05", "0.05"), ("0", "0"), ("1.25", "1.25")] {
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::EarlyExitMinMovePct, text);
+        let vm = evaluate(&f, &s);
+        assert!(vm.can_save, "{text}: {:?}", vm.field_errors);
+        assert_eq!(vm.result.as_ref().unwrap().0.early_exit_min_move_pct, d(want));
+    }
+}
+
+#[test]
+fn early_exit_negative_or_blank_or_text_is_refused_by_name_and_nothing_is_sent() {
+    let s = complete_settings("0.01");
+    for text in ["-0.01", "", "abc"] {
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::EarlyExitMinMovePct, text);
+        let vm = evaluate(&f, &s);
+        assert!(vm.field_errors.contains_key("early_exit_min_move_pct"), "{text:?}: {:?}", vm.field_errors);
+        assert!(vm.field_errors["early_exit_min_move_pct"].contains("early_exit_min_move_pct"));
+        assert!(!vm.can_save, "{text:?}");
+        let sink = Sink::default();
+        assert!(!save(&vm, &sink));
+        assert!(sink.0.borrow().is_empty());
+    }
+}
+
+#[test]
+fn early_exit_does_not_make_the_config_incomplete() {
+    let mut s = complete_settings("0.01");
+    s.risk.early_exit_min_move_pct = d("0");
+    let vm = evaluate(&RiskForm::from_settings(&s), &s);
+    assert!(vm.missing.is_empty() && vm.incomplete_text.is_none(), "{:?}", vm.missing);
+}
