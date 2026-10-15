@@ -13,6 +13,8 @@ TONG_FUNDING_DB=/path/to/funding.db python3 issue/tools/trade_table.py rsr
 - 唯讀（只開資料庫 `mode=ro`），只用公開的 Binance demo 費率端點補「demo 費率」欄位，離線時該欄顯示 `-`。
 - **內建自我檢查**：算出的「實際淨損益」必須等於資料庫最新一筆 PnL 事件的淨額（狀態 `COMPLETE` 時），不相等就停止並報錯，不會印出看起來合理但算錯的表。已用 2026-10-14／15 的四筆驗證（ARC、BLUR、1000CAT、RSR 都一致）。
 
+測試（合成資料，不連網路、不讀真實資料庫）：`python3 -m unittest issue/tools/test_trade_table.py -v`，5 個測試涵蓋淨損益定義、符號與括號、費率百分比、與資料庫不符時停止、該所無結算時推算為 0。
+
 ## 讀法與定義
 
 - **符號**：收入／獲利 `+`，虧損 `−`；**成本（手續費、總成本）一律放括號 `( )`**。要加的看 `+`，要減的看 `−` 與括號。
