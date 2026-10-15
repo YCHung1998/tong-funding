@@ -131,7 +131,7 @@ fn positions_snapshot(f: PairFunding) -> UiSnapshot {
 #[test]
 fn funding_vm_positions_rows_and_card_show_funding_received() {
     let snap = positions_snapshot(funding([LegFunding::Received(d("-0.12")), LegFunding::Received(d("0.36"))], vec![]));
-    let vm = build(&snap, &Filter::default());
+    let vm = build(&snap, &Filter::default(), T);
     let TableView::Rows(rows) = &vm.table else { panic!() };
     let cell = |e| rows.iter().find(|r| r.exchange == e).unwrap();
     assert_eq!((cell(Binance).cells()[8].as_str(), cell(Binance).funding_tone), ("−0.12 USDT", Tone::Negative));

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tong_funding_core::grouping::{Grouping, PositionRow, ReconciledPair, group_positions};
 use tong_funding_core::pair::PairState;
 use tong_funding_core::risk::effective_for_pair;
+use tong_funding_core::spread_tag::{spread_tag, SpreadKind, SpreadTag};
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::bridge::{AccountState, PairInfo, UiSnapshot, ACCOUNT_EXCHANGES};
@@ -73,8 +74,42 @@ fn pnl_text(long: &LegView, short: &LegView) -> String {
     format!("Pair Unrealized PnL {} USDT（{} / {}）", format::money(l + s, 2), format::signed(l, 2), format::signed(s, 2))
 }
 
+/// spread-position-tag: the live spread tag of a held pair, for display only (never a decision input).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpreadView {
+    pub tag: SpreadTag,
+    /// `價差 positive +0.20%（標記價）`; the word is always shown, never colour alone.
+    pub text: String,
+    pub tone: Tone,
+}
+
+/// The mark price of `symbol` on `ex`, or `None` when the exchange's market source is failing /
+/// never succeeded, the symbol is missing, or the observation is older than
+/// `stale_data_threshold_ms` (the same rules as `candidates::eligibility`). No stale price is used.
+pub fn fresh_mark_price(snap: &UiSnapshot, ex: Exchange, symbol: &str, now_ms: i64) -> Option<Decimal> {
+    let feed = snap.market.get(&ex)?;
+    if feed.failing() || feed.last_success_at.is_none() {
+        return None;
+    }
+    let stale_ms = i64::try_from(snap.settings.risk.stale_data_threshold_ms).unwrap_or(i64::MAX);
+    let o = feed.observations.iter().find(|o| o.symbol == symbol)?;
+    (!tong_funding_core::funding::is_stale(o, now_ms, stale_ms)).then_some(o.mark_price)
+}
+
+/// The tag of a pair from the two legs' exchanges' latest prices; `None` (not shown) when unknown.
+pub fn spread_view(snap: &UiSnapshot, long_ex: Exchange, short_ex: Exchange, symbol: &str, now_ms: i64) -> Option<SpreadView> {
+    let tag = spread_tag(fresh_mark_price(snap, long_ex, symbol, now_ms), fresh_mark_price(snap, short_ex, symbol, now_ms));
+    let pct = tag.pct?;
+    let tone = match tag.kind {
+        SpreadKind::Positive => Tone::Positive,
+        SpreadKind::Negative => Tone::Negative,
+        SpreadKind::Neutral | SpreadKind::Unknown => Tone::Muted,
+    };
+    Some(SpreadView { tag, text: format!("價差 {} {}%（標記價）", tag.kind.as_str(), format::signed(pct, 2)), tone })
+}
+
 /// Cards: every grouped (`RECONCILED`) pair, then every locked pair with whatever legs exist.
-fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
+fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
     let mut cards = Vec::new();
     for grp in &g.grouping.groups {
         let info = &g.pairs[grp.pair_index];
@@ -94,6 +129,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
             state_warning: None,
             funding,
             pair_id: info.pair_id.clone(),
+            spread: spread_view(snap, info.long_exchange, info.short_exchange, &info.symbol, now_ms),
         });
     }
     for p in &snap.pairs {
@@ -107,7 +143,9 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped) -> Vec<PairCard> {
         let pnl = long.as_ref().zip(short.as_ref()).map(|(l, s)| pnl_text(l, s));
         let spread = long.as_ref().and_then(|l| l.pnl).zip(short.as_ref().and_then(|s| s.pnl)).map(|(l, s)| l + s);
         let funding = FundingView::of(snap.funding.get(&p.pair_id), spread);
-        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding, pair_id: p.pair_id.clone() });
+        // a locked pair shows the tag only while at least one leg still holds a position
+        let spread = (long.is_some() || short.is_some()).then(|| spread_view(snap, p.long_exchange, p.short_exchange, &p.symbol, now_ms)).flatten();
+        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding, pair_id: p.pair_id.clone(), spread });
     }
     cards
 }
@@ -194,6 +232,8 @@ pub struct PairCard {
     pub funding: FundingView,
     /// The pair this card shows (the re-query action targets it).
     pub pair_id: String,
+    /// spread-position-tag: live positive / negative / neutral tag and spread %; `None` = not shown.
+    pub spread: Option<SpreadView>,
 }
 
 /// The funding part of a pair card (settlement-timeline).
@@ -281,7 +321,7 @@ fn contracts_of(snap: &UiSnapshot, p: &Position) -> Option<Decimal> {
     Some((p.quantity / ct_val).normalize())
 }
 
-pub fn build(snap: &UiSnapshot, filter: &Filter) -> PositionsVm {
+pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
     let g = group(snap);
     // funding-pnl: each grouped row's leg funding; unpaired rows have none ("—").
     let mut leg_of_row: BTreeMap<usize, (String, usize)> = BTreeMap::new();
@@ -383,7 +423,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter) -> PositionsVm {
         notional_breakdown,
         pnl_total,
         pnl_breakdown,
-        pair_cards: pair_cards(snap, &g),
+        pair_cards: pair_cards(snap, &g, now_ms),
         notices,
     }
 }
