@@ -80,6 +80,23 @@ class TradeTable(unittest.TestCase):
             self.render(net="-9.99")
         self.assertIn("SELF-CHECK FAILED", str(cm.exception))
 
+    def test_the_interval_labels_follow_the_exchanges_of_the_legs(self):
+        out = self.render()
+        self.assertIn("Bybit 週期 8h／Binance 週期 4h", out)
+        db = make_db("-11.72")
+        row = db.execute("select id, payload from events where event_type='PAIR_TRANSITION'").fetchone()
+        p = json.loads(row[1])
+        snap = p["detail"]["entry_snapshot"]
+        snap["long"]["exchange"], snap["short"]["exchange"] = "Binance", "Bybit"
+        db.execute("update events set payload=? where id=?", (json.dumps(p), row[0]))
+        for r in db.execute("select id, payload from events where event_type='PAIR_PNL_RECOMPUTED'").fetchall():
+            q = json.loads(r[1])
+            q["breakdown"]["legs"][0]["exchange"], q["breakdown"]["legs"][1]["exchange"] = "Binance", "Bybit"
+            db.execute("update events set payload=? where id=?", (json.dumps(q), r[0]))
+        with mock.patch.object(tt, "demo_rate", return_value="-"):
+            out = tt.pair_table(db, PID)
+        self.assertIn("Binance 週期 8h／Bybit 週期 4h", out)  # the long leg (Binance) has the 8h interval in the fixture
+
     def test_a_leg_without_a_settlement_at_this_time_has_zero_estimated_funding(self):
         db = make_db("-11.72")
         row = db.execute("select id, payload from events where event_type='PAIR_TRANSITION'").fetchone()

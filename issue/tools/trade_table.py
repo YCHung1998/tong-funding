@@ -88,7 +88,7 @@ def pair_table(db, pid):
     # ---- A. basic info and timeline
     hold = (fills[("long", "close")][0] - fills[("long", "open")][0]) / 1000
     out += ["**A. 基本資訊與時間線（UTC）**", "", "| 項目 | 內容 |", "|---|---|"]
-    out += [f"| 結算時間 | {utc(settle_ms)}（Bybit 週期 {L['interval'] // 3600}h／Binance 週期 {S['interval'] // 3600}h） |"]
+    out += [f"| 結算時間 | {utc(settle_ms)}（{L['ex']} 週期 {L['interval'] // 3600}h／{S['ex']} 週期 {S['interval'] // 3600}h） |"]
     out += [f"| 目標名目／槓桿 | {snap['notional_usdt']} USDT／{snap['leverage']}x |"]
     out += [f"| T-10 快照（進場檢查） | {utc(check[0])}（距結算 {(settle_ms - check[0]) / 1000:.1f} 秒） |"]
     out += [f"| 進場成交 | {utc(fills[('long', 'open')][0])} |"]
