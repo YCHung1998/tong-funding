@@ -352,7 +352,10 @@ impl BybitTickerFeed {
             }
             let now = self.clock.mono_ms();
             let (mut last_ping, mut last_refresh) = (now, now);
-            while sent_ok {
+            loop {
+                if !sent_ok {
+                    break; // the subscribe could not be sent: reconnect (clippy: `sent_ok` never changes in the loop)
+                }
                 match source.next_event(IDLE_CHECK).await {
                     FeedEvent::Text(t) => {
                         if self.handle_text(&t) {
