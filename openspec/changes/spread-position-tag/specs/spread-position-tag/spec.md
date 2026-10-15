@@ -44,3 +44,22 @@
 
 - **WHEN** 配對為 `PREPARED`、`CANCELLED` 或已 `FINALIZED`
 - **THEN** 不顯示標籤
+
+### Requirement: 進場與平倉前各記錄一次標籤
+
+配對進場成交後（進入 `RECONCILED`）以及平倉單送出前，系統 SHALL 各寫一筆 `SPREAD_TAG` 事件，內容為標籤、價差百分比、long 與 short 兩腿所用的價格與其觀測時間；價格不可用時 SHALL 寫入 `unknown` 與原因，不得省略事件。進場的那一筆使用進場檢查（T-10）當時兩腿的價格，平倉前的那一筆使用平倉參考價（平倉前重新抓取的價格）。事件為純記錄，SHALL NOT 影響任何交易決策。
+
+#### Scenario: 進場成交後寫一筆
+
+- **WHEN** 配對由 `FILL_MONITOR` 進入 `RECONCILED`
+- **THEN** 寫入一筆 `SPREAD_TAG` 事件，標籤依 T-10 兩腿價格判定
+
+#### Scenario: 平倉前寫一筆
+
+- **WHEN** 配對送出平倉單之前
+- **THEN** 寫入一筆 `SPREAD_TAG` 事件，標籤依兩腿平倉參考價判定
+
+#### Scenario: 價格不可用仍留下記錄
+
+- **WHEN** 平倉前其中一腿的參考價抓取失敗
+- **THEN** 事件標籤為 `unknown` 並附原因

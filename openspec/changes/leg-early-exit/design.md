@@ -11,7 +11,7 @@
 **Goals:**
 - T+5～T+15 窗內，每一腿相對自己的開倉成交價有利幅度 ≥ `early_exit_min_move_pct` 時，只平該腿，保留獲利。
 - 不新增配對狀態、不改轉移表；單腿平倉後配對仍是 `RECONCILED`。
-- 設定未填即完全不改變現行行為（T+15 兩腿一起平）。
+- 設定為 0 即完全不改變現行行為（T+15 兩腿一起平）；預設 0.3（使用者拍板）。
 - 每次提早平倉都有可稽核的事件與損益拆解。
 
 **Non-Goals:**
@@ -31,7 +31,7 @@
 7. **兩腿都平倉後**：偵測到兩腿記錄持倉皆為 0 時直接走既有 `begin_close`（兩腿 `close_qty` 皆 0，沒有單可送）進入「確認已平倉」流程，而不是等 T+15。
 8. **損益拆解**：平倉成交事件本來就帶 `leg`／`action`，損益記錄（`app/src/funding/pnl_record.rs`）以每腿的 open／close 成交計算，不依賴兩腿同時平倉；需補測試證明兩腿平倉時間不同時拆解正確、資金費視窗的 `closed_at` 以各腿自己的為準。
 9. **新增事件 `LEG_EARLY_EXIT`**：腿、交易所、開倉均價、觸發價、價格時間、漲跌幅、門檻、觸發時的 T+秒數。
-10. **設定**：`early_exit_min_move_pct` 選填 Decimal，未填或 0 停用；寫入 `config.risk`，設定頁新增一欄並說明（沿用 `min_expected_net_pnl_pct` 的做法）。預設值不內建，由使用者決定（見 Open Questions）。
+10. **設定**：`early_exit_min_move_pct` Decimal，≥ 0，**預設 0.3**（使用者 2026-10-15 拍板），0 停用；缺欄位的既有設定在載入時取預設值（serde default）；寫入 `config.risk`，設定頁新增一欄並說明（沿用 `min_expected_net_pnl_pct` 的做法）。
 
 ## Risks / Trade-offs
 
@@ -50,6 +50,6 @@
 
 ## Open Questions
 
-- `early_exit_min_move_pct` 的建議預設值？（目前不內建；以 25 秒內價差損益多為 0.1～0.3% 量級作參考，由使用者決定，例如 0.05%。）
+- （已決定）預設 0.3%；價格新鮮度上限沿用 `stale_data_threshold_ms`——正常情況下每次都是剛抓到的價格，所以這條幾乎不會觸發，保留只是防止請求卡住時拿舊價格動作。
 - 是否需要「價格資料過舊就放棄」的上限（預設沿用 `stale_data_threshold_ms`）？
 - 是否也要在 `MANUAL` 模式提供一個「提早平倉」的人工按鈕（本提案不含）？

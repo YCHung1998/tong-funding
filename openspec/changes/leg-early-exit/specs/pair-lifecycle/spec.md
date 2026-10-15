@@ -9,7 +9,7 @@
 
 達標的那一腿 SHALL 以 reduce-only 市價單單獨平倉，數量為該腿的記錄成交量與實際持倉較小者，並套用既有平倉的數量與不平衡檢查；另一腿 SHALL NOT 因此被動作。單腿平倉後，配對狀態 SHALL 維持 `RECONCILED`，且 SHALL NOT 被視為單腿失敗或不平衡。
 
-`early_exit_min_move_pct` 未設定或為 0 時，系統 SHALL NOT 提早平倉。提早平倉 SHALL 僅在 `trigger_mode = AUTO` 且 kill switch 未啟用時進行。窗口結束（T+15）時，仍未平倉的腿 SHALL 依既有的排程平倉規則平倉；兩腿都已平倉時，配對 SHALL 進入既有的「確認已平倉」流程，不再送任何平倉單。
+`early_exit_min_move_pct` 為 0 時，系統 SHALL NOT 提早平倉。提早平倉 SHALL 僅在 `trigger_mode = AUTO` 且 kill switch 未啟用時進行。窗口結束（T+15）時，仍未平倉的腿 SHALL 依既有的排程平倉規則平倉；兩腿都已平倉時，配對 SHALL 進入既有的「確認已平倉」流程，不再送任何平倉單。
 
 每一次單腿提早平倉 SHALL 寫入一筆事件，包含腿、開倉成交價、觸發時的價格、漲跌幅與門檻。
 

@@ -13,7 +13,8 @@
   - 價差百分比 = (short 價格 − long 價格) ÷ long 價格 × 100（正值對應 `positive`）。
 - 持倉期間（配對為 `RECONCILED`，以及仍持有部位的狀態）在「持倉」頁的配對卡與「交易單」頁的進行中列表，**持續更新**顯示標籤與價差百分比（隨掃幣資料與 WebSocket 覆蓋每秒更新）。
 - `positive` 以正向色調、`negative` 以負向色調顯示，`neutral`／無資料以靜音色調顯示。
-- 純顯示用：不影響達標判定、進場、平倉、提早平倉的任何決策，不寫入資料庫，不新增設定。
+- **記錄（使用者 2026-10-15 要求在交易頁面考慮記錄，決定記錄）**：配對進場成交（進入 `RECONCILED`）時、以及平倉單送出前，各寫一筆 `SPREAD_TAG` 事件（標籤、價差百分比、兩腿價格與時間），供事後分析；顯示本身不影響達標判定、進場、平倉、提早平倉的任何決策，不新增設定。
+- 掃幣頁**不顯示**標籤（掃幣頁只有資金費，進場前不預判）。
 - 不改：既有的未實現損益、IMBALANCE 標示、資金費時間線。
 
 ## Capabilities
@@ -30,5 +31,5 @@
 
 - 程式：新增 `app/src/ui/vm/spread_tag.rs`（純函式與測試）；`app/src/ui/vm/positions.rs` 的 `PairCard` 增加標籤欄位；`app/src/ui/vm/staged_orders.rs` 的 `RunningRow` 增加標籤欄位；`app/src/ui/trading_pages.rs`／持倉頁畫面顯示。
 - 資料來源：`UiSnapshot.market` 的各所最新觀測價格（REST 輪詢，Binance 與 Bybit 另有 WebSocket 每秒覆蓋）；無新的網路請求。
-- 無資料庫變更、無設定、無事件。
+- 無資料庫結構變更、無設定；新增事件類型 `SPREAD_TAG`（寫入既有 events 表）。
 - 相依：與 `leg-early-exit`、`require-synchronized-settlement` 兩個提案互相獨立。

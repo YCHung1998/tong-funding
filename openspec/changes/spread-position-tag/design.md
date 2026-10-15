@@ -12,13 +12,13 @@
 
 **Non-Goals:**
 - 不用在達標判定、進場、平倉或提早平倉。
-- 不寫入資料庫或事件、不新增設定。
+- 不新增設定；不在掃幣頁顯示；不影響任何交易決策。
 - 不顯示開倉當時的固定標籤（使用者選擇持續更新的即時版本）。
 - 不使用買賣盤報價。
 
 ## Decisions
 
-1. **純函式放在 `app/src/ui/vm/spread_tag.rs`**：`spread_tag(long_price: Option<Price>, short_price: Option<Price>) -> SpreadTag { kind, pct }`，`kind ∈ {Positive, Negative, Neutral, Unknown}`。與 vm 其他模組一致，不依賴 GPUI。
+1. **純函式放在 `core/src/spread_tag.rs`（UI 與引擎共用）**：`spread_tag(long_price: Option<Price>, short_price: Option<Price>) -> SpreadTag { kind, pct }`，`kind ∈ {Positive, Negative, Neutral, Unknown}`。與 vm 其他模組一致，不依賴 GPUI。
 2. **價格取得與新鮮度判斷放在 vm 層**：`positions::build` 與 `staged_orders::build` 呼叫一個共用的小函式，依 `(long_exchange, short_exchange, symbol)` 從 `snap.market` 找觀測，來源 `failing()` 或觀測 `observed_at` 超過 `stale_data_threshold_ms` 就回傳 `None`，由純函式變成 `Unknown`。理由：與 `candidates::eligibility` 的新鮮度規則一致。
 3. **價差百分比以 long 價格為分母**：`(short − long) ÷ long × 100`；long 價格為 0 時回傳 `Unknown`，避免除以零。
 4. **顯示用文字加色調**：`positive`／`negative`／`neutral` 文字一律顯示，色調用既有的 `Tone::Positive`／`Negative`／`Muted`。
@@ -36,5 +36,5 @@
 
 ## Open Questions
 
-- 標籤是否也要出現在掃幣頁（進場前以兩腿現價預判）？本提案只做持倉期間；若需要另案。
+- （已決定）掃幣頁不顯示標籤；改在交易頁面記錄（進場成交與平倉前各一筆 `SPREAD_TAG` 事件）。
 - 價差百分比是否要顯示在表格欄位，還是只在配對卡內顯示？（預設兩處都顯示。）

@@ -1,6 +1,6 @@
 ## 1. 設定
 
-- [ ] 1.1 在 `core/src/risk.rs` 的風控設定新增選填欄位 `early_exit_min_move_pct`（Decimal，≥ 0，未填／0 = 停用）；先寫紅色測試（序列化、驗證負值被拒、空白設定不影響「完整性」判定）再實作
+- [ ] 1.1 在 `core/src/risk.rs` 的風控設定新增選填欄位 `early_exit_min_move_pct`（Decimal，≥ 0，預設 0.3，0 = 停用；缺欄位的既有設定載入時取預設值）；先寫紅色測試（序列化、驗證負值被拒、缺欄位的既有設定取得預設 0.3、不影響「完整性」判定）再實作
 - [ ] 1.2 在 `app/src/ui/vm/risk_settings.rs` 與設定頁新增該欄位與說明文字（沿用 `min_expected_net_pnl_pct` 的做法），補 vm 測試
 
 ## 2. 排程判斷（純函式）
