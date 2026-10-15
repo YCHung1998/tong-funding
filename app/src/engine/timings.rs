@@ -17,6 +17,9 @@ pub struct EngineTimings {
     pub base_price_lead_ms: i64,
     /// Exit fires at `T + exit_delay_ms`.
     pub exit_delay_ms: i64,
+    /// leg-early-exit: a RECONCILED leg may be closed alone from `T + early_exit_start_ms` until
+    /// the scheduled exit (`T + exit_delay_ms`, exclusive).
+    pub early_exit_start_ms: i64,
     /// Scheduler tick period.
     pub tick_ms: i64,
     /// Minimum interval between two Snapshots pushed to the UI (unverified proposal, design D3).
@@ -30,6 +33,7 @@ impl Default for EngineTimings {
             entry_lead_ms: 10_000,
             base_price_lead_ms: 5_000,
             exit_delay_ms: 15_000,
+            early_exit_start_ms: 5_000,
             tick_ms: 1_000,
             snapshot_min_interval_ms: 250,
             missed_window_policy: MissedWindowPolicy::WarnThenCancel,
@@ -47,6 +51,9 @@ impl EngineTimings {
     pub fn exit_at(&self, settlement_ms: i64) -> i64 {
         settlement_ms + self.exit_delay_ms
     }
+    pub fn early_exit_at(&self, settlement_ms: i64) -> i64 {
+        settlement_ms + self.early_exit_start_ms
+    }
 }
 
 #[cfg(test)]
@@ -60,6 +67,7 @@ mod tests {
         assert_eq!(t.entry_at(settle), settle - 10_000);
         assert_eq!(t.base_price_at(settle), settle - 15_000);
         assert_eq!(t.exit_at(settle), settle + 15_000);
+        assert_eq!(t.early_exit_at(settle), settle + 5_000);
         assert_eq!(t.tick_ms, 1_000);
         assert_eq!(t.missed_window_policy, MissedWindowPolicy::WarnThenCancel);
     }
