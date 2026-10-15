@@ -84,7 +84,7 @@ pub fn eligibility(row: &ScanRow, snap: &UiSnapshot, now_ms: i64) -> Result<(), 
     match row.qualified {
         Qualified::Yes => {}
         Qualified::NotConfigured => return Err(CandidateBlock::NotDecidable),
-        Qualified::No | Qualified::NotApplicable => return Err(CandidateBlock::NotQualified),
+        Qualified::No | Qualified::NotApplicable | Qualified::NotSynchronized => return Err(CandidateBlock::NotQualified),
     }
     for ex in [long, short] {
         if snap.market.get(&ex).is_none_or(|f| f.failing() || f.last_success_at.is_none()) {

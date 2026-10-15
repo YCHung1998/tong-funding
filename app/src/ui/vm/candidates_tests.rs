@@ -469,3 +469,32 @@ fn auto_add_does_not_touch_a_symbol_that_is_already_staged() {
     pair_in(&mut s, "u1", PairState::Prepared, false);
     assert_eq!(auto_run(&mut auto_on(), &s, NOW).0, 0, "already staged (by hand or by an earlier pass)");
 }
+
+// ---- require-synchronized-settlement ---------------------------------------------------------------------
+
+/// BTC with legs settling an hour apart: a big Net Edge, but not synchronized.
+fn unsynced_snap() -> UiSnapshot {
+    let mut s = snap();
+    let o = s.market.get_mut(&Exchange::Bybit).unwrap().observations.iter_mut().find(|o| o.symbol == "BTCUSDT").unwrap();
+    o.next_funding_time = T + 3_600_000;
+    s
+}
+
+#[test]
+fn an_unsynchronized_row_cannot_be_ticked() {
+    let s = unsynced_snap();
+    let vm = scanner::build(&s, NOW);
+    assert_eq!(row(&vm, "BTCUSDT").qualified, Qualified::NotSynchronized);
+    assert_eq!(eligibility(row(&vm, "BTCUSDT"), &s, NOW), Err(CandidateBlock::NotQualified));
+    let mut list = CandidateList::default();
+    assert!(!list.toggle(row(&vm, "BTCUSDT"), &s, NOW));
+    assert!(!list.contains("BTCUSDT"));
+}
+
+#[test]
+fn auto_add_never_picks_an_unsynchronized_row() {
+    let s = unsynced_snap();
+    assert_eq!(auto_run(&mut auto_on(), &s, NOW).0, 0);
+    // The synchronized original is still picked.
+    assert_eq!(added_symbols(&auto_run(&mut auto_on(), &snap(), NOW).1), vec!["BTCUSDT".to_string()]);
+}

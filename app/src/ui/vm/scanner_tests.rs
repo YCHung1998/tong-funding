@@ -432,3 +432,34 @@ fn a_missing_okx_fee_makes_only_okx_pairs_undecidable_never_binance_bybit_rows()
     assert_eq!(b.qualified, Qualified::NotConfigured);
     assert!(a.qualified != Qualified::NotConfigured, "the Binance-Bybit row is judged on its own settings");
 }
+
+// ---- require-synchronized-settlement ---------------------------------------------------------------------
+
+#[test]
+fn legs_settling_at_different_times_show_not_synchronized_even_with_a_huge_edge() {
+    // Binance settles at T8, Bybit 4h later: Net Edge is computed (only Binance's short leg earns) and
+    // is far above the 0.01 threshold, yet the row is not 達標.
+    let mut s = snap(complete_settings("0.01"), &[(Bybit, "BTCUSDT", "-0.0100")]);
+    s.market.get_mut(&Binance).unwrap().observations.push(obs(Binance, "BTCUSDT", "0.0100", 28_800, T8 + 4 * H, NOW));
+    let vm = build(&s, NOW);
+    let r = row(&vm, "BTCUSDT");
+    assert!(r.net_edge.value().unwrap() > d("0.5"), "net edge still computed: {:?}", r.net_edge);
+    assert_eq!(r.qualified, Qualified::NotSynchronized);
+    assert_eq!(r.qualified.text(), "結算不同步");
+    assert_eq!(vm.summary.qualified, Some(0));
+}
+
+#[test]
+fn legs_settling_together_with_the_same_rates_still_qualify() {
+    let s = snap(complete_settings("0.01"), &[(Bybit, "BTCUSDT", "-0.0100"), (Binance, "BTCUSDT", "0.0100")]);
+    let vm = build(&s, NOW);
+    assert_eq!(row(&vm, "BTCUSDT").qualified, Qualified::Yes);
+}
+
+#[test]
+fn a_missing_settlement_time_is_not_synchronized() {
+    let mut s = snap(complete_settings("0.01"), &[(Bybit, "BTCUSDT", "-0.0100")]);
+    s.market.get_mut(&Binance).unwrap().observations.push(obs(Binance, "BTCUSDT", "0.0100", 28_800, 0, NOW));
+    let vm = build(&s, NOW);
+    assert_eq!(row(&vm, "BTCUSDT").qualified, Qualified::NotSynchronized);
+}
