@@ -19,6 +19,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 use super::bridge::{CommandSink, LegAccount, UiSnapshot, ACCOUNT_EXCHANGES};
 use super::contract_settings::{pair_quantity, QuoteCell};
 use super::leverage_cap::{self, CapCheck};
+use super::positions::{spread_view, SpreadView};
 use super::engine_view::{blocker_text, refusing_blockers};
 use super::risk_settings::missing_display;
 use crate::engine::command::{Blocker, Command, PairView};
@@ -259,6 +260,8 @@ pub struct RunningRow {
     pub exit_in_ms: i64,
     /// MANUAL: "立即平倉" is offered (with its own confirmation).
     pub close_now: bool,
+    /// spread-position-tag: live positive / negative / neutral tag; `None` = not shown (price missing / stale).
+    pub spread: Option<SpreadView>,
 }
 
 impl RunningRow {
@@ -507,6 +510,7 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
             symbol: p.symbol.clone(),
             exit_in_ms: p.settlement_ms + exit_delay - now_ms,
             close_now: trigger_mode == Some(TriggerMode::Manual),
+            spread: spread_view(snap, p.long_exchange, p.short_exchange, &p.symbol, now_ms),
         })
         .collect();
     StagedVm {

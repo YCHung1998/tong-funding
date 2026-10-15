@@ -371,6 +371,10 @@ fn pair_card(c: &PairCard, on_recheck: &dyn Fn(String) -> ClickFn) -> Div {
     if let Some(p) = &c.pnl_text {
         out = out.child(small(p.clone(), theme::TEXT_PRIMARY));
     }
+    // spread-position-tag: live tag (word + percentage + 標記價); absent when a price is missing / stale.
+    if let Some(sp) = &c.spread {
+        out = out.child(small(sp.text.clone(), tone(sp.tone)));
+    }
     // funding-pnl (settlement-timeline): funding received, running total, timeline, panel.
     let f = &c.funding;
     out = out.child(small(f.text.clone(), tone(f.tone))).child(small(f.running_total.clone(), theme::TEXT_SECONDARY));
@@ -682,5 +686,37 @@ impl TableDelegate for ScannerTable {
             }
             ScanColumn::Qualified => small(r.qualified.text(), if r.qualified == scanner::Qualified::Yes { theme::POSITIVE } else { theme::TEXT_MUTED }),
         }
+    }
+}
+
+#[cfg(test)]
+mod spread_tag_smoke {
+    // not `use super::*`: its gpui_kit glob would shadow the std `#[test]` attribute
+    use super::pair_card;
+    use crate::ui::bridge::{MarketFeed, UiSnapshot};
+    use crate::ui::positions::{build, Filter};
+    use crate::ui::testkit::{d, loaded, obs, pair, position};
+    use tong_funding_core::pair::PairState;
+    use tong_funding_core::types::Exchange::{Binance, Bybit};
+
+    /// The positions page builds its pair card (with the spread-tag line) from a live snapshot
+    /// without panicking; text/tone content is asserted in the view-model tests (`positions_tests`).
+    /// No window is opened (`Div` cannot be inspected without one).
+    #[test]
+    fn a_pair_card_with_a_spread_tag_draws() {
+        let now = 1_791_201_600_000;
+        let mut s = UiSnapshot::default();
+        s.accounts.insert(Binance, loaded(vec![], vec![position(Binance, "BTCUSDT", "0.02", "60000", "60200", "3", "4", Some("400"))], now));
+        s.accounts.insert(Bybit, loaded(vec![], vec![position(Bybit, "BTCUSDT", "-0.02", "60000", "60200", "3", "-4", Some("400"))], now));
+        s.pairs = vec![pair("p1", "BTCUSDT", Binance, Bybit, PairState::Reconciled)];
+        for (ex, px) in [(Binance, "100"), (Bybit, "100.2")] {
+            let mut o = obs(ex, "BTCUSDT", "0.0001", 28_800, now + 3_600_000, now - 500);
+            o.mark_price = d(px);
+            s.market.insert(ex, MarketFeed { observations: vec![o], last_success_at: Some(now - 500), last_error: None });
+        }
+        let vm = build(&s, &Filter::default(), now);
+        let card = &vm.pair_cards[0];
+        assert!(card.spread.is_some());
+        let _ = pair_card(card, &|_| Box::new(|_, _, _| {}));
     }
 }

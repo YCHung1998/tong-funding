@@ -664,6 +664,10 @@ impl Shell {
             for r in &vm.running {
                 let row = r.clone();
                 let mut line = div().flex().gap_3().items_center().child(small(r.symbol.clone(), theme::TEXT_PRIMARY)).child(small(format!("平倉倒數 {}", format::hms(r.exit_in_ms)), theme::TEXT_SECONDARY));
+                // spread-position-tag: live tag (word + percentage + 標記價), hidden when a price is missing / stale.
+                if let Some(sp) = &r.spread {
+                    line = line.child(small(sp.text.clone(), sp.tone.color()));
+                }
                 line = if r.close_now {
                     line.child(btn(SharedString::from(format!("close-now-{}", r.uuid)), "立即平倉", true, self.click(cx, move |this, _| this.trading.close_now_confirm = Some(row.clone()))))
                 } else {

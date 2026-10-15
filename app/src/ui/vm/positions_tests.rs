@@ -39,7 +39,7 @@ fn rows(vm: &PositionsVm) -> &Vec<PosRow> {
 
 #[test]
 fn title_counts_and_default_filter_shows_everything() {
-    let vm = build(&four(), &Filter::default());
+    let vm = build(&four(), &Filter::default(), NOW);
     assert_eq!(vm.title, "4 OPEN · 2 PAIRS");
     assert_eq!(vm.exchange_options, [Binance, Bybit]);
     assert_eq!(vm.coin_options, ["BTC", "ETH"]);
@@ -50,7 +50,7 @@ fn title_counts_and_default_filter_shows_everything() {
 #[test]
 fn selecting_one_exchange_filters_rows_only() {
     let f = Filter { exchanges: Some([Binance].into()), coins: None };
-    let vm = build(&four(), &f);
+    let vm = build(&four(), &f, NOW);
     assert_eq!(rows(&vm).len(), 2);
     assert_eq!(vm.filter_text, "已選 1 個交易所 / 2 個幣種 · 顯示 2 / 4");
     assert_eq!(vm.title, "4 OPEN · 2 PAIRS", "header counts ignore filters");
@@ -63,7 +63,7 @@ fn selecting_one_exchange_filters_rows_only() {
 #[test]
 fn unticking_everything_shows_the_nothing_selected_state() {
     let f = Filter { exchanges: Some(BTreeSet::new()), coins: None };
-    let vm = build(&four(), &f);
+    let vm = build(&four(), &f, NOW);
     assert_eq!(vm.table, TableView::NothingSelected);
 }
 
@@ -76,7 +76,7 @@ fn summary_cards_entry_notional_and_pnl() {
             data.positions[1].entry_price = Some(d("1500"));
         }
     }
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     assert_eq!(format::money(vm.notional_total, 2), "5,400.00");
     assert_eq!(vm.notional_breakdown, "BTC 2,400 + ETH 3,000 USDT");
     assert_eq!(format::money(vm.pnl_total, 2), "0.00");
@@ -86,7 +86,7 @@ fn summary_cards_entry_notional_and_pnl() {
 
 #[test]
 fn a_row_renders_like_the_spec() {
-    let vm = build(&four(), &Filter::default());
+    let vm = build(&four(), &Filter::default(), NOW);
     let r = &rows(&vm)[0];
     // funding-pnl: no ledger data yet: a dash with the reason, never 0.00.
     assert_eq!(r.cells().join(" · "), "Binance · BTCUSDT · LONG · 0.020000 BTC · 60,000.00 · 60,200.00 · 3× · +4.00 USDT · —（尚未取得）");
@@ -104,13 +104,13 @@ fn tiny_size_is_not_shown_as_zero() {
 #[test]
 fn funding_column_is_a_dash_for_every_row_without_ledger_data() {
     // funding-pnl: paired rows say why ("尚未取得"); never 0.00.
-    let vm = build(&four(), &Filter::default());
+    let vm = build(&four(), &Filter::default(), NOW);
     assert!(rows(&vm).iter().all(|r| r.cells()[8] == "—（尚未取得）"), "{:?}", rows(&vm).iter().map(|r| r.cells()[8].clone()).collect::<Vec<_>>());
 }
 
 #[test]
 fn balanced_pair_is_hedged_with_zero_imbalance() {
-    let vm = build(&four(), &Filter::default());
+    let vm = build(&four(), &Filter::default(), NOW);
     let c = &vm.pair_cards[0];
     assert_eq!(c.label.as_deref(), Some("HEDGED · 0.00% IMBALANCE"));
     assert!(!c.imbalanced);
@@ -127,7 +127,7 @@ fn imbalance_beyond_tolerance_is_labelled_imbalanced() {
         data.positions[0].quantity = d("-0.018");
     }
     s.settings.risk.max_leg_imbalance_pct = d("1.0");
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     let c = vm.pair_cards.iter().find(|c| c.symbol == "BTCUSDT").unwrap();
     assert_eq!(c.label.as_deref(), Some("IMBALANCED · 10.00% IMBALANCE"));
     assert!(c.imbalanced);
@@ -137,7 +137,7 @@ fn imbalance_beyond_tolerance_is_labelled_imbalanced() {
 fn locked_pair_state_is_shown_in_warning_with_manual_handling() {
     let mut s = four();
     s.pairs[0].state = Ok(PairState::PartialFailure);
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     let c = vm.pair_cards.iter().find(|c| c.symbol == "BTCUSDT").unwrap();
     assert_eq!(c.state_warning.as_deref(), Some("PARTIAL_FAILURE · 需人工處理"));
     // grouping is RECONCILED-only: the BTC legs are unpaired and only one pair remains grouped
@@ -149,7 +149,7 @@ fn locked_pair_state_is_shown_in_warning_with_manual_handling() {
 fn unpaired_rows_are_tagged_and_match_the_dashboard_count() {
     let mut s = four();
     s.pairs.truncate(1);
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     let unpaired: Vec<_> = rows(&vm).iter().filter(|r| r.unpaired).map(|r| r.symbol.as_str()).collect();
     assert_eq!(unpaired, ["ETHUSDT", "ETHUSDT"]);
     assert!(vm.pair_cards.iter().all(|c| c.symbol != "ETHUSDT"));
@@ -164,14 +164,14 @@ fn incomplete_lists_unconnected_exchanges_and_okx_are_announced() {
     if let Some(AccountState::Loaded { data, .. }) = s.accounts.get_mut(&Bybit) {
         data.positions_incomplete = Some("page 2 failed".into());
     }
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     assert!(vm.notices.contains(&"Bybit 持倉列表可能不完整".to_string()), "{:?}", vm.notices);
     assert_eq!(rows(&vm).len(), 4, "the rows already fetched are still shown");
     assert!(vm.notices.iter().all(|n| !n.contains("僅比價")), "OKX is no longer compare-only: {:?}", vm.notices);
     assert!(vm.notices.contains(&"OKX 持倉載入中".to_string()), "OKX not read yet: {:?}", vm.notices);
 
     s.accounts.insert(Binance, AccountState::NotConnected { reason: "金鑰不存在".into() });
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     assert!(vm.notices.contains(&"Binance 未連線：金鑰不存在".to_string()), "{:?}", vm.notices);
     assert!(vm.notices.iter().all(|n| !n.contains("Binance 無持倉")));
 }
@@ -204,7 +204,7 @@ fn with_okx_short() -> UiSnapshot {
 
 #[test]
 fn an_okx_row_shows_coins_with_the_contracts_and_groups_with_the_other_exchanges_leg() {
-    let vm = build(&with_okx_short(), &Filter::default());
+    let vm = build(&with_okx_short(), &Filter::default(), NOW);
     let okx = rows(&vm).iter().find(|r| r.exchange == Okx).expect("OKX row");
     assert_eq!(okx.cells()[3], "0.030000 BTC（3 張）");
     assert_eq!(okx.side, Side::Short);
@@ -222,7 +222,7 @@ fn an_okx_row_shows_coins_with_the_contracts_and_groups_with_the_other_exchanges
 fn an_okx_row_without_a_known_ct_val_shows_coins_only_never_contracts_as_coins() {
     let mut s = with_okx_short();
     s.rules.remove(&(Okx, "BTCUSDT".into()));
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     assert_eq!(rows(&vm).iter().find(|r| r.exchange == Okx).unwrap().cells()[3], "0.030000 BTC");
 }
 
@@ -230,18 +230,117 @@ fn an_okx_row_without_a_known_ct_val_shows_coins_only_never_contracts_as_coins()
 fn okx_states_are_announced_like_the_other_exchanges_with_the_reason() {
     let mut s = with_okx_short();
     s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     assert!(vm.notices.contains(&"OKX 未連線：Keychain 沒有 API key".to_string()), "{:?}", vm.notices);
     assert!(vm.notices.iter().all(|n| !n.contains("僅比價")));
     s.accounts.insert(Okx, AccountState::Failed { error: "帳戶模式不支援 (acctLv 2, posMode long_short_mode)".into(), at: NOW });
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     assert!(vm.notices.iter().any(|n| n.starts_with("OKX 持倉讀取失敗：") && n.contains("long_short_mode")), "{:?}", vm.notices);
     // an incomplete list names its reason (a position that could not be converted is never silently dropped)
     let mut s = with_okx_short();
     if let Some(AccountState::Loaded { data, .. }) = s.accounts.get_mut(&Okx) {
         data.positions_incomplete = Some("ETHUSDT 空 7 張（無法換算：ctVal 未知）".into());
     }
-    let vm = build(&s, &Filter::default());
+    let vm = build(&s, &Filter::default(), NOW);
     assert!(vm.notices.contains(&"OKX 持倉列表可能不完整".to_string()), "{:?}", vm.notices);
     assert!(vm.notices.iter().any(|n| n.contains("7 張") && n.contains("無法換算")), "{:?}", vm.notices);
+}
+
+// ---- spread-position-tag ---------------------------------------------------------------------
+
+use crate::ui::bridge::MarketFeed;
+use crate::ui::testkit::obs;
+use tong_funding_core::spread_tag::SpreadKind;
+
+/// `four()` plus a market feed per exchange carrying BTCUSDT's mark price (observed at `at`).
+fn with_prices(long_px: &str, short_px: &str, at: i64) -> UiSnapshot {
+    let mut s = four();
+    for (ex, px) in [(Binance, long_px), (Bybit, short_px)] {
+        let mut o = obs(ex, "BTCUSDT", "0.0001", 28_800, NOW + 3_600_000, at);
+        o.mark_price = d(px);
+        s.market.insert(ex, MarketFeed { observations: vec![o], last_success_at: Some(at), last_error: None });
+    }
+    s
+}
+
+fn btc_card(vm: &PositionsVm) -> &PairCard {
+    vm.pair_cards.iter().find(|c| c.symbol == "BTCUSDT").unwrap()
+}
+
+#[test]
+fn fresh_mark_price_needs_a_healthy_fresh_observation() {
+    let s = with_prices("100", "100.2", NOW - 1_000);
+    assert_eq!(fresh_mark_price(&s, Binance, "BTCUSDT", NOW), Some(d("100")));
+    // exactly at the threshold is still fresh (default 3000 ms), one ms beyond is stale
+    assert_eq!(fresh_mark_price(&s, Binance, "BTCUSDT", NOW - 1_000 + 3_000), Some(d("100")));
+    assert_eq!(fresh_mark_price(&s, Binance, "BTCUSDT", NOW - 1_000 + 3_001), None);
+    // symbol missing / exchange without a feed
+    assert_eq!(fresh_mark_price(&s, Binance, "ETHUSDT", NOW), None);
+    assert_eq!(fresh_mark_price(&s, Okx, "BTCUSDT", NOW), None);
+    // source failing (error newer than the last success): the kept price is not used
+    let mut f = with_prices("100", "100.2", NOW - 1_000);
+    f.market.get_mut(&Bybit).unwrap().last_error = Some(("timeout".into(), NOW - 500));
+    assert_eq!(fresh_mark_price(&f, Bybit, "BTCUSDT", NOW), None);
+    assert_eq!(fresh_mark_price(&f, Binance, "BTCUSDT", NOW), Some(d("100")));
+    // never succeeded
+    let mut n = with_prices("100", "100.2", NOW - 1_000);
+    n.market.get_mut(&Bybit).unwrap().last_success_at = None;
+    assert_eq!(fresh_mark_price(&n, Bybit, "BTCUSDT", NOW), None);
+}
+
+#[test]
+fn spread_view_shows_the_word_the_percentage_and_the_tone() {
+    let v = spread_view(&with_prices("100", "100.2", NOW - 500), Binance, Bybit, "BTCUSDT", NOW).unwrap();
+    assert_eq!(v.tag.kind, SpreadKind::Positive);
+    assert_eq!(v.text, "價差 positive +0.20%（標記價）");
+    assert_eq!(v.tone, Tone::Positive);
+    let v = spread_view(&with_prices("100.3", "100", NOW - 500), Binance, Bybit, "BTCUSDT", NOW).unwrap();
+    assert_eq!(v.tag.kind, SpreadKind::Negative);
+    assert!(v.text.starts_with("價差 negative −0.29") || v.text.starts_with("價差 negative −0.30"), "{}", v.text);
+    assert_eq!(v.tone, Tone::Negative);
+    let v = spread_view(&with_prices("100", "100", NOW - 500), Binance, Bybit, "BTCUSDT", NOW).unwrap();
+    assert_eq!(v.text, "價差 neutral 0.00%（標記價）");
+    assert_eq!(v.tone, Tone::Muted);
+}
+
+#[test]
+fn spread_view_is_none_when_a_leg_is_failing_stale_or_missing() {
+    let mut s = with_prices("100", "100.2", NOW - 500);
+    s.market.get_mut(&Bybit).unwrap().last_error = Some(("HTTP 500".into(), NOW));
+    assert_eq!(spread_view(&s, Binance, Bybit, "BTCUSDT", NOW), None);
+    assert_eq!(spread_view(&with_prices("100", "100.2", NOW - 10_000), Binance, Bybit, "BTCUSDT", NOW), None);
+    assert_eq!(spread_view(&four(), Binance, Bybit, "BTCUSDT", NOW), None);
+}
+
+#[test]
+fn a_reconciled_card_shows_the_tag_and_it_flips_when_the_quotes_move() {
+    let vm = build(&with_prices("100", "100.2", NOW - 500), &Filter::default(), NOW);
+    let tag = btc_card(&vm).spread.as_ref().expect("tag shown");
+    assert_eq!((tag.tag.kind, tag.text.as_str()), (SpreadKind::Positive, "價差 positive +0.20%（標記價）"));
+    // long 100 → 100.5 while short stays 100.2: positive → negative, no other input changed
+    let vm = build(&with_prices("100.5", "100.2", NOW - 500), &Filter::default(), NOW);
+    assert_eq!(btc_card(&vm).spread.as_ref().unwrap().tag.kind, SpreadKind::Negative);
+    // the same snapshot goes stale as time passes: the tag disappears, no old price is used
+    let vm = build(&with_prices("100.5", "100.2", NOW - 500), &Filter::default(), NOW + 60_000);
+    assert_eq!(btc_card(&vm).spread, None);
+}
+
+#[test]
+fn a_reconciled_card_without_prices_shows_no_tag() {
+    let vm = build(&four(), &Filter::default(), NOW);
+    assert!(vm.pair_cards.iter().all(|c| c.spread.is_none()));
+}
+
+#[test]
+fn a_locked_card_shows_the_tag_only_while_a_leg_is_held() {
+    let mut s = with_prices("100", "100.2", NOW - 500);
+    s.pairs[0].state = Ok(PairState::PartialFailure);
+    let vm = build(&s, &Filter::default(), NOW);
+    assert_eq!(btc_card(&vm).spread.as_ref().unwrap().tag.kind, SpreadKind::Positive);
+    // both legs gone from the account lists: nothing is held, nothing is shown
+    for ex in [Binance, Bybit] {
+        s.accounts.insert(ex, loaded(vec![], vec![], NOW));
+    }
+    let vm = build(&s, &Filter::default(), NOW);
+    assert_eq!(btc_card(&vm).spread, None);
 }

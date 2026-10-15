@@ -392,6 +392,43 @@ fn reconciled_pairs_offer_close_now_only_in_manual_mode() {
     assert_eq!(r.action_text(), "自動");
 }
 
+// ---- spread-position-tag: the running list shows the live tag --------------------------------
+
+mod spread_tag_running {
+    use super::*;
+    use tong_funding_core::spread_tag::SpreadKind;
+
+    fn set_marks(s: &mut UiSnapshot, long_px: &str, short_px: &str) {
+        for (ex, px) in [(Exchange::Binance, long_px), (Exchange::Bybit, short_px)] {
+            s.market.get_mut(&ex).unwrap().observations.iter_mut().find(|o| o.symbol == "BTCUSDT").unwrap().mark_price = d(px);
+        }
+    }
+
+    fn running(s: &UiSnapshot, now: i64) -> RunningRow {
+        build(s, &BTreeSet::new(), now).running.into_iter().find(|r| r.uuid == "u-BTCUSDT").unwrap()
+    }
+
+    #[test]
+    fn a_running_row_shows_the_tag_and_it_changes_with_the_quotes() {
+        let mut s = snap();
+        eng(&mut s).pairs[0].state = PairState::Reconciled;
+        set_marks(&mut s, "100", "100.2");
+        let v = running(&s, NOW).spread.expect("tag shown");
+        assert_eq!((v.tag.kind, v.text.as_str()), (SpreadKind::Positive, "價差 positive +0.20%（標記價）"));
+        set_marks(&mut s, "100.5", "100.2");
+        assert_eq!(running(&s, NOW).spread.unwrap().tag.kind, SpreadKind::Negative);
+    }
+
+    #[test]
+    fn a_failing_or_stale_leg_shows_no_tag() {
+        let mut s = snap();
+        eng(&mut s).pairs[0].state = PairState::Reconciled;
+        assert_eq!(running(&s, NOW + 60_000).spread, None, "stale");
+        s.market.get_mut(&Exchange::Bybit).unwrap().last_error = Some(("HTTP 500".into(), NOW));
+        assert_eq!(running(&s, NOW).spread, None, "failing");
+    }
+}
+
 // ---- trade-cost-estimate: per-row cost estimate at the shared quantity --------------------
 
 mod cost {
