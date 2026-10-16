@@ -24,6 +24,8 @@ use super::okx::{OKX_LEG_CAP_FACTOR, OkxLimitsSource, OkxOrderClient, check_size
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{BoxFut, Executor, OrderRequest, QueryOutcome, ServerOffsets, SubmitOutcome};
 use crate::exchange::health::ratelimit::{BackoffState, RateLimiter, RequestClass};
+use crate::exchange::signed::endpoints::{BinanceEnv, BinanceHost, BybitEnv, BybitHost, Realm};
+use crate::engine::ids::IdPrefix;
 use crate::ports::TimeSource;
 use crate::store::db::Db;
 
@@ -31,6 +33,7 @@ use crate::store::db::Db;
 pub use crate::exchange::signed::okx::POSITION_MODE_TTL_MS;
 
 /// Reason of OKX order calls on an executor built without an OKX client and without a reason.
+pub const OKX_NOT_IN_LIVE: &str = "OKX has no live path; OKX order not sent";
 pub const OKX_UNAVAILABLE: &str = "OKX order client not configured";
 
 /// Which `client_order_id`s belong to this system (`order_intents`).
@@ -44,9 +47,9 @@ impl IntentLedger for Db {
     }
 }
 
-pub struct DemoExecutor<T> {
-    binance: BinanceOrderClient<T>,
-    bybit: BybitOrderClient<T>,
+pub struct DemoExecutor<T, BE = BinanceHost, YE = BybitHost> {
+    binance: BinanceOrderClient<T, BE>,
+    bybit: BybitOrderClient<T, YE>,
     /// OKX is optional: without keys the factory gives a reason instead and OKX orders are not sent.
     okx: Option<OkxOrderClient<T>>,
     okx_unavailable: String,
@@ -60,29 +63,24 @@ pub struct DemoExecutor<T> {
     one_way_at: Mutex<HashMap<(Exchange, String), i64>>,
 }
 
-impl<T: OrderTransport> DemoExecutor<T> {
+impl<T: OrderTransport, BE: BinanceEnv, YE: BybitEnv<Realm = BE::Realm>> DemoExecutor<T, BE, YE> {
     pub fn new(
-        binance: BinanceOrderClient<T>,
-        bybit: BybitOrderClient<T>,
+        binance: BinanceOrderClient<T, BE>,
+        bybit: BybitOrderClient<T, YE>,
         clock: Arc<dyn TimeSource>,
         offsets: Arc<dyn ServerOffsets>,
         intents: Arc<dyn IntentLedger>,
         limiter: Arc<RateLimiter>,
     ) -> Self {
-        DemoExecutor { binance, bybit, okx: None, okx_unavailable: OKX_UNAVAILABLE.to_string(), okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
+        // OKX has no live path: a live executor says so, whatever else is configured.
+        let okx_unavailable = if BE::Realm::ID_PREFIX == IdPrefix::Live { OKX_NOT_IN_LIVE.to_string() } else { OKX_UNAVAILABLE.to_string() };
+        DemoExecutor { binance, bybit, okx: None, okx_unavailable, okx_limits: None, clock, offsets, intents, limiter, one_way_at: Mutex::new(HashMap::new()) }
     }
 
-    /// Adds the OKX client. Its latch is the client's own: production attaches the factory's single
-    /// latch to the client when it builds it (`DemoExecutorFactory::build`), so there is no
-    /// builder-order-dependent second latch here.
-    pub fn with_okx(mut self, okx: OkxOrderClient<T>) -> Self {
-        self.okx = Some(okx);
-        self
-    }
-
-    pub fn with_okx_limits(mut self, limits: Arc<dyn OkxLimitsSource>) -> Self {
-        self.okx_limits = Some(limits);
-        self
+    /// The `client_order_id` prefix this executor sends and accepts: `demo` or `live`, decided by
+    /// the (paired) host types of its two clients.
+    fn id_prefix(&self) -> IdPrefix {
+        BE::Realm::ID_PREFIX
     }
 
     /// OKX orders answer `not_sent` with `reason` (never contains a key value).
@@ -186,7 +184,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
         if req.exchange == Exchange::Okx {
             self.okx()?;
         }
-        let order = ValidOrder::from_request(req)?;
+        let order = ValidOrder::from_request_for(req, self.id_prefix())?;
         if req.exchange == Exchange::Okx {
             // size guard first: nothing is requested for an order that is not a sane number of contracts
             // (a close is only checked for sz > 0 and the lot rule: never blocked by the cap or by missing data)
@@ -297,7 +295,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
         {
             return naked("not_sent".into(), reason);
         }
-        let order = match ValidOrder::from_request(req) {
+        let order = match ValidOrder::from_request_for(req, self.id_prefix()) {
             Ok(o) => o,
             Err(e) => return naked("not_sent".into(), e),
         };
@@ -361,7 +359,7 @@ impl<T: OrderTransport> DemoExecutor<T> {
         {
             return QueryOutcome::Failed { reason };
         }
-        let id = match ClientOrderId::parse(client_order_id) {
+        let id = match ClientOrderId::parse_for(client_order_id, self.id_prefix()) {
             Ok(id) => id,
             Err(e) => return QueryOutcome::Failed { reason: format!("cancel refused: {e}") },
         };
@@ -389,7 +387,24 @@ impl<T: OrderTransport> DemoExecutor<T> {
     }
 }
 
-impl<T: OrderTransport + 'static> Executor for DemoExecutor<T> {
+/// OKX exists only in the demo world: these builders are not available on a live executor (the
+/// OKX order client itself can only be built with a demo order transport).
+impl<T: OrderTransport> DemoExecutor<T, BinanceHost, BybitHost> {
+    /// Adds the OKX client. Its latch is the client's own: production attaches the factory's single
+    /// latch to the client when it builds it (`DemoExecutorFactory::build`), so there is no
+    /// builder-order-dependent second latch here.
+    pub fn with_okx(mut self, okx: OkxOrderClient<T>) -> Self {
+        self.okx = Some(okx);
+        self
+    }
+
+    pub fn with_okx_limits(mut self, limits: Arc<dyn OkxLimitsSource>) -> Self {
+        self.okx_limits = Some(limits);
+        self
+    }
+}
+
+impl<T: OrderTransport + 'static, BE: BinanceEnv, YE: BybitEnv<Realm = BE::Realm>> Executor for DemoExecutor<T, BE, YE> {
     fn is_simulated(&self) -> bool {
         false
     }
@@ -410,7 +425,7 @@ impl<T: OrderTransport + 'static> Executor for DemoExecutor<T> {
     fn query(&self, exchange: Exchange, symbol: &str, client_order_id: &str) -> BoxFut<'_, QueryOutcome> {
         let (symbol, id) = (symbol.to_string(), client_order_id.to_string());
         Box::pin(async move {
-            match ClientOrderId::parse(&id) {
+            match ClientOrderId::parse_for(&id, self.id_prefix()) {
                 Ok(cid) => self.query_by(exchange, &symbol, &OrderRef::Client(cid)).await,
                 Err(e) => QueryOutcome::Failed { reason: format!("query refused: {e}") },
             }

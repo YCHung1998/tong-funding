@@ -12,7 +12,7 @@ use tong_funding_core::redact::redact_secrets;
 
 use crate::exchange::error::AdapterError;
 use crate::exchange::reqwest_transport::{HostPolicy, MAX_BODY_BYTES};
-use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost, is_okx_auth_header, is_protected_okx_header};
+use crate::exchange::signed::endpoints::{BinanceEnv, BinanceHost, BinanceLive, BybitEnv, BybitHost, BybitLive, OkxHost, is_okx_auth_header, is_protected_okx_header};
 use crate::exchange::transport::HttpResponse;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,6 +69,15 @@ impl OrderHttpRequest {
             }
         };
         OrderHttpRequest { method, url, headers, body: None, timeout, protected_header_misuse: false }
+    }
+    /// A Binance request to the host of `env` (a demo host or the live host; the host type is
+    /// paired with the transport at the client constructor). `path_and_query` starts with `/`.
+    pub fn to_binance<E: BinanceEnv>(method: Method, env: E, path_and_query: &str, timeout: Duration) -> Self {
+        OrderHttpRequest { method, url: format!("{}{}", env.base_url(), path_and_query), headers: Vec::new(), body: None, timeout, protected_header_misuse: false }
+    }
+    /// A Bybit request to the host of `env`, see [`Self::to_binance`].
+    pub fn to_bybit<E: BybitEnv>(method: Method, env: E, path_and_query: &str, timeout: Duration) -> Self {
+        OrderHttpRequest { method, url: format!("{}{}", env.base_url(), path_and_query), headers: Vec::new(), body: None, timeout, protected_header_misuse: false }
     }
     /// Generic header. The OKX demo flag and `OK-ACCESS-*` are NOT settable here (see `okx_auth`).
     pub fn header(mut self, name: &str, value: &str) -> Self {
@@ -146,6 +155,15 @@ pub trait DemoOrderTransport: OrderTransport {}
 /// Marker: an order transport bound to the live hosts. Only [`SignedLiveOrderTransport`] implements
 /// it; no demo order client accepts it.
 pub trait LiveOrderTransport: OrderTransport {}
+
+/// "This order transport may carry orders to host type `E`": demo/testnet host types accept only a
+/// [`DemoOrderTransport`], live host types only a [`LiveOrderTransport`]. The order clients bound
+/// their transport by this, so the pairing is checked by the compiler.
+pub trait OrderTransportFor<E>: OrderTransport {}
+impl<T: DemoOrderTransport> OrderTransportFor<BinanceHost> for T {}
+impl<T: DemoOrderTransport> OrderTransportFor<BybitHost> for T {}
+impl<T: LiveOrderTransport> OrderTransportFor<BinanceLive> for T {}
+impl<T: LiveOrderTransport> OrderTransportFor<BybitLive> for T {}
 
 /// The real transport on `reqwest` + rustls. Its constructors are private: callers use the two
 /// wrapper types below, so the TYPE says which hosts the transport may reach.
@@ -334,6 +352,7 @@ pub mod fake {
     }
 
     impl DemoOrderTransport for FakeOrderTransport {}
+    impl LiveOrderTransport for FakeOrderTransport {}
 
     impl OrderTransport for FakeOrderTransport {
         fn send(&self, req: OrderHttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {

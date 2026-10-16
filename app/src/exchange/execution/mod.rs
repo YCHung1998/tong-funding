@@ -20,6 +20,7 @@ pub mod endpoints;
 pub mod executor;
 pub mod factory;
 pub mod http;
+pub mod live_factory;
 pub mod okx;
 pub mod order;
 
@@ -35,3 +36,5 @@ mod leverage_tests;
 mod live_probe;
 #[cfg(test)]
 mod replay_tests;
+#[cfg(test)]
+mod live_order_tests;

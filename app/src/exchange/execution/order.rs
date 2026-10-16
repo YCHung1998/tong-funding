@@ -14,7 +14,18 @@ use crate::engine::ports::{OrderRequest, OrderSide};
 pub struct ClientOrderId(String);
 
 impl ClientOrderId {
+    /// A `demo` engine id (the demo world).
     pub fn parse(id: &str) -> Result<ClientOrderId, String> {
+        Self::parse_for(id, IdPrefix::Demo)
+    }
+
+    /// An engine id of exactly `expected` (`Demo` for the demo world, `Live` for the live world);
+    /// a `sim` prefix is never an exchange id, whatever is expected. A live id never reaches a demo
+    /// executor and a demo id never reaches a live one.
+    pub fn parse_for(id: &str, expected: IdPrefix) -> Result<ClientOrderId, String> {
+        if !matches!(expected, IdPrefix::Demo | IdPrefix::Live) {
+            return Err("only demo or live ids reach an exchange".into());
+        }
         if id.is_empty() {
             return Err("client_order_id is required".into());
         }
@@ -24,9 +35,9 @@ impl ClientOrderId {
         if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
             return Err("client_order_id may only contain [A-Za-z0-9_-]".into());
         }
-        if IdPrefix::of(id) != Some(IdPrefix::Demo) {
-            // A simulated (or foreign) id never reaches an exchange.
-            return Err("demo executor only accepts demo-prefixed client_order_ids".into());
+        if IdPrefix::of(id) != Some(expected) {
+            // A simulated, foreign or other-world id never reaches an exchange.
+            return Err(format!("this executor only accepts {}-prefixed client_order_ids", expected.as_str()));
         }
         Ok(ClientOrderId(id.to_string()))
     }
@@ -60,7 +71,12 @@ pub const LEVERAGE_RANGE: std::ops::RangeInclusive<u32> = 1..=125;
 
 impl ValidOrder {
     pub fn from_request(req: &OrderRequest) -> Result<ValidOrder, String> {
-        let id = ClientOrderId::parse(&req.client_order_id)?;
+        Self::from_request_for(req, IdPrefix::Demo)
+    }
+
+    /// As [`Self::from_request`], for the world whose ids start with `expected`.
+    pub fn from_request_for(req: &OrderRequest, expected: IdPrefix) -> Result<ValidOrder, String> {
+        let id = ClientOrderId::parse_for(&req.client_order_id, expected)?;
         if req.symbol.is_empty() || !req.symbol.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
             return Err(format!("invalid symbol {:?}", req.symbol));
         }

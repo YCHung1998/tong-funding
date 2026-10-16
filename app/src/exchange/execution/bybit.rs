@@ -15,11 +15,11 @@ use serde_json::{Value, json};
 use super::binance::ModeReading;
 use super::classify::{BYBIT_LEVERAGE_UNCHANGED_CODES, BYBIT_NOT_FOUND_CODES, LeverageOutcome, Reply, SubmitClass, bybit_reply, bybit_state, leverage_outcome, query_outcome, submit_class};
 use super::endpoints::{BYBIT_CANCEL_PATH, BYBIT_CREATE_PATH, BYBIT_HISTORY_PATH, BYBIT_POSITION_PATH, BYBIT_REALTIME_PATH, BYBIT_SET_LEVERAGE_PATH};
-use super::http::{DemoEnv, DemoOrderTransport, Method, OrderHttpRequest, OrderTransport};
+use super::http::{Method, OrderHttpRequest, OrderTransport, OrderTransportFor};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderState, OrderStatus, QueryOutcome};
 use crate::exchange::error::AdapterError;
-use crate::exchange::signed::endpoints::BybitHost;
+use crate::exchange::signed::endpoints::{BybitEnv, BybitHost};
 use crate::exchange::signed::models::{dec_opt, dec_req, str_opt, str_req};
 use crate::exchange::signed::signing::{Credentials, RECV_WINDOW_MS, bybit_signature, encode_query};
 
@@ -27,10 +27,10 @@ pub const ORDER_TIMEOUT: Duration = Duration::from_secs(5);
 /// Fee asset of USDT-settled linear contracts (UNVERIFIED for every account type).
 pub const BYBIT_FEE_ASSET: &str = "USDT";
 
-pub struct BybitOrderClient<T> {
+pub struct BybitOrderClient<T, E = BybitHost> {
     transport: Arc<T>,
     creds: Arc<Credentials>,
-    env: BybitHost,
+    env: E,
 }
 
 fn side_param(side: OrderSide) -> &'static str {
@@ -40,13 +40,13 @@ fn side_param(side: OrderSide) -> &'static str {
     }
 }
 
-impl<T: DemoOrderTransport> BybitOrderClient<T> {
-    pub fn new(transport: Arc<T>, creds: Arc<Credentials>, demo_env: BybitHost) -> Self {
-        BybitOrderClient { transport, creds, env: demo_env }
+impl<T: OrderTransportFor<E>, E: BybitEnv> BybitOrderClient<T, E> {
+    pub fn new(transport: Arc<T>, creds: Arc<Credentials>, env: E) -> Self {
+        BybitOrderClient { transport, creds, env }
     }
 }
 
-impl<T: OrderTransport> BybitOrderClient<T> {
+impl<T: OrderTransport, E: BybitEnv> BybitOrderClient<T, E> {
 
     fn sign_headers(&self, req: OrderHttpRequest, timestamp: i64, payload: &str) -> Result<OrderHttpRequest, AdapterError> {
         let signature = bybit_signature(&self.creds.api_secret, timestamp, &self.creds.api_key, RECV_WINDOW_MS, payload)?;
@@ -59,13 +59,13 @@ impl<T: OrderTransport> BybitOrderClient<T> {
 
     fn post(&self, path: &str, body: &Value, timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {
         let text = body.to_string(); // the exact text that is signed is the text that is sent
-        let req = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(self.env), path, ORDER_TIMEOUT);
+        let req = OrderHttpRequest::to_bybit(Method::Post, self.env, path, ORDER_TIMEOUT);
         self.sign_headers(req, timestamp, &text).map(|r| r.json_body(text))
     }
 
     fn get(&self, path: &str, params: &[(&str, String)], timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {
         let query = encode_query(params);
-        let req = OrderHttpRequest::to_demo(Method::Get, DemoEnv::Bybit(self.env), &format!("{path}?{query}"), ORDER_TIMEOUT);
+        let req = OrderHttpRequest::to_bybit(Method::Get, self.env, &format!("{path}?{query}"), ORDER_TIMEOUT);
         self.sign_headers(req, timestamp, &query)
     }
 

@@ -14,6 +14,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 use crate::engine::ports::{AccountOrder, AccountPosition, AccountView, BoxFut, Listed};
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
+use crate::exchange::signed::endpoints::{BinanceEnv, BinanceHost, BybitEnv, BybitHost};
 use crate::exchange::signed::okx::OkxSignedClient;
 use crate::exchange::error::AdapterError;
 use crate::exchange::signed::models::{Balance, OpenOrder, Position, PositionMode};
@@ -24,14 +25,14 @@ pub const OKX_NOT_WIRED: &str = "OKX account client is not wired";
 /// Asset whose available balance is the margin of USDT-margined contracts.
 pub const MARGIN_ASSET: &str = "USDT";
 
-pub struct DemoAccountView<T> {
-    binance: Arc<BinanceSignedClient<T>>,
-    bybit: Arc<BybitSignedClient<T>>,
+pub struct DemoAccountView<T, BE = BinanceHost, YE = BybitHost> {
+    binance: Arc<BinanceSignedClient<T, BE>>,
+    bybit: Arc<BybitSignedClient<T, YE>>,
     okx: Option<Arc<OkxSignedClient<T>>>,
 }
 
-impl<T: HttpTransport + 'static> DemoAccountView<T> {
-    pub fn new(binance: Arc<BinanceSignedClient<T>>, bybit: Arc<BybitSignedClient<T>>) -> Self {
+impl<T: HttpTransport + 'static, BE: BinanceEnv, YE: BybitEnv> DemoAccountView<T, BE, YE> {
+    pub fn new(binance: Arc<BinanceSignedClient<T, BE>>, bybit: Arc<BybitSignedClient<T, YE>>) -> Self {
         DemoAccountView { binance, bybit, okx: None }
     }
 
@@ -86,7 +87,7 @@ pub fn to_margin(exchange: Exchange, balances: &[Balance]) -> Result<Decimal, St
         .ok_or_else(|| format!("{}: available {MARGIN_ASSET} balance not reported", exchange.name()))
 }
 
-impl<T: HttpTransport + 'static> AccountView for DemoAccountView<T> {
+impl<T: HttpTransport + 'static, BE: BinanceEnv, YE: BybitEnv> AccountView for DemoAccountView<T, BE, YE> {
     fn positions(&self, exchange: Exchange) -> BoxFut<'_, Result<Listed<AccountPosition>, String>> {
         Box::pin(async move {
             match exchange {

@@ -13,3 +13,5 @@ pub mod signing;
 
 #[cfg(test)]
 mod leverage_cap_tests;
+#[cfg(test)]
+mod live_host_tests;

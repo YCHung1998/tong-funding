@@ -9,15 +9,16 @@ use tong_funding_core::types::{Decimal, Exchange};
 use super::fetch::BoxFut;
 use super::slot_runner::RateSource;
 use crate::exchange::signed::binance::BinanceSignedClient;
+use crate::exchange::signed::endpoints::{BinanceEnv, BinanceHost, BybitEnv, BybitHost};
 use crate::exchange::signed::bybit::BybitSignedClient;
 use crate::exchange::transport::HttpTransport;
 
-pub struct DemoRateSource<T> {
-    pub binance: Arc<BinanceSignedClient<T>>,
-    pub bybit: Arc<BybitSignedClient<T>>,
+pub struct DemoRateSource<T, BE = BinanceHost, YE = BybitHost> {
+    pub binance: Arc<BinanceSignedClient<T, BE>>,
+    pub bybit: Arc<BybitSignedClient<T, YE>>,
 }
 
-impl<T: HttpTransport + 'static> RateSource for DemoRateSource<T> {
+impl<T: HttpTransport + 'static, BE: BinanceEnv, YE: BybitEnv> RateSource for DemoRateSource<T, BE, YE> {
     fn rate_at<'a>(&'a self, exchange: Exchange, symbol: &'a str, settle_ms: i64) -> BoxFut<'a, Result<Option<Decimal>, String>> {
         Box::pin(async move {
             match exchange {

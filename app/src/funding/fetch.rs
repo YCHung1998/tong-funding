@@ -19,6 +19,7 @@ use tong_funding_core::types::Exchange;
 use super::pnl_record::{assemble, latest_pnl, recompute_if_changed};
 use super::{FETCH_DELAY_MS, FETCH_ERROR, FUNDING_LEDGER_FETCHED, PNL_RETRY_WINDOW_MS};
 use crate::exchange::error::AdapterError;
+use crate::exchange::signed::endpoints::{BinanceEnv, BinanceHost, BybitEnv, BybitHost};
 use crate::exchange::signed::ledger::{BINANCE_INCOME_LIMIT, BinanceLedgerClient, BybitLedgerClient, LedgerPage};
 use crate::exchange::signed::okx::OkxSignedClient;
 use crate::exchange::transport::HttpTransport;
@@ -255,9 +256,9 @@ pub fn plan_fetches(db: &Db, now_ms: i64) -> Result<Vec<FetchPlan>, String> {
 
 /// Binance income as a `LedgerSource`: pages are numbered; a page shorter than the limit ends
 /// the window (a full page means "there may be more").
-pub struct BinanceLedgerSource<T>(pub Arc<BinanceLedgerClient<T>>);
+pub struct BinanceLedgerSource<T, E = BinanceHost>(pub Arc<BinanceLedgerClient<T, E>>);
 
-impl<T: HttpTransport + 'static> LedgerSource for BinanceLedgerSource<T> {
+impl<T: HttpTransport + 'static, E: BinanceEnv> LedgerSource for BinanceLedgerSource<T, E> {
     fn exchange(&self) -> Exchange {
         Exchange::Binance
     }
@@ -278,9 +279,9 @@ impl<T: HttpTransport + 'static> LedgerSource for BinanceLedgerSource<T> {
 }
 
 /// Bybit transaction-log as a `LedgerSource` (every symbol; `nextPageCursor`).
-pub struct BybitLedgerSource<T>(pub Arc<BybitLedgerClient<T>>);
+pub struct BybitLedgerSource<T, E = BybitHost>(pub Arc<BybitLedgerClient<T, E>>);
 
-impl<T: HttpTransport + 'static> LedgerSource for BybitLedgerSource<T> {
+impl<T: HttpTransport + 'static, E: BybitEnv> LedgerSource for BybitLedgerSource<T, E> {
     fn exchange(&self) -> Exchange {
         Exchange::Bybit
     }

@@ -15,11 +15,11 @@ use tong_funding_core::types::Decimal;
 
 use super::classify::{BINANCE_NOT_FOUND_CODES, LeverageOutcome, Reply, SubmitClass, binance_reply, binance_state, leverage_outcome, query_outcome, submit_class};
 use super::endpoints::{BINANCE_LEVERAGE_PATH, BINANCE_ORDER_PATH, BINANCE_POSITION_MODE_PATH, BINANCE_RESP_TYPE, BINANCE_USER_TRADES_PATH};
-use super::http::{DemoEnv, DemoOrderTransport, Method, OrderHttpRequest, OrderTransport};
+use super::http::{Method, OrderHttpRequest, OrderTransport, OrderTransportFor};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderStatus, QueryOutcome};
 use crate::exchange::error::AdapterError;
-use crate::exchange::signed::endpoints::BinanceHost;
+use crate::exchange::signed::endpoints::{BinanceEnv, BinanceHost};
 use crate::exchange::signed::models::{dec_opt, dec_req, str_opt, str_req};
 use crate::exchange::signed::signing::{Credentials, RECV_WINDOW_MS, binance_signature, encode_query};
 
@@ -33,10 +33,10 @@ pub enum ModeReading {
     Hedge,
 }
 
-pub struct BinanceOrderClient<T> {
+pub struct BinanceOrderClient<T, E = BinanceHost> {
     transport: Arc<T>,
     creds: Arc<Credentials>,
-    env: BinanceHost,
+    env: E,
 }
 
 fn side_param(side: OrderSide) -> &'static str {
@@ -46,13 +46,13 @@ fn side_param(side: OrderSide) -> &'static str {
     }
 }
 
-impl<T: DemoOrderTransport> BinanceOrderClient<T> {
-    pub fn new(transport: Arc<T>, creds: Arc<Credentials>, demo_env: BinanceHost) -> Self {
-        BinanceOrderClient { transport, creds, env: demo_env }
+impl<T: OrderTransportFor<E>, E: BinanceEnv> BinanceOrderClient<T, E> {
+    pub fn new(transport: Arc<T>, creds: Arc<Credentials>, env: E) -> Self {
+        BinanceOrderClient { transport, creds, env }
     }
 }
 
-impl<T: OrderTransport> BinanceOrderClient<T> {
+impl<T: OrderTransport, E: BinanceEnv> BinanceOrderClient<T, E> {
 
     /// Signs `params` (+ `timestamp`, `recvWindow`) and builds the request.
     fn signed(&self, method: Method, path: &str, mut params: Vec<(&str, String)>, timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {
@@ -60,7 +60,7 @@ impl<T: OrderTransport> BinanceOrderClient<T> {
         params.push(("recvWindow", RECV_WINDOW_MS.to_string()));
         let query = encode_query(&params);
         let signature = binance_signature(&self.creds.api_secret, &query)?;
-        Ok(OrderHttpRequest::to_demo(method, DemoEnv::Binance(self.env), &format!("{path}?{query}&signature={signature}"), ORDER_TIMEOUT)
+        Ok(OrderHttpRequest::to_binance(method, self.env, &format!("{path}?{query}&signature={signature}"), ORDER_TIMEOUT)
             .header("X-MBX-APIKEY", &self.creds.api_key))
     }
 

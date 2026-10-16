@@ -9,7 +9,7 @@ use tong_funding_core::redact::redact_secrets;
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::endpoints::{
-    BYBIT_BALANCE_PATH, BYBIT_FUNDING_HISTORY_PATH, BYBIT_INSTRUMENTS_PATH, BYBIT_OPEN_ORDERS_PATH, BYBIT_ORDERS_PAGE_LIMIT, BYBIT_POSITIONS_PAGE_LIMIT, BYBIT_POSITIONS_PATH, BybitHost, MAX_PAGES,
+    BYBIT_BALANCE_PATH, BYBIT_FUNDING_HISTORY_PATH, BYBIT_INSTRUMENTS_PATH, BYBIT_OPEN_ORDERS_PATH, BYBIT_ORDERS_PAGE_LIMIT, BYBIT_POSITIONS_PAGE_LIMIT, BYBIT_POSITIONS_PATH, BybitEnv, BybitHost, MAX_PAGES, SignedTransportFor,
 };
 use super::models::{Balance, Completeness, Listing, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
@@ -20,7 +20,7 @@ use super::signing::{
 /// Bybit `retCode` for "Too many visits" (rate limit), delivered with HTTP 200.
 const BYBIT_RATE_LIMIT_RET_CODE: i64 = 10006;
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpTransport};
+use crate::exchange::transport::{HttpRequest, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
 /// Bybit `accountType` of `wallet-balance`. `.env.example`: UNIFIED is the default for new demo
@@ -31,18 +31,18 @@ pub enum BybitAccountType {
     Contract,
 }
 
-pub struct BybitSignedClient<T> {
+pub struct BybitSignedClient<T, E = BybitHost> {
     transport: Arc<T>,
     secrets: Arc<dyn SecretProvider>,
     clock: Arc<dyn Clock>,
     offset: Arc<dyn ClockOffsetSource>,
     resync: Arc<dyn Resync>,
-    host: BybitHost,
+    host: E,
     account_type: BybitAccountType,
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: DemoSignedTransport> BybitSignedClient<T> {
+impl<T: SignedTransportFor<E>, E: BybitEnv> BybitSignedClient<T, E> {
     /// `clock` + `offset` produce the calibrated exchange time used for signing and `fetched_at`;
     /// `resync` is called once when a timestamp is rejected.
     pub fn new(
@@ -51,13 +51,13 @@ impl<T: DemoSignedTransport> BybitSignedClient<T> {
         clock: Arc<dyn Clock>,
         offset: Arc<dyn ClockOffsetSource>,
         resync: Arc<dyn Resync>,
-        demo_env: BybitHost,
+        env: E,
     ) -> Self {
-        BybitSignedClient { transport, secrets, clock, offset, resync, host: demo_env, account_type: BybitAccountType::Unified, reason: Mutex::new(None) }
+        BybitSignedClient { transport, secrets, clock, offset, resync, host: env, account_type: BybitAccountType::Unified, reason: Mutex::new(None) }
     }
 }
 
-impl<T: HttpTransport> BybitSignedClient<T> {
+impl<T: HttpTransport, E: BybitEnv> BybitSignedClient<T, E> {
     pub const EXCHANGE: Exchange = Exchange::Bybit;
 
     /// Why the most recent signed call answered `NotConnected` (`None` if it did not, or no call yet).

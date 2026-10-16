@@ -2,6 +2,8 @@
 //! there is no constructor taking a base URL and no host is read from the environment or a file.
 //! The host is chosen by the enums below, which is the only knob a caller has.
 
+use crate::exchange::transport::{DemoSignedTransport, HttpTransport, LiveSignedTransport};
+
 /// Binance USDS-M Futures hosts that may receive signed requests.
 /// UNVERIFIED which of the two accepts a user's demo key (task 4.2 decides); both are listed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -180,6 +182,93 @@ impl BybitHost {
         }
     }
 }
+
+/// Which world a host type belongs to; it decides the `client_order_id` prefix an executor accepts
+/// (`demo` for the demo world, `live` for the live world). A live executor cannot be assembled from
+/// a demo client and a live client: the executor bounds both clients to the same realm.
+pub trait Realm: Copy + Send + Sync + 'static {
+    const ID_PREFIX: crate::engine::ids::IdPrefix;
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DemoRealm;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveRealm;
+impl Realm for DemoRealm {
+    const ID_PREFIX: crate::engine::ids::IdPrefix = crate::engine::ids::IdPrefix::Demo;
+}
+impl Realm for LiveRealm {
+    const ID_PREFIX: crate::engine::ids::IdPrefix = crate::engine::ids::IdPrefix::Live;
+}
+
+/// The host a Binance signed client talks to: a demo/testnet [`BinanceHost`] or the live
+/// [`BinanceLive`]. Closed set (the only implementors are those two types, in this file).
+pub trait BinanceEnv: Copy + Send + Sync + 'static {
+    type Realm: Realm;
+    fn host(self) -> &'static str;
+    fn base_url(self) -> &'static str;
+}
+
+/// The host a Bybit signed client talks to: [`BybitHost`] (demo) or [`BybitLive`].
+pub trait BybitEnv: Copy + Send + Sync + 'static {
+    type Realm: Realm;
+    fn host(self) -> &'static str;
+    fn base_url(self) -> &'static str;
+}
+
+/// Binance live host (`fapi.binance.com`). A type of its own, deliberately not a [`BinanceHost`]
+/// variant; it pairs only with a live signed transport (see [`SignedTransportFor`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BinanceLive;
+
+/// Bybit live host (`api.bybit.com`); pairs only with a live signed transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BybitLive;
+
+impl BinanceEnv for BinanceHost {
+    type Realm = DemoRealm;
+    fn host(self) -> &'static str {
+        BinanceHost::host(self)
+    }
+    fn base_url(self) -> &'static str {
+        BinanceHost::base_url(self)
+    }
+}
+impl BybitEnv for BybitHost {
+    type Realm = DemoRealm;
+    fn host(self) -> &'static str {
+        BybitHost::host(self)
+    }
+    fn base_url(self) -> &'static str {
+        BybitHost::base_url(self)
+    }
+}
+impl BinanceEnv for BinanceLive {
+    type Realm = LiveRealm;
+    fn host(self) -> &'static str {
+        LiveHost::Binance.host()
+    }
+    fn base_url(self) -> &'static str {
+        LiveHost::Binance.base_url()
+    }
+}
+impl BybitEnv for BybitLive {
+    type Realm = LiveRealm;
+    fn host(self) -> &'static str {
+        LiveHost::Bybit.host()
+    }
+    fn base_url(self) -> &'static str {
+        LiveHost::Bybit.base_url()
+    }
+}
+
+/// "This transport may carry signed requests to host type `E`": demo/testnet host types accept only
+/// a `DemoSignedTransport`, live host types only a `LiveSignedTransport`. The signed client
+/// constructors bound their transport by this, so the pairing is checked by the compiler.
+pub trait SignedTransportFor<E>: HttpTransport {}
+impl<T: DemoSignedTransport> SignedTransportFor<BinanceHost> for T {}
+impl<T: DemoSignedTransport> SignedTransportFor<BybitHost> for T {}
+impl<T: LiveSignedTransport> SignedTransportFor<BinanceLive> for T {}
+impl<T: LiveSignedTransport> SignedTransportFor<BybitLive> for T {}
 
 pub const BINANCE_BALANCE_PATH: &str = "/fapi/v2/balance";
 pub const BINANCE_POSITIONS_PATH: &str = "/fapi/v2/positionRisk";

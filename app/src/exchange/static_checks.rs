@@ -1452,13 +1452,13 @@ const LATE: &str = "api.bybit.com";
     #[test]
     fn signed_client_constructors_require_the_matching_transport_marker() {
         const CASES: [(&str, &str); 10] = [
-            ("exchange/signed/binance.rs", "impl<T: DemoSignedTransport> BinanceSignedClient<T> {"),
-            ("exchange/signed/bybit.rs", "impl<T: DemoSignedTransport> BybitSignedClient<T> {"),
+            ("exchange/signed/binance.rs", "impl<T: SignedTransportFor<E>, E: BinanceEnv> BinanceSignedClient<T, E> {"),
+            ("exchange/signed/bybit.rs", "impl<T: SignedTransportFor<E>, E: BybitEnv> BybitSignedClient<T, E> {"),
             ("exchange/signed/okx.rs", "impl<T: DemoSignedTransport> OkxSignedClient<T> {"),
-            ("exchange/signed/ledger.rs", "impl<T: DemoSignedTransport> BinanceLedgerClient<T> {"),
-            ("exchange/signed/ledger.rs", "impl<T: DemoSignedTransport> BybitLedgerClient<T> {"),
-            ("exchange/execution/binance.rs", "impl<T: DemoOrderTransport> BinanceOrderClient<T> {"),
-            ("exchange/execution/bybit.rs", "impl<T: DemoOrderTransport> BybitOrderClient<T> {"),
+            ("exchange/signed/ledger.rs", "impl<T: SignedTransportFor<E>, E: BinanceEnv> BinanceLedgerClient<T, E> {"),
+            ("exchange/signed/ledger.rs", "impl<T: SignedTransportFor<E>, E: BybitEnv> BybitLedgerClient<T, E> {"),
+            ("exchange/execution/binance.rs", "impl<T: OrderTransportFor<E>, E: BinanceEnv> BinanceOrderClient<T, E> {"),
+            ("exchange/execution/bybit.rs", "impl<T: OrderTransportFor<E>, E: BybitEnv> BybitOrderClient<T, E> {"),
             ("exchange/execution/okx.rs", "impl<T: DemoOrderTransport> OkxOrderClient<T> {"),
             ("exchange/execution/factory.rs", "impl<T: DemoOrderTransport + 'static> DemoExecutorFactory<T> {"),
             ("exchange/execution/http.rs", "pub trait DemoOrderTransport: OrderTransport"),
@@ -1466,10 +1466,29 @@ const LATE: &str = "api.bybit.com";
         for (file, needle) in CASES {
             let code = production_code(&std::fs::read_to_string(src_dir().join(file)).unwrap());
             let at = code.find(needle).unwrap_or_else(|| panic!("{file}: missing `{needle}`"));
-            if needle.starts_with("impl<T: Demo") {
+            if needle.starts_with("impl<T: Demo") || needle.contains("TransportFor<") {
                 let block: String = code[at..].chars().take(700).collect();
                 assert!(block.contains("pub fn new("), "{file}: `pub fn new(` must be inside `{needle}`");
             }
+        }
+    }
+
+    /// live-process 5.1: the host-type / transport pairing lives in exactly these eight impls (demo
+    /// hosts with demo transports, live hosts with live transports) and nowhere else; the live host
+    /// types are never paired with a demo transport.
+    #[test]
+    fn host_types_are_paired_with_their_own_transport_marker_only() {
+        let signed = production_code(&std::fs::read_to_string(src_dir().join("exchange/signed/endpoints.rs")).unwrap());
+        let orders = production_code(&std::fs::read_to_string(src_dir().join("exchange/execution/http.rs")).unwrap());
+        for (code, tr) in [(&signed, "SignedTransportFor"), (&orders, "OrderTransportFor")] {
+            let (demo, live) = if tr == "SignedTransportFor" { ("DemoSignedTransport", "LiveSignedTransport") } else { ("DemoOrderTransport", "LiveOrderTransport") };
+            for host in ["BinanceHost", "BybitHost"] {
+                assert!(code.contains(&format!("impl<T: {demo}> {tr}<{host}> for T {{}}")), "{tr}<{host}> must need {demo}");
+            }
+            for host in ["BinanceLive", "BybitLive"] {
+                assert!(code.contains(&format!("impl<T: {live}> {tr}<{host}> for T {{}}")), "{tr}<{host}> must need {live}");
+            }
+            assert_eq!(code.matches(&format!("> {tr}<")).count(), 4, "exactly four {tr} impls");
         }
     }
 

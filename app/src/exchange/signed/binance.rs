@@ -6,43 +6,43 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
-use super::endpoints::{BINANCE_BALANCE_PATH, BINANCE_FUNDING_RATE_PATH, BINANCE_LEVERAGE_BRACKET_PATH, BINANCE_OPEN_ORDERS_PATH, BINANCE_POSITIONS_PATH, BinanceHost};
+use super::endpoints::{BINANCE_BALANCE_PATH, BINANCE_FUNDING_RATE_PATH, BINANCE_LEVERAGE_BRACKET_PATH, BINANCE_OPEN_ORDERS_PATH, BINANCE_POSITIONS_PATH, BinanceEnv, BinanceHost, SignedTransportFor};
 use super::models::{Balance, OpenOrder, OrderSide, Position, PositionMode, bool_opt, dec_opt, dec_req, str_opt, str_req};
 use super::signing::{
     ClockOffsetSource, NotConnectedReason, RECV_WINDOW_MS, Resync, SIGNED_TIMEOUT, binance_signature, check_status, encode_query, load_credentials, parse_json, sanitize_error,
     is_timestamp_rejected, require_offset,
 };
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpResponse, HttpTransport};
+use crate::exchange::transport::{HttpRequest, HttpResponse, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
-pub struct BinanceSignedClient<T> {
+pub struct BinanceSignedClient<T, E = BinanceHost> {
     transport: Arc<T>,
     secrets: Arc<dyn SecretProvider>,
     clock: Arc<dyn Clock>,
     offset: Arc<dyn ClockOffsetSource>,
     resync: Arc<dyn Resync>,
-    host: BinanceHost,
+    host: E,
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: DemoSignedTransport> BinanceSignedClient<T> {
+impl<T: SignedTransportFor<E>, E: BinanceEnv> BinanceSignedClient<T, E> {
     /// `clock` + `offset` produce the calibrated exchange time used for signing and `fetched_at`;
-    /// `resync` is called once when a timestamp is rejected; `demo_env` selects one of the
-    /// compile-time demo/testnet hosts (there is no way to pass a URL).
+    /// `resync` is called once when a timestamp is rejected; `env` selects the host (a demo host with a demo transport, or the live host with a live transport; the
+    /// pairing is a compile-time bound; there is no way to pass a URL).
     pub fn new(
         transport: Arc<T>,
         secrets: Arc<dyn SecretProvider>,
         clock: Arc<dyn Clock>,
         offset: Arc<dyn ClockOffsetSource>,
         resync: Arc<dyn Resync>,
-        demo_env: BinanceHost,
+        env: E,
     ) -> Self {
-        BinanceSignedClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None) }
+        BinanceSignedClient { transport, secrets, clock, offset, resync, host: env, reason: Mutex::new(None) }
     }
 }
 
-impl<T: HttpTransport> BinanceSignedClient<T> {
+impl<T: HttpTransport, E: BinanceEnv> BinanceSignedClient<T, E> {
     pub const EXCHANGE: Exchange = Exchange::Binance;
 
     /// Why the most recent signed call answered `NotConnected` (`None` if it did not, or no call yet).

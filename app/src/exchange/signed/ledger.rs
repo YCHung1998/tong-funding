@@ -14,7 +14,7 @@ use serde_json::Value;
 use tong_funding_core::pnl::FundingLedgerEntry;
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::endpoints::{BinanceHost, BybitHost, okx_inst_id, okx_symbol};
+use super::endpoints::{BinanceEnv, BinanceHost, BybitEnv, BybitHost, SignedTransportFor, okx_inst_id, okx_symbol};
 use super::okx::OkxSignedClient;
 use super::models::{dec_req, str_req};
 use super::signing::{
@@ -22,7 +22,7 @@ use super::signing::{
     encode_query, is_timestamp_rejected, load_credentials, parse_json, require_offset, sanitize_error,
 };
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpResponse, HttpTransport};
+use crate::exchange::transport::{HttpRequest, HttpResponse, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
 /// `GET /fapi/v1/income` (USER_DATA, weight 30 per the docs).
@@ -150,30 +150,30 @@ pub fn parse_okx_bills(body: &Value) -> Result<LedgerPage, AdapterError> {
 // ---- Binance client ---------------------------------------------------------------------------
 
 /// Signed GET of Binance funding income (demo/testnet host only).
-pub struct BinanceLedgerClient<T> {
+pub struct BinanceLedgerClient<T, E = BinanceHost> {
     transport: Arc<T>,
     secrets: Arc<dyn SecretProvider>,
     clock: Arc<dyn Clock>,
     offset: Arc<dyn ClockOffsetSource>,
     resync: Arc<dyn Resync>,
-    host: BinanceHost,
+    host: E,
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: DemoSignedTransport> BinanceLedgerClient<T> {
+impl<T: SignedTransportFor<E>, E: BinanceEnv> BinanceLedgerClient<T, E> {
     pub fn new(
         transport: Arc<T>,
         secrets: Arc<dyn SecretProvider>,
         clock: Arc<dyn Clock>,
         offset: Arc<dyn ClockOffsetSource>,
         resync: Arc<dyn Resync>,
-        demo_env: BinanceHost,
+        env: E,
     ) -> Self {
-        BinanceLedgerClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None) }
+        BinanceLedgerClient { transport, secrets, clock, offset, resync, host: env, reason: Mutex::new(None) }
     }
 }
 
-impl<T: HttpTransport> BinanceLedgerClient<T> {
+impl<T: HttpTransport, E: BinanceEnv> BinanceLedgerClient<T, E> {
 
     pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {
         self.reason.lock().ok().and_then(|g| *g)
@@ -252,30 +252,30 @@ fn binance_body(resp: HttpResponse) -> Result<Value, AdapterError> {
 // ---- Bybit client -----------------------------------------------------------------------------
 
 /// Signed GET of Bybit UTA transaction-log settlements (Demo Trading host only).
-pub struct BybitLedgerClient<T> {
+pub struct BybitLedgerClient<T, E = BybitHost> {
     transport: Arc<T>,
     secrets: Arc<dyn SecretProvider>,
     clock: Arc<dyn Clock>,
     offset: Arc<dyn ClockOffsetSource>,
     resync: Arc<dyn Resync>,
-    host: BybitHost,
+    host: E,
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: DemoSignedTransport> BybitLedgerClient<T> {
+impl<T: SignedTransportFor<E>, E: BybitEnv> BybitLedgerClient<T, E> {
     pub fn new(
         transport: Arc<T>,
         secrets: Arc<dyn SecretProvider>,
         clock: Arc<dyn Clock>,
         offset: Arc<dyn ClockOffsetSource>,
         resync: Arc<dyn Resync>,
-        demo_env: BybitHost,
+        env: E,
     ) -> Self {
-        BybitLedgerClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None) }
+        BybitLedgerClient { transport, secrets, clock, offset, resync, host: env, reason: Mutex::new(None) }
     }
 }
 
-impl<T: HttpTransport> BybitLedgerClient<T> {
+impl<T: HttpTransport, E: BybitEnv> BybitLedgerClient<T, E> {
 
     pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {
         self.reason.lock().ok().and_then(|g| *g)
