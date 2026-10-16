@@ -1,7 +1,7 @@
 ## 1. 身分與單一實例
 
 - [x] 1.1 新增 `ProcessIdentity { Demo, Live }` 與參數解析（`--live`）；紅色測試先行：預設 Demo、`--live` 為 Live、環境變數不影響、`--live` 搭配 `--bench-*` 被拒、同一個程序內無法改變
-- [ ] 1.2 單一實例鎖（資料目錄 `tong-funding.lock`，作業系統檔案鎖）；測試：第二個實例被拒（任一身分組合）、釋放後可重新取得；鎖在開資料庫與啟動引擎之前取得
+- [x] 1.2 單一實例鎖（資料目錄 `tong-funding.lock`，作業系統檔案鎖）；測試：第二個實例被拒（任一身分組合）、釋放後可重新取得；鎖在開資料庫與啟動引擎之前取得
 
 ## 2. 傳輸、主機與限頻
 
@@ -13,13 +13,13 @@
 
 ## 3. 資料庫
 
-- [ ] 3.1 `db_venue` 中繼資料、schema 版本 5、`HaltReason::VenueMismatch`、依身分的預設路徑（`funding-live.db`）；測試：新建、環境不符停機、既有 `funding.db` 升級為 demo、舊版 schema 支援值拒絕新資料庫、Live 開無中繼資料的既有資料庫被拒
-- [ ] 3.2 命令列工具（`config`、`import` 等）的 `--db` 走同一個開檔規則；測試：Live 身分的工具不能開 demo 資料庫
+- [x] 3.1 `db_venue` 中繼資料、schema 版本 5、`HaltReason::VenueMismatch`、依身分的預設路徑（`funding-live.db`）；測試：新建、環境不符停機、既有 `funding.db` 升級為 demo、舊版 schema 支援值拒絕新資料庫、Live 開無中繼資料的既有資料庫被拒
+- [x] 3.2 命令列工具（`config`、`import` 等）的 `--db` 走同一個開檔規則；測試：Live 身分的工具不能開 demo 資料庫
 
 ## 4. 金鑰與訂單 ID
 
 - [ ] 4.1 `BundleSecrets` 依身分選鑰匙圈 service；`secrets` 子命令 `--live`；`import-env` 與 `--live` 互斥；測試用假 `KeyStore`：Live 不讀 demo 項目且不退回、Demo 不讀 live 項目、`import-env --live` 失敗且零寫入
-- [ ] 4.2 `IdPrefix::Live` 與 `recovery` 辨識；測試：ID 前綴為 `live`、長度 ≤ 36、重啟對帳辨識 live 單
+- [x] 4.2 `IdPrefix::Live` 與 `recovery` 辨識；測試：ID 前綴為 `live`、長度 ≤ 36、重啟對帳辨識 live 單
 
 ## 5. 組合根與 OKX
 

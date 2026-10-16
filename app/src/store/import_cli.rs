@@ -2,10 +2,12 @@
 //! opening a window.
 //!
 //! ```text
-//! tong-funding import-legacy-events <events.jsonl> [--db <funding.db>] [--skip-invalid]
+//! tong-funding import-legacy-events <events.jsonl> [--db <funding.db>] [--skip-invalid] [--live]
 //! ```
 //!
-//! Without `--db` the default database path is used. Exit codes: 0 imported (report identity
+//! Without `--db` the default database path is used. `--live` selects the Live identity (default
+//! database `funding-live.db`); the database must belong to that environment (`db_venue`), so a
+//! Live import can never open a demo database and the reverse (live-process 3.2). Exit codes: 0 imported (report identity
 //! holds), 1 import refused or failed, 2 usage error.
 
 use std::io::Write;
@@ -14,29 +16,34 @@ use std::sync::Arc;
 
 use tong_funding_core::redact::redact_secrets;
 
+use crate::identity::ProcessIdentity;
 use crate::ports::{Clock, SystemClock};
 use crate::store::db::Db;
 use crate::store::legacy_import::{run_import, ImportError, ImportOptions};
 
 pub const SUBCOMMAND: &str = "import-legacy-events";
 
-const USAGE: &str = "usage: tong-funding import-legacy-events <events.jsonl> [--db <funding.db>] [--skip-invalid]";
+const USAGE: &str = "usage: tong-funding import-legacy-events <events.jsonl> [--db <funding.db>] [--skip-invalid] [--live]";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Args {
     source: PathBuf,
     db: Option<PathBuf>,
     skip_invalid: bool,
+    identity: ProcessIdentity,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut source = None;
     let mut db = None;
     let mut skip_invalid = false;
+    let mut live = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--skip-invalid" => skip_invalid = true,
+            "--live" if live => return Err("--live given twice".into()),
+            "--live" => live = true,
             "--db" => match it.next() {
                 Some(p) if db.is_none() => db = Some(PathBuf::from(p)),
                 Some(_) => return Err("--db given twice".into()),
@@ -47,7 +54,8 @@ fn parse(args: &[String]) -> Result<Args, String> {
             s => return Err(format!("unexpected argument {s}")),
         }
     }
-    Ok(Args { source: source.ok_or("missing <events.jsonl>")?, db, skip_invalid })
+    let identity = if live { ProcessIdentity::Live } else { ProcessIdentity::Demo };
+    Ok(Args { source: source.ok_or("missing <events.jsonl>")?, db, skip_invalid, identity })
 }
 
 /// Runs the subcommand with the arguments that follow its name; returns the process exit code.
@@ -64,8 +72,8 @@ fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, e
         }
     };
     let db = match &args.db {
-        Some(p) => Db::open(p, clock),
-        None => match Db::open_default(clock) {
+        Some(p) => Db::open_for(args.identity, p, clock),
+        None => match Db::open_default_for(args.identity, clock) {
             Ok(db) => db,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -129,13 +137,49 @@ mod tests {
         "{\"ts\": 1791090104.0, \"event_type\": \"ORDER_SUBMITTED\", \"pair_id\": \"p1\"}\n",
     );
 
+    // ---- live-process 3.2: `--db` follows the same environment rule as the app ----
+
+    #[test]
+    fn the_live_flag_is_optional_and_parsed_anywhere() {
+        assert_eq!(parse(&s(&["events.jsonl"])).unwrap().identity, ProcessIdentity::Demo);
+        assert_eq!(parse(&s(&["events.jsonl", "--live"])).unwrap().identity, ProcessIdentity::Live);
+        assert_eq!(parse(&s(&["--live", "events.jsonl", "--skip-invalid"])).unwrap().identity, ProcessIdentity::Live);
+        assert!(parse(&s(&["events.jsonl", "--live", "--live"])).is_err(), "given twice");
+    }
+
+    #[test]
+    fn a_live_import_cannot_touch_a_demo_database_and_the_reverse() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("events.jsonl");
+        fs::write(&src, GOOD).unwrap();
+        let demo = dir.path().join("funding.db");
+        let live = dir.path().join("funding-live.db");
+        let run = |db: &Path, live_flag: bool| {
+            let mut a = s(&[src.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+            if live_flag {
+                a.push("--live".into());
+            }
+            call(&a)
+        };
+        assert_eq!(run(&demo, false).0, 0);
+        assert_eq!(run(&live, true).0, 0);
+        let (demo_before, live_before) = (fs::read(&demo).unwrap(), fs::read(&live).unwrap());
+        for (db, flag, other) in [(&demo, true, "demo"), (&live, false, "live")] {
+            let (code, out, err) = run(db, flag);
+            assert_eq!(code, 1, "{out}{err}");
+            assert!(err.contains("environment mismatch") && err.contains(other), "{err}");
+        }
+        assert_eq!(fs::read(&demo).unwrap(), demo_before);
+        assert_eq!(fs::read(&live).unwrap(), live_before);
+    }
+
     #[test]
     fn parses_flags_in_any_order_and_rejects_bad_usage() {
         assert_eq!(
             parse(&s(&["--skip-invalid", "a.jsonl", "--db", "x.db"])).unwrap(),
-            Args { source: "a.jsonl".into(), db: Some("x.db".into()), skip_invalid: true }
+            Args { source: "a.jsonl".into(), db: Some("x.db".into()), skip_invalid: true, identity: ProcessIdentity::Demo }
         );
-        assert_eq!(parse(&s(&["a.jsonl"])).unwrap(), Args { source: "a.jsonl".into(), db: None, skip_invalid: false });
+        assert_eq!(parse(&s(&["a.jsonl"])).unwrap(), Args { source: "a.jsonl".into(), db: None, skip_invalid: false, identity: ProcessIdentity::Demo });
         for bad in [&[][..], &["--db"], &["a", "b"], &["a", "--force"], &["a", "--db", "x", "--db", "y"]] {
             assert!(parse(&s(bad)).is_err(), "{bad:?}");
         }

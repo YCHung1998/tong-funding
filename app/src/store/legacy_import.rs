@@ -846,10 +846,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = write_src(&dir, &[ev(1791090102.0, "A")]);
         let mut c = mem_db();
-        // funding-slot-tracing: v4 is supported now, so the unsupported example is 5.
-        c.execute("UPDATE schema_version SET version = 5", []).unwrap();
+        // live-process: v5 is supported now, so the unsupported example is 6.
+        c.execute("UPDATE schema_version SET version = 6", []).unwrap();
         let err = run_import_on(&mut c, &p, ImportOptions::default()).unwrap_err();
-        assert!(matches!(err, ImportError::UnsupportedSchema { found: 5 }), "{err:?}");
+        assert!(matches!(err, ImportError::UnsupportedSchema { found: 6 }), "{err:?}");
         assert_eq!(count(&c), 0);
     }
 

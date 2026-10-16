@@ -28,7 +28,8 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tong_funding_core::redact::redact_secrets;
 
 use super::events::insert_event_on;
-use super::schema::{FUNDING_LEDGER_INDEX, FUNDING_SLOTS_TABLE, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4};
+use super::schema::{FUNDING_LEDGER_INDEX, FUNDING_SLOTS_TABLE, SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5};
+use crate::identity::ProcessIdentity;
 use crate::ports::Clock;
 
 /// One schema migration step. `version` must be strictly increasing within a list.
@@ -38,10 +39,29 @@ pub struct Migration {
 }
 
 /// Every migration this build knows about; the last version is the highest supported schema.
-pub const MIGRATIONS: &[Migration] = &[Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }, Migration { version: 4, sql: SCHEMA_V4 }];
+pub const MIGRATIONS: &[Migration] = &[
+    Migration { version: 1, sql: SCHEMA_V1 },
+    Migration { version: 2, sql: SCHEMA_V2 },
+    Migration { version: 3, sql: SCHEMA_V3 },
+    Migration { version: 4, sql: SCHEMA_V4 },
+    Migration { version: 5, sql: SCHEMA_V5 },
+];
 
 /// The highest schema version this build writes.
-pub const LATEST_SCHEMA_VERSION: i64 = 4;
+pub const LATEST_SCHEMA_VERSION: i64 = 5;
+
+/// First schema version that carries the `db_venue` metadata.
+const VENUE_SCHEMA_VERSION: i64 = 5;
+/// Suffix of the copy taken before a database is upgraded to the venue-carrying schema.
+const PRE_V5_BACKUP_SUFFIX: &str = ".pre-v5.bak";
+
+/// The `db_venue` value of a process identity.
+fn venue_name(identity: ProcessIdentity) -> &'static str {
+    match identity {
+        ProcessIdentity::Demo => "demo",
+        ProcessIdentity::Live => "live",
+    }
+}
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
 
@@ -64,6 +84,10 @@ pub enum HaltReason {
     EventWriteFailed(String),
     #[error("database is already open in another instance: {0}")]
     AlreadyOpen(String),
+    /// live-process: the database belongs to another environment than this process (or carries
+    /// no environment metadata where it must). Nothing was read or written.
+    #[error("database environment mismatch: {0}")]
+    VenueMismatch(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +131,8 @@ struct Inner {
     halt: Mutex<Option<HaltReason>>,
     clock: Arc<dyn Clock>,
     path: PathBuf,
+    /// The process identity this handle was opened for (matches the database's `db_venue`).
+    identity: ProcessIdentity,
     /// Single-instance lock; released when the last clone of the handle is dropped.
     _lock: Option<File>,
 }
@@ -121,10 +147,16 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `$HOME/Library/Application Support/tong-funding/funding.db`.
+/// `$HOME/Library/Application Support/tong-funding/funding.db` (the Demo identity's database).
 pub fn default_db_path_from(home: Option<&str>) -> Result<PathBuf, StoreError> {
+    default_db_path_for(ProcessIdentity::Demo, home)
+}
+
+/// The default database of `identity`: `funding.db` (Demo) or `funding-live.db` (Live), in the
+/// same data directory.
+pub fn default_db_path_for(identity: ProcessIdentity, home: Option<&str>) -> Result<PathBuf, StoreError> {
     let home = home.filter(|h| !h.is_empty()).ok_or(StoreError::HomeNotSet)?;
-    Ok(PathBuf::from(home).join("Library/Application Support/tong-funding/funding.db"))
+    Ok(PathBuf::from(home).join("Library/Application Support/tong-funding").join(identity.db_file_name()))
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
@@ -160,10 +192,20 @@ fn classify(e: rusqlite::Error) -> HaltReason {
     }
 }
 
-fn migrate(conn: &mut Connection, migrations: &[Migration], current: i64) -> rusqlite::Result<()> {
+/// Whether this migration list carries the venue-bearing schema (production always does; the
+/// generic framework tests inject shorter lists without it).
+fn has_venue_schema(migrations: &[Migration]) -> bool {
+    migrations.iter().any(|m| m.sql == SCHEMA_V5)
+}
+
+fn migrate(conn: &mut Connection, migrations: &[Migration], current: i64, venue: &str) -> rusqlite::Result<()> {
     for m in migrations.iter().filter(|m| m.version > current) {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute_batch(m.sql)?;
+        if m.sql == SCHEMA_V5 {
+            // Same transaction as the schema: a database never exists at v5 without its venue.
+            tx.execute("INSERT INTO db_meta (key, value) VALUES ('db_venue', ?1)", [venue])?;
+        }
         tx.execute("UPDATE schema_version SET version = ?1", [m.version])?;
         tx.commit()?;
     }
@@ -173,6 +215,8 @@ fn migrate(conn: &mut Connection, migrations: &[Migration], current: i64) -> rus
 /// How the open behaves; tests inject variations.
 struct OpenCfg {
     take_lock: bool,
+    /// Who is opening: decides the venue a new database gets and the venue an old one must have.
+    identity: ProcessIdentity,
     /// chmod for the parent directory (injectable to simulate EPERM).
     set_dir_mode: fn(&Path, u32) -> std::io::Result<()>,
 }
@@ -274,13 +318,54 @@ fn required_from_v3(migrations: &[Migration], version: i64) -> &'static [(&'stat
     if applied { &[("table", FUNDING_SLOTS_TABLE)] } else { &[] }
 }
 
+/// Objects required once this build's live-process v5 migration has been applied.
+fn required_from_v5(migrations: &[Migration], version: i64) -> &'static [(&'static str, &'static str)] {
+    let applied = migrations.iter().any(|m| m.version <= version && m.sql == SCHEMA_V5);
+    if applied {
+        &[("table", "db_meta"), ("trigger", "db_meta_no_update"), ("trigger", "db_meta_no_delete"), ("trigger", "db_meta_no_second_row")]
+    } else {
+        &[]
+    }
+}
+
+/// The only triggers allowed on `db_meta`.
+const ALLOWED_META_TRIGGERS: &[&str] = &["db_meta_no_update", "db_meta_no_delete", "db_meta_no_second_row"];
+
+/// The stored `db_venue`, if the row exists. The table must exist (callers verified the schema).
+fn read_venue(conn: &Connection) -> Result<Option<String>, HaltReason> {
+    let mut st = conn.prepare("SELECT value FROM db_meta WHERE key = 'db_venue'").map_err(classify)?;
+    let mut rows = st.query([]).map_err(classify)?;
+    match rows.next().map_err(classify)? {
+        Some(r) => Ok(Some(r.get::<_, String>(0).map_err(classify)?)),
+        None => Ok(None),
+    }
+}
+
+/// The stored venue must be exactly this process's. Anything else (another venue, no row) halts.
+fn check_venue(conn: &Connection, identity: ProcessIdentity, path: &Path) -> Result<(), HaltReason> {
+    let want = venue_name(identity);
+    match read_venue(conn)? {
+        Some(found) if found == want => Ok(()),
+        Some(found) => Err(HaltReason::VenueMismatch(format!(
+            "{} is a {found} database but this process is {want}; refusing to open it",
+            path.display()
+        ))),
+        None => Err(HaltReason::VenueMismatch(format!("{} has no environment metadata (db_venue); refusing to open it", path.display()))),
+    }
+}
+
 fn current_version(conn: &Connection) -> Result<i64, HaltReason> {
     conn.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_version", [], |r| r.get(0)).map_err(classify)
 }
 
 fn verify_required_objects(conn: &Connection, migrations: &[Migration]) -> Result<(), HaltReason> {
     let version = current_version(conn)?;
-    for (kind, name) in REQUIRED_OBJECTS.iter().chain(required_from_v2(migrations, version)).chain(required_from_v3(migrations, version)) {
+    let required = REQUIRED_OBJECTS
+        .iter()
+        .chain(required_from_v2(migrations, version))
+        .chain(required_from_v3(migrations, version))
+        .chain(required_from_v5(migrations, version));
+    for (kind, name) in required {
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2", [kind, name], |r| r.get(0))
             .map_err(classify)?;
@@ -299,13 +384,22 @@ fn verify_required_objects(conn: &Connection, migrations: &[Migration]) -> Resul
     if let Some(bad) = names.iter().find(|n| !ALLOWED_EVENT_TRIGGERS.contains(&n.as_str())) {
         return Err(HaltReason::Corrupt(format!("unexpected trigger {bad} on events")));
     }
+    if required_from_v5(migrations, version).is_empty() {
+        return Ok(());
+    }
+    let mut st = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'db_meta'").map_err(classify)?;
+    let meta: Vec<String> = st.query_map([], |r| r.get::<_, String>(0)).map_err(classify)?.collect::<Result<_, _>>().map_err(classify)?;
+    if let Some(bad) = meta.iter().find(|n| !ALLOWED_META_TRIGGERS.contains(&n.as_str())) {
+        return Err(HaltReason::Corrupt(format!("unexpected trigger {bad} on db_meta")));
+    }
     Ok(())
 }
 
 /// What the store's own connection refuses to do: weaken the `events` guarantees.
 /// Installed after migrations (which legitimately alter schema) and before any use.
 fn authorize(action: AuthAction<'_>) -> Authorization {
-    let is_events = |t: &str| t.eq_ignore_ascii_case("events");
+    // `events` (append-only) and `db_meta` (the immutable environment binding) are both protected.
+    let is_events = |t: &str| t.eq_ignore_ascii_case("events") || t.eq_ignore_ascii_case("db_meta");
     match action {
         AuthAction::DropTable { table_name }
         | AuthAction::AlterTable { table_name, .. }
@@ -384,7 +478,7 @@ fn open_connection(path: &Path, migrations: &[Migration], cfg: &OpenCfg) -> Resu
         perm_events.extend(tighten_parent(parent, meta.uid(), cfg.set_dir_mode));
     }
 
-    match open_inner(path, migrations, !created, &mut perm_events) {
+    match open_inner(path, migrations, !created, cfg.identity, &mut perm_events) {
         Ok(conn) => Ok(Opened { conn, perm_events, lock }),
         Err(reason) => {
             if created {
@@ -398,7 +492,26 @@ fn open_connection(path: &Path, migrations: &[Migration], cfg: &OpenCfg) -> Resu
     }
 }
 
-fn open_inner(path: &Path, migrations: &[Migration], existing: bool, perm_events: &mut Vec<PermEvent>) -> Result<Connection, HaltReason> {
+/// Copy a database that is about to be upgraded to the venue-bearing schema to
+/// `<path>.pre-v5.bak` (a consistent snapshot, owner-only). An existing backup is never replaced.
+/// A backup that cannot be taken blocks the upgrade (fail closed): the old file stays untouched.
+fn backup_before_upgrade(ro: &Connection, path: &Path) -> Result<(), HaltReason> {
+    let bak = sidecar(path, PRE_V5_BACKUP_SUFFIX);
+    let fail = |why: String| HaltReason::MigrationFailed(format!("cannot back up {} before the upgrade: {why}", path.display()));
+    reject_symlink(&bak)?;
+    if std::fs::symlink_metadata(&bak).is_ok() {
+        return Ok(());
+    }
+    let target = bak.to_str().ok_or_else(|| fail("backup path is not valid UTF-8".into()))?;
+    if let Err(e) = ro.execute("VACUUM INTO ?1", [target]) {
+        let _ = std::fs::remove_file(&bak);
+        return Err(fail(e.to_string()));
+    }
+    std::fs::set_permissions(&bak, std::fs::Permissions::from_mode(0o600)).map_err(|e| fail(e.to_string()))?;
+    Ok(())
+}
+
+fn open_inner(path: &Path, migrations: &[Migration], existing: bool, identity: ProcessIdentity, perm_events: &mut Vec<PermEvent>) -> Result<Connection, HaltReason> {
     let io = |e: std::io::Error| HaltReason::CannotOpen(e.to_string());
     let no_ckpt = rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;
 
@@ -429,6 +542,21 @@ fn open_inner(path: &Path, migrations: &[Migration], existing: bool, perm_events
             return Err(HaltReason::SchemaTooNew { found: current, supported });
         }
         verify_required_objects(&ro, migrations)?;
+        if has_venue_schema(migrations) {
+            if current >= VENUE_SCHEMA_VERSION {
+                // Already bound to an environment: it must be this process's.
+                check_venue(&ro, identity, path)?;
+            } else if identity == ProcessIdentity::Live {
+                // An old database has no environment metadata. Only a Demo process may adopt it
+                // (it is the only identity that ever wrote such files); live never does.
+                return Err(HaltReason::VenueMismatch(format!(
+                    "{} has no environment metadata (db_venue); a live process only opens databases it created",
+                    path.display()
+                )));
+            } else {
+                backup_before_upgrade(&ro, path)?;
+            }
+        }
     }
 
     let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(classify)?;
@@ -444,8 +572,12 @@ fn open_inner(path: &Path, migrations: &[Migration], existing: bool, perm_events
     conn.pragma_update(None, "fullfsync", true).map_err(classify)?;
     conn.pragma_update(None, "checkpoint_fullfsync", true).map_err(classify)?;
 
-    migrate(&mut conn, migrations, current).map_err(|e| HaltReason::MigrationFailed(e.to_string()))?;
+    migrate(&mut conn, migrations, current, venue_name(identity)).map_err(|e| HaltReason::MigrationFailed(e.to_string()))?;
     verify_required_objects(&conn, migrations)?;
+    if has_venue_schema(migrations) {
+        // Whatever path got us here (new file, upgrade, plain reopen), the stored venue is ours.
+        check_venue(&conn, identity, path)?;
+    }
 
     let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).map_err(classify)?;
     if !mode.eq_ignore_ascii_case("wal") {
@@ -465,36 +597,53 @@ fn open_inner(path: &Path, migrations: &[Migration], existing: bool, perm_events
 impl Db {
     /// Open the database at the default path (reads the `HOME` environment variable).
     pub fn open_default(clock: Arc<dyn Clock>) -> Result<Db, StoreError> {
-        let home = std::env::var("HOME").ok();
-        Ok(Db::open(&default_db_path_from(home.as_deref())?, clock))
+        Db::open_default_for(ProcessIdentity::Demo, clock)
     }
 
+    /// Open the default database of `identity` (`funding.db` / `funding-live.db`).
+    pub fn open_default_for(identity: ProcessIdentity, clock: Arc<dyn Clock>) -> Result<Db, StoreError> {
+        let home = std::env::var("HOME").ok();
+        Ok(Db::open_for(identity, &default_db_path_for(identity, home.as_deref())?, clock))
+    }
+
+    /// Open as the Demo identity (the behaviour before live-process existed).
     pub fn open(path: &Path, clock: Arc<dyn Clock>) -> Db {
-        Db::open_with(path, clock, MIGRATIONS)
+        Db::open_for(ProcessIdentity::Demo, path, clock)
+    }
+
+    /// Open `path` as `identity`: a new file is stamped with it, an existing one must carry the
+    /// same `db_venue` (Demo alone may adopt an old, unstamped database). A mismatch halts.
+    pub fn open_for(identity: ProcessIdentity, path: &Path, clock: Arc<dyn Clock>) -> Db {
+        Db::open_impl(path, clock, MIGRATIONS, OpenCfg { take_lock: true, identity, set_dir_mode: real_chmod })
+    }
+
+    /// The process identity this handle was opened for.
+    pub fn identity(&self) -> ProcessIdentity {
+        self.inner.identity
     }
 
     /// Test-only: like [`Db::open`] but without the single-instance lock, so a test can hold
     /// two handles on one file (to exercise contention between connections).
     #[cfg(test)]
     pub(crate) fn open_unlocked(path: &Path, clock: Arc<dyn Clock>) -> Db {
-        Db::open_impl(path, clock, MIGRATIONS, OpenCfg { take_lock: false, set_dir_mode: real_chmod })
+        Db::open_impl(path, clock, MIGRATIONS, OpenCfg { take_lock: false, identity: ProcessIdentity::Demo, set_dir_mode: real_chmod })
     }
 
     /// Test-only: inject the chmod used on the parent directory (to simulate EPERM).
     #[cfg(test)]
     pub(crate) fn open_with_dir_chmod_for_tests(path: &Path, clock: Arc<dyn Clock>, f: fn(&Path, u32) -> std::io::Result<()>) -> Db {
-        Db::open_impl(path, clock, MIGRATIONS, OpenCfg { take_lock: true, set_dir_mode: f })
+        Db::open_impl(path, clock, MIGRATIONS, OpenCfg { take_lock: true, identity: ProcessIdentity::Demo, set_dir_mode: f })
     }
 
     /// Like [`Db::open`] with an explicit migration list (tests inject failing migrations).
     pub fn open_with(path: &Path, clock: Arc<dyn Clock>, migrations: &[Migration]) -> Db {
-        Db::open_impl(path, clock, migrations, OpenCfg { take_lock: true, set_dir_mode: real_chmod })
+        Db::open_impl(path, clock, migrations, OpenCfg { take_lock: true, identity: ProcessIdentity::Demo, set_dir_mode: real_chmod })
     }
 
     fn open_impl(path: &Path, clock: Arc<dyn Clock>, migrations: &[Migration], cfg: OpenCfg) -> Db {
         match open_connection(path, migrations, &cfg) {
             Ok(Opened { conn, perm_events, lock }) => {
-                let db = Db::from_parts(Some(conn), None, clock, path, lock);
+                let db = Db::from_parts(Some(conn), None, clock, path, cfg.identity, lock);
                 for ev in perm_events {
                     let ts = db.now_ms();
                     let (ty, payload) = match ev {
@@ -522,13 +671,13 @@ impl Db {
                 }
                 db
             }
-            Err(reason) => Db::from_parts(None, Some(reason), clock, path, None),
+            Err(reason) => Db::from_parts(None, Some(reason), clock, path, cfg.identity, None),
         }
     }
 
-    fn from_parts(conn: Option<Connection>, halt: Option<HaltReason>, clock: Arc<dyn Clock>, path: &Path, lock: Option<File>) -> Db {
+    fn from_parts(conn: Option<Connection>, halt: Option<HaltReason>, clock: Arc<dyn Clock>, path: &Path, identity: ProcessIdentity, lock: Option<File>) -> Db {
         Db {
-            inner: Arc::new(Inner { conn: Mutex::new(conn), halt: Mutex::new(halt), clock, path: path.to_path_buf(), _lock: lock }),
+            inner: Arc::new(Inner { conn: Mutex::new(conn), halt: Mutex::new(halt), clock, path: path.to_path_buf(), identity, _lock: lock }),
         }
     }
 
@@ -630,6 +779,10 @@ impl Db {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "db_venue_tests.rs"]
+mod venue_tests;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -757,7 +910,7 @@ mod tests {
         }
         assert!(index_exists(&db, crate::store::schema::FUNDING_LEDGER_INDEX));
         drop(db);
-        assert_eq!(schema_version(&dir.path().join("funding.db")), 4);
+        assert_eq!(schema_version(&dir.path().join("funding.db")), 5);
     }
 
     fn index_exists(db: &Db, name: &str) -> bool {
@@ -793,7 +946,7 @@ mod tests {
         });
         assert!(dup.is_err(), "{dup:?}");
         drop(db);
-        assert_eq!(schema_version(&p), 4);
+        assert_eq!(schema_version(&p), 5);
     }
 
     #[test]
@@ -937,15 +1090,15 @@ mod tests {
         let dir = crate::store::db::test_support::tempdir();
         let p = dir.path().join("funding.db");
         populated(&p);
-        // funding-pnl: this build supports v2, so "newer" is now 5 (v3 = funding_slots, v4 = its NO_SETTLEMENT resolution).
-        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 5", []).unwrap();
+        // funding-pnl: this build supports v2, so "newer" is now 6 (v3 = funding_slots, v4 = its NO_SETTLEMENT resolution, v5 = db_meta).
+        Connection::open(&p).unwrap().execute("UPDATE schema_version SET version = 6", []).unwrap();
         let before = std::fs::read(&p).unwrap();
         let (c, _) = clock(9);
         let db = Db::open(&p, c);
-        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 5, supported: 4 }));
+        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 6, supported: 5 }));
         drop(db);
         assert_eq!(std::fs::read(&p).unwrap(), before, "file must not be modified");
-        assert_eq!(schema_version(&p), 5, "no downgrade");
+        assert_eq!(schema_version(&p), 6, "no downgrade");
     }
 
     #[test]
@@ -1004,12 +1157,12 @@ mod tests {
     }
 
     // The generic framework tests add a hypothetical next migration on top of this build's list
-    // (funding-pnl made the real list v1 + v2 + v3 + v4, so "next" is v5).
+    // (the real list is v1..v5, so "next" is v6).
     const GOOD_NEXT: &str = "CREATE TABLE next_added (x INTEGER);";
     const BAD_NEXT: &str = "CREATE TABLE half_applied (x INTEGER); THIS IS NOT SQL;";
 
     fn migrations(next: &'static str) -> Vec<Migration> {
-        vec![Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }, Migration { version: 4, sql: SCHEMA_V4 }, Migration { version: 5, sql: next }]
+        vec![Migration { version: 1, sql: SCHEMA_V1 }, Migration { version: 2, sql: SCHEMA_V2 }, Migration { version: 3, sql: SCHEMA_V3 }, Migration { version: 4, sql: SCHEMA_V4 }, Migration { version: 5, sql: SCHEMA_V5 }, Migration { version: 6, sql: next }]
     }
 
     #[test]
@@ -1024,7 +1177,7 @@ mod tests {
         let n: i64 = db.with_conn(|c| Ok(c.query_row("SELECT COUNT(*) FROM events WHERE event_type='X'", [], |r| r.get(0))?)).unwrap();
         assert_eq!(n, 400, "existing data preserved");
         drop(db);
-        assert_eq!(schema_version(&p), 5);
+        assert_eq!(schema_version(&p), 6);
     }
 
     #[test]
@@ -1037,7 +1190,7 @@ mod tests {
         let db = Db::open_with(&p, c, &migrations(BAD_NEXT));
         assert!(matches!(db.halt_reason(), Some(HaltReason::MigrationFailed(_))), "{:?}", db.halt_reason());
         drop(db);
-        assert_eq!(schema_version(&p), 4);
+        assert_eq!(schema_version(&p), 5);
         let c = Connection::open(&p).unwrap();
         let n: i64 = c.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name='half_applied'", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 0, "no half-applied migration");
@@ -1084,7 +1237,7 @@ mod tests {
         let c = Connection::open(p).unwrap();
         c.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
         c.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0)).unwrap();
-        c.execute("UPDATE schema_version SET version = 5", []).unwrap();
+        c.execute("UPDATE schema_version SET version = 6", []).unwrap();
         drop(c);
         assert!(std::fs::metadata(sidecar(p, "-wal")).unwrap().len() > 0, "fixture must leave a -wal behind");
     }
@@ -1097,7 +1250,7 @@ mod tests {
         let (main_before, wal_before) = (bytes_of(&p), bytes_of(&sidecar(&p, "-wal")));
         let (c, _) = clock(9);
         let db = Db::open(&p, c);
-        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 5, supported: 4 }));
+        assert_eq!(db.halt_reason(), Some(HaltReason::SchemaTooNew { found: 6, supported: 5 }));
         drop(db);
         assert!(bytes_of(&p) == main_before, "main file must be byte-identical");
         assert!(bytes_of(&sidecar(&p, "-wal")) == wal_before, "-wal must be byte-identical (and still exist)");
@@ -1280,7 +1433,7 @@ mod tests {
         let db = Db::open_with(&p, c, &migrations("ALTER TABLE events ADD COLUMN extra TEXT;"));
         assert!(!db.is_halted(), "{:?}", db.halt_reason());
         drop(db);
-        assert_eq!(schema_version(&p), 5, "the migration really ran");
+        assert_eq!(schema_version(&p), 6, "the migration really ran");
     }
 
     #[test]

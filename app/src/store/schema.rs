@@ -8,6 +8,9 @@ pub const SCHEMA_V2: &str = include_str!("schema_v2.sql");
 pub const SCHEMA_V3: &str = include_str!("schema_v3.sql");
 /// funding slots: `NO_SETTLEMENT` resolution (table rebuilt with the wider CHECK).
 pub const SCHEMA_V4: &str = include_str!("schema_v4.sql");
+/// live-process: the immutable `db_meta` row (`db_venue` = demo | live) binding a database to a
+/// process identity.
+pub const SCHEMA_V5: &str = include_str!("schema_v5.sql");
 /// Name of the table created by [`SCHEMA_V3`] (required from schema v3 on).
 pub const FUNDING_SLOTS_TABLE: &str = "funding_slots";
 /// Name of the index created by [`SCHEMA_V2`] (required from schema v2 on).

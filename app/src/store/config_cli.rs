@@ -3,9 +3,13 @@
 //! spec. Headless: runs before any window is opened.
 //!
 //! ```text
-//! tong-funding config show [--db <funding.db>]
-//! tong-funding config set <risk|risk_overrides> '<json>' [--db <funding.db>]
+//! tong-funding config show [--live] [--db <funding.db>]
+//! tong-funding config set <risk|risk_overrides> '<json>' [--live] [--db <funding.db>]
 //! ```
+//!
+//! `--live` selects the Live identity (default database `funding-live.db`). The database must
+//! belong to that environment (`db_venue`): a Live tool cannot open a demo database and the
+//! reverse (live-process 3.2). Without `--live` nothing changes (Demo).
 //!
 //! `set` validates with core (`RiskConfig::from_json` / `parse_overrides`) before writing, writes
 //! with optimistic locking and records a `CONFIG_UPDATED` event (`source: "cli"`). The value
@@ -20,6 +24,7 @@ use serde_json::{Value, json};
 use tong_funding_core::redact::redact_secrets;
 use tong_funding_core::risk::{RiskConfig, parse_overrides};
 
+use crate::identity::ProcessIdentity;
 use crate::ports::{Clock, SystemClock};
 use crate::store::db::Db;
 use crate::store::events::EventStore;
@@ -31,7 +36,7 @@ pub const KEY_RISK: &str = "risk";
 pub const KEY_RISK_OVERRIDES: &str = "risk_overrides";
 pub const CONFIG_UPDATED: &str = "CONFIG_UPDATED";
 
-const USAGE: &str = "usage:\n  tong-funding config show [--db <funding.db>]\n  tong-funding config set <risk|risk_overrides> '<json>' [--db <funding.db>]\n\nexample:\n  tong-funding config set risk '{\"net_edge_threshold_pct\":\"0.01\",\"est_slippage_pct\":\"0.02\",\"taker_fee_pct\":{\"Binance\":\"0.05\",\"Bybit\":\"0.055\",\"Okx\":\"0.05\"}}'\n  tong-funding config set risk_overrides '{\"Bybit\":{\"est_slippage_pct\":\"0.03\"}}'";
+const USAGE: &str = "usage:\n  tong-funding config show [--live] [--db <funding.db>]\n  tong-funding config set <risk|risk_overrides> '<json>' [--live] [--db <funding.db>]\n\nexample:\n  tong-funding config set risk '{\"net_edge_threshold_pct\":\"0.01\",\"est_slippage_pct\":\"0.02\",\"taker_fee_pct\":{\"Binance\":\"0.05\",\"Bybit\":\"0.055\",\"Okx\":\"0.05\"}}'\n  tong-funding config set risk_overrides '{\"Bybit\":{\"est_slippage_pct\":\"0.03\"}}'";
 
 #[derive(Debug, PartialEq)]
 enum Cmd {
@@ -39,8 +44,9 @@ enum Cmd {
     Set { key: String, value: Value },
 }
 
-fn parse(args: &[String]) -> Result<(Cmd, Option<PathBuf>), String> {
+fn parse(args: &[String]) -> Result<(Cmd, Option<PathBuf>, ProcessIdentity), String> {
     let mut db = None;
+    let mut live = false;
     let mut rest = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -50,6 +56,8 @@ fn parse(args: &[String]) -> Result<(Cmd, Option<PathBuf>), String> {
                 Some(_) => return Err("--db given twice".into()),
                 None => return Err("--db needs a path".into()),
             },
+            "--live" if live => return Err("--live given twice".into()),
+            "--live" => live = true,
             s if s.starts_with("--") => return Err(format!("unknown option {s}")),
             s => rest.push(s.to_string()),
         }
@@ -67,7 +75,7 @@ fn parse(args: &[String]) -> Result<(Cmd, Option<PathBuf>), String> {
         [] => return Err("missing command".into()),
         [c, ..] => return Err(format!("unknown command {c}")),
     };
-    Ok((cmd, db))
+    Ok((cmd, db, if live { ProcessIdentity::Live } else { ProcessIdentity::Demo }))
 }
 
 /// Validates a value for `key` with core; the error names the offending field.
@@ -85,7 +93,7 @@ pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 }
 
 fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let (cmd, path) = match parse(args) {
+    let (cmd, path, identity) = match parse(args) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(err, "{e}\n{USAGE}");
@@ -93,8 +101,8 @@ fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, e
         }
     };
     let db = match &path {
-        Some(p) => Db::open(p, clock),
-        None => match Db::open_default(clock) {
+        Some(p) => Db::open_for(identity, p, clock),
+        None => match Db::open_default_for(identity, clock) {
             Ok(db) => db,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
@@ -273,6 +281,80 @@ mod tests {
         assert_eq!(call(&p, &["set", "max_leverage", "3"]).0, 2);
         assert_eq!(call(&p, &["set", "risk", "{not json"]).0, 2);
         assert_eq!(call(&p, &["frobnicate"]).0, 2);
+    }
+
+    // ---- live-process 3.2: `--db` follows the same environment rule as the app ----
+
+    fn call_live(db: &std::path::Path, args: &[&str]) -> (i32, String, String) {
+        let mut full = s(args);
+        full.push("--live".into());
+        full.push("--db".into());
+        full.push(db.display().to_string());
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), &mut out, &mut err);
+        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    }
+
+    #[test]
+    fn the_live_flag_is_optional_and_parsed_anywhere() {
+        assert_eq!(parse(&s(&["show"])).unwrap().2, ProcessIdentity::Demo);
+        assert_eq!(parse(&s(&["show", "--live"])).unwrap().2, ProcessIdentity::Live);
+        assert_eq!(parse(&s(&["--live", "set", "risk", "{}"])).unwrap().2, ProcessIdentity::Live);
+        assert!(parse(&s(&["show", "--live", "--live"])).is_err(), "given twice");
+    }
+
+    #[test]
+    fn a_live_tool_cannot_open_a_demo_database_and_writes_nothing() {
+        let dir = tempdir();
+        let p = dir.path().join("funding.db");
+        assert_eq!(call(&p, &["set", "risk", FULL]).0, 0, "creates a demo database");
+        let before = std::fs::read(&p).unwrap();
+        for args in [&["show"][..], &["set", "risk", r#"{"net_edge_threshold_pct":"0.02"}"#]] {
+            let (code, _, err) = call_live(&p, args);
+            assert_eq!(code, 1, "{args:?}");
+            assert!(err.contains("environment mismatch") && err.contains("demo"), "{err}");
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), before, "the demo database is untouched");
+    }
+
+    #[test]
+    fn a_demo_tool_cannot_open_a_live_database_and_writes_nothing() {
+        let dir = tempdir();
+        let p = dir.path().join("funding-live.db");
+        let (code, _, err) = call_live(&p, &["set", "risk", FULL]);
+        assert_eq!(code, 0, "{err}");
+        let before = std::fs::read(&p).unwrap();
+        for args in [&["show"][..], &["set", "risk", r#"{"net_edge_threshold_pct":"0.02"}"#]] {
+            let (code, _, err) = call(&p, args);
+            assert_eq!(code, 1, "{args:?}");
+            assert!(err.contains("environment mismatch") && err.contains("live"), "{err}");
+        }
+        assert_eq!(std::fs::read(&p).unwrap(), before, "the live database is untouched");
+        // And the live tool still works on its own database.
+        let (code, out, _) = call_live(&p, &["show"]);
+        assert_eq!(code, 0);
+        assert!(out.contains("risk (version 1)"), "{out}");
+    }
+
+    #[test]
+    fn a_live_tool_refuses_an_old_demo_database_without_metadata() {
+        let dir = tempdir();
+        let p = dir.path().join("funding.db");
+        {
+            let migrations = [
+                crate::store::db::Migration { version: 1, sql: crate::store::schema::SCHEMA_V1 },
+                crate::store::db::Migration { version: 2, sql: crate::store::schema::SCHEMA_V2 },
+                crate::store::db::Migration { version: 3, sql: crate::store::schema::SCHEMA_V3 },
+                crate::store::db::Migration { version: 4, sql: crate::store::schema::SCHEMA_V4 },
+            ];
+            let db = Db::open_with(&p, Arc::new(ManualClock::new(1)), &migrations);
+            assert!(!db.is_halted());
+        }
+        let before = std::fs::read(&p).unwrap();
+        let (code, _, err) = call_live(&p, &["show"]);
+        assert_eq!(code, 1);
+        assert!(err.contains("environment"), "{err}");
+        assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 
     #[test]

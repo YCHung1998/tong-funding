@@ -197,7 +197,7 @@ fn funding_slots_store_v4_keeps_the_v3_rows_and_accepts_no_settlement() {
     }
     let db = Db::open(&path, clock);
     assert!(!db.is_halted(), "{:?}", db.halt_reason());
-    assert_eq!(MIGRATIONS.last().unwrap().version, 4);
+    assert_eq!(MIGRATIONS.last().unwrap().version, 5);
     let rows = db.slots_of_pair("p1").unwrap();
     assert_eq!(rows.len(), 2, "both rows survive the rebuild");
     assert_eq!(db.get_slot("p1", SlotLeg::Long, T).unwrap().unwrap(), manual);
