@@ -161,3 +161,44 @@ fn a_bridge_started_with_an_identity_hands_it_to_every_snapshot() {
 fn the_default_snapshot_is_demo() {
     assert_eq!(UiSnapshot::default().identity, ProcessIdentity::Demo);
 }
+
+// ---- live-guardrails G: the live status and the three live commands reach the pages ----------
+
+#[test]
+fn the_default_snapshot_has_an_empty_live_status() {
+    let live = UiSnapshot::default().live;
+    assert_eq!(live, LiveStatusView::default());
+    assert!(!live.is_live && !live.armed && live.preflight.is_none() && live.frozen.is_none());
+}
+
+#[test]
+fn a_live_status_update_replaces_the_view_and_the_view_mirrors_the_engine_status() {
+    use crate::engine::live_guard::LiveStatus;
+    let mut snap = UiSnapshot::default();
+    let status = LiveStatus { is_live: true, armed: true, pairs_entered: 2, preflight_running: true, last_lock_reason: Some("why".into()), ..LiveStatus::default() };
+    apply_update(&mut snap, SourceUpdate::LiveStatus(LiveStatusView::from(&status)));
+    assert!(snap.live.is_live && snap.live.armed && snap.live.preflight_running);
+    assert_eq!((snap.live.pairs_entered, snap.live.last_lock_reason.as_deref()), (2, Some("why")));
+    apply_update(&mut snap, SourceUpdate::LiveStatus(LiveStatusView::default()));
+    assert_eq!(snap.live, LiveStatusView::default());
+}
+
+#[test]
+fn the_default_command_sink_methods_send_exactly_the_live_commands() {
+    use crate::engine::ports::Leg;
+    use std::cell::RefCell;
+    struct Rec(RefCell<Vec<(String, Command)>>);
+    impl CommandSink for Rec {
+        fn send(&self, label: String, command: Command) {
+            self.0.borrow_mut().push((label, command));
+        }
+    }
+    let s = Rec(RefCell::new(Vec::new()));
+    s.run_preflight("preflight".into());
+    s.arm("arm".into(), "pf-1".into(), "hash".into(), "confirm".into(), true);
+    s.flatten_leg("flatten".into(), "pair-1".into(), Leg::Short);
+    let sent = s.0.borrow();
+    assert_eq!(sent[0], ("preflight".to_string(), Command::RunPreflight));
+    assert_eq!(sent[1], ("arm".to_string(), Command::Arm { preflight_id: "pf-1".into(), caps_hash: "hash".into(), confirmation: "confirm".into(), checklist_ack: true }));
+    assert_eq!(sent[2], ("flatten".to_string(), Command::FlattenLeg { pair: "pair-1".into(), leg: Leg::Short }));
+}

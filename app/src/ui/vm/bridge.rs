@@ -276,6 +276,49 @@ pub struct CommandOutcome {
 /// no page holds an exchange client). Replies come back as [`SourceUpdate::CommandResult`].
 pub trait CommandSink {
     fn send(&self, label: String, command: Command);
+
+    /// live-guardrails: ask the engine for a preflight; the result arrives as `UiSnapshot::live.preflight`.
+    fn run_preflight(&self, label: String) {
+        self.send(label, Command::RunPreflight);
+    }
+
+    /// live-guardrails: arm with the fields the engine verifies itself (fresh preflight id, caps hash,
+    /// the confirmation sentence, the checklist). The page only forwards what the user typed.
+    fn arm(&self, label: String, preflight_id: String, caps_hash: String, confirmation: String, checklist_ack: bool) {
+        self.send(label, Command::Arm { preflight_id, caps_hash, confirmation, checklist_ack });
+    }
+
+    /// live-guardrails: close ONE leg of a pair that is not whole (reduce-only; Live only, allowed while locked).
+    fn flatten_leg(&self, label: String, pair: String, leg: crate::engine::ports::Leg) {
+        self.send(label, Command::FlattenLeg { pair, leg });
+    }
+}
+
+/// live-guardrails: the engine's Live status as the pages read it (a copy; the pages never touch the
+/// engine). Empty (`Default`) in a Demo process and before the engine published anything.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct LiveStatusView {
+    pub is_live: bool,
+    pub armed: bool,
+    pub frozen: Option<crate::engine::live_guard::FrozenCaps>,
+    pub pairs_entered: u32,
+    pub preflight_running: bool,
+    pub preflight: Option<crate::engine::preflight::PreflightReport>,
+    pub last_lock_reason: Option<String>,
+}
+
+impl From<&crate::engine::live_guard::LiveStatus> for LiveStatusView {
+    fn from(s: &crate::engine::live_guard::LiveStatus) -> Self {
+        LiveStatusView {
+            is_live: s.is_live,
+            armed: s.armed,
+            frozen: s.frozen.clone(),
+            pairs_entered: s.pairs_entered,
+            preflight_running: s.preflight_running,
+            preflight: s.preflight.clone(),
+            last_lock_reason: s.last_lock_reason.clone(),
+        }
+    }
 }
 
 /// How many command replies the snapshot keeps.
@@ -357,6 +400,8 @@ pub struct UiSnapshot {
     pub bybit_ws_disabled: bool,
     /// live-banners: which world this process is (fixed at start; `Demo` only for a bare default).
     pub identity: crate::identity::ProcessIdentity,
+    /// live-guardrails: the engine's Live status (armed, frozen caps, preflight); empty in Demo.
+    pub live: LiveStatusView,
 }
 
 impl UiSnapshot {
@@ -411,6 +456,8 @@ pub enum SourceUpdate {
     Funding(BTreeMap<String, crate::ui::funding::PairFunding>),
     /// The OKX latch tripped (the one shared `OkxLatch`): why OKX is disabled until restart.
     OkxDisabled(String),
+    /// live-guardrails: the engine's Live status changed.
+    LiveStatus(LiveStatusView),
     /// The Bybit WebSocket feed is off by the roll-back switch (sent once at start).
     BybitWsDisabled,
 }
@@ -509,6 +556,7 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         }
         SourceUpdate::Funding(f) => snap.funding = f,
         SourceUpdate::OkxDisabled(why) => snap.okx_disabled = Some(why),
+        SourceUpdate::LiveStatus(v) => snap.live = v,
         SourceUpdate::BybitWsDisabled => snap.bybit_ws_disabled = true,
     }
 }
