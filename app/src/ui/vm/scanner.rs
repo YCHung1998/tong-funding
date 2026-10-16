@@ -10,7 +10,7 @@ use tong_funding_core::net_edge::{NetEdgeParams, best_opportunity_with, legs_set
 use tong_funding_core::risk::{EffectiveConfig, RiskConfig, RiskOverrides, effective_for_pair};
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::bridge::{ClockState, MarketFeed, Settings, SourceId, UiSnapshot, is_tradable};
+use super::bridge::{ClockState, MarketFeed, Settings, SourceId, UiSnapshot, tradable_exchanges};
 use super::format::{self, DASH};
 use crate::ui::theme::{Tone, funding_tone};
 
@@ -497,7 +497,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> ScannerVm {
         }
     }
 
-    let tradable: Vec<Exchange> = enabled.iter().copied().filter(|e| is_tradable(*e)).collect();
+    let tradable: Vec<Exchange> = enabled.iter().copied().filter(|e| tradable_exchanges(snap.identity).contains(e)).collect();
     let tradable_pairs = pairs_of(&tradable);
     let decidable = settings.error.is_none()
         && if tradable_pairs.is_empty() {
@@ -513,7 +513,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> ScannerVm {
             continue;
         }
         let cells = Exchange::ALL.map(|e| (e, cell_for(by_ex.get(&e).copied(), enabled.contains(&e), feed(e).failing())));
-        let candidates: Vec<&FundingObservation> = listed.iter().copied().filter(|o| is_tradable(o.exchange)).collect();
+        let candidates: Vec<&FundingObservation> = listed.iter().copied().filter(|o| tradable_exchanges(snap.identity).contains(&o.exchange)).collect();
         let mut row = ScanRow {
             rank: 0,
             symbol: symbol.to_string(),

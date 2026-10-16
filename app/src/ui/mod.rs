@@ -81,6 +81,8 @@ mod notifications_ui_tests;
 #[cfg(test)]
 mod env_banner_ui_tests;
 #[cfg(test)]
+mod live_ui_tests;
+#[cfg(test)]
 mod scan_table_ui_tests;
 #[cfg(test)]
 mod shell_tests;

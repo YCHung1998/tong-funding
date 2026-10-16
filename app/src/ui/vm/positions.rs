@@ -11,7 +11,7 @@ use tong_funding_core::risk::effective_for_pair;
 use tong_funding_core::spread_tag::{spread_tag, SpreadKind, SpreadTag};
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
-use super::bridge::{AccountState, PairInfo, UiSnapshot, ACCOUNT_EXCHANGES};
+use super::bridge::{tradable_exchanges, AccountState, PairInfo, UiSnapshot};
 use super::env_label::EnvLabel;
 use super::format::{self, DASH};
 use super::funding::{self as fv, PairFunding, PnlPanel, TimelineRow};
@@ -41,7 +41,7 @@ impl Grouped {
 /// Collects positions from every `Loaded` account and groups them with `core`.
 pub fn group(snap: &UiSnapshot) -> Grouped {
     let mut rows = Vec::new();
-    for e in ACCOUNT_EXCHANGES {
+    for e in tradable_exchanges(snap.identity).iter().copied() {
         if let AccountState::Loaded { data, .. } = snap.account(e) {
             rows.extend(data.positions);
         }
@@ -408,7 +408,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
     };
 
     let mut notices = Vec::new();
-    for e in ACCOUNT_EXCHANGES {
+    for e in tradable_exchanges(snap.identity).iter().copied() {
         match snap.account(e) {
             AccountState::Loaded { data, .. } if data.positions_incomplete.is_some() => {
                 notices.push(format!("{} 持倉列表可能不完整", e.name()));

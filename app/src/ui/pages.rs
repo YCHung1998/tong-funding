@@ -296,7 +296,7 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
     let mut total = card()
         .child(small("Total Portfolio Value", theme::TEXT_MUTED))
         .child(text(format!("{} USDT", format::money(vm.total, 2)), theme::TEXT_PRIMARY).text_size(fs(21.0)))
-        .child(small("Binance + Bybit + OKX", theme::TEXT_SECONDARY));
+        .child(small(vm.exchanges_text.clone(), theme::TEXT_SECONDARY));
     for n in [&vm.excluded_note, &vm.unvalued_note].into_iter().flatten() {
         total = total.child(small(n.clone(), theme::WARNING));
     }

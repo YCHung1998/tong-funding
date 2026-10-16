@@ -164,3 +164,7 @@ pub fn send_flatten(snap: &UiSnapshot, c: &FlattenConfirm, sink: &dyn CommandSin
 #[cfg(test)]
 #[path = "live_actions_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "live_scope_tests.rs"]
+mod scope_tests;

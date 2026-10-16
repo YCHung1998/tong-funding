@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::bridge::{AccountData, AccountState, ContractEquity, UiSnapshot, ACCOUNT_EXCHANGES};
+use super::bridge::{tradable_exchanges, AccountData, AccountState, ContractEquity, UiSnapshot};
 use super::format::{self, DASH};
 use super::positions::{Grouped, group};
 use crate::exchange::signed::models::Position;
@@ -90,6 +90,8 @@ pub enum ExchangeCard {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DashboardVm {
     pub total: Decimal,
+    /// `Binance + Bybit + OKX` (a Live process: `Binance + Bybit`).
+    pub exchanges_text: String,
     /// e.g. `不含未連線的交易所：Bybit`.
     pub excluded_note: Option<String>,
     /// `不含 N 項無法估值的資產`.
@@ -204,7 +206,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
     let mut unvalued_total = 0;
     let mut used_total = Decimal::ZERO;
     let mut pnl_total = Decimal::ZERO;
-    for e in ACCOUNT_EXCHANGES {
+    for e in tradable_exchanges(snap.identity).iter().copied() {
         match snap.account(e) {
             AccountState::Loaded { data, fetched_at, error } => {
                 let (assets, value, unvalued) = asset_rows(&data);
@@ -256,7 +258,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
         format::money(used_total, 2),
         format::money(pnl_total, 2)
     );
-    let refresh_text = ACCOUNT_EXCHANGES
+    let refresh_text = tradable_exchanges(snap.identity)
         .iter()
         .filter_map(|e| snap.health_of(super::bridge::SourceId::Account(*e)).and_then(|h| h.next_poll_at))
         .min()
@@ -264,6 +266,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
 
     DashboardVm {
         total,
+        exchanges_text: tradable_exchanges(snap.identity).iter().map(|e| e.name()).collect::<Vec<_>>().join(" + "),
         excluded_note: (!excluded.is_empty()).then(|| format!("不含未連線的交易所：{}", excluded.join("、"))),
         unvalued_note: (unvalued_total > 0).then(|| format!("不含 {unvalued_total} 項無法估值的資產")),
         cards,

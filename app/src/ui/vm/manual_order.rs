@@ -9,7 +9,7 @@ use tong_funding_core::quantity::Quantity;
 use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::bridge::{CommandSink, LegAccount, UiSnapshot, TRADABLE_EXCHANGES};
+use super::bridge::{tradable_exchanges, CommandSink, LegAccount, UiSnapshot};
 use super::engine_view::{blocker_text, refusing_blockers};
 use super::env_label::{ConfirmKind, EnvLabel};
 use super::format;
@@ -55,8 +55,16 @@ pub struct ManualResult {
     pub ok: bool,
 }
 
+/// Live: the page never opens a position by hand (the engine refuses it too; this is the reason shown).
+pub const LIVE_OPEN_REFUSED: &str = "真錢模式不開放手動開倉：開倉只能走「掃幣 → 交易單」流程；此頁只保留 reduce-only 平倉與取消。要在交易所手動下單，請按下方「前往交易所」。";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ManualVm {
+    /// `false` in a Live process: the opening inputs (reduce_only off, leverage) are disabled.
+    pub open_allowed: bool,
+    /// Live only: why opening is off, with the buttons to the exchange pages of the typed symbol.
+    pub live_notice: Option<&'static str>,
+    pub links: Vec<super::live_actions::LinkButton>,
     /// One panel per exchange; `Err` = disabled with the reason.
     pub panels: Vec<(Exchange, Result<(), String>)>,
     pub mode: Option<ExecutionMode>,
@@ -245,12 +253,16 @@ fn results(snap: &UiSnapshot) -> Vec<ManualResult> {
 /// Builds the page. Pure.
 pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> ManualVm {
     let mode = snap.engine.as_ref().map(|e| e.execution_mode);
-    let panels: Vec<(Exchange, Result<(), String>)> = TRADABLE_EXCHANGES.iter().map(|ex| (*ex, panel_state(snap, *ex))).collect();
+    let panels: Vec<(Exchange, Result<(), String>)> = tradable_exchanges(snap.identity).iter().map(|ex| (*ex, panel_state(snap, *ex))).collect();
     let price = snap.market.get(&form.exchange).and_then(|f| f.observations.iter().find(|o| o.symbol == form.symbol.trim().to_ascii_uppercase())).map(|o| o.mark_price);
     let r = sized(form, snap, price);
     let est_notional = r.as_ref().ok().zip(price).map(|(z, p)| z.base_qty * p);
 
     let mut submit_disabled = Vec::new();
+    let open_allowed = !snap.identity.is_live();
+    if !open_allowed && !form.reduce_only {
+        submit_disabled.push(LIVE_OPEN_REFUSED.to_string());
+    }
     match &snap.engine {
         None => submit_disabled.push("引擎未啟動".into()),
         Some(e) => {
@@ -298,7 +310,9 @@ pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> Manua
         Ok(z) => (z.note.clone(), if form.reduce_only { None } else { z.typed }, Some(z.text.clone())),
         Err(_) => (None, None, None),
     };
-    ManualVm { panels, mode, identity: snap.identity, env_text: env_text(snap.identity, mode), ledger_source: EnvLabel::from_snapshot(snap).ledger_source().to_string(), rounded: r.map(|z| z.order_qty), qty_note, qty_text, intended_base_qty, est_notional, leverage, cap_text, submit_disabled, cancel_disabled, results: results(snap) }
+    let symbol = form.symbol.trim().to_ascii_uppercase();
+    let links = tradable_exchanges(snap.identity).iter().flat_map(|ex| super::live_actions::exchange_links(snap.identity, &symbol, *ex, *ex)).collect();
+    ManualVm { open_allowed, live_notice: (!open_allowed).then_some(LIVE_OPEN_REFUSED), links, panels, mode, identity: snap.identity, env_text: env_text(snap.identity, mode), ledger_source: EnvLabel::from_snapshot(snap).ledger_source().to_string(), rounded: r.map(|z| z.order_qty), qty_note, qty_text, intended_base_qty, est_notional, leverage, cap_text, submit_disabled, cancel_disabled, results: results(snap) }
 }
 
 /// Opens the confirmation; `None` while submit is disabled. Sends nothing.
@@ -438,7 +452,7 @@ fn pick_lists<A, T>(
     row: impl Fn(&A) -> Option<T>,
 ) -> Vec<PickList<T>> {
     let simulated = account_is_simulated(snap);
-    TRADABLE_EXCHANGES
+    tradable_exchanges(snap.identity)
         .iter()
         .map(|ex| match snap.leg_accounts.get(&(simulated, *ex)) {
             None => PickList { exchange: *ex, fetched_at: None, state: PickState::NotQueried },

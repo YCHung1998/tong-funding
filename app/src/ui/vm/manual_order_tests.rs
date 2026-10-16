@@ -538,13 +538,14 @@ fn the_ledger_follows_identity_and_mode_exhaustively() {
 #[test]
 fn a_live_manual_confirmation_repeats_environment_and_amount_with_real_money_buttons() {
     let vm = build(&form("0.0014"), &CancelForm::default(), &live_snap(ExecutionMode::ExchangeDemo));
-    let c = open_confirm(&vm, &form("0.0014")).unwrap();
-    assert!(c.env_line().contains("LIVE 真錢") && c.env_line().contains("USDT"), "{}", c.env_line());
-    assert_eq!(c.button(), "以真錢下單");
+    // live UI task 5: a Live process no longer opens positions by hand, so there is no opening confirmation.
+    assert!(open_confirm(&vm, &form("0.0014")).is_none());
     let mut reduce = form("0.0014");
     reduce.reduce_only = true;
     let vm = build(&reduce, &CancelForm::default(), &live_snap(ExecutionMode::ExchangeDemo));
-    assert_eq!(open_confirm(&vm, &reduce).unwrap().button(), "以真錢平倉");
+    let c = open_confirm(&vm, &reduce).unwrap();
+    assert!(c.env_line().contains("LIVE 真錢") && c.env_line().contains("USDT"), "{}", c.env_line());
+    assert_eq!(c.button(), "以真錢平倉");
     let demo = open_confirm(&build(&form("0.0014"), &CancelForm::default(), &snap(ExecutionMode::ExchangeDemo)), &form("0.0014")).unwrap();
     assert_eq!(demo.button(), "確認送出");
     assert!(demo.env_line().contains("DEMO") && !demo.env_line().contains("LIVE") && !demo.env_line().contains("真錢"));

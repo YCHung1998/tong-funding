@@ -16,7 +16,7 @@ use tong_funding_core::risk::{effective_for_pair, ExecutionMode, TriggerMode};
 use tong_funding_core::trade_cost::{estimate_cost, CostEstimate, CostInput};
 use tong_funding_core::types::{Decimal, Exchange};
 
-use super::bridge::{CommandSink, LegAccount, UiSnapshot, ACCOUNT_EXCHANGES};
+use super::bridge::{tradable_exchanges, CommandSink, LegAccount, UiSnapshot};
 use super::contract_settings::{pair_quantity, QuoteCell};
 use super::leverage_cap::{self, CapCheck};
 use super::positions::{spread_view, SpreadView};
@@ -546,7 +546,7 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         }
     }
 
-    let margins = ACCOUNT_EXCHANGES.iter().map(|ex| (*ex, margin_text(snap.leg_accounts.get(&(false, *ex))))).collect();
+    let margins = tradable_exchanges(snap.identity).iter().map(|ex| (*ex, margin_text(snap.leg_accounts.get(&(false, *ex))))).collect();
     let manual = pairs.iter().filter(|p| is_alert(p.state)).map(|p| handling(snap, p)).collect();
     let exit_delay = EngineTimings::default().exit_delay_ms;
     let trigger_mode = engine.map(|e| e.trigger_mode);

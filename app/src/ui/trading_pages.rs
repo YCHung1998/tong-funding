@@ -1179,17 +1179,28 @@ impl Shell {
             }
             self.trading.m_requested = sym;
         }
+        // Live: only reduce-only orders are possible here, so the form is held there.
+        if self.snap.identity.is_live() {
+            self.trading.m_reduce = true;
+        }
+        let form = self.trading.manual_form(cx);
         let vm = manual_order::build(&form, &cancel_form, &self.snap);
         if !form.reduce_only
             && let Some(n) = vm.est_notional
         {
             self.source.request_leverage_cap(form.exchange, &form.symbol.trim().to_ascii_uppercase(), manual_order::cap_request_notional(n));
         }
-        let warning = warn_box(vec![
-            format!("⚠ {DEBUG_WARNING}：單腿下單會造成未避險曝險；標準流程為「掃幣 → 交易單」。"),
-            vm.env_text.clone(),
-            vm.ledger_source.clone(),
-        ]);
+        let mut lines = vec![format!("⚠ {DEBUG_WARNING}：單腿下單會造成未避險曝險；標準流程為「掃幣 → 交易單」。"), vm.env_text.clone(), vm.ledger_source.clone()];
+        lines.extend(vm.live_notice.map(str::to_string));
+        let mut warning = warn_box(lines);
+        if !vm.links.is_empty() {
+            let mut row = div().flex().flex_wrap().gap_2();
+            for (j, l) in vm.links.iter().enumerate() {
+                let url = l.url.clone();
+                row = row.child(btn(SharedString::from(format!("m-open-{j}")), format!("{} ↗", l.label), true, self.click(cx, move |_, cx| cx.open_url(&url))));
+            }
+            warning = warning.child(row);
+        }
         let mut panels = div().flex().gap_2().items_center().child(small("交易所", theme::TEXT_SECONDARY));
         for (ex, state) in &vm.panels {
             let ex = *ex;
@@ -1206,7 +1217,7 @@ impl Shell {
             let on = this.trading.m_side == s;
             btn(SharedString::from(format!("m-side-{}", side_text(s))), format!("{} {}", if on { "●" } else { "○" }, side_text(s)), true, this.click(cx, move |this, _| this.trading.m_side = s))
         };
-        let reduce = btn("m-reduce", if self.trading.m_reduce { "☑ reduce_only" } else { "☐ reduce_only" }, true, self.click(cx, |this, _| this.trading.m_reduce = !this.trading.m_reduce));
+        let reduce = btn("m-reduce", if self.trading.m_reduce { "☑ reduce_only" } else { "☐ reduce_only" }, vm.open_allowed, self.click(cx, |this, _| this.trading.m_reduce = !this.trading.m_reduce));
         let mut order = card()
             .child(text("單腿下單 · 市價單", theme::TEXT_PRIMARY))
             .child(self.position_picker(cx))
@@ -1214,7 +1225,7 @@ impl Shell {
             .child(pick_row("Symbol", self.trading.m_symbol.element("BTCUSDT"), self.trading.m_symbol.loaded(), "行情", self.trading.m_symbol.is_unlisted(cx).then(|| self.trading.m_symbol.value(cx))))
             .child(div().flex().gap_2().child(side(self, cx, OrderSide::Buy)).child(side(self, cx, OrderSide::Sell)).child(reduce))
             .child(field_row("Quantity", if form.exchange == Exchange::Okx { "幣量（系統依 ctVal 換算為張數）" } else { "" }, &self.trading.m_qty, None))
-            .child(field_row("Leverage", "×（開倉單必填；reduce_only 不使用）", &self.trading.m_lev, None))
+            .children(vm.open_allowed.then(|| field_row("Leverage", "×（開倉單必填；reduce_only 不使用）", &self.trading.m_lev, None)))
             .child(small(
                 vm.cap_text.clone().unwrap_or_else(|| if form.reduce_only { "reduce_only：不設定槓桿".to_string() } else { "槓桿上限：—".to_string() }),
                 theme::TEXT_SECONDARY,
