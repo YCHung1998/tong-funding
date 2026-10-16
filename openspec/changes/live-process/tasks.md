@@ -1,6 +1,6 @@
 ## 1. 身分與單一實例
 
-- [ ] 1.1 新增 `ProcessIdentity { Demo, Live }` 與參數解析（`--live`）；紅色測試先行：預設 Demo、`--live` 為 Live、環境變數不影響、`--live` 搭配 `--bench-*` 被拒、同一個程序內無法改變
+- [x] 1.1 新增 `ProcessIdentity { Demo, Live }` 與參數解析（`--live`）；紅色測試先行：預設 Demo、`--live` 為 Live、環境變數不影響、`--live` 搭配 `--bench-*` 被拒、同一個程序內無法改變
 - [ ] 1.2 單一實例鎖（資料目錄 `tong-funding.lock`，作業系統檔案鎖）；測試：第二個實例被拒（任一身分組合）、釋放後可重新取得；鎖在開資料庫與啟動引擎之前取得
 
 ## 2. 傳輸、主機與限頻

@@ -1,6 +1,7 @@
 mod engine;
 mod exchange;
 mod funding;
+mod identity;
 mod ports;
 mod store;
 mod ui;
