@@ -22,7 +22,7 @@ use super::rate_source::DemoRateSource;
 use super::slot_runner::{RateSource, delay_report, slots_tick};
 use crate::exchange::error::AdapterError;
 use crate::exchange::health::clock_sync::ClockSync;
-use crate::exchange::reqwest_transport::ReqwestTransport;
+use crate::exchange::reqwest_transport::SignedDemoTransport;
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
 use crate::exchange::signed::endpoints::{BinanceHost, BybitHost};
@@ -66,7 +66,7 @@ async fn live_funding_slot_probe() {
     let db = Db::open(std::path::Path::new(&copy), clock.clone());
     assert!(!db.is_halted(), "{:?}", db.halt_reason());
     let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
-    let t = Arc::new(ReqwestTransport::signed_demo().expect("transport"));
+    let t = Arc::new(SignedDemoTransport::new().expect("transport"));
     let b = ClockSync::new(clock.clone()).sync_once(t.as_ref(), Exchange::Binance, host.base_url()).await.expect("Binance serverTime");
     let y = ClockSync::new(clock.clone()).sync_once(t.as_ref(), Exchange::Bybit, BybitHost::Demo.base_url()).await.expect("Bybit time");
     let (ob, oy) = (b.offset_ms, y.offset_ms);

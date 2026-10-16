@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use super::error::AdapterError;
-use super::transport::{HttpRequest, HttpResponse, HttpTransport};
+use super::transport::{DemoSignedTransport, HttpRequest, HttpResponse, HttpTransport, LiveSignedTransport};
 
 /// Largest response body accepted (32 MiB). Bigger is `Incomplete`, never silently truncated.
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -97,14 +97,18 @@ impl ReqwestTransport {
         Ok(Self { client, policy, max_body_bytes: MAX_BODY_BYTES })
     }
 
-    /// For public (unsigned) market data: only the production market-data hosts.
-    pub fn public_production() -> Result<Self, AdapterError> {
+    // The three constructors are private on purpose: callers get a transport only through the
+    // thin wrapper types below, whose TYPE says what the transport may carry.
+    fn public_production() -> Result<Self, AdapterError> {
         Self::build(HostPolicy::PublicProduction)
     }
 
-    /// For signed read-only requests: only demo / testnet hosts.
-    pub fn signed_demo() -> Result<Self, AdapterError> {
+    fn signed_demo() -> Result<Self, AdapterError> {
         Self::build(HostPolicy::SignedDemo)
+    }
+
+    fn signed_live() -> Result<Self, AdapterError> {
+        Self::build(HostPolicy::SignedLive)
     }
 
     #[cfg(test)]
@@ -127,6 +131,41 @@ impl ReqwestTransport {
         self.policy
     }
 }
+
+/// Public (unsigned) market data: the production market-data hosts only, and the policy refuses
+/// every authentication header and `signature` / `sign` parameter. Satisfies NO signed marker.
+pub struct PublicTransport(ReqwestTransport);
+
+/// Signed requests to the demo / testnet hosts. The only production implementor of
+/// [`DemoSignedTransport`]: the demo signed clients accept nothing else.
+pub struct SignedDemoTransport(ReqwestTransport);
+
+/// Signed requests to the live hosts. The only implementor of [`LiveSignedTransport`].
+pub struct SignedLiveTransport(ReqwestTransport);
+
+macro_rules! wrapper {
+    ($name:ident, $ctor:ident) => {
+        impl $name {
+            pub fn new() -> Result<Self, AdapterError> {
+                ReqwestTransport::$ctor().map($name)
+            }
+            pub fn policy(&self) -> HostPolicy {
+                self.0.policy()
+            }
+        }
+        impl HttpTransport for $name {
+            fn get(&self, req: HttpRequest) -> impl std::future::Future<Output = Result<HttpResponse, AdapterError>> + Send {
+                self.0.get(req)
+            }
+        }
+    };
+}
+wrapper!(PublicTransport, public_production);
+wrapper!(SignedDemoTransport, signed_demo);
+wrapper!(SignedLiveTransport, signed_live);
+
+impl DemoSignedTransport for SignedDemoTransport {}
+impl LiveSignedTransport for SignedLiveTransport {}
 
 fn map_error(e: reqwest::Error) -> AdapterError {
     if e.is_timeout() {
@@ -440,6 +479,66 @@ mod tests {
         let r = block_on(t.get(HttpRequest::get(format!("{base}/fapi/v1/time?signature=x"), Duration::from_secs(2)).header("X-MBX-APIKEY", "k")));
         assert_eq!(r, Err(AdapterError::network("host not allowed")));
         assert_eq!(connections.load(Ordering::SeqCst), 0);
+    }
+
+    // ------------------------------------------------ live-process 2.3: transport types are disjoint
+
+    use crate::exchange::transport::{DemoSignedTransport, LiveSignedTransport};
+    use std::marker::PhantomData;
+
+    /// "Does T implement the marker?" answered at compile time: the inherent method (only present
+    /// when the bound holds) wins over the trait fallback.
+    struct Probe<T>(PhantomData<T>);
+    trait NotImplemented {
+        fn is_demo_signed(&self) -> bool {
+            false
+        }
+        fn is_live_signed(&self) -> bool {
+            false
+        }
+    }
+    impl<T> NotImplemented for Probe<T> {}
+    impl<T: DemoSignedTransport> Probe<T> {
+        fn is_demo_signed(&self) -> bool {
+            true
+        }
+    }
+    impl<T: LiveSignedTransport> Probe<T> {
+        fn is_live_signed(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn only_the_matching_signed_transport_type_satisfies_each_signed_marker() {
+        let public = Probe::<PublicTransport>(PhantomData);
+        assert!(!public.is_demo_signed() && !public.is_live_signed(), "a public transport must not be accepted by any signed client");
+        let demo = Probe::<SignedDemoTransport>(PhantomData);
+        assert!(demo.is_demo_signed() && !demo.is_live_signed());
+        let live = Probe::<SignedLiveTransport>(PhantomData);
+        assert!(live.is_live_signed() && !live.is_demo_signed(), "a live transport must not feed a demo client");
+    }
+
+    #[test]
+    fn wrapper_constructors_carry_their_policy() {
+        assert_eq!(PublicTransport::new().unwrap().policy(), HostPolicy::PublicProduction);
+        assert_eq!(SignedDemoTransport::new().unwrap().policy(), HostPolicy::SignedDemo);
+        assert_eq!(SignedLiveTransport::new().unwrap().policy(), HostPolicy::SignedLive);
+    }
+
+    #[test]
+    fn a_live_transport_refuses_demo_hosts_and_a_demo_transport_refuses_live_hosts_before_any_dns() {
+        let live = SignedLiveTransport::new().unwrap();
+        let demo = SignedDemoTransport::new().unwrap();
+        let started = Instant::now();
+        let req = |h: &str| HttpRequest::get(format!("https://{h}/fapi/v1/time"), Duration::from_secs(5));
+        for h in ["demo-fapi.binance.com", "testnet.binancefuture.com", "api-demo.bybit.com"] {
+            assert_eq!(block_on(live.get(req(h))), Err(AdapterError::network("host not allowed")), "{h} via live");
+        }
+        for h in ["fapi.binance.com", "api.bybit.com"] {
+            assert_eq!(block_on(demo.get(req(h))), Err(AdapterError::network("host not allowed")), "{h} via demo");
+        }
+        assert!(started.elapsed() < Duration::from_millis(500), "refusal must happen before any DNS/connection");
     }
 
     #[test]

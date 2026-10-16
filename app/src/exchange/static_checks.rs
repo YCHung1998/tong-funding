@@ -1157,7 +1157,7 @@ const LATE: &str = "api.bybit.com";
         assert!(violations.is_empty(), "{violations:?}");
         // the factory is built on the plain order transport in ui/live.rs
         let live = production_code(&std::fs::read_to_string(app.join("src/ui/live.rs")).unwrap());
-        let from = live.find("ReqwestOrderTransport::signed_demo()").expect("live.rs builds the order transport");
+        let from = live.find("SignedDemoOrderTransport::new()").expect("live.rs builds the order transport");
         let to = live[from..].find("DemoExecutorFactory::new").expect("and passes it to the factory") + from;
         assert!(!live[from..to].contains("Gated"), "the order transport must reach the factory ungated: {}", &live[from..to]);
     }
@@ -1406,5 +1406,71 @@ const LATE: &str = "api.bybit.com";
         ] {
             assert!(!has(ok, |v| matches!(v, Violation::ExternalBaseUrl(_))), "wrongly flagged: {ok}");
         }
+    }
+
+    // ------------------------------------------------ live-process 2.3: transport marker traits
+
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Every signed / order client constructor sits alone in an `impl<T: Marker>` block, so a
+    /// public (or live) transport cannot be passed to a demo client: the compiler enforces the bound,
+    /// this test pins that nobody weakens it back to plain `HttpTransport` / `OrderTransport`.
+    #[test]
+    fn signed_client_constructors_require_the_matching_transport_marker() {
+        const CASES: [(&str, &str); 10] = [
+            ("exchange/signed/binance.rs", "impl<T: DemoSignedTransport> BinanceSignedClient<T> {"),
+            ("exchange/signed/bybit.rs", "impl<T: DemoSignedTransport> BybitSignedClient<T> {"),
+            ("exchange/signed/okx.rs", "impl<T: DemoSignedTransport> OkxSignedClient<T> {"),
+            ("exchange/signed/ledger.rs", "impl<T: DemoSignedTransport> BinanceLedgerClient<T> {"),
+            ("exchange/signed/ledger.rs", "impl<T: DemoSignedTransport> BybitLedgerClient<T> {"),
+            ("exchange/execution/binance.rs", "impl<T: DemoOrderTransport> BinanceOrderClient<T> {"),
+            ("exchange/execution/bybit.rs", "impl<T: DemoOrderTransport> BybitOrderClient<T> {"),
+            ("exchange/execution/okx.rs", "impl<T: DemoOrderTransport> OkxOrderClient<T> {"),
+            ("exchange/execution/factory.rs", "impl<T: DemoOrderTransport + 'static> DemoExecutorFactory<T> {"),
+            ("exchange/execution/http.rs", "pub trait DemoOrderTransport: OrderTransport"),
+        ];
+        for (file, needle) in CASES {
+            let code = production_code(&std::fs::read_to_string(src_dir().join(file)).unwrap());
+            let at = code.find(needle).unwrap_or_else(|| panic!("{file}: missing `{needle}`"));
+            if needle.starts_with("impl<T: Demo") {
+                let block: String = code[at..].chars().take(700).collect();
+                assert!(block.contains("pub fn new("), "{file}: `pub fn new(` must be inside `{needle}`");
+            }
+        }
+    }
+
+    /// The marker traits are implemented, in production code, only by the thin transport wrappers
+    /// in their two homes. (Test fakes implement them inside `#[cfg(test)]` modules, which this
+    /// scan skips.)
+    #[test]
+    fn transport_marker_traits_are_implemented_only_by_the_wrapper_homes() {
+        let homes = [src_dir().join("exchange/reqwest_transport.rs"), src_dir().join("exchange/execution/http.rs")];
+        let mut seen_in_homes = 0;
+        for f in rust_files(&src_dir()) {
+            // `*_tests.rs` files are `#[cfg(test)] mod x;` declarations: wholly test code.
+            if f.file_name().is_some_and(|n| n == "static_checks.rs" || n.to_string_lossy().ends_with("_tests.rs")) {
+                continue;
+            }
+            let code = production_code(&std::fs::read_to_string(&f).unwrap());
+            for marker in ["DemoSignedTransport for", "LiveSignedTransport for", "DemoOrderTransport for", "LiveOrderTransport for"] {
+                let n = code.matches(&format!("impl {marker}")).count();
+                if homes.contains(&f) {
+                    seen_in_homes += n;
+                } else {
+                    assert_eq!(n, 0, "{}: `impl {marker}` outside the wrapper homes", f.display());
+                }
+            }
+        }
+        assert_eq!(seen_in_homes, 4, "exactly the four wrappers implement the markers (demo/live x read/order)");
+    }
+
+    #[test]
+    fn marker_impl_scan_catches_a_stray_impl() {
+        let code = production_code("impl DemoSignedTransport for PublicTransport {}");
+        assert!(code.contains("impl DemoSignedTransport for"));
+        let test_only = production_code("#[cfg(test)]\nmod t { impl DemoSignedTransport for Fake {} }");
+        assert!(!test_only.contains("impl DemoSignedTransport for"), "test modules are skipped");
     }
 }

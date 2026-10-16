@@ -113,6 +113,15 @@ pub trait HttpTransport: Send + Sync {
     fn get(&self, req: HttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send;
 }
 
+/// Marker: a transport that may carry SIGNED requests to the demo / testnet hosts. The signed
+/// client constructors take only this, so a public transport cannot be passed to them (the
+/// compiler refuses). In production code only `SignedDemoTransport` implements it (static check).
+pub trait DemoSignedTransport: HttpTransport {}
+
+/// Marker: a transport that may carry SIGNED requests to the live hosts. Only `SignedLiveTransport`
+/// implements it; no demo client constructor accepts it.
+pub trait LiveSignedTransport: HttpTransport {}
+
 #[cfg(test)]
 #[allow(unused_imports)]
 pub use fake::FakeTransport;
@@ -150,6 +159,8 @@ mod fake {
             self.seen.lock().unwrap().clone()
         }
     }
+
+    impl DemoSignedTransport for FakeTransport {}
 
     impl HttpTransport for FakeTransport {
         fn get(&self, req: HttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {

@@ -44,7 +44,7 @@ use crate::engine::sim::{MarginFromAccount, SimPriceBook, SimulatedExecutor};
 use crate::engine::timings::EngineTimings;
 use crate::exchange::execution::account::DemoAccountView;
 use crate::exchange::execution::factory::DemoExecutorFactory;
-use crate::exchange::execution::http::ReqwestOrderTransport;
+use crate::exchange::execution::http::SignedDemoOrderTransport;
 use crate::exchange::execution::okx::{OkxLimits, OkxLimitsSource};
 use crate::exchange::public::adapter::ExchangeAdapter;
 use crate::exchange::signed::signing::load_credentials;
@@ -66,7 +66,8 @@ use crate::exchange::public::bybit::BybitAdapter;
 use crate::exchange::public::endpoints::OKX_HOST;
 use crate::exchange::public::feed_endpoints::{BybitFeedMode, BINANCE_MARK_PRICE_WS_URL, BYBIT_FEED_ENV, BYBIT_TICKERS_WS_URL};
 use crate::exchange::public::okx::OkxAdapter;
-use crate::exchange::reqwest_transport::ReqwestTransport;
+use crate::exchange::reqwest_transport::{PublicTransport, SignedDemoTransport};
+use crate::exchange::transport::HttpTransport;
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
 use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost};
@@ -404,16 +405,16 @@ impl CommandSink for LiveSource {
     }
 }
 
-type PublicT = GatedTransport<ReqwestTransport>;
+type PublicT = GatedTransport<PublicTransport>;
 
-struct ClockResync {
+struct ClockResync<T> {
     sync: Arc<ClockSync>,
-    transport: Arc<ReqwestTransport>,
+    transport: Arc<T>,
     exchange: Exchange,
     base_url: &'static str,
 }
 
-impl Resync for ClockResync {
+impl<T: HttpTransport + 'static> Resync for ClockResync<T> {
     fn resync(&self) -> Pin<Box<dyn Future<Output = Result<(), AdapterError>> + Send + '_>> {
         Box::pin(async move { self.sync.sync_once(self.transport.as_ref(), self.exchange, self.base_url).await.map(|_| ()) })
     }
@@ -525,7 +526,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         feed: std::sync::OnceLock::new(),
     });
 
-    let public = match ReqwestTransport::public_production() {
+    let public = match PublicTransport::new() {
         Ok(t) => t,
         Err(e) => {
             for ex in Exchange::ALL {
@@ -537,10 +538,10 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     if let Some(w) = proxy_env_warning(|k| std::env::var(k).ok()) {
         eprintln!("{w}");
     }
-    let signed = ReqwestTransport::signed_demo().ok().map(Arc::new);
+    let signed = SignedDemoTransport::new().ok().map(Arc::new);
     let weight = Arc::new(WeightGate::new(time.clone()));
     let gated = |ex: Exchange| -> Result<Arc<PublicT>, AdapterError> {
-        Ok(Arc::new(GatedTransport::new(ReqwestTransport::public_production()?, ex, ctx.limiter.clone(), weight.clone(), time.clone())))
+        Ok(Arc::new(GatedTransport::new(PublicTransport::new()?, ex, ctx.limiter.clone(), weight.clone(), time.clone())))
     };
     let (Ok(tb), Ok(ty), Ok(to)) = (gated(Exchange::Binance), gated(Exchange::Bybit), gated(Exchange::Okx)) else { return };
     let dyn_clock: Arc<dyn crate::ports::Clock> = clock.clone();
@@ -858,7 +859,7 @@ fn demo_keys_for(secrets: &dyn SecretProvider, allowed: &[Exchange]) -> Result<(
 }
 
 /// The three signed read clients (they back the account polls and the engine's demo account view).
-type SignedClients = (Arc<BinanceSignedClient<ReqwestTransport>>, Arc<BybitSignedClient<ReqwestTransport>>, Arc<OkxSignedClient<ReqwestTransport>>);
+type SignedClients = (Arc<BinanceSignedClient<SignedDemoTransport>>, Arc<BybitSignedClient<SignedDemoTransport>>, Arc<OkxSignedClient<SignedDemoTransport>>);
 
 /// The EXCHANGE_DEMO executor factory and the one OKX latch it owns (the read client shares it). The
 /// order transport is the plain (never gated) one. Without a store or an order transport the factory
@@ -873,7 +874,7 @@ fn build_factory(
     okx_limits: &Arc<LiveOkxLimits>,
 ) -> (Arc<dyn ExecutorFactory>, Arc<OkxLatch>) {
     let Some(db) = db else { return (Arc::new(NoFactory("資料庫不可用".into())), OkxLatch::new()) };
-    match ReqwestOrderTransport::signed_demo() {
+    match SignedDemoOrderTransport::new() {
         Ok(t) => {
             let f = DemoExecutorFactory::new(Arc::new(t), secrets.clone(), time.clone(), offsets.clone(), Arc::new(db.clone()), limiter.clone(), bhost).with_okx_limits(okx_limits.clone());
             let latch = f.okx_latch();
@@ -981,8 +982,8 @@ where
 fn start_funding_loop(
     ctx: &Arc<Ctx>,
     db: Db,
-    sources: (BinanceLedgerSource<ReqwestTransport>, BybitLedgerSource<ReqwestTransport>, OkxLedgerSource<ReqwestTransport>),
-    rates: Option<DemoRateSource<ReqwestTransport>>,
+    sources: (BinanceLedgerSource<SignedDemoTransport>, BybitLedgerSource<SignedDemoTransport>, OkxLedgerSource<SignedDemoTransport>),
+    rates: Option<DemoRateSource<SignedDemoTransport>>,
     secrets: Arc<dyn SecretProvider>,
 ) {
     let ctx = ctx.clone();
@@ -1179,7 +1180,7 @@ fn marks_of(ctx: &Ctx, ex: Exchange) -> HashMap<String, Decimal> {
     ctx.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ex).cloned().unwrap_or_default()
 }
 
-async fn poll_binance_account(ctx: &Ctx, c: &BinanceSignedClient<ReqwestTransport>, env: &'static str) {
+async fn poll_binance_account(ctx: &Ctx, c: &BinanceSignedClient<SignedDemoTransport>, env: &'static str) {
     let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
     match res {
         Ok((balances, positions)) => {
@@ -1190,7 +1191,7 @@ async fn poll_binance_account(ctx: &Ctx, c: &BinanceSignedClient<ReqwestTranspor
     }
 }
 
-async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<ReqwestTransport>) {
+async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<SignedDemoTransport>) {
     let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
     match res {
         Ok((balances, listing)) => {
@@ -1208,7 +1209,7 @@ async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<ReqwestTransport>) 
 /// OKX account poll: balances and positions (converted to coins with the catalog's `ctVal`), shown as
 /// the dashboard's OKX card. A position whose `ctVal` is unknown is named in the incomplete reason
 /// instead of being dropped; the rules of the positions' symbols are requested for the pages.
-async fn poll_okx_account(ctx: &Ctx, c: &OkxSignedClient<ReqwestTransport>, adapter: &OkxAdapter<PublicT>, limits: &LiveOkxLimits) {
+async fn poll_okx_account(ctx: &Ctx, c: &OkxSignedClient<SignedDemoTransport>, adapter: &OkxAdapter<PublicT>, limits: &LiveOkxLimits) {
     let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
     match res {
         Ok((balances, listing)) => {

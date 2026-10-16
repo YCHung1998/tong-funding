@@ -522,12 +522,12 @@ impl MessageSource for Deadline {
 fn live_bybit_ws_vs_rest() {
     use crate::exchange::public::adapter::ExchangeAdapter;
     use crate::exchange::public::bybit::BybitAdapter;
-    use crate::exchange::reqwest_transport::ReqwestTransport;
+    use crate::exchange::reqwest_transport::PublicTransport;
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
     rt.block_on(async {
         let clock: Arc<dyn TimeSource> = Arc::new(crate::ports::SystemClock);
         let sink = Arc::new(MemoryEventSink::default());
-        let adapter = BybitAdapter::new(Arc::new(ReqwestTransport::public_production().unwrap()), Arc::new(crate::ports::SystemClock));
+        let adapter = BybitAdapter::new(Arc::new(PublicTransport::new().unwrap()), Arc::new(crate::ports::SystemClock));
         let first: HashMap<String, FundingObservation> = adapter.fetch_snapshot().await.unwrap().into_iter().map(|o| (o.symbol.clone(), o)).collect();
         let list: Vec<String> = first.keys().filter(|s| s.ends_with("USDT") && !s.contains('-')).cloned().collect();
         println!("REST symbols: {}, subscribed: {}", first.len(), list.len());

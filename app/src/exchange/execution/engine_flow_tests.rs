@@ -9,7 +9,7 @@ use tong_funding_core::types::Exchange;
 use super::binance::BinanceOrderClient;
 use super::bybit::BybitOrderClient;
 use super::executor::DemoExecutor;
-use super::http::Method;
+use super::http::{DemoOrderTransport, Method};
 use super::http::fake::{FakeOrderTransport, Reply};
 use super::okx::{OkxLimits, OkxLimitsSource, OkxOrderClient};
 use crate::engine::actor::flow_tests::run_okx_pair_with;
@@ -79,6 +79,8 @@ struct HaltAfterBinanceOrder {
     inner: FakeOrderTransport,
     db: Arc<StdMutex<Option<Db>>>,
 }
+impl DemoOrderTransport for HaltAfterBinanceOrder {}
+
 impl OrderTransport for HaltAfterBinanceOrder {
     fn send(&self, req: OrderHttpRequest) -> impl std::future::Future<Output = Result<HttpResponse, AdapterError>> + Send {
         if req.method() == Method::Post && req.full_url().contains("/fapi/v1/order") {
