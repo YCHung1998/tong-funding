@@ -3,7 +3,7 @@
 //! the pair data and an order whose result is unknown is looked up under its original id.
 //!
 //! Layout (lowercase ASCII alphanumerics only, fixed-width fields so it parses unambiguously):
-//! `<sim|demo><l|s><o|c><seq: 4 base36><hash: 13 base36><uuid head: 0–8 alnum>`, at most 31
+//! `<sim|demo|live><l|s><o|c><seq: 4 base36><hash: 13 base36><uuid head: 0–8 alnum>`, at most 31
 //! characters. The spec allows `[A-Za-z0-9_-]` and 36 characters (unverified per exchange, D11);
 //! this stays inside the narrower intersection (OKX `clOrdId` is alphanumeric, ≤ 32) on purpose.
 //! `hash` is 64-bit FNV-1a of the full pair uuid, so uuids that differ only after the readable
@@ -17,6 +17,8 @@ use super::ports::{Leg, OrderAction};
 pub enum IdPrefix {
     Sim,
     Demo,
+    /// live-process: orders sent by the `Live` process identity; same length as `demo`.
+    Live,
 }
 
 impl IdPrefix {
@@ -24,12 +26,13 @@ impl IdPrefix {
         match self {
             IdPrefix::Sim => "sim",
             IdPrefix::Demo => "demo",
+            IdPrefix::Live => "live",
         }
     }
 
     /// The prefix of an id produced by [`client_order_id`], if any.
     pub fn of(client_order_id: &str) -> Option<IdPrefix> {
-        [IdPrefix::Sim, IdPrefix::Demo].into_iter().find(|p| {
+        [IdPrefix::Sim, IdPrefix::Demo, IdPrefix::Live].into_iter().find(|p| {
             client_order_id.strip_prefix(p.as_str()).is_some_and(|rest| {
                 let b = rest.as_bytes();
                 let lower_alnum = |c: &u8| c.is_ascii_digit() || c.is_ascii_lowercase();
@@ -137,6 +140,32 @@ mod tests {
     }
 
     #[test]
+    fn live_prefix_is_live_equal_in_length_to_demo_and_within_the_exchange_limit() {
+        // live-process: a live order's id starts with `live`, parses back, and stays <= 36.
+        assert_eq!(IdPrefix::Live.as_str(), "live");
+        assert_eq!(IdPrefix::Live.as_str().len(), IdPrefix::Demo.as_str().len());
+        let u = "6f1c2d3e-4b5a-4c6d-8e7f-0123456789ab";
+        let long = "x".repeat(500);
+        for uuid in [u, "", long.as_str()] {
+            for leg in Leg::BOTH {
+                for action in ACTIONS {
+                    let id = client_order_id(IdPrefix::Live, uuid, leg, action, u16::MAX);
+                    assert!(id.starts_with("live"), "{id}");
+                    assert!(valid(&id) && id.len() <= 36, "{id}");
+                    assert_eq!(IdPrefix::of(&id), Some(IdPrefix::Live), "{id}");
+                    assert_eq!(leg_action_of(&id), Some((leg, action)), "{id}");
+                    for other in [IdPrefix::Sim, IdPrefix::Demo] {
+                        assert_ne!(id, client_order_id(other, uuid, leg, action, u16::MAX));
+                    }
+                }
+            }
+        }
+        // A foreign id that merely starts with `live` is not ours.
+        assert_eq!(IdPrefix::of("liveXYZ"), None);
+        assert_eq!(IdPrefix::of("live"), None);
+    }
+
+    #[test]
     fn leg_action_and_seq_each_change_the_id() {
         let u = "pair-1";
         let mut seen = HashSet::new();
@@ -153,7 +182,7 @@ mod tests {
 
     #[test]
     fn leg_and_action_are_read_back_from_an_id() {
-        for prefix in [IdPrefix::Sim, IdPrefix::Demo] {
+        for prefix in [IdPrefix::Sim, IdPrefix::Demo, IdPrefix::Live] {
             for leg in Leg::BOTH {
                 for action in ACTIONS {
                     let id = client_order_id(prefix, "6f1c2d3e-4b5a", leg, action, 7);
@@ -210,7 +239,7 @@ mod tests {
         for _ in 0..20_000 {
             let len = (next() % 40) as usize;
             let u: String = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
-            let prefix = if next() % 2 == 0 { IdPrefix::Sim } else { IdPrefix::Demo };
+            let prefix = [IdPrefix::Sim, IdPrefix::Demo, IdPrefix::Live][(next() % 3) as usize];
             let leg = Leg::BOTH[(next() % 2) as usize];
             let action = ACTIONS[(next() % 2) as usize];
             let seq = (next() % 70_000).min(u16::MAX as u64) as u16;

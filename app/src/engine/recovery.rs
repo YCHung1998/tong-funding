@@ -1264,6 +1264,29 @@ mod tests {
         fx.assert_read_only();
     }
 
+    // live-process: a restart reconciles `live`-prefixed intents like demo ones (queries the
+    // exchange; never treated as simulated, never skipped).
+    #[test]
+    fn live_prefixed_intents_are_recognised_and_reconciled_against_the_exchange() {
+        let (_d, db, _) = open_tmp();
+        seed_pair(&db, PAIR, PairState::FillMonitor, false);
+        let l = seed_intent(&db, IdPrefix::Live, Leg::Long, OrderAction::Open, "0.01", IntentState::Submitted);
+        let s = seed_intent(&db, IdPrefix::Live, Leg::Short, OrderAction::Open, "0.01", IntentState::Submitted);
+        assert!(l.starts_with("live") && s.starts_with("live"), "{l} {s}");
+        assert_eq!(action_of(&l), Some(OrderAction::Open));
+        let fx = FakeExchange::default();
+        fx.filled(&l, "0.01");
+        fx.filled(&s, "0.01");
+        fx.position(LONG_EX, "0.01");
+        fx.position(SHORT_EX, "-0.01");
+        let r = run(&db, &fx);
+        assert_eq!(r.pending, None, "{r:?}");
+        assert_eq!((intent_state(&db, &l), intent_state(&db, &s)), ("FILLED".into(), "FILLED".into()));
+        assert!(!fx.queries().is_empty(), "a live order must be looked up on the exchange, not treated as simulated");
+        assert_eq!(pair_state(&db), "RECONCILED");
+        fx.assert_read_only();
+    }
+
     // spec "一腿成交、另一腿查無"
     #[test]
     fn long_filled_short_not_found_without_position_is_partial_failure_with_alert() {
