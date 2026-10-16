@@ -170,6 +170,7 @@ async fn replay(orders: FakeOrderTransport) -> Replay {
         sim_account,
         reconciler: None,
         notifier: notifier.clone(),
+        identity: crate::identity::ProcessIdentity::Demo,
     };
     let h = start(deps);
     let pair = NewPreparedPair {

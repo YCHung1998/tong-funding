@@ -457,6 +457,7 @@ fn rig(o: Opts) -> (Rig, EngineDeps) {
         sim_account,
         reconciler: o.reconciler,
         notifier: notifier.clone(),
+        identity: crate::identity::ProcessIdentity::Demo,
     };
     (Rig { _dir: dir, db, clock, market, offsets, sim, factory, demo, notifier }, deps)
 }
@@ -1655,6 +1656,7 @@ fn crash_deps(path: &std::path::Path, clock: &ManualClock, exchange: &Arc<CrashE
         sim_account: exchange.clone(),
         reconciler: Some(Arc::new(RecoveryReconciler::new(market, shared))),
         notifier: Arc::new(RecordingNotifier::default()),
+        identity: crate::identity::ProcessIdentity::Demo,
     };
     (db, factory, deps)
 }
@@ -2060,6 +2062,7 @@ fn restarted(rig: &Rig, notifier: Arc<RecordingNotifier>) -> EngineDeps {
         sim_account,
         reconciler: None,
         notifier,
+        identity: crate::identity::ProcessIdentity::Demo,
     }
 }
 

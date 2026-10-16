@@ -934,6 +934,7 @@ where
         sim_account: sim_account.clone(),
         reconciler: Some(reconciler),
         notifier: Arc::new(LogNotifier),
+        identity: crate::identity::ProcessIdentity::Demo,
     };
     let handle = engine_actor::start(deps);
     let _ = ctx.feed.set((prices, handle.market.clone()));

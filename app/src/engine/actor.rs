@@ -173,6 +173,9 @@ pub struct EngineDeps {
     pub reconciler: Option<Arc<dyn StartupReconciler>>,
     /// System notification channel for alerts (`alert::LogNotifier` until the macOS one exists).
     pub notifier: Arc<dyn Notifier>,
+    /// Which world this process lives in (live-process): decided once at start. Demo keeps every
+    /// existing behaviour; Live switches the live-guardrails on.
+    pub identity: crate::identity::ProcessIdentity,
 }
 
 /// The public surface: send commands, read snapshots, feed prices. Nothing here exposes mutable
@@ -506,6 +509,9 @@ struct Actor {
     reconcile_inflight: bool,
     last_reconcile_ms: Option<i64>,
     notifier: Arc<dyn Notifier>,
+    /// Process identity (live-process): Demo keeps every existing behaviour.
+    #[allow(dead_code)]
+    identity: crate::identity::ProcessIdentity,
     /// Reason of the current alert entry per pair (shown with the banner).
     alert_reasons: BTreeMap<PairUuid, String>,
     /// `(pair, transition event id)` whose notification is in flight or done in this run.
@@ -525,7 +531,7 @@ struct Actor {
 
 impl Actor {
     fn new(deps: EngineDeps) -> (Actor, EngineHandle) {
-        let EngineDeps { db, clock, timings, simulator, factory, market, offsets, account, sim_account, reconciler, notifier } = deps;
+        let EngineDeps { db, clock, timings, simulator, factory, market, offsets, account, sim_account, reconciler, notifier, identity } = deps;
         let events = EventStore::new(db.clone());
         let (trigger_mode, mut execution_mode, warnings) = gate::load_modes(&db);
         for w in warnings {
@@ -593,6 +599,7 @@ impl Actor {
             reconcile_inflight: false,
             last_reconcile_ms: None,
             notifier,
+            identity,
             alert_reasons: BTreeMap::new(),
             notify_started: BTreeSet::new(),
             pending_confirms: BTreeMap::new(),
@@ -3401,6 +3408,7 @@ mod tests {
             sim_account: Arc::new(NoPorts),
             reconciler: None,
             notifier: Arc::new(crate::engine::alert::RecordingNotifier::default()),
+            identity: crate::identity::ProcessIdentity::Demo,
         };
         (Rig { _dir: dir, db, sim, factory }, deps)
     }
