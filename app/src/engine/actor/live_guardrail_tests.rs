@@ -766,3 +766,23 @@ async fn the_final_check_before_sending_uses_the_cap_and_the_armed_state_as_they
     let (demo_actor, _dh) = Actor::new(demo_deps);
     assert_eq!(demo_actor.live_final_check(UUID, &set), Ok(()));
 }
+
+/// live-process: the id prefix follows the process identity for orders that reach an exchange
+/// executor (`live` for Live, `demo` for Demo); only the simulator keeps `sim`.
+#[tokio::test(start_paused = true)]
+async fn real_orders_carry_the_prefix_of_the_process_identity() {
+    for (identity, expect, other) in [(ProcessIdentity::Live, "live", "demo"), (ProcessIdentity::Demo, "demo", "live")] {
+        let (rig, mut deps) = rig(Opts { demo: true, trigger: "MANUAL", ..Opts::default() });
+        deps.identity = identity;
+        store_risk(&rig.db, &live_risk());
+        let h = start_with_probes(deps, FakeProbes::green());
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(ask(&h, Command::SetExecutionMode(ExecutionMode::ExchangeDemo)).await, CommandReply::Accepted, "{identity:?}");
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(ask(&h, manual(true, "0.01")).await, CommandReply::Accepted);
+        sleep(Duration::from_millis(50)).await;
+        let sent = rig.demo.requests.lock().unwrap().clone();
+        assert!(!sent.is_empty(), "{identity:?}: the real executor must receive the order");
+        assert!(sent.iter().all(|r| r.client_order_id.starts_with(expect) && !r.client_order_id.starts_with(other)), "{identity:?}: {sent:?}");
+    }
+}

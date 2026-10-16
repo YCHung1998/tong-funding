@@ -2700,7 +2700,13 @@ impl Actor {
     // ---- order plumbing ----
 
     fn id_prefix(&self) -> IdPrefix {
-        if self.executor.is_simulated() { IdPrefix::Sim } else { IdPrefix::Demo }
+        if self.executor.is_simulated() {
+            IdPrefix::Sim
+        } else if self.identity.is_live() {
+            IdPrefix::Live
+        } else {
+            IdPrefix::Demo
+        }
     }
 
     /// Positions / open orders of a pair come from the simulated ledger for simulated pairs.
