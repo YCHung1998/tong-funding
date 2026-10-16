@@ -767,6 +767,49 @@ async fn the_final_check_before_sending_uses_the_cap_and_the_armed_state_as_they
     assert_eq!(demo_actor.live_final_check(UUID, &set), Ok(()));
 }
 
+/// live-process 5.2: a Live engine takes no OKX leg anywhere (add, entry, manual order) and its
+/// effective `allowed_exchanges` never lists OKX; Demo keeps OKX.
+#[tokio::test(start_paused = true)]
+async fn a_live_engine_refuses_every_okx_leg_while_demo_keeps_them() {
+    let okx_pair = |uuid: &str| {
+        let mut p = pair_n(uuid, SYM, "9");
+        p.short_exchange = Exchange::Okx;
+        p
+    };
+    // add_prepared
+    let (_rig, h, _p) = live_started(&live_risk()).await;
+    let r = ask(&h, Command::AddPrepared(okx_pair("okx-1"))).await;
+    assert!(matches!(&r, CommandReply::Rejected(m) if m.contains("OKX") && m.contains("live")), "{r:?}");
+    assert_eq!(ask(&h, Command::AddPrepared(pair_n(UUID, SYM, "9"))).await, CommandReply::Accepted, "Binance/Bybit pairs still work");
+    // manual order on OKX
+    let mut o = manual(true, "0.01");
+    if let Command::ManualOrder(m) = &mut o {
+        m.exchange = Exchange::Okx;
+    }
+    let r = ask(&h, o).await;
+    assert!(matches!(&r, CommandReply::Rejected(m) if m.contains("OKX")), "{r:?}");
+    // start_entry (second line of defence: a pair that got in some other way)
+    let (_rig2, deps) = live_deps("MANUAL", &live_risk());
+    let (mut actor, _h2) = Actor::new(deps);
+    actor.pairs.insert(
+        "okx-2".into(),
+        PairView { internal_uuid: "okx-2".into(), pair_id: "p".into(), symbol: SYM.into(), long_exchange: Exchange::Binance, short_exchange: Exchange::Okx, state: PairState::Prepared, settlement_ms: 1, simulated: true, flat_confirmed: false },
+    );
+    let r = actor.start_entry("okx-2", "test");
+    assert!(matches!(&r, CommandReply::Rejected(m) if m.contains("OKX") && m.contains("live")), "{r:?}");
+    // effective risk: OKX never allowed in live
+    let mut cfg = live_risk();
+    cfg.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx];
+    let (_rig3, deps3) = live_deps("MANUAL", &cfg);
+    let (actor3, _h3) = Actor::new(deps3);
+    assert!(!actor3.load_risk().unwrap().0.allowed_exchanges.contains(&Exchange::Okx));
+    // Demo keeps OKX
+    let (rig4, deps4) = rig(Opts::default());
+    store_risk(&rig4.db, &cfg);
+    let (actor4, _h4) = Actor::new(deps4);
+    assert!(actor4.load_risk().unwrap().0.allowed_exchanges.contains(&Exchange::Okx));
+}
+
 /// live-process: the id prefix follows the process identity for orders that reach an exchange
 /// executor (`live` for Live, `demo` for Demo); only the simulator keeps `sim`.
 #[tokio::test(start_paused = true)]

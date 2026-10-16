@@ -1349,6 +1349,9 @@ impl Actor {
         let Some(view) = self.pairs.get(pair).cloned() else {
             return CommandReply::Rejected(format!("unknown pair {pair}"));
         };
+        if let Some(why) = self.live_okx_refusal(&[view.long_exchange, view.short_exchange]) {
+            return CommandReply::Rejected(why);
+        }
         if view.state != PairState::Prepared {
             return CommandReply::Rejected(format!("pair is {}, not PREPARED", view.state));
         }
@@ -2117,6 +2120,9 @@ impl Actor {
     // ---- manual orders: same executor, same intent path, not part of a pair ----
 
     fn manual_order(&mut self, o: ManualOrder) -> CommandReply {
+        if let Some(why) = self.live_okx_refusal(&[o.exchange]) {
+            return CommandReply::Rejected(why);
+        }
         // manual-order-leverage: only an opening order applies a leverage; a non-positive one is refused.
         let leverage = if o.reduce_only { None } else { o.leverage };
         if leverage.is_some_and(|l| l <= Decimal::ZERO) {
@@ -2475,7 +2481,16 @@ impl Actor {
 
     // ---- pairs, modes, config ----
 
+    /// live-process 5.2: OKX has no live path. `Some(reason)` when this is a Live engine and one of
+    /// the exchanges is OKX (checked at every place a leg enters: add, entry, manual order).
+    fn live_okx_refusal(&self, exchanges: &[Exchange]) -> Option<String> {
+        (self.identity.is_live() && exchanges.contains(&Exchange::Okx)).then(|| "live does not support OKX: no OKX leg in a live process".to_string())
+    }
+
     fn add_prepared(&mut self, p: NewPreparedPair) -> CommandReply {
+        if let Some(why) = self.live_okx_refusal(&[p.long_exchange, p.short_exchange]) {
+            return CommandReply::Rejected(why);
+        }
         let simulated = self.execution_mode == ExecutionMode::Simulation;
         let env = PairEnvelope {
             long_exchange: p.long_exchange,
@@ -2694,7 +2709,12 @@ impl Actor {
 
     /// Stored global settings and overrides (validated by core). Missing keys = defaults / none.
     fn load_risk(&self) -> Result<(RiskConfig, RiskOverrides), String> {
-        load_risk_config(&self.db)
+        let (mut risk, overrides) = load_risk_config(&self.db)?;
+        if self.identity.is_live() {
+            // live-process 5.2: OKX is never an allowed exchange of a live process
+            risk.allowed_exchanges.retain(|e| *e != Exchange::Okx);
+        }
+        Ok((risk, overrides))
     }
 
     // ---- order plumbing ----

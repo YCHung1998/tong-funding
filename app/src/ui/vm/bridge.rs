@@ -33,6 +33,14 @@ pub const TRADABLE_EXCHANGES: [Exchange; 3] = Exchange::ALL;
 /// Exchanges whose account (signed) data the pages show.
 pub const ACCOUNT_EXCHANGES: [Exchange; 3] = Exchange::ALL;
 
+/// live-process 5.2: a live process trades Binance and Bybit only (OKX has no live path).
+pub const LIVE_TRADABLE_EXCHANGES: [Exchange; 2] = [Exchange::Binance, Exchange::Bybit];
+
+/// The exchanges the pages and account reads cover under `identity`.
+pub fn tradable_exchanges(identity: crate::identity::ProcessIdentity) -> &'static [Exchange] {
+    if identity.is_live() { &LIVE_TRADABLE_EXCHANGES } else { &TRADABLE_EXCHANGES }
+}
+
 pub fn is_tradable(e: Exchange) -> bool {
     TRADABLE_EXCHANGES.contains(&e)
 }

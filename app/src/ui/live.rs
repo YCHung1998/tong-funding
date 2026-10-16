@@ -253,6 +253,15 @@ pub fn not_connected_text(r: Option<NotConnectedReason>) -> String {
     }
 }
 
+/// live-process 5.2: the settings as this process sees them: a live process never lists OKX in
+/// `allowed_exchanges` (same rule as the engine's `load_risk`).
+pub fn settings_for(identity: crate::identity::ProcessIdentity, mut s: Settings) -> Settings {
+    if identity.is_live() {
+        s.risk.allowed_exchanges.retain(|e| *e != Exchange::Okx);
+    }
+    s
+}
+
 /// Settings from the `config` table (same keys and validation as the engine).
 pub fn load_settings(db: &Db) -> Settings {
     let risk = match db.config_get(crate::store::config_cli::KEY_RISK) {
@@ -487,7 +496,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
             kill_switch: super::bridge::KillSwitchState::Unknown,
         }));
     }
-    let settings = db.as_ref().map(load_settings).unwrap_or_default();
+    let settings = db.as_ref().map(load_settings).map(|s| settings_for(identity, s)).unwrap_or_default();
     let stale_ms = settings.risk.stale_data_threshold_ms as i64;
     shared.push(SourceUpdate::Settings(settings.clone()));
 
@@ -651,7 +660,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
             });
         }
         None => {
-            for ex in super::bridge::ACCOUNT_EXCHANGES {
+            for ex in super::bridge::tradable_exchanges(identity).iter().copied() {
                 shared.push(SourceUpdate::Account { exchange: ex, state: AccountState::NotConnected { reason: "簽名傳輸層無法建立".into() } });
             }
         }
@@ -705,7 +714,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
             let mut keys_cadence = DemoKeysCadence::default();
             loop {
                 if let Some(db) = &db {
-                    let settings = load_settings(db);
+                    let settings = settings_for(ctx.identity, load_settings(db));
                     okx_limits.set_cap(okx_leg_cap(&settings));
                     *ctx.enabled.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = settings.risk.allowed_exchanges.iter().copied().collect();
                     ctx.shared.push(SourceUpdate::Settings(settings));
@@ -906,7 +915,7 @@ where
         tokio::spawn(async move {
             loop {
                 for (simulated, view) in [(true, &sim_account), (false, &account)] {
-                    for ex in super::bridge::TRADABLE_EXCHANGES {
+                    for ex in super::bridge::tradable_exchanges(ctx.identity).iter().copied() {
                         let (positions, open_orders, available_margin) = tokio::join!(view.positions(ex), view.open_orders(ex), view.available_margin(ex));
                         let acc = LegAccount { positions, open_orders, available_margin, fetched_at: clock_now(&ctx.clock) };
                         ctx.shared.push(SourceUpdate::LegAccount { simulated, exchange: ex, account: acc });
@@ -1211,6 +1220,17 @@ mod tests {
         };
         let rest: HashMap<String, FundingObservation> = ["ETHUSDT", "BTCUSDT", "BTCUSDT-09OCT26", "BTCPERP"].into_iter().map(|s| (s.to_string(), obs(s))).collect();
         assert_eq!(bybit_ws_symbols(&rest), vec!["BTCUSDT".to_string(), "ETHUSDT".to_string()]);
+    }
+
+    #[test]
+    fn a_live_process_never_sees_okx_as_allowed_or_tradable_and_demo_keeps_it() {
+        use crate::identity::ProcessIdentity::{Demo, Live};
+        let mut s = Settings::default();
+        s.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit, Exchange::Okx];
+        assert_eq!(settings_for(Live, s.clone()).risk.allowed_exchanges, vec![Exchange::Binance, Exchange::Bybit]);
+        assert_eq!(settings_for(Demo, s).risk.allowed_exchanges.len(), 3);
+        assert_eq!(super::super::bridge::tradable_exchanges(Live), &[Exchange::Binance, Exchange::Bybit]);
+        assert_eq!(super::super::bridge::tradable_exchanges(Demo).len(), 3);
     }
 
     #[test]
