@@ -6,6 +6,7 @@ use tong_funding_core::pair::PairState;
 use tong_funding_core::risk::{ExecutionMode, TriggerMode};
 use tong_funding_core::types::{Decimal, Exchange};
 
+use super::preflight::PreflightReport;
 use super::ports::{FreshQuote, Leg, OrderAction, OrderRules, OrderSide, QueryOutcome, SubmitOutcome};
 
 /// Saved risk settings (global + overrides), with before / after values, in the same transaction
@@ -81,6 +82,15 @@ pub enum Command {
     /// Contract page save (per-leg notional and leverage, both > 0) with `CONTRACT_SETTINGS_UPDATED`.
     SaveContractTemplate { notional_usdt: Decimal, leverage: Decimal },
     SetKillSwitch { on: bool },
+    /// live-guardrails: the ONLY way to lift a Live kill switch. The engine verifies every field
+    /// itself (fresh engine-issued preflight, caps hash, confirmation sentence, checklist).
+    Arm { preflight_id: String, caps_hash: String, confirmation: String, checklist_ack: bool },
+    /// live-guardrails: run the preflight; the result (with the `preflight_id` when green) is
+    /// published on `EngineHandle::live`.
+    RunPreflight,
+    /// live-guardrails: close ONE leg of a pair in PARTIAL_FAILURE / IMBALANCED / UNRESOLVED with a
+    /// reduce-only market order sized by `plan_leg_close` (Live only; allowed while locked).
+    FlattenLeg { pair: PairUuid, leg: Leg },
 }
 
 impl Command {
@@ -104,7 +114,10 @@ impl Command {
             | Command::ManualCancel { .. }
             | Command::SaveRiskSettings { .. }
             | Command::SaveContractTemplate { .. }
-            | Command::SetKillSwitch { .. } => false,
+            | Command::SetKillSwitch { .. }
+            | Command::Arm { .. }
+            | Command::RunPreflight
+            | Command::FlattenLeg { .. } => false,
         }
     }
 }
@@ -179,6 +192,10 @@ pub enum Event {
     /// recorded fill (open fills minus earlier close fills; `Err` = unknown), read before its
     /// reduce-only order is sized.
     EarlyPositionFetched { pair: PairUuid, leg: Leg, position: Result<Decimal, String>, recorded: Result<Decimal, String>, trigger: EarlyTrigger },
+    /// live-guardrails: a preflight run finished (the report holds results only).
+    PreflightDone { report: PreflightReport },
+    /// live-guardrails `FlattenLeg`: the leg's signed position and the pair's recorded fill on it.
+    FlattenPositionFetched { pair: PairUuid, leg: Leg, position: Result<Decimal, String>, recorded: Result<Decimal, String> },
 }
 
 /// What made a leg reach the early-exit threshold (recorded with the `LEG_EARLY_EXIT` event).
@@ -327,6 +344,9 @@ mod tests {
             Command::SaveRiskSettings { risk: serde_json::json!({}), overrides: serde_json::json!({}) },
             Command::SaveContractTemplate { notional_usdt: Decimal::ONE, leverage: Decimal::ONE },
             Command::SetKillSwitch { on: false },
+            Command::Arm { preflight_id: "pf".into(), caps_hash: "h".into(), confirmation: "c".into(), checklist_ack: true },
+            Command::RunPreflight,
+            Command::FlattenLeg { pair: p(), leg: Leg::Long },
         ];
         for c in &opens {
             assert!(c.opens_exposure(), "{c:?} must open exposure");

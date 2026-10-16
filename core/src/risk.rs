@@ -107,7 +107,20 @@ pub struct RiskConfig {
     /// this percentage (vs its own open fill average) is closed alone. Global only, default 0.3
     /// (user decision 2026-10-15), 0 = disabled; never makes the config incomplete.
     pub early_exit_min_move_pct: Pct,
+    /// live-guardrails: per-leg notional cap (USDT) enforced by the engine under the Live identity.
+    /// Required for Live, no default (`None` = not set); ignored by Demo. Must be in
+    /// `(0, LIVE_CAP_CEILING_LEG_NOTIONAL_USDT]`. Global only.
+    pub live_max_leg_notional_usdt: Option<Decimal>,
+    /// live-guardrails: most pairs entered per arming. Required for Live, no default; ignored by
+    /// Demo. Must be in `1..=LIVE_CAP_CEILING_PAIRS_PER_ARMING`. Global only.
+    pub live_max_pairs_per_arming: Option<u32>,
 }
+
+/// Absolute per-leg notional ceiling (USDT) baked into the program: neither the config nor the
+/// database can raise it, only a new release (live-guardrails).
+pub const LIVE_CAP_CEILING_LEG_NOTIONAL_USDT: Decimal = Decimal::from_parts(100, 0, 0, false, 0);
+/// Absolute ceiling on pairs entered per arming (live-guardrails).
+pub const LIVE_CAP_CEILING_PAIRS_PER_ARMING: u32 = 5;
 
 impl Default for RiskConfig {
     fn default() -> Self {
@@ -129,6 +142,8 @@ impl Default for RiskConfig {
             taker_fee_pct: BTreeMap::new(),
             min_expected_net_pnl_pct: Decimal::new(3, 2),
             early_exit_min_move_pct: Decimal::new(3, 1),
+            live_max_leg_notional_usdt: None,
+            live_max_pairs_per_arming: None,
         }
     }
 }
@@ -172,6 +187,26 @@ impl RiskConfig {
         }
         non_negative("min_expected_net_pnl_pct", self.min_expected_net_pnl_pct)?;
         non_negative("early_exit_min_move_pct", self.early_exit_min_move_pct)?;
+        if let Some(v) = self.live_max_leg_notional_usdt {
+            positive("live_max_leg_notional_usdt", v)?;
+            if v > LIVE_CAP_CEILING_LEG_NOTIONAL_USDT {
+                return Err(invalid(
+                    "live_max_leg_notional_usdt",
+                    format!("exceeds the built-in ceiling of {LIVE_CAP_CEILING_LEG_NOTIONAL_USDT} USDT"),
+                ));
+            }
+        }
+        if let Some(n) = self.live_max_pairs_per_arming {
+            if n < 1 {
+                return Err(invalid("live_max_pairs_per_arming", "must be an integer >= 1"));
+            }
+            if n > LIVE_CAP_CEILING_PAIRS_PER_ARMING {
+                return Err(invalid(
+                    "live_max_pairs_per_arming",
+                    format!("exceeds the built-in ceiling of {LIVE_CAP_CEILING_PAIRS_PER_ARMING} pairs per arming"),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -204,6 +239,23 @@ impl RiskConfig {
     /// True when no required field is missing; Net Edge must not be used otherwise.
     pub fn is_complete(&self) -> bool {
         self.missing_fields().is_empty()
+    }
+
+    /// Live identity only: `missing_fields()` plus the live-only caps still unset. Demo keeps
+    /// using `missing_fields()` / `is_complete()` (the live caps never affect it).
+    pub fn missing_live_fields(&self) -> Vec<String> {
+        let mut out = self.missing_fields();
+        if self.live_max_leg_notional_usdt.is_none() {
+            out.push("live_max_leg_notional_usdt".to_string());
+        }
+        if self.live_max_pairs_per_arming.is_none() {
+            out.push("live_max_pairs_per_arming".to_string());
+        }
+        out
+    }
+
+    pub fn is_live_complete(&self) -> bool {
+        self.missing_live_fields().is_empty()
     }
 }
 

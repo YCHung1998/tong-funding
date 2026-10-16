@@ -52,6 +52,8 @@ use super::command::{
     PairView, RISK_CONFIG_UPDATED, Snapshot,
 };
 use super::latency::{self, ORDER_LATENCY};
+use super::live_guard::{LiveGuard, LiveStatus};
+use super::preflight::{NoProbes, PreflightProbes};
 use super::fill::{self, AutoCancel, FillDecision, LegFill, LegSizing, PreparedRecheck, SubmitPlan};
 use super::gate::{self, ModeSwitch};
 use super::ids::{self, IdPrefix, client_order_id};
@@ -72,6 +74,7 @@ use crate::store::state::{AddPairOutcome, ConfigChange, FLAG_EXECUTION_MODE, Int
 
 #[cfg(test)]
 pub(crate) mod flow_tests;
+mod live;
 mod pnl_gate;
 
 /// Command queue bound: a UI that floods commands waits (backpressure) instead of growing memory.
@@ -184,6 +187,8 @@ pub struct EngineHandle {
     pub commands: mpsc::Sender<CommandMsg>,
     pub snapshots: watch::Receiver<Snapshot>,
     pub market: watch::Sender<MarketPrices>,
+    /// live-guardrails: armed / locked, frozen caps, pairs entered, the latest preflight result.
+    pub live: watch::Receiver<LiveStatus>,
 }
 
 impl EngineHandle {
@@ -199,7 +204,13 @@ impl EngineHandle {
 
 /// Start the actor on the current tokio runtime.
 pub fn start(deps: EngineDeps) -> EngineHandle {
-    let (actor, handle) = Actor::new(deps);
+    start_with_probes(deps, Arc::new(NoProbes))
+}
+
+/// `start` with the Live preflight probes (keys present, position mode, database, disk). Without
+/// probes (`start`) a Live engine can never pass its preflight, so it can never be armed.
+pub fn start_with_probes(deps: EngineDeps, probes: Arc<dyn PreflightProbes>) -> EngineHandle {
+    let (actor, handle) = Actor::with_probes(deps, probes);
     tokio::spawn(actor.run());
     handle
 }
@@ -441,6 +452,11 @@ struct Flow {
     early: [EarlyLeg; 2],
     /// A price fetch for the early exit is in flight (at most one at a time).
     early_fetch_inflight: bool,
+    /// live-guardrails: per leg, the worst protection price the opening order was checked with
+    /// (re-used for the final check right before the send).
+    live_worst_price: [Option<Decimal>; 2],
+    /// live-guardrails `FlattenLeg`: the position / recorded-fill read of a leg is in flight.
+    flatten_inflight: [bool; 2],
 }
 
 /// Progress of one leg's early exit.
@@ -510,8 +526,11 @@ struct Actor {
     last_reconcile_ms: Option<i64>,
     notifier: Arc<dyn Notifier>,
     /// Process identity (live-process): Demo keeps every existing behaviour.
-    #[allow(dead_code)]
     identity: crate::identity::ProcessIdentity,
+    /// live-guardrails: preflight probes, and the Live state (armed caps, preflight, pair count).
+    probes: Arc<dyn PreflightProbes>,
+    live: LiveGuard,
+    live_tx: watch::Sender<LiveStatus>,
     /// Reason of the current alert entry per pair (shown with the banner).
     alert_reasons: BTreeMap<PairUuid, String>,
     /// `(pair, transition event id)` whose notification is in flight or done in this run.
@@ -531,11 +550,20 @@ struct Actor {
 
 impl Actor {
     fn new(deps: EngineDeps) -> (Actor, EngineHandle) {
+        Actor::with_probes(deps, Arc::new(NoProbes))
+    }
+
+    fn with_probes(deps: EngineDeps, probes: Arc<dyn PreflightProbes>) -> (Actor, EngineHandle) {
         let EngineDeps { db, clock, timings, simulator, factory, market, offsets, account, sim_account, reconciler, notifier, identity } = deps;
         let events = EventStore::new(db.clone());
-        let (trigger_mode, mut execution_mode, warnings) = gate::load_modes(&db);
+        let (mut trigger_mode, mut execution_mode, warnings) = gate::load_modes(&db);
         for w in warnings {
             let _ = events.append("MODE_LOAD_WARNING", None, json!({ "warning": w }));
+        }
+        // live-guardrails: Live never runs AUTO (the stored value is taken back to MANUAL).
+        if identity.is_live() && trigger_mode == TriggerMode::Auto {
+            trigger_mode = TriggerMode::Manual;
+            let _ = gate::set_trigger_mode(&db, TriggerMode::Auto, TriggerMode::Manual);
         }
         let mut executor = simulator.clone();
         let mut notices = Vec::new();
@@ -573,6 +601,7 @@ impl Actor {
         let (cmd_tx, cmd_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel(EVENT_CAPACITY);
         let (market_tx, market_rx) = watch::channel(MarketPrices::new());
+        let (live_tx, live_rx) = watch::channel(LiveStatus::default());
         let mut actor = Actor {
             db,
             events,
@@ -600,6 +629,9 @@ impl Actor {
             last_reconcile_ms: None,
             notifier,
             identity,
+            probes,
+            live: LiveGuard::default(),
+            live_tx,
             alert_reasons: BTreeMap::new(),
             notify_started: BTreeSet::new(),
             pending_confirms: BTreeMap::new(),
@@ -612,12 +644,15 @@ impl Actor {
             dirty: false,
             last_push: None,
         };
+        // live-guardrails: Live starts locked (kill switch forced ON) before anything else can act.
+        actor.live_startup();
         // Pairs already in an alert state at startup: banner from their state; PAIR_ALERT /
         // notification only for an entry that has none yet (never again after a restart).
         actor.sync_alerts();
         let (snapshot_tx, snapshots) = watch::channel(actor.snapshot());
         actor.snapshot_tx = snapshot_tx;
-        (actor, EngineHandle { commands: cmd_tx, snapshots, market: market_tx })
+        actor.publish_live();
+        (actor, EngineHandle { commands: cmd_tx, snapshots, market: market_tx, live: live_rx })
     }
 
     async fn run(mut self) {
@@ -758,6 +793,13 @@ impl Actor {
     /// The single entry for every command: gate first, then one handler per variant.
     fn dispatch(&mut self, cmd: Command) -> CommandReply {
         self.dirty = true;
+        // live-guardrails: Live-only rules come first (Demo never reaches them).
+        if self.live_on()
+            && let Err(why) = gate::live_precheck(&cmd, self.armed())
+        {
+            self.note(COMMAND_REFUSED, pair_of(&cmd), json!({ "command": command_name(&cmd), "reason": why }));
+            return CommandReply::Rejected(why);
+        }
         if cmd.opens_exposure() {
             let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
             let refusing = gate::refusing(&blockers, self.execution_mode);
@@ -779,7 +821,10 @@ impl Actor {
         }
         match cmd {
             Command::Tick => self.on_tick(),
-            Command::AddPrepared(p) => self.add_prepared(p),
+            Command::AddPrepared(p) => match self.live_add_prepared_check(&p.entry) {
+                Ok(()) => self.add_prepared(p),
+                Err(why) => CommandReply::Rejected(why),
+            },
             Command::EntryTrigger { pair } => self.start_entry(&pair, "scheduler"),
             Command::ManualEnter { pair } => self.start_entry(&pair, "user"),
             Command::EnterSelected { pairs } => self.enter_selected(pairs),
@@ -802,9 +847,17 @@ impl Actor {
             Command::SaveRiskSettings { risk, overrides } => self.save_risk_settings(risk, overrides),
             Command::SaveContractTemplate { notional_usdt, leverage } => self.save_contract_template(notional_usdt, leverage),
             Command::SetKillSwitch { on } => match self.db.set_kill_switch(on) {
-                Ok(()) => CommandReply::Accepted,
+                Ok(()) => {
+                    if on {
+                        self.live_disarm();
+                    }
+                    CommandReply::Accepted
+                }
                 Err(e) => CommandReply::Rejected(format!("cannot save kill switch: {e}")),
             },
+            Command::Arm { preflight_id, caps_hash, confirmation, checklist_ack } => self.arm(&preflight_id, &caps_hash, &confirmation, checklist_ack),
+            Command::RunPreflight => self.run_preflight_command(),
+            Command::FlattenLeg { pair, leg } => self.flatten_leg(&pair, leg),
         }
     }
 
@@ -849,6 +902,10 @@ impl Actor {
                 PairState::FillMonitor if !orphan => {
                     self.poll(&id, OrderAction::Open);
                     self.check_fills(&id, now);
+                }
+                // live-guardrails: a FlattenLeg order of a locked pair is looked up like any close
+                PairState::PartialFailure | PairState::Imbalanced | PairState::Unresolved if !orphan && self.flatten_pending(&id) => {
+                    self.poll(&id, OrderAction::Close);
                 }
                 PairState::Closing if !orphan && self.awaiting_pnl(&id) => self.finalize_closed(&id),
                 PairState::Closing if !orphan => {
@@ -1303,7 +1360,11 @@ impl Actor {
         }
         // Never enter without calibrated exchange time, never at or after settlement (D9).
         match self.reading(&view, self.clock.now_ms()).exchange_now_range() {
-            None => return CommandReply::Rejected("serverTime offset unavailable: no entry (fail closed)".into()),
+            None => {
+                // live-guardrails: a clock that cannot be trusted before an entry locks Live
+                self.lock_live("clock sync failed before entry (serverTime offset unavailable)");
+                return CommandReply::Rejected("serverTime offset unavailable: no entry (fail closed)".into());
+            }
             Some((_, latest)) if latest >= view.settlement_ms => {
                 return CommandReply::Rejected("entry window closed: settlement time reached".into());
             }
@@ -1452,6 +1513,10 @@ impl Actor {
                 };
                 fail(self, json!({ "block": format!("{block:?}"), "notes": notes, "failed_checks": failed_checks }))
             }
+            // live-guardrails: RiskLimits for Live = pair notional, frozen leverage, pairs per arming
+            Node0Verdict::Pass if let Some(why) = self.live_entry_block(&entry) => {
+                fail(self, json!({ "block": format!("RiskLimits: live: {why}"), "notes": notes, "failed_checks": ["RiskLimits"] }))
+            }
             Node0Verdict::Pass if let Some(why) = leverage_cap_block(&view, entry.leverage, context.leverage_caps.as_ref()) => {
                 fail(self, json!({ "block": format!("LeverageCap: {why}"), "notes": notes, "failed_checks": ["LeverageCap"] }))
             }
@@ -1496,6 +1561,9 @@ impl Actor {
 
     /// Right before the legs are sent: no blocker refuses exposure and the entry window is still open.
     fn entry_still_allowed(&self, pair: &str) -> Result<(), String> {
+        if self.live_on() && !self.armed() {
+            return Err("live is not armed".into());
+        }
         let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
         if let Some(b) = gate::refusing(&blockers, self.execution_mode).first() {
             return Err(format!("refused while the pre-send barrier ran: {b:?}"));
@@ -1585,6 +1653,19 @@ impl Actor {
                     return;
                 }
             };
+            // live-guardrails: quantity x worst protection price against the cap, before anything is landed
+            if self.live_on() {
+                let (scan_price, pre_price) = match leg {
+                    Leg::Long => (entry.long_scan_price, prices[0]),
+                    Leg::Short => (entry.short_scan_price, prices[1]),
+                };
+                let worst = self.live_worst_price(pair, leg, exchange, &view.symbol, scan_price, pre_price);
+                if let Err(why) = self.live_order_check(&req, u, worst) {
+                    let _ = self.land(pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": [format!("{}: live cap: {why}", leg.as_str())] }));
+                    return;
+                }
+                self.flows.entry(pair.to_string()).or_default().live_worst_price[idx(leg)] = worst;
+            }
             legs[idx(leg)] = Some(LegOrder::new(req, u));
         }
         let set = OrderSet { sent_at_ms: self.clock.now_ms(), eff, legs, cancel_started: false };
@@ -1624,6 +1705,11 @@ impl Actor {
                 // Both legs are spawned before either can answer: they run in parallel (D5).
                 for (leg, req) in reqs {
                     self.spawn_submit_inner(pair.to_string(), leg, action, req, triggered, true);
+                }
+                // live-guardrails: this pair's entry is used for good; at the cap the engine locks
+                if action == OrderAction::Open {
+                    self.live_pair_sent(pair);
+                    self.live_lock_if_cap_reached();
                 }
             }
             Err(why) => {
@@ -2156,6 +2242,8 @@ impl Actor {
     /// Results of spawned I/O. Only here may they change state.
     fn on_event(&mut self, ev: Event) {
         self.dirty = true;
+        // live-guardrails: authentication errors and rate limits lock an armed Live engine
+        self.watch_event_errors(&ev);
         match ev {
             Event::BaselineFetched { pair, long, short } => {
                 for (leg, r) in [(Leg::Long, &long), (Leg::Short, &short)] {
@@ -2202,10 +2290,16 @@ impl Actor {
                 let result = result.and_then(|()| self.entry_still_allowed(&pair));
                 match result {
                     Ok(()) => {
+                        // live-guardrails: armed and every leg within the cap as it stands now
+                        if let Err(why) = self.live_final_check(&pair, &set) {
+                            let _ = self.land(&pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": [format!("live: {why}")] }));
+                            return;
+                        }
                         set.sent_at_ms = self.clock.now_ms();
                         // one snapshot of each leg's clock offset, taken now and carried on the request
                         for o in set.legs.iter_mut().flatten() {
                             let Some(offset_ms) = self.offsets.offset_ms(o.req.exchange) else {
+                                self.lock_live("clock sync failed before entry (serverTime offset unavailable)");
                                 let _ = self.land(&pair, SubmitPlan::ABORT_EVENT, json!({ "reason": "nothing sent", "failed": [format!("{} serverTime offset unavailable", o.req.exchange.name())] }));
                                 return;
                             };
@@ -2312,6 +2406,8 @@ impl Actor {
             Event::ConfirmChecked { pair, result } => self.on_confirm_checked(&pair, result),
             Event::EarlyExitFetched { pair, long, short } => self.on_early_exit_fetched(&pair, long, short),
             Event::EarlyPositionFetched { pair, leg, position, recorded, trigger } => self.on_early_position(&pair, leg, position, recorded, trigger),
+            Event::PreflightDone { report } => self.on_preflight_done(report),
+            Event::FlattenPositionFetched { pair, leg, position, recorded } => self.on_flatten_position(&pair, leg, position, recorded),
         }
     }
 
@@ -2441,6 +2537,11 @@ impl Actor {
                 // The actor (a user command) moved it: it is no longer the reconciler's.
                 self.reconcile_scope.remove(pair);
                 self.dirty = true;
+                if to == PairState::OrderSubmit {
+                    self.live_pair_entered(pair);
+                } else if from == PairState::OrderSubmit {
+                    self.live_pair_left_order_submit(pair);
+                }
                 self.sync_alert_for(pair);
                 Ok(to)
             }
@@ -2507,6 +2608,15 @@ impl Actor {
 
     /// Validate with core (`RiskConfig::from_json` / `parse_overrides`) before storing.
     fn update_config(&mut self, key: &str, value: Value) -> CommandReply {
+        // live-guardrails: while armed no cap may be raised
+        let frozen_check = match key {
+            CONFIG_RISK => self.live_settings_check(Some(&value), None),
+            CONFIG_RISK_OVERRIDES => self.live_settings_check(None, Some(&value)),
+            _ => Ok(()),
+        };
+        if let Err(why) = frozen_check {
+            return CommandReply::Rejected(why);
+        }
         let valid = match key {
             CONFIG_RISK => RiskConfig::from_json(&value.to_string()).map(|_| ()).map_err(|e| e.to_string()),
             CONFIG_RISK_OVERRIDES => parse_overrides(&value).map(|_| ()).map_err(|e| e.to_string()),
@@ -2537,6 +2647,9 @@ impl Actor {
         if let Err(e) = parse_overrides(&overrides) {
             return CommandReply::Rejected(format!("risk_overrides: {e}"));
         }
+        if let Err(why) = self.live_settings_check(Some(&risk), Some(&overrides)) {
+            return CommandReply::Rejected(why);
+        }
         let (old_risk, old_ov) = match (self.db.config_get(CONFIG_RISK), self.db.config_get(CONFIG_RISK_OVERRIDES)) {
             (Ok(r), Ok(o)) => (r, o),
             (Err(e), _) | (_, Err(e)) => return CommandReply::Rejected(format!("cannot read settings: {e}")),
@@ -2562,6 +2675,9 @@ impl Actor {
             if v <= Decimal::ZERO {
                 return CommandReply::Rejected(format!("{name} must be > 0"));
             }
+        }
+        if let Err(why) = self.live_notional_check(notional_usdt, "contract template notional") {
+            return CommandReply::Rejected(why);
         }
         let old = match self.db.config_get(CONFIG_CONTRACT_TEMPLATE) {
             Ok(e) => e,
@@ -2767,6 +2883,10 @@ impl Actor {
         if !alert::is_alert_state(view.state) {
             self.alert_reasons.remove(pair);
             return;
+        }
+        // live-guardrails: a pair that needs the user locks Live (once per pair and state)
+        if self.live_on() && self.live.locked_alerts.insert((pair.to_string(), view.state.as_str())) {
+            self.lock_live(&format!("pair {} entered {}", view.pair_id, view.state.as_str()));
         }
         let entry = match alert::entry_of(&self.db, pair, view.state) {
             Ok(Some(e)) => e,
@@ -3297,6 +3417,9 @@ fn command_name(c: &Command) -> &'static str {
         Command::SaveRiskSettings { .. } => "SaveRiskSettings",
         Command::SaveContractTemplate { .. } => "SaveContractTemplate",
         Command::SetKillSwitch { .. } => "SetKillSwitch",
+        Command::Arm { .. } => "Arm",
+        Command::RunPreflight => "RunPreflight",
+        Command::FlattenLeg { .. } => "FlattenLeg",
     }
 }
 
@@ -3308,7 +3431,8 @@ fn pair_of(c: &Command) -> Option<&str> {
         | Command::ManualExit { pair }
         | Command::ManualClose { pair }
         | Command::ConfirmClosed { pair, .. }
-        | Command::CancelPrepared { pair, .. } => Some(pair),
+        | Command::CancelPrepared { pair, .. }
+        | Command::FlattenLeg { pair, .. } => Some(pair),
         Command::AddPrepared(p) => Some(&p.internal_uuid),
         Command::Tick
         | Command::ManualOrder(_)
@@ -3319,7 +3443,9 @@ fn pair_of(c: &Command) -> Option<&str> {
         | Command::UpdateConfig { .. }
         | Command::SaveRiskSettings { .. }
         | Command::SaveContractTemplate { .. }
-        | Command::SetKillSwitch { .. } => None,
+        | Command::SetKillSwitch { .. }
+        | Command::Arm { .. }
+        | Command::RunPreflight => None,
     }
 }
 
@@ -3968,12 +4094,12 @@ mod tests {
     async fn a_stopped_engine_rejects_commands() {
         let (_rig, deps) = rig();
         let h = start(deps);
-        let EngineHandle { commands, snapshots, market } = h;
+        let EngineHandle { commands, snapshots, market, live } = h;
         drop(commands); // the actor exits once every command sender is gone
         sleep(Duration::from_millis(10)).await;
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        let h = EngineHandle { commands: tx, snapshots, market };
+        let h = EngineHandle { commands: tx, snapshots, market, live };
         assert!(matches!(h.send(Command::Tick).await, CommandReply::Rejected(_)));
     }
 }
