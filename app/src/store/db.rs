@@ -617,6 +617,34 @@ impl Db {
         Db::open_impl(path, clock, MIGRATIONS, OpenCfg { take_lock: true, identity, set_dir_mode: real_chmod })
     }
 
+    /// live-guardrails preflight: can this database take a write right now? Takes the write lock
+    /// (`BEGIN IMMEDIATE`) and rolls back: nothing is written. A halted store, a read-only file or a
+    /// lock held elsewhere is an `Err`.
+    pub fn probe_writable(&self) -> Result<(), StoreError> {
+        self.with_conn(|c| {
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.rollback()?;
+            Ok(())
+        })
+    }
+
+    /// live-guardrails preflight: free bytes (available to this user) on the filesystem that holds
+    /// the database file.
+    pub fn free_disk_bytes(&self) -> Result<u64, String> {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = self.path().parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|_| "database path contains a NUL byte".to_string())?;
+        let mut st = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+        // SAFETY: `c` is a valid NUL-terminated path and `st` is a properly sized, writable statvfs.
+        let rc = unsafe { libc::statvfs(c.as_ptr(), st.as_mut_ptr()) };
+        if rc != 0 {
+            return Err(format!("statvfs failed: {}", std::io::Error::last_os_error()));
+        }
+        // SAFETY: statvfs returned 0, so the struct is initialised.
+        let st = unsafe { st.assume_init() };
+        Ok((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    }
+
     /// The process identity this handle was opened for.
     pub fn identity(&self) -> ProcessIdentity {
         self.inner.identity

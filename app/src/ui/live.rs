@@ -616,7 +616,9 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         ProcessIdentity::Live => {
             let signed = SignedLiveTransport::new().ok().map(Arc::new);
             let orders = SignedLiveOrderTransport::new().map(Arc::new).map_err(|e| e.to_string());
-            live_env::build_live_env(signed, orders, common, Arc::new(NoProbes))
+            // live-guardrails: the real preflight probes (live keys, live position mode, live database, disk)
+            let probes = live_env::LiveProbes::new(secrets.clone(), orders.clone().ok(), offsets.clone(), time.clone(), db.clone());
+            live_env::build_live_env(signed, orders, common, Arc::new(probes))
         }
     };
     let okx_latch = bundle.okx_latch.clone();
@@ -895,6 +897,18 @@ where
     let handle = engine_actor::start_with_probes(deps, probes);
     let _ = ctx.feed.set((prices, handle.market.clone()));
     let _ = ctx.shared.engine.set((handle.commands.clone(), tokio::runtime::Handle::current()));
+    // live-guardrails: every change of the engine's Live status reaches the pages as `SourceUpdate::LiveStatus`.
+    {
+        let (shared, mut rx) = (ctx.shared.clone(), handle.live.clone());
+        tokio::spawn(async move {
+            loop {
+                shared.push(SourceUpdate::LiveStatus(super::bridge::LiveStatusView::from(&*rx.borrow_and_update())));
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     // Snapshot forwarder: every engine snapshot reaches the pages as `SourceUpdate::Engine`.
     {
         let (shared, mut rx) = (ctx.shared.clone(), handle.snapshots.clone());

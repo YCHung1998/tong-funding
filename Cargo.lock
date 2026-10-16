@@ -7377,6 +7377,7 @@ dependencies = [
  "hmac 0.13.0",
  "http",
  "keyring",
+ "libc",
  "reqwest",
  "rusqlite",
  "rust_decimal",

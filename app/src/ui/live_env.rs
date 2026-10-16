@@ -44,7 +44,8 @@ use crate::funding::fetch::{BinanceLedgerSource, BybitLedgerSource, LedgerSource
 use crate::funding::rate_source::DemoRateSource;
 use crate::funding::slot_runner::RateSource;
 use crate::identity::ProcessIdentity;
-use crate::ports::{Clock, SecretProvider, TimeSource};
+use crate::exchange::signed::signing::load_credentials;
+use crate::ports::{Clock, SecretName, SecretProvider, TimeSource};
 use crate::store::db::Db;
 
 /// The three public adapters (market data only; they hold no credentials and no signed marker).
@@ -319,6 +320,171 @@ where
         probes,
         poller: Some(Arc::new(LivePoller { binance: stack.binance, bybit: stack.bybit })),
         clock_sync: Some(Arc::new(HostClockSync { transport: t, binance: BinanceLive, bybit: BybitLive })),
+    }
+}
+
+// ---- Live preflight probes (live-guardrails, composition-root part) -----------------------------
+
+/// The real [`PreflightProbes`] of a live process: the LIVE Keychain bundle, the live order
+/// transport (position-mode reads) and the live database. Every failure is an `Err`, never a guess.
+pub struct LiveProbes<O> {
+    secrets: Arc<dyn SecretProvider>,
+    orders: Option<Arc<O>>,
+    offsets: Arc<dyn ServerOffsets>,
+    clock: Arc<dyn TimeSource>,
+    db: Option<Db>,
+}
+
+/// Any live symbol works for the Bybit position-mode read (the mode is account-wide in practice;
+/// the read lists the symbol's position rows).
+const BYBIT_MODE_PROBE_SYMBOL: &str = "BTCUSDT";
+
+impl<O: LiveOrderTransport + 'static> LiveProbes<O> {
+    pub fn new(secrets: Arc<dyn SecretProvider>, orders: Option<Arc<O>>, offsets: Arc<dyn ServerOffsets>, clock: Arc<dyn TimeSource>, db: Option<Db>) -> Self {
+        LiveProbes { secrets, orders, offsets, clock, db }
+    }
+
+    fn present(&self, exchange: Exchange, name: SecretName) -> Result<bool, String> {
+        match self.secrets.get(exchange, name) {
+            Ok(v) => Ok(v.is_some_and(|s| !s.trim().is_empty())),
+            Err(e) => Err(format!("{} live key store unreadable ({e})", exchange.name())),
+        }
+    }
+
+    async fn read_mode(&self, exchange: Exchange) -> Result<bool, String> {
+        use crate::exchange::execution::binance::{BinanceOrderClient, ModeReading};
+        use crate::exchange::execution::bybit::BybitOrderClient;
+        let transport = self.orders.clone().ok_or("live order transport unavailable")?;
+        let creds = load_credentials(self.secrets.as_ref(), exchange, false).map(Arc::new).map_err(|r| format!("{} live keys unavailable ({r:?})", exchange.name()))?;
+        let ts = self.offsets.offset_ms(exchange).map(|o| self.clock.now_ms().saturating_add(o)).ok_or_else(|| format!("{} clock offset not calibrated", exchange.name()))?;
+        let reading = match exchange {
+            Exchange::Binance => BinanceOrderClient::new(transport, creds, BinanceLive).position_mode(ts).await,
+            Exchange::Bybit => BybitOrderClient::new(transport, creds, BybitLive).position_mode(BYBIT_MODE_PROBE_SYMBOL, ts).await,
+            Exchange::Okx => return Err("OKX has no live path".into()),
+        };
+        reading.map(|m| m == ModeReading::OneWay)
+    }
+}
+
+impl<O: LiveOrderTransport + 'static> PreflightProbes for LiveProbes<O> {
+    fn key_present(&self, exchange: Exchange) -> BoxFut<'_, Result<bool, String>> {
+        Box::pin(async move {
+            if exchange == Exchange::Okx {
+                return Ok(false);
+            }
+            Ok(self.present(exchange, SecretName::ApiKey)? && self.present(exchange, SecretName::ApiSecret)?)
+        })
+    }
+
+    fn one_way_mode(&self, exchange: Exchange) -> BoxFut<'_, Result<bool, String>> {
+        Box::pin(self.read_mode(exchange))
+    }
+
+    fn db_writable(&self) -> BoxFut<'_, Result<(), String>> {
+        Box::pin(async move {
+            let db = self.db.as_ref().ok_or("no database")?;
+            db.probe_writable().map_err(|e| e.to_string())
+        })
+    }
+
+    fn free_disk_bytes(&self) -> BoxFut<'_, Result<u64, String>> {
+        Box::pin(async move { self.db.as_ref().ok_or_else(|| "no database".to_string())?.free_disk_bytes() })
+    }
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+    use crate::exchange::execution::http::Method;
+    use crate::exchange::execution::http::fake::{FakeOrderTransport, Reply};
+    use crate::exchange::signed::endpoints::{BINANCE_LIVE_HOST, BYBIT_LIVE_HOST};
+    use crate::ports::{ManualClock, MemorySecrets, SecretName};
+    use crate::store::db::test_support::{clock as db_clock, tempdir};
+
+    struct Off(Option<i64>);
+    impl ServerOffsets for Off {
+        fn offset_ms(&self, _: Exchange) -> Option<i64> {
+            self.0
+        }
+    }
+
+    fn secrets(full: &[Exchange], key_only: &[Exchange]) -> Arc<dyn SecretProvider> {
+        let mut m = MemorySecrets::default();
+        for e in full {
+            m = m.with(*e, SecretName::ApiKey, "K").with(*e, SecretName::ApiSecret, "S");
+        }
+        for e in key_only {
+            m = m.with(*e, SecretName::ApiKey, "K");
+        }
+        Arc::new(m)
+    }
+
+    fn live_db() -> (tempfile::TempDir, Db) {
+        let dir = tempdir();
+        let (clk, _) = db_clock(1_000_000);
+        let db = Db::open_for(ProcessIdentity::Live, &dir.path().join("funding-live.db"), clk);
+        assert!(!db.is_halted());
+        (dir, db)
+    }
+
+    fn probes(s: Arc<dyn SecretProvider>, t: &FakeOrderTransport, offset: Option<i64>, db: Option<Db>) -> LiveProbes<FakeOrderTransport> {
+        LiveProbes::new(s, Some(Arc::new(t.clone())), Arc::new(Off(offset)), Arc::new(ManualClock::new(1_700_000_000_000)), db)
+    }
+
+    #[tokio::test]
+    async fn a_key_is_present_only_when_both_key_and_secret_are_stored_and_okx_never_is() {
+        let t = FakeOrderTransport::new();
+        let p = probes(secrets(&[Exchange::Binance], &[Exchange::Bybit]), &t, Some(0), None);
+        assert_eq!(p.key_present(Exchange::Binance).await, Ok(true));
+        assert_eq!(p.key_present(Exchange::Bybit).await, Ok(false), "a key without its secret is not a key");
+        assert_eq!(p.key_present(Exchange::Okx).await, Ok(false));
+        let empty = probes(secrets(&[], &[]), &t, Some(0), None);
+        assert_eq!(empty.key_present(Exchange::Binance).await, Ok(false));
+    }
+
+    #[tokio::test]
+    async fn one_way_mode_reads_the_live_exchange_and_treats_hedge_unknown_and_no_clock_as_failures() {
+        let t = FakeOrderTransport::new();
+        t.on(Method::Get, "/fapi/v1/positionSide/dual", Reply::ok(r#"{"dualSidePosition":false}"#));
+        t.on(Method::Get, "/v5/position/list", Reply::ok(r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"BTCUSDT","positionIdx":0,"size":"0"}]}}"#));
+        let p = probes(secrets(&[Exchange::Binance, Exchange::Bybit], &[]), &t, Some(0), None);
+        assert_eq!(p.one_way_mode(Exchange::Binance).await, Ok(true));
+        assert_eq!(p.one_way_mode(Exchange::Bybit).await, Ok(true));
+        let hosts: Vec<String> = t.requests().iter().map(|r| r.full_url().trim_start_matches("https://").split('/').next().unwrap().to_string()).collect();
+        assert_eq!(hosts, vec![BINANCE_LIVE_HOST.to_string(), BYBIT_LIVE_HOST.to_string()]);
+        // hedge
+        let h = FakeOrderTransport::new();
+        h.on(Method::Get, "/fapi/v1/positionSide/dual", Reply::ok(r#"{"dualSidePosition":true}"#));
+        h.on(Method::Get, "/v5/position/list", Reply::ok(r#"{"retCode":0,"retMsg":"OK","result":{"list":[{"symbol":"BTCUSDT","positionIdx":1,"size":"0"},{"symbol":"BTCUSDT","positionIdx":2,"size":"0"}]}}"#));
+        let ph = probes(secrets(&[Exchange::Binance, Exchange::Bybit], &[]), &h, Some(0), None);
+        assert_eq!(ph.one_way_mode(Exchange::Binance).await, Ok(false));
+        assert_eq!(ph.one_way_mode(Exchange::Bybit).await, Ok(false));
+        // unreadable reply, no clock offset, no key, OKX: all errors, nothing guessed
+        let bad = FakeOrderTransport::new();
+        bad.on(Method::Get, "/fapi/v1/positionSide/dual", Reply::status(500, "boom"));
+        assert!(probes(secrets(&[Exchange::Binance], &[]), &bad, Some(0), None).one_way_mode(Exchange::Binance).await.is_err());
+        let none = FakeOrderTransport::new();
+        assert!(probes(secrets(&[Exchange::Binance], &[]), &none, None, None).one_way_mode(Exchange::Binance).await.is_err());
+        assert!(none.requests().is_empty(), "no signed request without a calibrated clock");
+        assert!(probes(secrets(&[], &[]), &none, Some(0), None).one_way_mode(Exchange::Binance).await.is_err());
+        assert!(p.one_way_mode(Exchange::Okx).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_database_and_disk_probes_look_at_the_live_database_itself() {
+        let t = FakeOrderTransport::new();
+        let (_dir, db) = live_db();
+        let p = probes(secrets(&[], &[]), &t, Some(0), Some(db.clone()));
+        assert_eq!(p.db_writable().await, Ok(()));
+        let free = p.free_disk_bytes().await.unwrap();
+        assert!(free > 0, "{free}");
+        // no database: both fail
+        let none = probes(secrets(&[], &[]), &t, Some(0), None);
+        assert!(none.db_writable().await.is_err() && none.free_disk_bytes().await.is_err());
+        // a halted store is not writable
+        let (_d2, halted) = live_db();
+        halted.halt(crate::store::db::HaltReason::CannotOpen("test".into()));
+        assert!(probes(secrets(&[], &[]), &t, Some(0), Some(halted)).db_writable().await.is_err());
     }
 }
 
