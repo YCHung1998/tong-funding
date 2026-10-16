@@ -39,3 +39,18 @@
 ## Open Questions
 
 - Live 的紅色是否需要和現有的負向色（虧損紅）區分，以免與損益紅色混淆？（預設使用同一個紅，靠文字與固定位置區分；若你覺得會混淆再調整。）
+
+## 附註：環境文字盤點與處置（task 1.1）
+
+盤點方式：`ui::env_label::tests::environment_words_live_only_here` 掃描 `app/src/ui/` 非測試程式碼的字串字面值（註解與 `#[cfg(test)]` 之後排除；欄位名與列舉變體名不算），出現 `EXCHANGE_DEMO`／`SIMULATION`／`LIVE` 即失敗。紅色時的清單與處置：
+
+| 位置 | 處置 |
+|---|---|
+| `status.rs` 模式徽章 | `ExecutionMode::label(identity)` → `EnvLabel::env_name` |
+| `vm/risk_settings.rs` 模式選項、說明、切換標籤 | `mode_label/mode_description(identity, …)` → `EnvLabel` |
+| `vm/staged_orders.rs` 模板標籤、確認環境句、歷史標題、人工處理 | `StagedVm.identity`、`PendingConfirm.env`、`EnvLabel::of_pair` |
+| `vm/contract_settings.rs` 邊界標籤 | `evaluate(…, Option<EnvLabel>)` |
+| `vm/funding.rs` 預期對實際面板 | `pnl_panel(f, identity)` |
+| `vm/manual_order.rs` 環境句、帳本來源 | `Ledger::of(EnvLabel)` 窮舉、`ManualVm.ledger_source` |
+| `trading_pages.rs` 觸發模式說明、設定不完整、不可選、切換確認、配對卡標頭 | 全部改呼叫 `EnvLabel` |
+| `engine/alert.rs`（ui/ 之外） | `AlertNotice.identity`，文字由 `EnvLabel::env_name` 產生 |

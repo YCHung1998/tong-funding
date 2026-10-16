@@ -52,8 +52,8 @@ fn max_leverage_zero_is_refused_by_name_and_nothing_is_sent() {
 
 #[test]
 fn the_mode_options_have_no_live_and_a_live_value_cannot_be_saved() {
-    assert_eq!(MODE_OPTIONS.map(|m| mode_label(m)), ["SIMULATION", "EXCHANGE_DEMO"]);
-    assert!(MODE_OPTIONS.iter().all(|m| !mode_label(*m).contains("LIVE")));
+    assert_eq!(MODE_OPTIONS.map(|m| mode_label(crate::identity::ProcessIdentity::Demo, m)), ["SIMULATION", "EXCHANGE_DEMO"]);
+    assert!(MODE_OPTIONS.iter().all(|m| !mode_label(crate::identity::ProcessIdentity::Demo, *m).contains("LIVE")));
     // Even a stored value cannot sneak LIVE through: the saved JSON carries the parsed mode.
     let vm = evaluate(&RiskForm::from_settings(&complete_settings("0.01")), &complete_settings("0.01"));
     let cfg = vm.result.as_ref().unwrap().0.clone();
@@ -200,21 +200,21 @@ fn a_bybit_override_of_4_from_the_page_blocks_leverage_5_only_for_pairs_with_byb
 fn switching_to_exchange_demo_needs_a_confirmation_first() {
     let s = complete_settings("0.01");
     let sink = Sink::default();
-    let step = request_mode(ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &s, Some(&Ok(())), &sink).unwrap();
+    let step = request_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &s, Some(&Ok(())), &sink).unwrap();
     assert_eq!(step, ModeStep::Confirm(ExecutionMode::ExchangeDemo));
     assert!(sink.0.borrow().is_empty(), "the mode stays SIMULATION until confirmed");
-    send_mode(ExecutionMode::ExchangeDemo, &sink);
+    send_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo, &sink);
     assert_eq!(*sink.0.borrow(), vec![Command::SetExecutionMode(ExecutionMode::ExchangeDemo)]);
     // Back to SIMULATION needs no confirmation.
     let sink = Sink::default();
-    assert_eq!(request_mode(ExecutionMode::ExchangeDemo, ExecutionMode::Simulation, &s, None, &sink).unwrap(), ModeStep::Sent);
+    assert_eq!(request_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo, ExecutionMode::Simulation, &s, None, &sink).unwrap(), ModeStep::Sent);
     assert_eq!(*sink.0.borrow(), vec![Command::SetExecutionMode(ExecutionMode::Simulation)]);
 }
 
 #[test]
 fn exchange_demo_is_refused_while_the_config_is_incomplete() {
     let sink = Sink::default();
-    let e = request_mode(ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &Settings::default(), Some(&Ok(())), &sink).unwrap_err();
+    let e = request_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &Settings::default(), Some(&Ok(())), &sink).unwrap_err();
     assert!(e.starts_with("設定不完整") && e.contains("Bybit taker_fee_pct"), "{e}");
     assert!(sink.0.borrow().is_empty());
 }
@@ -223,9 +223,9 @@ fn exchange_demo_is_refused_while_the_config_is_incomplete() {
 fn exchange_demo_is_refused_without_demo_keys() {
     let s = complete_settings("0.01");
     let sink = Sink::default();
-    let e = request_mode(ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &s, Some(&Err("Bybit keys unavailable (NoKey)".into())), &sink).unwrap_err();
+    let e = request_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &s, Some(&Err("Bybit keys unavailable (NoKey)".into())), &sink).unwrap_err();
     assert_eq!(e, "demo 金鑰不可用：Bybit keys unavailable (NoKey)");
-    let e = request_mode(ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &s, None, &sink).unwrap_err();
+    let e = request_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::Simulation, ExecutionMode::ExchangeDemo, &s, None, &sink).unwrap_err();
     assert_eq!(e, "demo 金鑰尚未確認");
     assert!(sink.0.borrow().is_empty());
 }
@@ -396,4 +396,29 @@ fn early_exit_does_not_make_the_config_incomplete() {
     s.risk.early_exit_min_move_pct = d("0");
     let vm = evaluate(&RiskForm::from_settings(&s), &s);
     assert!(vm.missing.is_empty() && vm.incomplete_text.is_none(), "{:?}", vm.missing);
+}
+
+// ---- live-banners: the mode selector names the world ---------------------------------------------
+
+#[test]
+fn a_live_process_calls_its_exchange_mode_live_and_says_real_money() {
+    assert_eq!(MODE_OPTIONS.map(|m| mode_label(crate::identity::ProcessIdentity::Live, m)), ["SIMULATION", "LIVE"]);
+    assert!(mode_description(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo).contains("真錢"));
+    assert!(!mode_description(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo).to_lowercase().contains("demo"));
+    assert!(mode_description(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo).contains("不涉及真錢"));
+}
+
+#[test]
+fn the_mode_switch_label_in_a_live_process_says_live() {
+    #[derive(Default)]
+    struct Labels(RefCell<Vec<String>>);
+    impl CommandSink for Labels {
+        fn send(&self, label: String, _command: Command) {
+            self.0.borrow_mut().push(label);
+        }
+    }
+    let sink = Labels::default();
+    send_mode(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo, &sink);
+    send_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo, &sink);
+    assert_eq!(*sink.0.borrow(), vec!["切換模式 → LIVE".to_string(), "切換模式 → EXCHANGE_DEMO".to_string()]);
 }

@@ -359,6 +359,18 @@ impl Shell {
         (a.critical.len(), a.notices.len(), a.reviews.len(), self.drawer_open, self.acks.len())
     }
 
+    /// Test view of the environment banner as drawn (live-banners smoke test).
+    #[cfg(test)]
+    pub(crate) fn env_banner_state(&self) -> EnvBanner {
+        EnvBanner::of_snapshot(&self.snap)
+    }
+
+    /// Test view of the identity the status bar badge uses.
+    #[cfg(test)]
+    pub(crate) fn status_identity(&self) -> crate::identity::ProcessIdentity {
+        self.status.identity
+    }
+
     pub(crate) fn toggle_drawer(&mut self) {
         self.drawer_open = !self.drawer_open;
     }
@@ -770,7 +782,7 @@ impl Shell {
             }
             cx.notify();
         }));
-        pages::system_log_page(self.log_vm.as_ref(), self.log_error.as_ref(), &selected, &on_type, on_older)
+        pages::system_log_page(self.log_vm.as_ref(), self.log_error.as_ref(), &selected, &on_type, on_older, self.snap.identity)
     }
 
     fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {

@@ -346,7 +346,7 @@ fn pair_card(c: &PairCard, on_recheck: &dyn Fn(String) -> ClickFn) -> Div {
         div()
             .flex()
             .justify_between()
-            .child(text(format!("{} · 中性組合", c.symbol), theme::TEXT_PRIMARY))
+            .child(text(format!("{} · 中性組合{}", c.symbol, c.badge.map_or(String::new(), |b| format!(" · {b}"))), if c.badge.is_some() { theme::NEGATIVE } else { theme::TEXT_PRIMARY }))
             .child(match (&c.state_warning, &c.label) {
                 (Some(w), _) => small(w.clone(), theme::WARNING),
                 (None, Some(l)) => small(l.clone(), if c.imbalanced { theme::WARNING } else { theme::POSITIVE }),
@@ -523,6 +523,7 @@ pub fn system_log_page(
     selected: &dyn Fn(&str) -> bool,
     on_type: &dyn Fn(String) -> ClickFn,
     on_older: ClickFn,
+    identity: crate::identity::ProcessIdentity,
 ) -> Div {
     let mut page = div().flex().flex_col().gap_3().child(div().flex().justify_between().child(title("系統日誌", "System Logs")).child(small("READ ONLY", theme::TEXT_MUTED)));
     if let Some(e) = error.and_then(load_state) {
@@ -551,6 +552,9 @@ pub fn system_log_page(
         Timeline::Rows(rows) => {
             for r in rows {
                 let mut head = div().flex().gap_2().child(small(r.time_text(), theme::TEXT_MUTED)).child(small(r.event_type.clone(), theme::ACCENT));
+                if let Some(b) = super::system_log::live_badge(r, identity) {
+                    head = head.child(small(b, theme::NEGATIVE));
+                }
                 for t in &r.tags {
                     head = head.child(small(format!("[{t}]"), theme::WARNING));
                 }

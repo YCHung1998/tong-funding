@@ -11,6 +11,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{CommandSink, LegAccount, UiSnapshot, TRADABLE_EXCHANGES};
 use super::engine_view::{blocker_text, refusing_blockers};
+use super::env_label::{ConfirmKind, EnvLabel};
 use super::format;
 use crate::engine::command::{Command, ManualOrder};
 use crate::engine::ports::{Listed, OrderSide};
@@ -59,7 +60,10 @@ pub struct ManualVm {
     /// One panel per exchange; `Err` = disabled with the reason.
     pub panels: Vec<(Exchange, Result<(), String>)>,
     pub mode: Option<ExecutionMode>,
+    pub identity: crate::identity::ProcessIdentity,
     pub env_text: String,
+    /// Where positions and orders are read from, named by the world (live-banners).
+    pub ledger_source: String,
     /// The floored order quantity in the exchange's unit (CONTRACTS on OKX, where the form takes
     /// coins), or why there is none.
     pub rounded: Result<Decimal, String>,
@@ -94,15 +98,45 @@ pub struct ManualConfirm {
     pub leverage: Option<Decimal>,
     pub cap_text: Option<String>,
     pub mode: ExecutionMode,
+    pub env: EnvLabel,
     pub env_text: String,
     pub warning: &'static str,
 }
 
-pub fn env_text(mode: Option<ExecutionMode>) -> String {
+impl ManualConfirm {
+    /// The environment and the amount, repeated in the confirmation.
+    pub fn env_line(&self) -> String {
+        self.env.confirm_env_line(self.est_notional)
+    }
+
+    /// "以真錢下單" / "以真錢平倉" in a Live process.
+    pub fn button(&self) -> &'static str {
+        self.env.confirm_button(if self.reduce_only { ConfirmKind::Close } else { ConfirmKind::Enter })
+    }
+}
+
+pub fn env_text(identity: crate::identity::ProcessIdentity, mode: Option<ExecutionMode>) -> String {
     match mode {
-        Some(ExecutionMode::Simulation) => "SIMULATION：由模擬器成交，不會送到交易所".into(),
-        Some(ExecutionMode::ExchangeDemo) => "EXCHANGE_DEMO：將對 demo / testnet 帳戶真實下單".into(),
+        Some(m) => EnvLabel::of(identity, m).manual_env_text().into(),
         None => "引擎未啟動：無法送出".into(),
+    }
+}
+
+/// Which ledger the engine trades against (live-banners: decided from identity AND mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ledger {
+    Simulated,
+    Exchange,
+}
+
+impl Ledger {
+    pub fn of(label: EnvLabel) -> Ledger {
+        match (label.identity, label.mode) {
+            (crate::identity::ProcessIdentity::Demo, ExecutionMode::Simulation) => Ledger::Simulated,
+            (crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo) => Ledger::Exchange,
+            (crate::identity::ProcessIdentity::Live, ExecutionMode::Simulation) => Ledger::Simulated,
+            (crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo) => Ledger::Exchange,
+        }
     }
 }
 
@@ -264,7 +298,7 @@ pub fn build(form: &ManualForm, cancel: &CancelForm, snap: &UiSnapshot) -> Manua
         Ok(z) => (z.note.clone(), if form.reduce_only { None } else { z.typed }, Some(z.text.clone())),
         Err(_) => (None, None, None),
     };
-    ManualVm { panels, mode, env_text: env_text(mode), rounded: r.map(|z| z.order_qty), qty_note, qty_text, intended_base_qty, est_notional, leverage, cap_text, submit_disabled, cancel_disabled, results: results(snap) }
+    ManualVm { panels, mode, identity: snap.identity, env_text: env_text(snap.identity, mode), ledger_source: EnvLabel::from_snapshot(snap).ledger_source().to_string(), rounded: r.map(|z| z.order_qty), qty_note, qty_text, intended_base_qty, est_notional, leverage, cap_text, submit_disabled, cancel_disabled, results: results(snap) }
 }
 
 /// Opens the confirmation; `None` while submit is disabled. Sends nothing.
@@ -288,7 +322,8 @@ pub fn open_confirm(vm: &ManualVm, form: &ManualForm) -> Option<ManualConfirm> {
         leverage: vm.leverage,
         cap_text: vm.cap_text.clone(),
         mode,
-        env_text: env_text(Some(mode)),
+        env: EnvLabel::of(vm.identity, mode),
+        env_text: env_text(vm.identity, Some(mode)),
         warning: "單腿下單不會自動建立對腿",
     })
 }
@@ -391,10 +426,10 @@ pub struct CancelPrefill {
     pub order_id: String,
 }
 
-/// The account the engine trades against: simulated ledger unless EXCHANGE_DEMO (engine stopped
-/// reads as simulated).
+/// The account the engine trades against: the simulated ledger unless it sends orders to an
+/// exchange (engine stopped reads as simulated).
 fn account_is_simulated(snap: &UiSnapshot) -> bool {
-    snap.engine.as_ref().map(|e| e.execution_mode) != Some(ExecutionMode::ExchangeDemo)
+    Ledger::of(EnvLabel::from_snapshot(snap)) == Ledger::Simulated
 }
 
 fn pick_lists<A, T>(

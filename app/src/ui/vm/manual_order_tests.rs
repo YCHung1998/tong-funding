@@ -500,3 +500,52 @@ mod okx {
         assert_eq!(rows[0].close_prefill(), None);
     }
 }
+
+// ---- live-banners 3.3: the page names the real account in a Live process -------------------------
+
+fn live_snap(mode: ExecutionMode) -> UiSnapshot {
+    let mut s = snap(mode);
+    s.identity = crate::identity::ProcessIdentity::Live;
+    s
+}
+
+#[test]
+fn a_live_manual_page_names_the_live_account_not_a_simulated_ledger() {
+    let live = build(&form("0.001"), &CancelForm::default(), &live_snap(ExecutionMode::ExchangeDemo));
+    assert!(live.ledger_source.contains("LIVE 交易所帳戶"), "{}", live.ledger_source);
+    assert!(live.env_text.starts_with("LIVE 真錢"), "{}", live.env_text);
+    assert!(!live.ledger_source.contains("模擬帳本") && !live.env_text.contains("EXCHANGE_DEMO"));
+    let sim = build(&form("0.001"), &CancelForm::default(), &live_snap(ExecutionMode::Simulation));
+    assert!(sim.ledger_source.contains("模擬帳本") && sim.env_text.starts_with("LIVE 模擬"));
+    let demo = build(&form("0.001"), &CancelForm::default(), &snap(ExecutionMode::ExchangeDemo));
+    assert_eq!(demo.ledger_source, "帳戶來源：demo / testnet 交易所帳戶");
+}
+
+#[test]
+fn the_ledger_follows_identity_and_mode_exhaustively() {
+    use crate::identity::ProcessIdentity::{Demo, Live};
+    use crate::ui::env_label::EnvLabel;
+    for (identity, mode, ledger) in [
+        (Demo, ExecutionMode::Simulation, Ledger::Simulated),
+        (Demo, ExecutionMode::ExchangeDemo, Ledger::Exchange),
+        (Live, ExecutionMode::Simulation, Ledger::Simulated),
+        (Live, ExecutionMode::ExchangeDemo, Ledger::Exchange),
+    ] {
+        assert_eq!(Ledger::of(EnvLabel::of(identity, mode)), ledger, "{identity:?} {mode:?}");
+    }
+}
+
+#[test]
+fn a_live_manual_confirmation_repeats_environment_and_amount_with_real_money_buttons() {
+    let vm = build(&form("0.0014"), &CancelForm::default(), &live_snap(ExecutionMode::ExchangeDemo));
+    let c = open_confirm(&vm, &form("0.0014")).unwrap();
+    assert!(c.env_line().contains("LIVE 真錢") && c.env_line().contains("USDT"), "{}", c.env_line());
+    assert_eq!(c.button(), "以真錢下單");
+    let mut reduce = form("0.0014");
+    reduce.reduce_only = true;
+    let vm = build(&reduce, &CancelForm::default(), &live_snap(ExecutionMode::ExchangeDemo));
+    assert_eq!(open_confirm(&vm, &reduce).unwrap().button(), "以真錢平倉");
+    let demo = open_confirm(&build(&form("0.0014"), &CancelForm::default(), &snap(ExecutionMode::ExchangeDemo)), &form("0.0014")).unwrap();
+    assert_eq!(demo.button(), "確認送出");
+    assert!(demo.env_line().contains("DEMO") && !demo.env_line().contains("LIVE") && !demo.env_line().contains("真錢"));
+}

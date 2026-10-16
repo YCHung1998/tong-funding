@@ -74,6 +74,8 @@ mod auto_add_ui_tests;
 #[cfg(test)]
 mod notifications_ui_tests;
 #[cfg(test)]
+mod env_banner_ui_tests;
+#[cfg(test)]
 mod scan_table_ui_tests;
 #[cfg(test)]
 mod shell_tests;

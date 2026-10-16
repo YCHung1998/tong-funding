@@ -24,7 +24,7 @@ fn form(n: &str, l: &str, m: &str, mode: CalcMode) -> ContractForm {
 
 #[test]
 fn leverage_mode_gives_margin_400_with_the_formula_and_pair_totals() {
-    let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(ExecutionMode::ExchangeDemo));
+    let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo)));
     assert_eq!(vm.margin, Some(d("400")));
     assert_eq!(vm.formula.as_deref(), Some("1,200 ÷ 3 = 400 / leg"));
     assert_eq!((vm.pair_notional, vm.pair_margin), (Some(d("2400")), Some(d("800"))));
@@ -191,4 +191,11 @@ mod contract_quote {
         let s = snap_with(Exchange::Okx, "100000", NOW - 100, Some(Ok(lot("1", "1"))));
         assert!(matches!(cell(&s, Exchange::Okx, "2100"), QuoteCell::NoRules(_)));
     }
+}
+
+#[test]
+fn the_template_page_names_the_live_world_in_a_live_process() {
+    let live = crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo);
+    let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(live));
+    assert_eq!(vm.mode_label, "LIVE");
 }

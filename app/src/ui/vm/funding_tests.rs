@@ -88,7 +88,7 @@ fn funding_vm_panel_complete_shows_every_component_and_other_cost_not_included()
         other_cost_included: false,
     };
     f.pnl = Some(PnlSummary { event_id: 7, status: "COMPLETE".into(), reasons: vec![], breakdown: Some(b), comparison: Some(Comparison::NoSnapshot) });
-    let p = pnl_panel(&f).unwrap();
+    let p = pnl_panel(&f, crate::identity::ProcessIdentity::Demo).unwrap();
     assert_eq!(p.status_line, None);
     let get = |k: &str| p.breakdown.iter().find(|(l, _)| l == k).unwrap().1.clone();
     assert_eq!(get("Net PnL"), "−0.82 USDT");
@@ -104,7 +104,7 @@ fn funding_vm_panel_incomplete_lists_reasons_on_top_and_dashes_missing_parts() {
     missing.insert(tong_funding_core::pnl::Component::Net);
     let b = tong_funding_core::pnl::PnlBreakdown { legs: vec![], total: Default::default(), missing, status: PnlStatus::Incomplete(vec![]), other_cost_included: false };
     f.pnl = Some(PnlSummary { event_id: 9, status: "INCOMPLETE".into(), reasons: vec!["缺少結算流水".into()], breakdown: Some(b), comparison: None });
-    let p = pnl_panel(&f).unwrap();
+    let p = pnl_panel(&f, crate::identity::ProcessIdentity::Demo).unwrap();
     assert_eq!(p.status_line.as_deref(), Some("INCOMPLETE · 缺少結算流水"));
     assert_eq!(p.breakdown[0], ("Funding PnL".to_string(), "—".to_string()));
     assert_eq!(p.breakdown.last().unwrap().1, "—");
@@ -114,7 +114,7 @@ fn funding_vm_panel_incomplete_lists_reasons_on_top_and_dashes_missing_parts() {
 fn funding_vm_simulated_pairs_show_simulated_and_no_actual_column() {
     let f = PairFunding { simulated: true, legs: [LegFunding::Simulated, LegFunding::Simulated], opening_fee: None, updated_at_ms: None, slots: vec![], pnl: None, alerts: vec![], trace: vec![] };
     assert_eq!(pair_funding_text(&f).0, "Funding 收到 模擬");
-    let p = pnl_panel(&f).unwrap();
+    let p = pnl_panel(&f, crate::identity::ProcessIdentity::Demo).unwrap();
     assert_eq!((p.mode.as_str(), p.status_line.as_deref()), ("SIMULATION", Some("模擬，無實際 PnL")));
     assert!(p.lines.is_empty() && p.breakdown.is_empty());
 }
@@ -240,4 +240,14 @@ fn funding_slot_tracing_recheck_applies_only_while_a_slot_is_unsettled() {
     assert!(!recheckable(&f));
     f.trace.push(trace("short", Exchange::Bybit, S::ManualCheck));
     assert!(recheckable(&f));
+}
+
+#[test]
+fn the_pnl_panel_names_the_world_of_the_pair() {
+    let sim = PairFunding { simulated: true, legs: [LegFunding::Simulated, LegFunding::Simulated], opening_fee: None, updated_at_ms: None, slots: vec![], pnl: None, alerts: vec![], trace: vec![] };
+    assert_eq!(pnl_panel(&sim, crate::identity::ProcessIdentity::Live).unwrap().mode, "LIVE SIMULATION");
+    let mut real = funding([LegFunding::Unavailable("尚未取得".into()), LegFunding::Received(d("0.36"))], vec![]);
+    real.pnl = Some(PnlSummary { event_id: 9, status: "INCOMPLETE".into(), reasons: vec![], breakdown: None, comparison: None });
+    assert_eq!(pnl_panel(&real, crate::identity::ProcessIdentity::Live).unwrap().mode, "LIVE");
+    assert_eq!(pnl_panel(&real, crate::identity::ProcessIdentity::Demo).unwrap().mode, "EXCHANGE_DEMO");
 }

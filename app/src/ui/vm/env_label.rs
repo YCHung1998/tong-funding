@@ -60,6 +60,15 @@ impl EnvLabel {
         EnvLabel { identity: snap.identity, mode }
     }
 
+    /// The world of one pair: whether the pair is simulated is a fact recorded on the pair itself.
+    pub fn of_pair(identity: ProcessIdentity, simulated: bool) -> EnvLabel {
+        let mode = match simulated {
+            true => ExecutionMode::Simulation,
+            false => ExecutionMode::ExchangeDemo,
+        };
+        EnvLabel { identity, mode }
+    }
+
     /// The chip next to the app name in the header.
     pub fn header_chip(identity: ProcessIdentity) -> &'static str {
         match identity {

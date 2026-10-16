@@ -11,12 +11,13 @@ use std::rc::Rc;
 
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::*;
-use tong_funding_core::risk::{ExecutionMode, TriggerMode};
+use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::Exchange;
 
 use super::bridge::{Settings, SourceUpdate, UiSnapshot};
 use super::candidates::{self, CandidateList};
 use super::contract_settings::{self, CalcMode, ContractForm};
+use super::env_label::{ConfirmKind, EnvLabel};
 use super::format::{self, DASH};
 use super::manual_order::{self, CancelForm, CancelPrefill, ManualConfirm, ManualForm, ManualPrefill, PickState};
 use super::nav::{Page, DEBUG_WARNING};
@@ -379,9 +380,9 @@ fn warn_box(lines: Vec<String>) -> Div {
     d
 }
 
-fn mode_text(m: Option<ExecutionMode>) -> &'static str {
+fn mode_text(identity: crate::identity::ProcessIdentity, m: Option<ExecutionMode>) -> &'static str {
     match m {
-        Some(m) => risk_settings::mode_label(m),
+        Some(m) => risk_settings::mode_label(identity, m),
         None => "未知（引擎未啟動）",
     }
 }
@@ -447,10 +448,8 @@ impl Shell {
         let a = &self.trading.auto_add;
         let mode = self.snap.engine.as_ref().map(|e| (e.trigger_mode, e.execution_mode));
         let consequence = match mode {
-            Some((TriggerMode::Auto, ExecutionMode::ExchangeDemo)) => "觸發模式 AUTO + EXCHANGE_DEMO：達標配對會自動加入，並依排程自動進場、真實下單到 demo / testnet 帳戶",
-            Some((TriggerMode::Auto, ExecutionMode::Simulation)) => "觸發模式 AUTO + SIMULATION：達標配對會自動加入並由模擬器自動進場",
-            Some((TriggerMode::Manual, _)) => "觸發模式 MANUAL：只會自動加入交易單，進場仍需到交易單頁手動按下",
-            None => "引擎未啟動",
+            Some((trigger, execution)) => EnvLabel::of(self.snap.identity, execution).auto_add_consequence(trigger),
+            None => "引擎未啟動".to_string(),
         };
         let mut row = div().flex().flex_wrap().gap_2().items_center();
         if a.enabled {
@@ -518,6 +517,10 @@ impl Shell {
             panel = panel.child(line);
         }
         let any_valid = views.iter().any(|v| v.valid.is_ok());
+        // The environment and the amount are repeated here too: adding only creates PREPARED pairs
+        // (no order), but the next click on the staged-orders page is the one that spends.
+        let total: tong_funding_core::types::Decimal = views.iter().filter(|v| v.valid.is_ok()).map(|v| v.notional * tong_funding_core::types::Decimal::from(2)).sum();
+        panel = panel.child(small(EnvLabel::from_snapshot(&self.snap).confirm_env_line(Some(total)), theme::TEXT_PRIMARY));
         panel.child(btn("cand-add", "加入並前往交易單 →", any_valid, self.click(cx, |this, cx| {
             let n = candidates::add_to_staged(&this.trading.candidates, &this.scanner, &this.snap, this.now_ms, this.sink.as_ref());
             if n > 0 {
@@ -579,7 +582,7 @@ impl Shell {
             page = page.child(small(n.clone(), theme::WARNING));
         }
         if let Some(p) = self.trading.staged_confirm.clone() {
-            let mut c = card().border_color(rgb(theme::WARNING)).child(text(format!("確認送出 {} 筆配對（{} 腿）", p.pairs.len(), p.legs.len()), theme::TEXT_PRIMARY)).child(small(p.env_text.clone(), theme::WARNING));
+            let mut c = card().border_color(rgb(theme::WARNING)).child(text(format!("確認送出 {} 筆配對（{} 腿）", p.pairs.len(), p.legs.len()), theme::TEXT_PRIMARY)).child(small(p.env_text.clone(), theme::WARNING)).child(small(p.env_line(), theme::TEXT_PRIMARY));
             for l in &p.legs {
                 c = c.child(small(
                     format!("{} · {} · {} · {} · Notional {} · {}× · Margin {}", l.exchange.name(), l.symbol, side_text(l.side), l.qty_text, format::money(l.notional, 2), l.leverage.normalize(), format::money(l.margin, 2)),
@@ -590,7 +593,7 @@ impl Shell {
                 div()
                     .flex()
                     .gap_2()
-                    .child(btn("confirm-yes", "確認送出", true, self.click(cx, |this, _| {
+                    .child(btn("confirm-yes", p.button(), true, self.click(cx, |this, _| {
                         if let Some(p) = this.trading.staged_confirm.take() {
                             let out = staged_orders::confirm(&p, &this.snap, this.sink.as_ref());
                             this.trading.staged_note = (!out.excluded.is_empty()).then(|| format!("已排除（已不是 PREPARED）：{}", out.excluded.join("、")));
@@ -638,6 +641,9 @@ impl Shell {
                 .child(small(opt_money(r.margin), theme::TEXT_SECONDARY))
                 .child(small(r.leverage.map_or_else(|| DASH.into(), |l| format!("{}×", l.normalize())), theme::TEXT_SECONDARY))
                 .child(small(r.entry_in_ms.map_or_else(|| DASH.into(), format::hms), theme::TEXT_SECONDARY));
+            if let Some(b) = r.badge {
+                line = line.child(small(b, theme::NEGATIVE));
+            }
             if let Some(cap) = &r.cap {
                 line = line.child(small(cap.text(), theme::TEXT_SECONDARY));
             }
@@ -676,11 +682,11 @@ impl Shell {
                 run = run.child(line);
             }
             if let Some(r) = self.trading.close_now_confirm.clone() {
-                run = run.child(small(format!("確認立即平倉 {}？兩腿以 reduce-only 平倉，數量由 engine 讀取實際持倉。", r.symbol), theme::WARNING)).child(
+                run = run.child(small(format!("確認立即平倉 {}？兩腿以 reduce-only 平倉，數量由 engine 讀取實際持倉。", r.symbol), theme::WARNING)).child(small(r.env_line(), theme::TEXT_PRIMARY)).child(
                     div()
                         .flex()
                         .gap_2()
-                        .child(btn("close-now-yes", "確認平倉", true, self.click(cx, |this, _| {
+                        .child(btn("close-now-yes", r.button(), true, self.click(cx, |this, _| {
                             if let Some(r) = this.trading.close_now_confirm.take() {
                                 staged_orders::send_close_now(&r, this.sink.as_ref());
                             }
@@ -717,10 +723,10 @@ impl Shell {
                 if let Err(why) = &h.confirm_closed {
                     actions = actions.child(small(why.clone(), theme::WARNING));
                 }
-                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, if h.simulated { "SIMULATION" } else { "EXCHANGE_DEMO" }), theme::TEXT_PRIMARY)).child(legs).child(actions);
+                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs).child(actions);
             }
             if let Some(c) = self.trading.close_confirm.clone() {
-                let mut panel = card().child(small(format!("確認人工要求平倉 {}（reduce-only，數量取自最新持倉）", c.symbol), theme::WARNING));
+                let mut panel = card().child(small(format!("確認人工要求平倉 {}（reduce-only，數量取自最新持倉）", c.symbol), theme::WARNING)).child(small(c.env_line(), theme::TEXT_PRIMARY));
                 for l in &c.legs {
                     panel = panel.child(small(format!("{} · {} · {}", l.exchange.name(), l.symbol, l.quantity.normalize()), theme::TEXT_SECONDARY));
                 }
@@ -728,7 +734,7 @@ impl Shell {
                     div()
                         .flex()
                         .gap_2()
-                        .child(btn("mclose-yes", "確認平倉", true, self.click(cx, |this, _| {
+                        .child(btn("mclose-yes", c.button(), true, self.click(cx, |this, _| {
                             if let Some(c) = this.trading.close_confirm.take() {
                                 staged_orders::send_close(&c, this.sink.as_ref());
                             }
@@ -756,9 +762,9 @@ impl Shell {
     // ---- contract settings ----------------------------------------------------------------------
 
     pub(crate) fn contract_settings_page(&mut self, cx: &mut Context<Self>) -> Div {
-        let mode = self.snap.engine.as_ref().map(|e| e.execution_mode);
+        let env = self.snap.engine.as_ref().map(|e| EnvLabel::of(self.snap.identity, e.execution_mode));
         let form = self.trading.contract_form(cx);
-        let vm = contract_settings::evaluate(&form, &self.snap.settings, mode);
+        let vm = contract_settings::evaluate(&form, &self.snap.settings, env);
         let symbol = self.trading.c_symbol.value(cx).trim().to_ascii_uppercase();
         if symbol != self.trading.c_requested {
             for ex in Exchange::ALL {
@@ -792,8 +798,8 @@ impl Shell {
             form_card = form_card.child(small(format!("已儲存的模板無效：{e}"), theme::NEGATIVE));
         }
         form_card = form_card.child(btn("c-save", "儲存模板", vm.can_save, self.click(cx, |this, cx| {
-            let mode = this.snap.engine.as_ref().map(|e| e.execution_mode);
-            let vm = contract_settings::evaluate(&this.trading.contract_form(cx), &this.snap.settings, mode);
+            let env = this.snap.engine.as_ref().map(|e| EnvLabel::of(this.snap.identity, e.execution_mode));
+            let vm = contract_settings::evaluate(&this.trading.contract_form(cx), &this.snap.settings, env);
             contract_settings::save(&vm, this.sink.as_ref());
         })));
         let boundary = card()
@@ -837,7 +843,7 @@ impl Shell {
             .on_click(|_, window, cx| open_risk_help(window, cx));
         let mut page = div().flex().flex_col().gap_3().child(div().flex().items_center().gap_3().child(title("風控設定", "Risk Management")).child(help_btn));
         if let Some(t) = &vm.incomplete_text {
-            page = page.child(warn_box(vec![t.clone(), "設定不完整時交易單與 EXCHANGE_DEMO 會被禁用".into()]));
+            page = page.child(warn_box(vec![t.clone(), EnvLabel::incomplete_settings_text(self.snap.identity)]));
         }
         if let Some(e) = &base.error {
             page = page.child(warn_box(vec![format!("已儲存的風控設定讀取失敗：{e}")]));
@@ -883,10 +889,11 @@ impl Shell {
         })));
         page = page.child(global);
 
-        // Execution mode (SIMULATION / EXCHANGE_DEMO only).
+        // Execution mode (the simulation and the exchange-ordering mode only).
         let current = self.snap.engine.as_ref().map(|e| e.execution_mode);
+        let identity = self.snap.identity;
         let demo_ok = risk_settings::demo_option(&base, self.snap.demo_keys.as_ref());
-        let mut mode = card().child(text(format!("執行模式 · 目前 {}", mode_text(current)), theme::TEXT_PRIMARY));
+        let mut mode = card().child(text(format!("執行模式 · 目前 {}", mode_text(self.snap.identity, current)), theme::TEXT_PRIMARY));
         for m in MODE_OPTIONS {
             let on = current == Some(m);
             let enabled = current.is_some() && (m == ExecutionMode::Simulation || demo_ok.is_ok());
@@ -895,31 +902,31 @@ impl Shell {
                     .flex()
                     .gap_2()
                     .items_center()
-                    .child(btn(SharedString::from(format!("mode-{}", risk_settings::mode_label(m))), format!("{} {}", if on { "●" } else { "○" }, risk_settings::mode_label(m)), enabled, self.click(cx, move |this, _| {
+                    .child(btn(SharedString::from(format!("mode-{}", risk_settings::mode_label(identity, m))), format!("{} {}", if on { "●" } else { "○" }, risk_settings::mode_label(identity, m)), enabled, self.click(cx, move |this, _| {
                         let Some(cur) = this.snap.engine.as_ref().map(|e| e.execution_mode) else { return };
-                        match risk_settings::request_mode(cur, m, &this.snap.settings, this.snap.demo_keys.as_ref(), this.sink.as_ref()) {
+                        match risk_settings::request_mode(this.snap.identity, cur, m, &this.snap.settings, this.snap.demo_keys.as_ref(), this.sink.as_ref()) {
                             Ok(risk_settings::ModeStep::Confirm(t)) => this.trading.mode_confirm = Some(t),
                             Ok(risk_settings::ModeStep::Sent | risk_settings::ModeStep::Unchanged) => this.trading.mode_error = None,
                             Err(why) => this.trading.mode_error = Some(why),
                         }
                     })))
-                    .child(small(risk_settings::mode_description(m), theme::TEXT_MUTED)),
+                    .child(small(risk_settings::mode_description(identity, m), theme::TEXT_MUTED)),
             );
         }
         if let Err(why) = &demo_ok {
-            mode = mode.child(small(format!("EXCHANGE_DEMO 不可選：{why}"), theme::WARNING));
+            mode = mode.child(small(EnvLabel::mode_unavailable_text(identity, why), theme::WARNING));
         }
         if let Some(e) = &self.trading.mode_error {
             mode = mode.child(small(e.clone(), theme::NEGATIVE));
         }
         if let Some(t) = self.trading.mode_confirm {
-            mode = mode.child(small(format!("確認切換到 {}？將對 demo / testnet 帳戶真實下單（不涉及真錢）。既有倉位與 trigger_mode 不變。", risk_settings::mode_label(t)), theme::WARNING)).child(
+            mode = mode.child(small(EnvLabel::of(identity, t).mode_switch_text(), theme::WARNING)).child(
                 div()
                     .flex()
                     .gap_2()
-                    .child(btn("mode-yes", "確認切換", true, self.click(cx, |this, _| {
+                    .child(btn("mode-yes", EnvLabel::of(identity, t).confirm_button(ConfirmKind::ModeSwitch), true, self.click(cx, |this, _| {
                         if let Some(t) = this.trading.mode_confirm.take() {
-                            risk_settings::send_mode(t, this.sink.as_ref());
+                            risk_settings::send_mode(this.snap.identity, t, this.sink.as_ref());
                         }
                     })))
                     .child(btn("mode-no", "取消", true, self.click(cx, |this, _| this.trading.mode_confirm = None))),
@@ -1072,6 +1079,7 @@ impl Shell {
         let warning = warn_box(vec![
             format!("⚠ {DEBUG_WARNING}：單腿下單會造成未避險曝險；標準流程為「掃幣 → 交易單」。"),
             vm.env_text.clone(),
+            vm.ledger_source.clone(),
         ]);
         let mut panels = div().flex().gap_2().items_center().child(small("交易所", theme::TEXT_SECONDARY));
         for (ex, state) in &vm.panels {
@@ -1132,12 +1140,13 @@ impl Shell {
                         theme::TEXT_PRIMARY,
                     ))
                     .child(small(c.env_text.clone(), theme::WARNING))
+                    .child(small(c.env_line(), theme::TEXT_PRIMARY))
                     .child(small(c.warning, theme::WARNING))
                     .child(
                         div()
                             .flex()
                             .gap_2()
-                            .child(btn("m-yes", "確認送出", true, self.click(cx, |this, _| {
+                            .child(btn("m-yes", c.button(), true, self.click(cx, |this, _| {
                                 if let Some(c) = this.trading.manual_confirm.take() {
                                     manual_order::confirm(&c, this.sink.as_ref());
                                 }

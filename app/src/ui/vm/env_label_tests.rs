@@ -1,4 +1,5 @@
 use super::*;
+use std::path::{Path, PathBuf};
 
 const IDENTITIES: [ProcessIdentity; 2] = [ProcessIdentity::Demo, ProcessIdentity::Live];
 const MODES: [ExecutionMode; 2] = [ExecutionMode::Simulation, ExecutionMode::ExchangeDemo];
@@ -239,4 +240,87 @@ fn the_banner_of_a_snapshot_follows_the_kill_switch() {
 fn the_header_chip_never_says_demo_in_a_live_process_nor_live_in_a_demo_one() {
     assert_eq!(EnvLabel::header_chip(ProcessIdentity::Demo), "Demo / Testnet");
     assert_eq!(EnvLabel::header_chip(ProcessIdentity::Live), "LIVE");
+}
+
+// ---- no hard-coded environment words anywhere else under ui/ ---------------------------------
+
+fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            rs_files(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// String literal contents of the non-test part of a source file (comments skipped, everything
+/// from the first `#[cfg(test)]` on dropped).
+fn string_literals(src: &str) -> Vec<String> {
+    let src = src.split("#[cfg(test)]").next().unwrap_or("");
+    let c: Vec<char> = src.chars().collect();
+    let (mut i, mut out) = (0, Vec::new());
+    while i < c.len() {
+        match c[i] {
+            '/' if c.get(i + 1) == Some(&'/') => {
+                while i < c.len() && c[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if c.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i + 1 < c.len() && !(c[i] == '*' && c[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            '\'' if c.get(i + 1) == Some(&'"') && c.get(i + 2) == Some(&'\'') => i += 3,
+            '"' => {
+                i += 1;
+                let mut s = String::new();
+                while i < c.len() && c[i] != '"' {
+                    if c[i] == '\\' {
+                        s.push(c[i]);
+                        i += 1;
+                    }
+                    if i < c.len() {
+                        s.push(c[i]);
+                    }
+                    i += 1;
+                }
+                i += 1;
+                out.push(s);
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+#[test]
+fn scanner_finds_literals_and_ignores_comments_and_test_code() {
+    let src = "// \"LIVE\" in a comment\nlet a = \"x EXCHANGE_DEMO y\"; let q = '\"'; let b = \"ok \\\" SIMULATION\";\n#[cfg(test)]\nmod t { const X: &str = \"LIVE\"; }";
+    assert_eq!(string_literals(src), vec!["x EXCHANGE_DEMO y".to_string(), "ok \\\" SIMULATION".to_string()]);
+}
+
+#[test]
+fn environment_words_live_only_here() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let mut files = Vec::new();
+    rs_files(&root, &mut files);
+    assert!(files.len() > 20, "scan found too few files: {}", files.len());
+    let mut offenders = Vec::new();
+    for f in files {
+        let name = f.file_name().unwrap().to_string_lossy().to_string();
+        if name == "env_label.rs" || name.ends_with("_tests.rs") || name == "testkit.rs" {
+            continue;
+        }
+        for lit in string_literals(&std::fs::read_to_string(&f).unwrap()) {
+            if ["EXCHANGE_DEMO", "SIMULATION", "LIVE"].iter().any(|w| lit.contains(w)) {
+                offenders.push(format!("{name}: {lit}"));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "environment words outside env_label.rs:\n{}", offenders.join("\n"));
 }
