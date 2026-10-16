@@ -2,6 +2,7 @@ mod engine;
 mod exchange;
 mod funding;
 mod identity;
+mod instance_lock;
 mod ports;
 mod store;
 mod ui;
@@ -44,6 +45,11 @@ fn main() {
             _ => {
                 // Composition root: ONE store instance for the data source and the engine; the
                 // engine starts with the window (headless subcommands above never reach this).
+                // live-process 1.2: one program at a time, taken BEFORE the store is opened.
+                if let Err(e) = instance_lock::acquire_for_process() {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
                 let db = store::db::Db::open_default(std::sync::Arc::new(ports::SystemClock)).ok();
                 let live = ui::live::LiveSource::start(db);
                 let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = live.clone();
