@@ -2259,6 +2259,10 @@ mod early_exit_tests;
 #[path = "spread_tag_tests.rs"]
 mod spread_tag_tests;
 
+// live-guardrails: the Live identity's start lock, Arm, caps, automatic locks and FlattenLeg.
+#[path = "live_guardrail_tests.rs"]
+mod live_guardrail_tests;
+
 // ---- candidate-readd-after-close: engine side ---------------------------------------------
 
 /// Recorded case NMRUSDT: flat confirmed, CLOSING while the funding PnL waits. The snapshot says so

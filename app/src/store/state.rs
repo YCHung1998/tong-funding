@@ -283,6 +283,22 @@ impl Db {
         })
     }
 
+    /// live-guardrails: persist the kill switch and write `KILL_SWITCH_CHANGED` plus one more event
+    /// (`LIVE_ARMED` / `LIVE_AUTO_LOCK` / `LIVE_STARTUP_LOCK`) in the SAME transaction: the lock and
+    /// its reason are recorded together or not at all.
+    pub fn set_kill_switch_with_event(&self, on: bool, event_type: &str, payload: &Value) -> Result<(), StoreError> {
+        self.with_conn(|c| {
+            let now = self.now_ms();
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            upsert_flag(&tx, FLAG_KILL_SWITCH, if on { KILL_ON } else { KILL_OFF }, now)?;
+            insert_event_on(&tx, now, "KILL_SWITCH_CHANGED", None, &serde_json::json!({ "on": on }))
+                .map_err(|e| self.event_write_failed("KILL_SWITCH_CHANGED", &e))?;
+            insert_event_on(&tx, now, event_type, None, payload).map_err(|e| self.event_write_failed(event_type, &e))?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Explicit recovery for the one halt that has a way out: the `kill_switch` row is missing (or
     /// unreadable). Writes the row as `on`, records `KILL_SWITCH_ROW_RESTORED` in the same
     /// transaction and lifts the halt. Refused for every other halt reason and when not halted.
@@ -829,6 +845,20 @@ mod tests {
         assert!(db.set_kill_switch(false).is_err());
         let v: String = plain_flag(&db, "kill_switch");
         assert_eq!(v, "ON", "flag unchanged after the failed transaction");
+    }
+
+    #[test]
+    fn kill_switch_with_event_writes_both_events_atomically() {
+        let (_d, db, _) = open_tmp();
+        db.set_kill_switch_with_event(true, "LIVE_AUTO_LOCK", &json!({ "reason": "x" })).unwrap();
+        assert!(db.kill_switch_halted());
+        assert_eq!(events_of(&db, "KILL_SWITCH_CHANGED").len(), 1);
+        assert_eq!(events_of(&db, "LIVE_AUTO_LOCK"), vec![(None, json!({ "reason": "x" }))]);
+        // A failing event write leaves the flag untouched (all or nothing).
+        db.set_kill_switch(false).unwrap();
+        break_event_inserts(&db);
+        assert!(db.set_kill_switch_with_event(true, "LIVE_AUTO_LOCK", &json!({})).is_err());
+        assert_eq!(plain_flag(&db, "kill_switch"), "OFF");
     }
 
     #[test]

@@ -73,6 +73,34 @@ pub fn admit(cmd: &Command, blockers: &[Blocker]) -> Result<(), String> {
     Err(format!("refused: {}", why.join("; ")))
 }
 
+/// live-guardrails: rules only the Live identity applies, BEFORE the blockers above (pure; the
+/// actor calls it for `ProcessIdentity::Live` only, Demo never gets here). `armed` = the engine
+/// holds frozen caps from a successful `Arm` (memory), independent of what the database flag says.
+///
+/// - a manual order that is not reduce-only is refused (the manual page cannot open in Live);
+/// - the kill switch can only be turned ON by hand, never OFF (`Arm` is the one way off);
+/// - `trigger_mode` AUTO is refused;
+/// - an exposure-opening command needs the engine to be armed, even if the stored kill switch
+///   reads OFF (a flag edited behind the engine's back arms nothing).
+pub fn live_precheck(cmd: &Command, armed: bool) -> Result<(), String> {
+    match cmd {
+        Command::ManualOrder(o) if !o.reduce_only => {
+            return Err("live: manual opening orders are disabled (use the pair flow; reduce-only orders and FlattenLeg stay available)".into());
+        }
+        Command::SetKillSwitch { on: false } => {
+            return Err("live: the kill switch can only be lifted with Arm (preflight, confirmation, checklist)".into());
+        }
+        Command::SetTriggerMode(TriggerMode::Auto) => {
+            return Err("live: trigger_mode AUTO is not allowed".into());
+        }
+        _ => {}
+    }
+    if cmd.opens_exposure() && !armed {
+        return Err("refused: live is not armed (Arm is required after every start and every lock)".into());
+    }
+    Ok(())
+}
+
 pub fn describe(b: &Blocker) -> String {
     match b {
         Blocker::KillSwitch => "kill switch is on".into(),
@@ -294,6 +322,9 @@ mod tests {
             Command::SetExecutionMode(ExecutionMode::ExchangeDemo),
             Command::UpdateConfig { key: "risk".into(), value: json!({}) },
             Command::SetKillSwitch { on: false },
+            Command::Arm { preflight_id: "pf".into(), caps_hash: "h".into(), confirmation: "c".into(), checklist_ack: true },
+            Command::RunPreflight,
+            Command::FlattenLeg { pair: p(), leg: crate::engine::ports::Leg::Long },
         ]
     }
 
@@ -316,6 +347,40 @@ mod tests {
         }
         for c in every_command() {
             assert_eq!(admit(&c, &[]), Ok(()), "{c:?} without blockers");
+        }
+    }
+
+    #[test]
+    fn live_precheck_refuses_manual_opens_kill_switch_off_auto_and_unarmed_exposure() {
+        let manual = |reduce_only| {
+            Command::ManualOrder(ManualOrder {
+                exchange: Exchange::Binance,
+                symbol: "BTCUSDT".into(),
+                side: OrderSide::Buy,
+                quantity: Decimal::ONE,
+                reduce_only,
+                leverage: None,
+                intended_base_qty: None,
+            })
+        };
+        // armed or not, a manual opening order is refused; a reduce-only one passes
+        for armed in [false, true] {
+            assert!(live_precheck(&manual(false), armed).unwrap_err().contains("manual opening"), "armed={armed}");
+            assert_eq!(live_precheck(&manual(true), armed), Ok(()), "armed={armed}");
+            assert!(live_precheck(&Command::SetKillSwitch { on: false }, armed).unwrap_err().contains("Arm"), "armed={armed}");
+            assert_eq!(live_precheck(&Command::SetKillSwitch { on: true }, armed), Ok(()), "armed={armed}");
+            assert!(live_precheck(&Command::SetTriggerMode(TriggerMode::Auto), armed).is_err(), "armed={armed}");
+            assert_eq!(live_precheck(&Command::SetTriggerMode(TriggerMode::Manual), armed), Ok(()));
+        }
+        // exposure-opening commands need the engine armed; everything else does not
+        for c in every_command() {
+            let r = live_precheck(&c, false);
+            let always_refused = matches!(&c, Command::SetKillSwitch { on: false } | Command::SetTriggerMode(TriggerMode::Auto))
+                || matches!(&c, Command::ManualOrder(o) if !o.reduce_only);
+            assert_eq!(r.is_err(), c.opens_exposure() || always_refused, "{c:?}: {r:?}");
+            if !always_refused {
+                assert_eq!(live_precheck(&c, true), Ok(()), "armed: {c:?}");
+            }
         }
     }
 
