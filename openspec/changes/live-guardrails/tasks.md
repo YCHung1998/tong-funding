@@ -25,4 +25,4 @@
 
 ## 5. 驗證
 
-- [ ] 5.1 `openspec validate live-guardrails` 通過；`cargo test -p tong-funding-core -p tong-funding` 全綠並記錄指令與通過數量；用乾淨的編譯目錄執行
+- [x] 5.1 `openspec validate live-guardrails` 通過；`cargo test -p tong-funding-core -p tong-funding` 全綠並記錄指令與通過數量；用乾淨的編譯目錄執行

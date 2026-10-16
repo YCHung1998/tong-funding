@@ -28,4 +28,4 @@
 
 ## 6. 驗證
 
-- [ ] 6.1 `openspec validate live-process` 通過；`cargo test -p tong-funding-core -p tong-funding` 全綠並記錄指令與通過數量；用乾淨的編譯目錄執行（避免共用快取的雜湊衝突）
+- [x] 6.1 `openspec validate live-process` 通過；`cargo test -p tong-funding-core -p tong-funding` 全綠並記錄指令與通過數量；用乾淨的編譯目錄執行（避免共用快取的雜湊衝突）
