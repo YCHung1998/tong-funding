@@ -20,6 +20,9 @@ pub enum HostPolicy {
     PublicProduction,
     /// Only the demo / testnet hosts that may receive signed requests (https, default port).
     SignedDemo,
+    /// Only the live Binance / Bybit hosts (https, default port); no OKX, no demo host. Built only
+    /// by the `Live` process identity (change live-process).
+    SignedLive,
     /// 127.0.0.1 over http: local fake servers in tests.
     #[cfg(test)]
     LocalTest,
@@ -39,15 +42,21 @@ impl HostPolicy {
     /// OKX demo and production share a host, so the host alone proves nothing: on the signed
     /// policy an OKX host (any `*.okx.com`) needs exactly one `x-simulated-trading` header whose
     /// value is exactly `1`, and so does any request carrying an `OK-ACCESS-*` header, whatever
-    /// its host. The public policy is unsigned: it refuses both header families.
+    /// its host. The public policy is unsigned: it refuses every exchange auth header (`X-MBX-APIKEY`, `X-BAPI-*`, `OK-ACCESS-*`, the OKX flag) and `signature` / `sign` query parameters.
     pub fn allows(self, url: &reqwest::Url, headers: &[(String, String)]) -> bool {
         use crate::exchange::public::endpoints::{BINANCE_HOST, BYBIT_HOST, OKX_HOST};
-        use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, carries_okx_auth, is_okx_host, is_protected_okx_header, okx_headers_valid};
+        use crate::exchange::signed::endpoints::{
+            ALLOWED_SIGNED_HOSTS, LIVE_SIGNED_HOSTS, carries_okx_auth, is_exchange_auth_header, is_okx_host, is_protected_okx_header, is_signature_param, okx_headers_valid,
+        };
         let okx_rule = || okx_headers_valid(headers);
         match self {
             HostPolicy::PublicProduction => {
-                https_host_in(url, &[host_of_base(BINANCE_HOST), host_of_base(BYBIT_HOST), host_of_base(OKX_HOST)]) && !headers.iter().any(|(n, _)| is_protected_okx_header(n))
+                https_host_in(url, &[host_of_base(BINANCE_HOST), host_of_base(BYBIT_HOST), host_of_base(OKX_HOST)])
+                    && !headers.iter().any(|(n, _)| is_protected_okx_header(n) || is_exchange_auth_header(n))
+                    && !url.query_pairs().any(|(k, _)| is_signature_param(&k))
             }
+            // No OKX at all on live: neither the OKX host family nor its credential/flag headers.
+            HostPolicy::SignedLive => https_host_in(url, &LIVE_SIGNED_HOSTS) && !headers.iter().any(|(n, _)| is_protected_okx_header(n)),
             HostPolicy::SignedDemo => {
                 https_host_in(url, &ALLOWED_SIGNED_HOSTS) && (!(url.host_str().is_some_and(is_okx_host) || carries_okx_auth(headers)) || okx_rule())
             }
@@ -327,6 +336,110 @@ mod tests {
             assert!(!p.allows(&url(&format!("{base}/fapi/v2/balance")), &sim), "production host {base} must never get a signed request");
         }
         assert!(!p.allows(&url("https://example.com/"), &sim));
+    }
+
+    // ------------------------------------------------ live-process 2.1: demo and live policies
+
+    #[test]
+    fn host_policy_demo_rejects_every_live_host() {
+        use crate::exchange::signed::endpoints::LIVE_SIGNED_HOSTS;
+        let p = HostPolicy::SignedDemo;
+        for h in LIVE_SIGNED_HOSTS {
+            for path in ["/x", "/fapi/v2/balance?timestamp=1&signature=x", "/v5/order/create"] {
+                assert!(!p.allows(&url(&format!("https://{h}{path}")), &[]), "{h}{path}");
+                assert!(!p.allows(&url(&format!("https://{h}{path}")), &hdrs(&[("X-MBX-APIKEY", "k")])), "{h}{path} with key");
+            }
+        }
+    }
+
+    #[test]
+    fn host_policy_live_rejects_every_demo_host_and_okx() {
+        let p = HostPolicy::SignedLive;
+        for h in ALLOWED_SIGNED_HOSTS {
+            assert!(!p.allows(&url(&format!("https://{h}/x")), &[]), "{h}");
+            assert!(!p.allows(&url(&format!("https://{h}/x")), &hdrs(&[("x-simulated-trading", "1")])), "{h} with the OKX flag");
+        }
+        for h in ["demo-fapi.binance.com", "testnet.binancefuture.com", "api-demo.bybit.com"] {
+            assert!(!p.allows(&url(&format!("https://{h}/x")), &[]), "{h}");
+        }
+        // OKX public host and look-alikes
+        assert!(!p.allows(&url(&format!("{OKX_HOST}/api/v5/account/balance")), &[]));
+        assert!(!p.allows(&url("https://example.com/"), &[]));
+    }
+
+    #[test]
+    fn host_policy_live_allows_exactly_the_live_hosts_over_plain_https() {
+        use crate::exchange::signed::endpoints::LIVE_SIGNED_HOSTS;
+        let p = HostPolicy::SignedLive;
+        for h in LIVE_SIGNED_HOSTS {
+            assert!(p.allows(&url(&format!("https://{h}/fapi/v2/balance?timestamp=1&signature=x")), &hdrs(&[("X-MBX-APIKEY", "k")])), "{h}");
+            assert!(p.allows(&url(&format!("https://{h}/v5/order/create")), &hdrs(&[("X-BAPI-API-KEY", "k"), ("X-BAPI-SIGN", "s")])), "{h}");
+            assert!(!p.allows(&url(&format!("http://{h}/x")), &[]), "plain http {h}");
+            assert!(!p.allows(&url(&format!("https://{h}:8443/x")), &[]), "other port {h}");
+            assert!(!p.allows(&url(&format!("https://{h}.evil.example/x")), &[]), "suffix {h}");
+            assert!(!p.allows(&url(&format!("https://x{h}/x")), &[]), "prefix {h}");
+            assert!(!p.allows(&url(&format!("https://{h}@evil.example/x")), &[]), "userinfo {h}");
+            assert!(!p.allows(&url(&format!("https://user:pw@{h}/x")), &[]), "credentials {h}");
+            assert!(!p.allows(&url(&format!("https://{h}./x")), &[]), "fqdn dot {h}");
+        }
+        // no OKX credential family on a live transport, whatever the host
+        assert!(!p.allows(&url("https://fapi.binance.com/x"), &hdrs(&[("OK-ACCESS-KEY", "k")])));
+        assert!(!p.allows(&url("https://fapi.binance.com/x"), &hdrs(&[("x-simulated-trading", "1")])));
+    }
+
+    #[test]
+    fn live_policy_list_is_the_endpoints_constant() {
+        use crate::exchange::signed::endpoints::{LIVE_SIGNED_HOSTS, LiveHost};
+        for lh in LiveHost::ALL {
+            assert!(HostPolicy::SignedLive.allows(&url(&format!("{}/x", lh.base_url())), &[]));
+        }
+        assert_eq!(LIVE_SIGNED_HOSTS.len(), 2, "adding a live host must be a deliberate, reviewed change");
+    }
+
+    // ------------------------------------------------ live-process 2.2: public policy is unsigned
+
+    #[test]
+    fn host_policy_public_rejects_every_exchange_auth_header() {
+        let p = HostPolicy::PublicProduction;
+        for base in [BINANCE_HOST, BYBIT_HOST, OKX_HOST] {
+            let u = url(&format!("{base}/x?symbol=A"));
+            assert!(p.allows(&u, &hdrs(&[("Accept", "application/json")])), "control: ordinary header on {base}");
+            for name in ["X-MBX-APIKEY", "x-mbx-apikey", "X-BAPI-API-KEY", "x-bapi-api-key", "X-BAPI-SIGN", "X-BAPI-TIMESTAMP", "X-BAPI-RECV-WINDOW", "OK-ACCESS-KEY", "OK-ACCESS-SIGN", "OK-ACCESS-PASSPHRASE", "OK-ACCESS-TIMESTAMP"] {
+                assert!(!p.allows(&u, &hdrs(&[(name, "v")])), "{name} on {base}");
+                assert!(!p.allows(&u, &hdrs(&[("Accept", "x"), (name, "v")])), "{name} after another header on {base}");
+            }
+        }
+    }
+
+    #[test]
+    fn host_policy_public_rejects_signature_and_sign_query_parameters() {
+        let p = HostPolicy::PublicProduction;
+        for base in [BINANCE_HOST, BYBIT_HOST, OKX_HOST] {
+            assert!(p.allows(&url(&format!("{base}/x?symbol=A&limit=1")), &[]), "control {base}");
+            for q in ["signature=abc", "symbol=A&signature=abc", "SIGNATURE=abc", "Signature=abc", "sign=abc", "a=1&sign=abc", "SIGN=abc", "signature=", "sign", "%73ignature=abc", "s%69gn=abc"] {
+                assert!(!p.allows(&url(&format!("{base}/x?{q}")), &[]), "{q} on {base}");
+            }
+            // look-alike names are not signature parameters
+            assert!(p.allows(&url(&format!("{base}/x?signed=1&design=2&sig=3")), &[]), "{base}");
+        }
+    }
+
+    #[test]
+    fn signed_policies_still_accept_their_own_signature_and_key_material() {
+        assert!(HostPolicy::SignedDemo.allows(&url("https://demo-fapi.binance.com/fapi/v2/balance?timestamp=1&signature=x"), &hdrs(&[("X-MBX-APIKEY", "k")])));
+        assert!(HostPolicy::SignedDemo.allows(&url("https://api-demo.bybit.com/v5/order/create"), &hdrs(&[("X-BAPI-API-KEY", "k"), ("X-BAPI-SIGN", "s")])));
+    }
+
+    #[test]
+    fn a_public_transport_refuses_an_authenticated_request_with_zero_connections() {
+        // the host here is local, so the policy refuses it on the host rule anyway; the real proof
+        // of the new rule is the `allows` tests above. This test pins that a public transport
+        // reports the refusal the same way (no connection, "host not allowed").
+        let (base, connections) = serve_counting(|_| Some(response("200 OK", "", "{}")));
+        let t = ReqwestTransport::public_production().unwrap();
+        let r = block_on(t.get(HttpRequest::get(format!("{base}/fapi/v1/time?signature=x"), Duration::from_secs(2)).header("X-MBX-APIKEY", "k")));
+        assert_eq!(r, Err(AdapterError::network("host not allowed")));
+        assert_eq!(connections.load(Ordering::SeqCst), 0);
     }
 
     #[test]

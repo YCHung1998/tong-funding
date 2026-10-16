@@ -891,13 +891,19 @@ const LATE: &str = "api.bybit.com";
             for v in scan_signed_source(&src) {
                 // `signed/endpoints.rs` is the one file that names the OKX signed host (it is also a
                 // production host: demo and production share it, see `OkxHost`).
-                if f == &okx_home() && v == Violation::ProductionHost(OKX_SIGNED_HOST.to_string()) {
+                if f == &okx_home() && endpoints_home_may_name(&v) {
                     continue;
                 }
                 violations.push(format!("{}: {v:?}", f.display()));
             }
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    /// `signed/endpoints.rs` is the one non-public file that spells production host names: the OKX
+    /// signed host and the two live hosts (change live-process).
+    fn endpoints_home_may_name(v: &Violation) -> bool {
+        matches!(v, Violation::ProductionHost(h) if h == OKX_SIGNED_HOST || crate::exchange::signed::endpoints::LIVE_SIGNED_HOSTS.contains(&h.as_str()))
     }
 
     fn okx_home() -> PathBuf {
@@ -914,7 +920,7 @@ const LATE: &str = "api.bybit.com";
         let mut violations = Vec::new();
         for f in &files {
             for v in scan_production_hosts(&std::fs::read_to_string(f).unwrap()) {
-                if f == &okx_home() && v == Violation::ProductionHost(OKX_SIGNED_HOST.to_string()) {
+                if f == &okx_home() && endpoints_home_may_name(&v) {
                     continue;
                 }
                 violations.push(format!("{}: {v:?}", f.display()));
