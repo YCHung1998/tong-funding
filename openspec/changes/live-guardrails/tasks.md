@@ -15,8 +15,8 @@
 - [x] 3.2 一次武裝筆數上限：累計進場數、達上限自動鎖定；測試：第 2 筆完成後鎖定、第 3 筆被拒
 - [x] 3.3 Live 手動下單：非 reduce-only 被拒；新增 `FlattenLeg { pair, leg }`（重用 `plan_leg_close`，kill switch ON 時允許）；測試：手動開倉被拒、`PARTIAL_FAILURE` 時只平裸露的一腿
 - [x] 3.4 自動鎖定：集中函式 `lock_live(reason)`；`PARTIAL_FAILURE`／`IMBALANCED`／`UNRESOLVED`、認證類錯誤、HTTP 418／429、校時失敗各有測試；鎖定不阻擋平倉
-- [ ] 3.5 設定凍結：武裝後調高被拒、調低生效；`config set` 對 live 資料庫拒絕寫入受保護鍵；測試涵蓋（引擎內凍結部分已完成並有測試：`FrozenCaps`、`live_settings_check`；`config set` 命令列部分留給整合階段）
-- [ ] 3.6 Live 資料庫初始值（`MANUAL`、`early_exit_min_move_pct = 0`、模板名目不超過上限）；Live 拒絕 `trigger_mode = AUTO`；測試涵蓋（引擎拒絕 AUTO 與純函式 `live_guard::live_db_defaults` 已完成並有測試；資料庫建立流程接線留給整合階段）
+- [x] 3.5 設定凍結：武裝後調高被拒、調低生效；`config set` 對 live 資料庫拒絕寫入受保護鍵；測試涵蓋（引擎內凍結部分已完成並有測試：`FrozenCaps`、`live_settings_check`；`config set` 命令列部分留給整合階段）
+- [x] 3.6 Live 資料庫初始值（`MANUAL`、`early_exit_min_move_pct = 0`、模板名目不超過上限）；Live 拒絕 `trigger_mode = AUTO`；測試涵蓋（引擎拒絕 AUTO 與純函式 `live_guard::live_db_defaults` 已完成並有測試；資料庫建立流程接線留給整合階段）
 
 ## 4. 畫面與連結
 

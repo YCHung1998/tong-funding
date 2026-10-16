@@ -23,8 +23,8 @@
 
 ## 5. 組合根與 OKX
 
-- [ ] 5.1 `main.rs`／`live.rs` 依身分建立「環境套件」（時鐘校時、帳戶、流水、費率、槓桿上限、下單傳輸）；`TONG_FUNDING_BINANCE_HOST` 只對 Demo 有效；測試：用假傳輸記錄目標主機，Live 身分只有 live 主機、Demo 身分只有 demo 主機
-- [ ] 5.2 Live 身分排除 OKX：可交易清單、`add_prepared`、`start_entry`、執行器工廠；測試：含 OKX 腿的配對被拒
+- [x] 5.1 `main.rs`／`live.rs` 依身分建立「環境套件」（時鐘校時、帳戶、流水、費率、槓桿上限、下單傳輸）；`TONG_FUNDING_BINANCE_HOST` 只對 Demo 有效；測試：用假傳輸記錄目標主機，Live 身分只有 live 主機、Demo 身分只有 demo 主機
+- [x] 5.2 Live 身分排除 OKX：可交易清單、`add_prepared`、`start_entry`、執行器工廠；測試：含 OKX 腿的配對被拒
 
 ## 6. 驗證
 
