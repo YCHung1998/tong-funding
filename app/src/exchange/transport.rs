@@ -161,6 +161,7 @@ mod fake {
     }
 
     impl DemoSignedTransport for FakeTransport {}
+    impl LiveSignedTransport for FakeTransport {}
 
     impl HttpTransport for FakeTransport {
         fn get(&self, req: HttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {

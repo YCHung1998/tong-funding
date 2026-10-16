@@ -90,20 +90,31 @@ pub fn classify_exchange_body(exchange: Exchange, body: &str) -> Option<AdapterE
     limited.then_some(AdapterError::RateLimited { retry_after_ms: None })
 }
 
-/// Request class derived from the URL (pure): a signed (demo/testnet) host is `Signed`; a public
-/// request naming one symbol (`symbol=`, or `instId=` other than `ANY`) is `Single`; the rest is `Batch`.
-pub fn classify_request(url: &str) -> RequestClass {
-    let Some((_, rest)) = url.split_once("://") else { return RequestClass::Batch };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    // The real host is after any `user@`, before any `:port`.
-    let host_port = rest[..authority_end].rsplit('@').next().unwrap_or("");
-    let host = host_port.split(':').next().unwrap_or("").to_ascii_lowercase();
-    if crate::exchange::signed::endpoints::ALLOWED_SIGNED_HOSTS.contains(&host.as_str()) {
-        return RequestClass::Signed;
+/// Which kind of client sends a request. The class follows THIS, never the host: since the live
+/// process, `fapi.binance.com` / `api.bybit.com` are public market-data hosts and signed hosts at
+/// the same time, so a host list cannot tell a public poll from a signed account read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    /// A signed client (demo or live): always [`RequestClass::Signed`].
+    Signed,
+    /// A public market-data client: [`RequestClass::Batch`] or [`RequestClass::Single`].
+    Public,
+}
+
+/// Request class of one request (pure). A signed caller is `Signed`; a public caller naming one
+/// symbol (`symbol=`, or `instId=` other than `ANY`) is `Single`, the rest is `Batch`.
+pub fn classify(caller: Caller, url: &str) -> RequestClass {
+    match caller {
+        Caller::Signed => RequestClass::Signed,
+        Caller::Public => {
+            if !url.contains("://") {
+                return RequestClass::Batch;
+            }
+            let query = url.find('?').map_or("", |q| url[q + 1..].split('#').next().unwrap_or(""));
+            let single = query.split('&').filter_map(|kv| kv.split_once('=')).any(|(k, v)| k == "symbol" || (k == "instId" && !v.eq_ignore_ascii_case("ANY")));
+            if single { RequestClass::Single } else { RequestClass::Batch }
+        }
     }
-    let query = rest.find('?').map_or("", |q| rest[q + 1..].split('#').next().unwrap_or(""));
-    let single = query.split('&').filter_map(|kv| kv.split_once('=')).any(|(k, v)| k == "symbol" || (k == "instId" && !v.eq_ignore_ascii_case("ANY")));
-    if single { RequestClass::Single } else { RequestClass::Batch }
 }
 
 /// 429 and Binance's 418 become `RateLimited`; any other status is not a rate limit.
@@ -554,30 +565,40 @@ mod tests {
         assert_eq!(classify_exchange_body(Exchange::Okx, r#"{"retCode":10006}"#), None);
     }
 
+    // ---- live-process 2.5: the class follows the CALLER type, never the host ----
+
     #[test]
-    fn requests_are_classified_by_url() {
-        use crate::exchange::signed::endpoints::{BINANCE_DEMO_HOST, BINANCE_TESTNET_HOST, BYBIT_DEMO_HOST};
-        let c = classify_request;
-        assert_eq!(c(&format!("https://{BINANCE_TESTNET_HOST}/fapi/v2/balance?timestamp=1&signature=x")), RequestClass::Signed);
-        assert_eq!(c(&format!("https://{BINANCE_DEMO_HOST}/fapi/v1/openOrders")), RequestClass::Signed);
-        assert_eq!(c(&format!("https://{BYBIT_DEMO_HOST}/v5/position/list?category=linear")), RequestClass::Signed);
-        assert_eq!(c(&format!("HTTPS://{}/x", BINANCE_TESTNET_HOST.to_uppercase())), RequestClass::Signed, "host case");
-        assert_eq!(c(&format!("https://{BINANCE_TESTNET_HOST}:443/x?symbol=BTCUSDT")), RequestClass::Signed, "port, and Signed beats symbol=");
-        assert_eq!(c("https://pub.example/fapi/v1/premiumIndex?symbol=BTCUSDT"), RequestClass::Single);
+    fn signed_callers_are_always_signed_whatever_the_host_or_query() {
+        use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, LIVE_SIGNED_HOSTS};
+        for host in ALLOWED_SIGNED_HOSTS.iter().chain(LIVE_SIGNED_HOSTS.iter()).chain(["pub.example"].iter()) {
+            for tail in ["/fapi/v2/positionRisk?timestamp=1&signature=x", "/x?symbol=BTCUSDT", "/x"] {
+                assert_eq!(classify(Caller::Signed, &format!("https://{host}{tail}")), RequestClass::Signed, "{host}{tail}");
+            }
+        }
+        assert_eq!(classify(Caller::Signed, "not a url"), RequestClass::Signed);
+    }
+
+    #[test]
+    fn public_callers_are_batch_or_single_on_every_host_including_the_live_signed_hosts() {
+        use crate::exchange::signed::endpoints::{ALLOWED_SIGNED_HOSTS, LIVE_SIGNED_HOSTS};
+        // the live host is BOTH a public market-data host and a signed host: the host alone says nothing
+        for host in LIVE_SIGNED_HOSTS.iter().chain(ALLOWED_SIGNED_HOSTS.iter()).chain(["pub.example"].iter()) {
+            assert_eq!(classify(Caller::Public, &format!("https://{host}/fapi/v1/premiumIndex")), RequestClass::Batch, "{host} batch");
+            assert_eq!(classify(Caller::Public, &format!("https://{host}/fapi/v1/premiumIndex?symbol=BTCUSDT")), RequestClass::Single, "{host} single");
+            assert_ne!(classify(Caller::Public, &format!("https://{host}/fapi/v2/balance?timestamp=1&signature=x")), RequestClass::Signed, "{host}");
+        }
+    }
+
+    #[test]
+    fn public_single_versus_batch_rules() {
+        let c = |u: &str| classify(Caller::Public, u);
         assert_eq!(c("https://pub.example/v5/market/tickers?category=linear&symbol=BTCUSDT"), RequestClass::Single);
-        assert_eq!(c("https://pub.example/fapi/v1/premiumIndex"), RequestClass::Batch);
         assert_eq!(c("https://pub.example/v5/market/tickers?category=linear"), RequestClass::Batch);
         assert_eq!(c("https://pub.example/api/v5/public/funding-rate?instId=BTC-USDT-SWAP"), RequestClass::Single);
         assert_eq!(c("https://pub.example/api/v5/public/funding-rate?instId=ANY"), RequestClass::Batch);
         assert_eq!(c("https://pub.example/x?notsymbol=1"), RequestClass::Batch, "parameter name must match exactly");
         assert_eq!(c("https://pub.example/x?a=1&symbol=ETHUSDT&b=2"), RequestClass::Single);
+        assert_eq!(c("https://pub.example/x?a=1#symbol=ETHUSDT"), RequestClass::Batch, "fragment is not a query");
         assert_eq!(c("not a url"), RequestClass::Batch);
-    }
-
-    #[test]
-    fn userinfo_tricks_do_not_make_a_public_url_look_signed() {
-        use crate::exchange::signed::endpoints::BINANCE_TESTNET_HOST;
-        let url = format!("https://{BINANCE_TESTNET_HOST}@pub.example/fapi/v1/premiumIndex");
-        assert_eq!(classify_request(&url), RequestClass::Batch);
     }
 }

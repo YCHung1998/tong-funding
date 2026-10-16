@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use tong_funding_core::types::Exchange;
 
-use super::ratelimit::{BackoffState, RateLimiter, WeightGate, classify_exchange_body, classify_request, rate_limit_error_at};
+use super::ratelimit::{BackoffState, Caller, RateLimiter, WeightGate, classify, classify_exchange_body, rate_limit_error_at};
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{HttpRequest, HttpResponse, HttpTransport};
+use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpResponse, HttpTransport, LiveSignedTransport};
 use crate::ports::TimeSource;
 
 /// Largest body inspected for an embedded rate-limit code.
@@ -23,17 +23,34 @@ pub struct GatedTransport<T: HttpTransport> {
     limiter: Arc<RateLimiter>,
     weight: Arc<WeightGate>,
     clock: Arc<dyn TimeSource>,
+    caller: Caller,
 }
 
 impl<T: HttpTransport> GatedTransport<T> {
+    /// A PUBLIC market-data client: requests are `Batch` or `Single`.
     pub fn new(inner: T, exchange: Exchange, limiter: Arc<RateLimiter>, weight: Arc<WeightGate>, clock: Arc<dyn TimeSource>) -> Self {
-        Self { inner, exchange, limiter, weight, clock }
+        Self { inner, exchange, limiter, weight, clock, caller: Caller::Public }
+    }
+}
+
+impl<T: DemoSignedTransport> GatedTransport<T> {
+    /// A signed client on the demo hosts: every request is `Signed`.
+    pub fn signed_demo(inner: T, exchange: Exchange, limiter: Arc<RateLimiter>, weight: Arc<WeightGate>, clock: Arc<dyn TimeSource>) -> Self {
+        Self { inner, exchange, limiter, weight, clock, caller: Caller::Signed }
+    }
+}
+
+impl<T: LiveSignedTransport> GatedTransport<T> {
+    /// A signed client on the live hosts: every request is `Signed`, even though the host is also a
+    /// public market-data host.
+    pub fn signed_live(inner: T, exchange: Exchange, limiter: Arc<RateLimiter>, weight: Arc<WeightGate>, clock: Arc<dyn TimeSource>) -> Self {
+        Self { inner, exchange, limiter, weight, clock, caller: Caller::Signed }
     }
 }
 
 impl<T: HttpTransport> HttpTransport for GatedTransport<T> {
     async fn get(&self, req: HttpRequest) -> Result<HttpResponse, AdapterError> {
-        let (ex, class) = (self.exchange, classify_request(&req.url));
+        let (ex, class) = (self.exchange, classify(self.caller, &req.url));
         if !self.limiter.allow_request(ex, class) {
             let retry_after_ms = match self.limiter.state(ex, class) {
                 BackoffState::Waiting { remaining_ms, .. } => Some(remaining_ms.max(0) as u64),
@@ -69,7 +86,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::exchange::health::ratelimit::RETRY_AFTER_CAP_MS;
+    use crate::exchange::health::ratelimit::{RETRY_AFTER_CAP_MS, RequestClass};
     use crate::exchange::signed::endpoints::BINANCE_TESTNET_HOST;
     use crate::exchange::transport::FakeTransport;
     use crate::ports::ManualClock;
@@ -81,8 +98,13 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(f)
     }
 
+    impl crate::exchange::transport::DemoSignedTransport for Arc<FakeTransport> {}
+    impl crate::exchange::transport::LiveSignedTransport for Arc<FakeTransport> {}
+
     struct Rig {
         clock: ManualClock,
+        limiter: Arc<RateLimiter>,
+        ts: Arc<dyn TimeSource>,
         weight: Arc<WeightGate>,
         gated: GatedTransport<Arc<FakeTransport>>,
         fake: Arc<FakeTransport>,
@@ -99,8 +121,9 @@ mod tests {
         let ts: Arc<dyn TimeSource> = Arc::new(clock.clone());
         let weight = Arc::new(WeightGate::new(ts.clone()));
         let fake = Arc::new(fake);
-        let gated = GatedTransport::new(fake.clone(), exchange, Arc::new(RateLimiter::new(ts.clone())), weight.clone(), ts);
-        Rig { clock, weight, gated, fake }
+        let limiter = Arc::new(RateLimiter::new(ts.clone()));
+        let gated = GatedTransport::new(fake.clone(), exchange, limiter.clone(), weight.clone(), ts.clone());
+        Rig { clock, limiter, ts, weight, gated, fake }
     }
 
     fn get(r: &Rig, url: &str) -> Result<HttpResponse, AdapterError> {
@@ -207,9 +230,40 @@ mod tests {
         assert!(matches!(get(&r, BATCH), Err(AdapterError::RateLimited { .. })), "batch deferred");
         assert_eq!(r.fake.requests().len(), before, "no request for a deferred batch");
         assert!(get(&r, SINGLE).is_ok(), "single-symbol re-fetch is exempt");
-        assert!(get(&r, &signed).is_ok(), "signed reads are exempt");
+        // a signed read goes through a SIGNED gated transport (class by caller type), same weight gate
+        let signed_gate = GatedTransport::signed_demo(r.fake.clone(), Exchange::Binance, r.limiter.clone(), r.weight.clone(), r.ts.clone());
+        assert!(block_on(signed_gate.get(HttpRequest::get(signed, Duration::from_secs(1)))).is_ok(), "signed reads are exempt");
         r.clock.advance(60_000);
         assert!(get(&r, BATCH).is_ok(), "the weight window rolled over: batch resumes");
+    }
+
+    // ---- live-process 2.5: same host, three callers, three classes ----
+
+    #[test]
+    fn on_the_same_live_host_public_batch_public_single_and_signed_are_classified_separately() {
+        let host = "https://fapi.binance.com";
+        let r = rig(
+            Exchange::Binance,
+            FakeTransport::new().on("premiumIndex?symbol", Ok(HttpResponse::ok("{}"))).on("premiumIndex", limited(429, Some("30"))).on("positionRisk", limited(429, Some("40"))),
+        );
+        let public_batch = format!("{host}/fapi/v1/premiumIndex");
+        let public_single = format!("{host}/fapi/v1/premiumIndex?symbol=BTCUSDT");
+        let signed_url = format!("{host}/fapi/v2/positionRisk?timestamp=1&signature=x");
+        let signed_gate = GatedTransport::signed_live(r.fake.clone(), Exchange::Binance, r.limiter.clone(), r.weight.clone(), r.ts.clone());
+        let signed = |u: &str| block_on(signed_gate.get(HttpRequest::get(u, Duration::from_secs(1))));
+
+        // the public batch is rate-limited -> only the public Batch class backs off
+        assert_eq!(get(&r, &public_batch), Err(AdapterError::RateLimited { retry_after_ms: Some(30_000) }));
+        assert_eq!(r.limiter.state(Exchange::Binance, RequestClass::Signed), BackoffState::Clear, "a public 429 must not lock the signed class");
+        assert!(get(&r, &public_single).is_ok(), "public single is its own class");
+        // the signed request is rate-limited -> only the Signed class backs off
+        assert_eq!(signed(&signed_url), Err(AdapterError::RateLimited { retry_after_ms: Some(40_000) }));
+        assert!(matches!(r.limiter.state(Exchange::Binance, RequestClass::Signed), BackoffState::Waiting { .. }));
+        assert!(matches!(r.limiter.state(Exchange::Binance, RequestClass::Batch), BackoffState::Waiting { .. }));
+        assert_eq!(r.limiter.state(Exchange::Binance, RequestClass::Single), BackoffState::Clear);
+        let before = r.fake.requests().len();
+        assert!(matches!(signed(&signed_url), Err(AdapterError::RateLimited { .. })), "signed class is locked");
+        assert_eq!(r.fake.requests().len(), before, "refused without touching the network");
     }
 
     #[test]
