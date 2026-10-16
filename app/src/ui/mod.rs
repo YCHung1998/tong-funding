@@ -4,6 +4,7 @@
 pub mod bench;
 pub mod clock;
 pub mod live;
+pub mod live_env;
 pub mod component_theme;
 pub mod font_check;
 pub mod frame_stats;

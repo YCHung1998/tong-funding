@@ -32,7 +32,7 @@ impl std::fmt::Display for IdentityError {
 
 impl ProcessIdentity {
     /// Parses `std::env::args()` (including the program name at index 0) for the GUI process.
-    /// The headless subcommands (`secrets`, `config`, `import`) are dispatched before this is
+    /// The headless subcommands (`secrets`, `config`, `import-legacy-events`) are dispatched before this is
     /// called and take their own `--live` flag; for them the identity here stays `Demo`.
     pub fn from_args(args: &[String]) -> Result<ProcessIdentity, IdentityError> {
         let rest = args.get(1..).unwrap_or(&[]);
@@ -46,7 +46,9 @@ impl ProcessIdentity {
             Some(_) => {
                 // A subcommand carries its own `--live` (e.g. `secrets set --live ...`).
                 let sub = rest.first().map(String::as_str);
-                if matches!(sub, Some("secrets") | Some("config") | Some("import")) { Ok(ProcessIdentity::Demo) } else { Err(IdentityError::LiveNotFirst) }
+                use crate::store::{config_cli, import_cli, secrets_cli};
+                let headless = [secrets_cli::SUBCOMMAND, config_cli::SUBCOMMAND, import_cli::SUBCOMMAND];
+                if sub.is_some_and(|s| headless.contains(&s)) { Ok(ProcessIdentity::Demo) } else { Err(IdentityError::LiveNotFirst) }
             }
         }
     }
@@ -112,6 +114,16 @@ mod tests {
     fn headless_subcommands_carry_their_own_live_flag_and_stay_demo_here() {
         assert_eq!(ProcessIdentity::from_args(&a(&["tong-funding", "secrets", "set", "--live", "Bybit", "api_key"])), Ok(ProcessIdentity::Demo));
         assert_eq!(ProcessIdentity::from_args(&a(&["tong-funding", "config", "--live"])), Ok(ProcessIdentity::Demo));
+    }
+
+    #[test]
+    fn every_real_headless_subcommand_name_may_carry_its_own_live_flag() {
+        use crate::store::{config_cli, import_cli, secrets_cli};
+        for sub in [secrets_cli::SUBCOMMAND, config_cli::SUBCOMMAND, import_cli::SUBCOMMAND] {
+            assert_eq!(ProcessIdentity::from_args(&a(&["tong-funding", sub, "x", "--live"])), Ok(ProcessIdentity::Demo), "{sub}");
+        }
+        // the old, wrong name is not a subcommand: `--live` after it is a misplaced flag
+        assert_eq!(ProcessIdentity::from_args(&a(&["tong-funding", "import", "--live"])), Err(IdentityError::LiveNotFirst));
     }
 
     #[test]

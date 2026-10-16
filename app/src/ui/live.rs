@@ -17,8 +17,6 @@
 //! Untested against the network here (no exchange access in CI); verified by task 4.1 on a Mac.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,23 +32,23 @@ use super::bridge::{CapReading,
     AccountData, AccountState, AssetInput, ClockState, CommandOutcome, CommandSink, ContractTemplate, LegAccount, PairInfo, ReadOnlyDataSource, RefreshRequest, Settings,
     SourceHealth, SourceId, SourceUpdate,
 };
-use super::wiring::{self, ClockOffsets, NoAccount, PublicMarketData};
+use super::wiring::{self, ClockOffsets, PublicMarketData};
 use crate::engine::actor::{self as engine_actor, CommandMsg, EngineDeps, MarketPrices};
 use crate::engine::alert::LogNotifier;
 use crate::engine::command::{Command, CommandReply};
 use crate::engine::ports::{AccountView, ExecutorFactory, ServerOffsets, StartupReconciler};
+use crate::engine::preflight::{NoProbes, PreflightProbes};
+use crate::identity::ProcessIdentity;
+use crate::funding::slot_runner::RateSource;
+use super::live_env;
 use crate::engine::recovery::RecoveryReconciler;
 use crate::engine::sim::{MarginFromAccount, SimPriceBook, SimulatedExecutor};
 use crate::engine::timings::EngineTimings;
-use crate::exchange::execution::account::DemoAccountView;
-use crate::exchange::execution::factory::DemoExecutorFactory;
-use crate::exchange::execution::http::SignedDemoOrderTransport;
+use crate::exchange::execution::http::{SignedDemoOrderTransport, SignedLiveOrderTransport};
 use crate::exchange::execution::okx::{OkxLimits, OkxLimitsSource};
 use crate::exchange::public::adapter::ExchangeAdapter;
 use crate::exchange::signed::signing::load_credentials;
-use crate::exchange::signed::ledger::{BinanceLedgerClient, BybitLedgerClient};
-use crate::funding::fetch::{BinanceLedgerSource, BybitLedgerSource, OkxLedgerSource, TokioPause};
-use crate::funding::rate_source::DemoRateSource;
+use crate::funding::fetch::{LedgerSource, TokioPause};
 use crate::funding::runner::{self as funding_runner, FundingLoop};
 use crate::funding::slot_runner;
 use super::scanner_refresh::{RefreshGate, RefreshGuard, RefreshOutcome, refresh_sources};
@@ -66,14 +64,14 @@ use crate::exchange::public::bybit::BybitAdapter;
 use crate::exchange::public::endpoints::OKX_HOST;
 use crate::exchange::public::feed_endpoints::{BybitFeedMode, BINANCE_MARK_PRICE_WS_URL, BYBIT_FEED_ENV, BYBIT_TICKERS_WS_URL};
 use crate::exchange::public::okx::OkxAdapter;
-use crate::exchange::reqwest_transport::{PublicTransport, SignedDemoTransport};
+use crate::exchange::reqwest_transport::{PublicTransport, SignedDemoTransport, SignedLiveTransport};
 use crate::exchange::transport::HttpTransport;
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
-use crate::exchange::signed::endpoints::{BinanceHost, BybitHost, OkxHost};
-use crate::exchange::signed::okx::{OkxLatch, OkxPosition, OkxSignedClient};
+use crate::exchange::signed::endpoints::{BinanceEnv, BinanceHost, BybitEnv};
+use crate::exchange::signed::okx::{OkxPosition, OkxSignedClient};
 use crate::exchange::signed::models::{Balance, Completeness, Position, PositionMode};
-use crate::exchange::signed::signing::{NotConnectedReason, Resync};
+use crate::exchange::signed::signing::NotConnectedReason;
 use crate::ports::{EventSink, SecretProvider, SystemClock, TimeSource};
 use crate::store::db::Db;
 use crate::store::event_query::{EventPage, EventQuery};
@@ -92,17 +90,10 @@ const STORE_POLL_MS: u64 = 2_000;
 /// (`testnet` = default, `demo`); never a URL (exchange-readonly-adapters Open Question 2).
 pub const BINANCE_HOST_ENV: &str = "TONG_FUNDING_BINANCE_HOST";
 
-fn binance_host() -> BinanceHost {
+pub(super) fn binance_host() -> BinanceHost {
     match std::env::var(BINANCE_HOST_ENV).ok().as_deref() {
         Some("demo") => BinanceHost::Demo,
         _ => BinanceHost::Testnet,
-    }
-}
-
-fn env_label(h: BinanceHost) -> &'static str {
-    match h {
-        BinanceHost::Testnet => "TESTNET",
-        BinanceHost::Demo => "DEMO",
     }
 }
 
@@ -410,20 +401,7 @@ impl CommandSink for LiveSource {
     }
 }
 
-type PublicT = GatedTransport<PublicTransport>;
-
-struct ClockResync<T> {
-    sync: Arc<ClockSync>,
-    transport: Arc<T>,
-    exchange: Exchange,
-    base_url: &'static str,
-}
-
-impl<T: HttpTransport + 'static> Resync for ClockResync<T> {
-    fn resync(&self) -> Pin<Box<dyn Future<Output = Result<(), AdapterError>> + Send + '_>> {
-        Box::pin(async move { self.sync.sync_once(self.transport.as_ref(), self.exchange, self.base_url).await.map(|_| ()) })
-    }
-}
+pub(super) type PublicT = GatedTransport<PublicTransport>;
 
 /// `config` key of the acknowledged notifications (header badge).
 const KEY_ALERT_ACKS: &str = "alert_acks";
@@ -467,7 +445,7 @@ impl LiveSource {
 }
 
 /// Shared state of the running tasks.
-struct Ctx {
+pub(super) struct Ctx {
     shared: Arc<Shared>,
     clock: Arc<SystemClock>,
     sink: Arc<dyn EventSink>,
@@ -546,7 +524,6 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     if let Some(w) = proxy_env_warning(|k| std::env::var(k).ok()) {
         eprintln!("{w}");
     }
-    let signed = SignedDemoTransport::new().ok().map(Arc::new);
     let weight = Arc::new(WeightGate::new(time.clone()));
     let gated = |ex: Exchange| -> Result<Arc<PublicT>, AdapterError> {
         Ok(Arc::new(GatedTransport::new(PublicTransport::new()?, ex, ctx.limiter.clone(), weight.clone(), time.clone())))
@@ -602,20 +579,47 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     }
     let bybit_health = start_bybit_feed(bybit_mode).then(|| bybit_feed.health());
 
-    // Clock sync (signing hosts for Binance / Bybit, the public host for OKX: countdowns and, since
-    // okx-trading-enablement, the OKX signing offset).
-    let bhost = binance_host();
+    // The environment bundle (live-process 5.1): everything that depends on WHICH world this
+    // process lives in is built by ONE builder per identity (`live_env`); the rest of `run` sees
+    // trait objects only. Keychain item, hosts and transports all follow the identity; the Demo
+    // builder never sees a live host and the Live one takes no host argument at all.
     let public = Arc::new(public);
+    let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system_for(identity));
+    let offsets: Arc<dyn ServerOffsets> = Arc::new(ClockOffsets { clocks: ctx.clocks.clone() });
+    let okx_limits = Arc::new(LiveOkxLimits::default());
+    okx_limits.set_cap(okx_leg_cap(&settings));
+    let common = live_env::Common {
+        secrets: secrets.clone(),
+        clock: dyn_clock.clone(),
+        time: time.clone(),
+        clocks: ctx.clocks.clone(),
+        offsets: offsets.clone(),
+        limiter: ctx.limiter.clone(),
+        db: db.clone(),
+    };
+    let bundle = match identity {
+        ProcessIdentity::Demo => {
+            let signed = SignedDemoTransport::new().ok().map(Arc::new);
+            let orders = SignedDemoOrderTransport::new().map(Arc::new).map_err(|e| e.to_string());
+            let parts = live_env::DemoParts { bhost: binance_host(), okx_public: public.clone(), adapters: adapters.clone(), okx_limits: okx_limits.clone() };
+            live_env::build_demo_env(signed, orders, common, parts)
+        }
+        ProcessIdentity::Live => {
+            let signed = SignedLiveTransport::new().ok().map(Arc::new);
+            let orders = SignedLiveOrderTransport::new().map(Arc::new).map_err(|e| e.to_string());
+            live_env::build_live_env(signed, orders, common, Arc::new(NoProbes))
+        }
+    };
+    let okx_latch = bundle.okx_latch.clone();
+
+    // Clock sync (the signing hosts of this environment for Binance / Bybit; the public host for OKX:
+    // countdowns and, since okx-trading-enablement, the OKX signing offset).
     {
-        let (ctx, signed, public) = (ctx.clone(), signed.clone(), public.clone());
+        let (ctx, sync, public) = (ctx.clone(), bundle.clock_sync.clone(), public.clone());
         tokio::spawn(async move {
             loop {
-                for (ex, base) in [(Exchange::Binance, bhost.base_url()), (Exchange::Bybit, BybitHost::Demo.base_url())] {
-                    if let Some(t) = &signed {
-                        if ctx.clocks[&ex].resync_due(RESYNC_INTERVAL_MS) {
-                            let _ = ctx.clocks[&ex].sync_once(t.as_ref(), ex, base).await;
-                        }
-                    }
+                if let Some(s) = &sync {
+                    s.sync_due(&ctx.clocks).await;
                 }
                 if ctx.clocks[&Exchange::Okx].resync_due(RESYNC_INTERVAL_MS) {
                     let _ = ctx.clocks[&Exchange::Okx].sync_once(public.as_ref(), Exchange::Okx, OKX_HOST).await;
@@ -632,68 +636,30 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         });
     }
 
-    // The executor factory (EXCHANGE_DEMO orders) owns the ONE OKX latch of the process; the OKX read
-    // client below gets the same `Arc`, so a `50101` on any OKX request disables OKX everywhere.
-    let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
-    let offsets: Arc<dyn ServerOffsets> = Arc::new(ClockOffsets { clocks: ctx.clocks.clone() });
-    let okx_limits = Arc::new(LiveOkxLimits::default());
-    okx_limits.set_cap(okx_leg_cap(&settings));
-    let (factory, okx_latch) = build_factory(db.as_ref(), &secrets, &time, &offsets, &ctx.limiter, bhost, &okx_limits);
-
-    // Account polls (the same signed clients back the engine's demo account view).
-    let mut signed_clients = None;
-    let mut ledger_sources = None;
-    let mut rate_clients = None;
-    if let Some(t) = signed.clone() {
-        let ledger_secrets = secrets.clone();
-        let secrets = secrets.clone();
-        let offset = |sync: Arc<ClockSync>| {
-            move || match sync.status() {
-                ClockStatus::Synced { offset_ms, .. } => Some(offset_ms),
-                ClockStatus::Unsynced => None,
+    // Account polls (the same signed clients back the engine's account view).
+    match bundle.poller.clone() {
+        Some(poller) => {
+            let ctx = ctx.clone();
+            tokio::spawn(async move {
+                // Give clock sync a moment so the first poll is not refused as "unsynced".
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                loop {
+                    *ctx.next_account_poll.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = clock_now(&ctx.clock) + ACCOUNT_POLL_MS;
+                    poller.poll(&ctx).await;
+                    tokio::time::sleep(Duration::from_millis(ACCOUNT_POLL_MS as u64)).await;
+                }
+            });
+        }
+        None => {
+            for ex in super::bridge::ACCOUNT_EXCHANGES {
+                shared.push(SourceUpdate::Account { exchange: ex, state: AccountState::NotConnected { reason: "簽名傳輸層無法建立".into() } });
             }
-        };
-        let resync = |ex: Exchange, base: &'static str| Arc::new(ClockResync { sync: ctx.clocks[&ex].clone(), transport: t.clone(), exchange: ex, base_url: base });
-        let binance = Arc::new(BinanceSignedClient::new(t.clone(), secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost));
-        let bybit = Arc::new(BybitSignedClient::new(t.clone(), secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo));
-        let okx = Arc::new(
-            OkxSignedClient::new(
-                t.clone(),
-                secrets.clone(),
-                dyn_clock.clone(),
-                Arc::new(offset(ctx.clocks[&Exchange::Okx].clone())),
-                Arc::new(ClockResync { sync: ctx.clocks[&Exchange::Okx].clone(), transport: public.clone(), exchange: Exchange::Okx, base_url: OKX_HOST }),
-                OkxHost::Demo,
-            )
-            .with_latch(okx_latch.clone()),
-        );
-        signed_clients = Some((binance.clone(), bybit.clone(), okx.clone()));
-        rate_clients = Some(DemoRateSource { binance: binance.clone(), bybit: bybit.clone() });
-        // funding-pnl: the signed ledger clients (same transport, Keychain keys, clock offsets).
-        let ledger_binance = BinanceLedgerClient::new(t.clone(), ledger_secrets.clone(), dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Binance].clone())), resync(Exchange::Binance, bhost.base_url()), bhost);
-        let ledger_bybit = BybitLedgerClient::new(t.clone(), ledger_secrets, dyn_clock.clone(), Arc::new(offset(ctx.clocks[&Exchange::Bybit].clone())), resync(Exchange::Bybit, BybitHost::Demo.base_url()), BybitHost::Demo);
-        ledger_sources = Some((BinanceLedgerSource(Arc::new(ledger_binance)), BybitLedgerSource(Arc::new(ledger_bybit)), OkxLedgerSource(okx.clone())));
-        let (ctx, adapters, okx_limits_poll) = (ctx.clone(), adapters.clone(), okx_limits.clone());
-        tokio::spawn(async move {
-            // Give clock sync a moment so the first poll is not refused as "unsynced".
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            loop {
-                *ctx.next_account_poll.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = clock_now(&ctx.clock) + ACCOUNT_POLL_MS;
-                poll_binance_account(&ctx, &binance, env_label(bhost)).await;
-                poll_bybit_account(&ctx, &bybit).await;
-                poll_okx_account(&ctx, &okx, &adapters.2, &okx_limits_poll).await;
-                tokio::time::sleep(Duration::from_millis(ACCOUNT_POLL_MS as u64)).await;
-            }
-        });
-    } else {
-        for ex in super::bridge::ACCOUNT_EXCHANGES {
-            shared.push(SourceUpdate::Account { exchange: ex, state: AccountState::NotConnected { reason: "簽名傳輸層無法建立".into() } });
         }
     }
 
     // The engine (composition root): same runtime, same store, real ports.
     let engine_running = match &db {
-        Some(db) => start_engine(&ctx, db, adapters.clone(), signed_clients, factory, offsets.clone(), dyn_clock.clone()),
+        Some(db) => start_engine(&ctx, db, adapters.clone(), bundle.account.clone(), bundle.factory.clone(), offsets.clone(), dyn_clock.clone(), bundle.probes.clone()),
         None => {
             shared.push(SourceUpdate::EngineUnavailable("資料庫不可用，引擎未啟動".into()));
             false
@@ -701,10 +667,10 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
     };
 
     // funding-pnl: ledger fetches and reconciliation (design D9 schedule, `funding::runner`).
-    match (&db, ledger_sources) {
-        (Some(db), Some(sources)) => start_funding_loop(&ctx, db.clone(), sources, rate_clients, secrets.clone()),
-        (Some(_), None) => eprintln!("funding ledger loop not started: signed transport unavailable"),
-        (None, _) => {}
+    match &db {
+        Some(db) if !bundle.ledgers.is_empty() => start_funding_loop(&ctx, db.clone(), bundle.ledgers.clone(), bundle.slot_ledgers.clone(), bundle.rates.clone(), secrets.clone()),
+        Some(_) => eprintln!("funding ledger loop not started: signed transport unavailable"),
+        None => {}
     }
 
     // Lot-rule requests from the pages (answered from the adapters' cached catalogs).
@@ -866,42 +832,17 @@ fn demo_keys_for(secrets: &dyn SecretProvider, allowed: &[Exchange]) -> Result<(
     Ok(())
 }
 
-/// The three signed read clients (they back the account polls and the engine's demo account view).
-type SignedClients = (Arc<BinanceSignedClient<SignedDemoTransport>>, Arc<BybitSignedClient<SignedDemoTransport>>, Arc<OkxSignedClient<SignedDemoTransport>>);
-
-/// The EXCHANGE_DEMO executor factory and the one OKX latch it owns (the read client shares it). The
-/// order transport is the plain (never gated) one. Without a store or an order transport the factory
-/// refuses EXCHANGE_DEMO and the latch is a private one (no order client exists to trip it).
-fn build_factory(
-    db: Option<&Db>,
-    secrets: &Arc<dyn SecretProvider>,
-    time: &Arc<dyn TimeSource>,
-    offsets: &Arc<dyn ServerOffsets>,
-    limiter: &Arc<RateLimiter>,
-    bhost: BinanceHost,
-    okx_limits: &Arc<LiveOkxLimits>,
-) -> (Arc<dyn ExecutorFactory>, Arc<OkxLatch>) {
-    let Some(db) = db else { return (Arc::new(NoFactory("資料庫不可用".into())), OkxLatch::new()) };
-    match SignedDemoOrderTransport::new() {
-        Ok(t) => {
-            let f = DemoExecutorFactory::new(Arc::new(t), secrets.clone(), time.clone(), offsets.clone(), Arc::new(db.clone()), limiter.clone(), bhost).with_okx_limits(okx_limits.clone());
-            let latch = f.okx_latch();
-            (Arc::new(f), latch)
-        }
-        Err(e) => (Arc::new(NoFactory(format!("order transport unavailable: {e}"))), OkxLatch::new()),
-    }
-}
-
 /// Builds the real `EngineDeps` and starts the engine on this runtime. Returns whether it runs.
 #[allow(clippy::too_many_arguments)]
 fn start_engine<B, Y, O>(
     ctx: &Arc<Ctx>,
     db: &Db,
     adapters: Arc<(B, Y, O)>,
-    signed_clients: Option<SignedClients>,
+    account: Arc<dyn AccountView>,
     factory: Arc<dyn ExecutorFactory>,
     offsets: Arc<dyn ServerOffsets>,
     clock: Arc<dyn crate::ports::Clock>,
+    probes: Arc<dyn PreflightProbes>,
 ) -> bool
 where
     B: ExchangeAdapter + 'static,
@@ -910,10 +851,6 @@ where
 {
     let prices = Arc::new(SimPriceBook::default());
     let simulator = Arc::new(SimulatedExecutor::new(prices.clone()));
-    let account: Arc<dyn AccountView> = match signed_clients {
-        Some((b, y, o)) => Arc::new(DemoAccountView::new(b, y).with_okx(o)),
-        None => Arc::new(NoAccount("簽名傳輸層無法建立".into())),
-    };
     // Leverage-cap reads for the pages (symbol-leverage-cap): fresh signed reads on the demo account.
     {
         let (tx, mut rx) = mpsc::unbounded_channel::<(Exchange, String, Decimal)>();
@@ -945,7 +882,8 @@ where
         notifier: Arc::new(LogNotifier),
         identity: ctx.identity,
     };
-    let handle = engine_actor::start(deps);
+    // Demo gets `NoProbes` (its engine never reads them); Live gets the real probes of its bundle.
+    let handle = engine_actor::start_with_probes(deps, probes);
     let _ = ctx.feed.set((prices, handle.market.clone()));
     let _ = ctx.shared.engine.set((handle.commands.clone(), tokio::runtime::Handle::current()));
     // Snapshot forwarder: every engine snapshot reaches the pages as `SourceUpdate::Engine`.
@@ -990,8 +928,9 @@ where
 fn start_funding_loop(
     ctx: &Arc<Ctx>,
     db: Db,
-    sources: (BinanceLedgerSource<SignedDemoTransport>, BybitLedgerSource<SignedDemoTransport>, OkxLedgerSource<SignedDemoTransport>),
-    rates: Option<DemoRateSource<SignedDemoTransport>>,
+    ledgers: Vec<Arc<dyn LedgerSource>>,
+    slot_ledgers: Vec<Arc<dyn LedgerSource>>,
+    rates: Option<Arc<dyn RateSource>>,
     secrets: Arc<dyn SecretProvider>,
 ) {
     let ctx = ctx.clone();
@@ -1003,14 +942,16 @@ fn start_funding_loop(
         let ready = move |ex: Exchange| load_credentials(secrets.as_ref(), ex, ex == Exchange::Okx).map(|_| ()).map_err(|reason| format!("{} keys unavailable ({reason:?})", ex.name()));
         loop {
             let now = clock_now(&ctx.clock);
-            let report = funding_runner::tick(&db, &[&sources.0, &sources.1, &sources.2], &ready, &TokioPause, &mut state, now).await;
+            let all: Vec<&dyn LedgerSource> = ledgers.iter().map(|s| s.as_ref()).collect();
+            let report = funding_runner::tick(&db, &all, &ready, &TokioPause, &mut state, now).await;
             for e in &report.errors {
                 eprintln!("funding ledger loop: {e}");
             }
             // funding-slot-tracing: create / check the funding slots (staged tracing, linking to pair_id).
+            let slot_sources: Vec<&dyn LedgerSource> = slot_ledgers.iter().map(|s| s.as_ref()).collect();
             let slot_report = match &rates {
-                Some(r) => slot_runner::slots_tick(&db, &[&sources.0, &sources.1], r, &ready, &TokioPause, now).await,
-                None => slot_runner::slots_tick(&db, &[&sources.0, &sources.1], &slot_runner::NoRates, &ready, &TokioPause, now).await,
+                Some(r) => slot_runner::slots_tick(&db, &slot_sources, r.as_ref(), &ready, &TokioPause, now).await,
+                None => slot_runner::slots_tick(&db, &slot_sources, &slot_runner::NoRates, &ready, &TokioPause, now).await,
             };
             for e in &slot_report.errors {
                 eprintln!("funding slot tracing: {e}");
@@ -1029,7 +970,7 @@ fn start_funding_loop(
 const LEG_ACCOUNT_POLL_MS: u64 = 15_000;
 
 /// The executor factory when no order transport could be built: EXCHANGE_DEMO stays refused.
-struct NoFactory(String);
+pub(super) struct NoFactory(pub(super) String);
 impl ExecutorFactory for NoFactory {
     fn create(&self, _: tong_funding_core::risk::ExecutionMode) -> Result<Arc<dyn crate::engine::ports::Executor>, String> {
         Err(self.0.clone())
@@ -1188,7 +1129,7 @@ fn marks_of(ctx: &Ctx, ex: Exchange) -> HashMap<String, Decimal> {
     ctx.marks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ex).cloned().unwrap_or_default()
 }
 
-async fn poll_binance_account(ctx: &Ctx, c: &BinanceSignedClient<SignedDemoTransport>, env: &'static str) {
+pub(super) async fn poll_binance_account<T: HttpTransport, E: BinanceEnv>(ctx: &Ctx, c: &BinanceSignedClient<T, E>, env: &'static str) {
     let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
     match res {
         Ok((balances, positions)) => {
@@ -1199,7 +1140,7 @@ async fn poll_binance_account(ctx: &Ctx, c: &BinanceSignedClient<SignedDemoTrans
     }
 }
 
-async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<SignedDemoTransport>) {
+pub(super) async fn poll_bybit_account<T: HttpTransport, E: BybitEnv>(ctx: &Ctx, c: &BybitSignedClient<T, E>, env: &'static str) {
     let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
     match res {
         Ok((balances, listing)) => {
@@ -1207,7 +1148,7 @@ async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<SignedDemoTransport
                 Completeness::Complete => None,
                 Completeness::Incomplete { reason } => Some(reason),
             };
-            let data = account_data(&balances, listing.items, incomplete, &marks_of(ctx, Exchange::Bybit), "DEMO");
+            let data = account_data(&balances, listing.items, incomplete, &marks_of(ctx, Exchange::Bybit), env);
             account_loaded(ctx, Exchange::Bybit, data);
         }
         Err(e) => account_failed(ctx, Exchange::Bybit, &e, c.last_not_connected_reason()),
@@ -1217,7 +1158,7 @@ async fn poll_bybit_account(ctx: &Ctx, c: &BybitSignedClient<SignedDemoTransport
 /// OKX account poll: balances and positions (converted to coins with the catalog's `ctVal`), shown as
 /// the dashboard's OKX card. A position whose `ctVal` is unknown is named in the incomplete reason
 /// instead of being dropped; the rules of the positions' symbols are requested for the pages.
-async fn poll_okx_account(ctx: &Ctx, c: &OkxSignedClient<SignedDemoTransport>, adapter: &OkxAdapter<PublicT>, limits: &LiveOkxLimits) {
+pub(super) async fn poll_okx_account<T: HttpTransport>(ctx: &Ctx, c: &OkxSignedClient<T>, adapter: &OkxAdapter<PublicT>, limits: &LiveOkxLimits) {
     let res = async { Ok::<_, AdapterError>((c.get_balances().await?, c.get_positions().await?)) }.await;
     match res {
         Ok((balances, listing)) => {

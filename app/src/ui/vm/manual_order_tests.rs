@@ -172,7 +172,7 @@ fn ui_pages_hold_no_exchange_client() {
     let banned = ["SignedClient", "OrderClient", "Executor", "ReqwestTransport", "Adapter::", "execution::", "exchange::public", "exchange::signed::binance", "exchange::signed::bybit"];
     // `scanner_refresh.rs` drives the read-only public market adapters (batch snapshots, no order
     // capability) for the existing data source; it is called only from `live.rs`.
-    let allowed_files = ["live.rs", "wiring.rs", "bench.rs", "scanner_refresh.rs"];
+    let allowed_files = ["live.rs", "live_env.rs", "wiring.rs", "bench.rs", "scanner_refresh.rs"];
     let mut stack = vec![dir];
     let mut hits = Vec::new();
     while let Some(dir) = stack.pop() {

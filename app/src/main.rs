@@ -58,7 +58,7 @@ fn main() {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
-                let db = store::db::Db::open_default(std::sync::Arc::new(ports::SystemClock)).ok();
+                let db = store::db::Db::open_default_for(identity, std::sync::Arc::new(ports::SystemClock)).ok();
                 let live = ui::live::LiveSource::start(db, identity);
                 let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = live.clone();
                 let sink: std::sync::Arc<dyn ui::bridge::CommandSink> = live;
