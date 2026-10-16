@@ -71,7 +71,7 @@ pub fn freshness_chip(label: &str, f: &Freshness) -> Div {
 // ---- banner ---------------------------------------------------------------------------------
 
 /// The banner; `None` when there is nothing to show (takes no space).
-pub fn banner<F, G>(vm: &BannerVm, mut on_dismiss: F, mut on_link: G) -> Option<Div>
+pub fn banner<F, G>(vm: &BannerVm, mut on_dismiss: F, mut on_link: G, on_open: &dyn Fn(String) -> ClickFn) -> Option<Div>
 where
     F: FnMut(usize) -> Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
     G: FnMut(usize) -> Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
@@ -93,6 +93,9 @@ where
         }
         if let Some((label, _)) = item.link {
             row = row.child(div().id(("banner-link", i)).cursor_pointer().on_click(on_link(i)).child(small(format!("{label} →"), theme::ACCENT)));
+        }
+        for (j, l) in item.links.iter().enumerate() {
+            row = row.child(open_button(SharedString::from(format!("banner-open-{i}-{j}")), &l.label, on_open(l.url.clone())));
         }
         if item.closable {
             row = row.child(div().id(("banner-close", i)).cursor_pointer().on_click(on_dismiss(i)).child(small("×", theme::TEXT_MUTED)));
@@ -341,7 +344,12 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
 
 // ---- positions ------------------------------------------------------------------------------
 
-fn pair_card(c: &PairCard, on_recheck: &dyn Fn(String) -> ClickFn) -> Div {
+/// A "前往交易所" button: the page opens the URL in the default browser.
+fn open_button(id: SharedString, label: &str, on: ClickFn) -> Stateful<Div> {
+    div().id(id).px_2().rounded_sm().cursor_pointer().border_1().border_color(rgb(theme::BORDER)).on_click(on).child(small(format!("{label} ↗"), theme::ACCENT))
+}
+
+fn pair_card(c: &PairCard, on_recheck: &dyn Fn(String) -> ClickFn, on_open: &dyn Fn(String) -> ClickFn, on_flatten: &dyn Fn(super::live_actions::FlattenButton) -> ClickFn) -> Div {
     let mut out = card().w(rx(360.0)).child(
         div()
             .flex()
@@ -405,6 +413,23 @@ fn pair_card(c: &PairCard, on_recheck: &dyn Fn(String) -> ClickFn) -> Div {
     for (_, a) in &f.alerts {
         out = out.child(small(a.clone(), theme::WARNING));
     }
+    // live-guardrails (Live only): the exchange's own page, and the flatten of a bare leg.
+    if !c.links.is_empty() {
+        let mut row = div().flex().flex_wrap().gap_2();
+        for (j, l) in c.links.iter().enumerate() {
+            row = row.child(open_button(SharedString::from(format!("open-{}-{j}", c.pair_id)), &l.label, on_open(l.url.clone())));
+        }
+        out = out.child(row);
+    }
+    if !c.flatten.is_empty() {
+        out = out.child(small(super::live_actions::FLATTEN_TITLE, theme::WARNING));
+        let mut row = div().flex().flex_wrap().gap_2();
+        for b in &c.flatten {
+            let id = SharedString::from(format!("flatten-{}-{}", c.pair_id, b.leg.as_str()));
+            row = row.child(div().id(id).px_2().rounded_sm().cursor_pointer().border_1().border_color(rgb(theme::WARNING)).on_click(on_flatten(b.clone())).child(small(b.label.clone(), theme::WARNING)));
+        }
+        out = out.child(row);
+    }
     // funding-slot-tracing: where each settlement's funding stands, and a re-query while unsettled.
     for line in &f.tracing {
         out = out.child(small(line.clone(), if line.contains("需人工檢查") { theme::WARNING } else { theme::TEXT_SECONDARY }));
@@ -434,6 +459,8 @@ pub fn positions_page(
     on_ex: &dyn Fn(Exchange) -> ClickFn,
     on_coin: &dyn Fn(String) -> ClickFn,
     on_recheck: &dyn Fn(String) -> ClickFn,
+    on_open: &dyn Fn(String) -> ClickFn,
+    on_flatten: &dyn Fn(super::live_actions::FlattenButton) -> ClickFn,
 ) -> Div {
     let chip = |id: SharedString, label: String, on: bool, f: ClickFn| {
         div()
@@ -512,7 +539,7 @@ pub fn positions_page(
         .child(cards)
         .child(notices)
         .child(card().child(table))
-        .child(div().flex().flex_wrap().gap_3().children(vm.pair_cards.iter().map(|c| pair_card(c, on_recheck))))
+        .child(div().flex().flex_wrap().gap_3().children(vm.pair_cards.iter().map(|c| pair_card(c, on_recheck, on_open, on_flatten))))
 }
 
 // ---- system log -----------------------------------------------------------------------------
@@ -721,6 +748,6 @@ mod spread_tag_smoke {
         let vm = build(&s, &Filter::default(), now);
         let card = &vm.pair_cards[0];
         assert!(card.spread.is_some());
-        let _ = pair_card(card, &|_| Box::new(|_, _, _| {}));
+        let _ = pair_card(card, &|_| Box::new(|_, _, _| {}), &|_| Box::new(|_, _, _| {}), &|_| Box::new(|_, _, _| {}));
     }
 }

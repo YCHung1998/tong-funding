@@ -15,6 +15,7 @@ use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::Exchange;
 
 use super::arming;
+use super::live_actions;
 use super::bridge::{Settings, SourceUpdate, UiSnapshot};
 use super::candidates::{self, CandidateList};
 use super::contract_settings::{self, CalcMode, ContractForm};
@@ -93,6 +94,9 @@ pub struct TradingState {
     a_confirm: In,
     pub a_checked: [bool; arming::CHECKLIST.len()],
     pub a_note: Option<String>,
+    /// "平掉裸露的一腿" waiting for its confirmation, and the last refusal.
+    pub flatten_confirm: Option<live_actions::FlattenConfirm>,
+    pub flatten_note: Option<String>,
 }
 
 fn new_input(window: &mut Window, cx: &mut Context<Shell>, value: &str) -> In {
@@ -161,6 +165,8 @@ impl TradingState {
             a_confirm: new_input(window, cx, ""),
             a_checked: [false; arming::CHECKLIST.len()],
             a_note: None,
+            flatten_confirm: None,
+            flatten_note: None,
         }
     }
 
@@ -452,6 +458,26 @@ impl Shell {
             c = c.child(small(n.clone(), theme::NEGATIVE));
         }
         Some(c)
+    }
+
+    /// The confirmation of a single-leg flatten (shown on the page where the button was pressed).
+    pub(crate) fn flatten_panel(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let c = self.trading.flatten_confirm.clone()?;
+        let mut p = card().border_color(rgb(theme::WARNING)).child(text(format!("{} · {}", live_actions::FLATTEN_TITLE, c.symbol), theme::TEXT_PRIMARY)).child(small(c.env_line(), theme::WARNING)).child(small(c.question.clone(), theme::TEXT_PRIMARY));
+        if let Some(n) = &self.trading.flatten_note {
+            p = p.child(small(n.clone(), theme::NEGATIVE));
+        }
+        Some(p.child(
+            div()
+                .flex()
+                .gap_2()
+                .child(btn("flatten-yes", c.button(), true, self.click(cx, |this, _| {
+                    if let Some(c) = this.trading.flatten_confirm.take() {
+                        this.trading.flatten_note = live_actions::send_flatten(&this.snap, &c, this.sink.as_ref()).err();
+                    }
+                })))
+                .child(btn("flatten-no", "取消", true, self.click(cx, |this, _| this.trading.flatten_confirm = None))),
+        ))
     }
 
     fn click(&self, cx: &mut Context<Self>, f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> ClickFn {
@@ -779,6 +805,28 @@ impl Shell {
                     actions = actions.child(small(why.clone(), theme::WARNING));
                 }
                 m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs).child(actions);
+                // live-guardrails (Live only): the exchange pages and the flatten of one bare leg.
+                if let [(long, _), (short, _)] = h.legs[..] {
+                    let mut links = div().flex().flex_wrap().gap_2();
+                    for (j, l) in live_actions::exchange_links(self.snap.identity, &h.symbol, long, short).into_iter().enumerate() {
+                        let url = l.url.clone();
+                        links = links.child(btn(SharedString::from(format!("mopen-{}-{j}", h.uuid)), format!("{} ↗", l.label), true, self.click(cx, move |_, cx| cx.open_url(&url))));
+                    }
+                    m = m.child(links);
+                }
+                let flat = live_actions::flatten_buttons_by_uuid(&self.snap, &h.uuid);
+                if !flat.is_empty() {
+                    m = m.child(small(live_actions::FLATTEN_TITLE, theme::WARNING));
+                    let mut row = div().flex().flex_wrap().gap_2();
+                    for b in flat {
+                        let (id, label) = (SharedString::from(format!("mflatten-{}-{}", h.uuid, b.leg.as_str())), b.label.clone());
+                        row = row.child(btn(id, label, true, self.click(cx, move |this, _| {
+                            this.trading.flatten_note = None;
+                            this.trading.flatten_confirm = live_actions::request_flatten(&this.snap, &b);
+                        })));
+                    }
+                    m = m.child(row);
+                }
             }
             if let Some(c) = self.trading.close_confirm.clone() {
                 let mut panel = card().child(small(format!("確認人工要求平倉 {}（reduce-only，數量取自最新持倉）", c.symbol), theme::WARNING)).child(small(c.env_line(), theme::TEXT_PRIMARY));
@@ -799,6 +847,9 @@ impl Shell {
                 m = m.child(panel);
             }
             page = page.child(m);
+        }
+        if let Some(p) = self.flatten_panel(cx) {
+            page = page.child(p);
         }
 
         let mut hist = card().child(text("上次執行結果（歷史紀錄，非目前選取項目）", theme::TEXT_PRIMARY));

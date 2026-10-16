@@ -58,6 +58,8 @@ pub struct BannerItem {
     pub link: Option<(&'static str, Page)>,
     pub key: AlertKey,
     pub severe: bool,
+    /// Live only: "go to the exchange" buttons for the pair this item is about (filled by the page from the snapshot).
+    pub links: Vec<super::live_actions::LinkButton>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -81,6 +83,7 @@ fn item_of(a: &Alert) -> BannerItem {
         link: a.link.map(|p| (if p == Page::Positions { "前往持倉" } else { "前往" }, p)),
         key: (a.category, a.source.clone()),
         severe: !a.dismissible(),
+        links: Vec::new(),
     }
 }
 
@@ -129,6 +132,16 @@ pub fn attention(alerts: &[Alert], acks: &Acks, now_ms: i64) -> Attention {
 /// The banner: only the critical tier.
 pub fn banner(alerts: &[Alert], acks: &Acks, now_ms: i64) -> BannerVm {
     BannerVm { items: attention(alerts, acks, now_ms).critical.iter().map(item_of).collect() }
+}
+
+/// Adds the Live "前往交易所" buttons to the items about a locked pair (nothing in Demo).
+pub fn with_exchange_links(mut vm: BannerVm, snap: &UiSnapshot) -> BannerVm {
+    for item in &mut vm.items {
+        if item.key.0 == Category::ManualAttention {
+            item.links = super::live_actions::banner_links(snap, &item.key.1);
+        }
+    }
+    vm
 }
 
 /// The drawer behind the header badge.

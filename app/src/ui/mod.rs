@@ -30,6 +30,8 @@ pub mod arming;
 pub mod banner;
 #[path = "vm/bridge.rs"]
 pub mod bridge;
+#[path = "vm/live_actions.rs"]
+pub mod live_actions;
 #[path = "vm/candidates.rs"]
 pub mod candidates;
 #[path = "vm/contract_settings.rs"]

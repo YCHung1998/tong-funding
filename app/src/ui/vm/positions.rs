@@ -133,6 +133,8 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
             pair_id: info.pair_id.clone(),
             spread: spread_view(snap, info.long_exchange, info.short_exchange, &info.symbol, now_ms),
             badge,
+            links: super::live_actions::pair_links(snap, info),
+            flatten: super::live_actions::flatten_buttons(snap, &info.pair_id),
         });
     }
     for p in &snap.pairs {
@@ -148,7 +150,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
         let funding = FundingView::of(snap.identity, snap.funding.get(&p.pair_id), spread);
         // a locked pair shows the tag only while at least one leg still holds a position
         let spread = (long.is_some() || short.is_some()).then(|| spread_view(snap, p.long_exchange, p.short_exchange, &p.symbol, now_ms)).flatten();
-        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding, pair_id: p.pair_id.clone(), spread, badge });
+        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding, pair_id: p.pair_id.clone(), spread, badge, links: super::live_actions::pair_links(snap, p), flatten: super::live_actions::flatten_buttons(snap, &p.pair_id) });
     }
     cards
 }
@@ -239,6 +241,10 @@ pub struct PairCard {
     pub spread: Option<SpreadView>,
     /// live-banners: `LIVE` in a Live process, so a screenshot alone shows the world.
     pub badge: Option<&'static str>,
+    /// Live only: "前往交易所" buttons of this pair.
+    pub links: Vec<super::live_actions::LinkButton>,
+    /// Live only: "平掉裸露的一腿" buttons (PARTIAL_FAILURE / IMBALANCED / UNRESOLVED pairs).
+    pub flatten: Vec<super::live_actions::FlattenButton>,
 }
 
 /// The funding part of a pair card (settlement-timeline).

@@ -482,7 +482,7 @@ impl Shell {
     }
 
     fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let vm = banner::banner(&self.alerts, &self.acks, self.now_ms);
+        let vm = banner::with_exchange_links(banner::banner(&self.alerts, &self.acks, self.now_ms), &self.snap);
         let keys: Vec<banner::AlertKey> = vm.items.iter().map(|i| i.key.clone()).collect();
         let links: Vec<Option<Page>> = vm.items.iter().map(|i| i.link.map(|l| l.1)).collect();
         pages::banner(
@@ -504,6 +504,7 @@ impl Shell {
                     cx.notify();
                 }))
             },
+            &|url: String| -> ClickFn { Box::new(move |_, _, cx| cx.open_url(&url)) },
         )
     }
 
@@ -756,7 +757,19 @@ impl Shell {
                 cx.notify();
             }))
         };
-        pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin, &on_recheck)
+        let on_open = |url: String| -> ClickFn { Box::new(move |_, _, cx| cx.open_url(&url)) };
+        let on_flatten = |b: super::live_actions::FlattenButton| -> ClickFn {
+            Box::new(cx.listener(move |this: &mut Shell, _, _, cx| {
+                this.trading.flatten_note = None;
+                this.trading.flatten_confirm = super::live_actions::request_flatten(&this.snap, &b);
+                cx.notify();
+            }))
+        };
+        let page = pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin, &on_recheck, &on_open, &on_flatten);
+        match self.flatten_panel(cx) {
+            Some(p) => div().flex().flex_col().gap_3().child(p).child(page),
+            None => page,
+        }
     }
 
     fn system_log_page(&self, cx: &mut Context<Self>) -> Div {
