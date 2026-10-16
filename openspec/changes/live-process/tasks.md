@@ -8,7 +8,7 @@
 - [x] 2.1 在 `signed/endpoints.rs` 新增 live 主機常數與 `LiveHost` 型別（不加進 `BinanceHost`／`BybitHost`），以及 `LIVE_SIGNED_HOSTS`；新增 `HostPolicy::SignedLive`；測試：Demo 政策拒絕 live 主機、Live 政策拒絕 demo 主機、清單與常數同源
 - [x] 2.2 公開政策拒絕所有交易所認證標頭與 `signature`／`sign` 參數；測試涵蓋三家的標頭與查詢參數
 - [x] 2.3 傳輸型別分離（`PublicTransport`／`SignedDemoTransport`／`SignedLiveTransport` 薄包裝）並改簽名客戶端建構子的參數型別；用 `compile_fail` 文件測試或型別測試證明接錯無法編譯
-- [ ] 2.4 靜態檢查擴大到整個 `src`（非測試程式碼）掃描正式主機字串，只放行 `signed/endpoints.rs` 與公開客戶端；測試：在其他檔案加入字串會失敗
+- [x] 2.4 靜態檢查擴大到整個 `src`（非測試程式碼）掃描正式主機字串，只放行 `signed/endpoints.rs` 與公開客戶端；測試：在其他檔案加入字串會失敗
 - [ ] 2.5 限頻分類改依呼叫端型別；測試：同一台主機的公開批次、公開單一、簽名請求各自分類正確
 
 ## 3. 資料庫

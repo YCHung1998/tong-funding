@@ -549,6 +549,24 @@ pub fn scan_production_hosts(src: &str) -> Vec<Violation> {
     scan_production_hosts_in(&production_code(src))
 }
 
+/// change live-process 2.4: production host names may appear (in non-test code) only in
+/// `exchange/public/**` (public clients), `exchange/static_checks.rs` (this file) and, for the live
+/// and OKX signed hosts, `exchange/signed/endpoints.rs`. `rel_path` is relative to `src/`.
+pub fn production_host_rule_violations(rel_path: &str, src: &str) -> Vec<String> {
+    if rel_path.starts_with("exchange/public/") || rel_path == "exchange/static_checks.rs" {
+        return Vec::new();
+    }
+    let signed_home = rel_path == "exchange/signed/endpoints.rs";
+    scan_production_hosts(src)
+        .into_iter()
+        .filter(|v| {
+            let Violation::ProductionHost(h) = v else { return true };
+            !(signed_home && (h == OKX_SIGNED_HOST || crate::exchange::signed::endpoints::LIVE_SIGNED_HOSTS.contains(&h.as_str())))
+        })
+        .map(|v| format!("{rel_path}: {v:?}"))
+        .collect()
+}
+
 /// Lower-cased text of every string literal in production code (comments and test modules excluded).
 pub fn production_literals(src: &str) -> Vec<String> {
     let prod = production(src);
@@ -910,23 +928,37 @@ const LATE: &str = "api.bybit.com";
         exchange_dir().join("signed").join("endpoints.rs")
     }
 
+    /// change live-process 2.4: the scan covers the WHOLE `src` (non-test code), not just
+    /// `src/exchange`. Only `exchange/public/` (the public clients) and `exchange/signed/endpoints.rs`
+    /// (the live and OKX signed hosts) may spell a production host.
     #[test]
-    fn production_hosts_appear_only_under_exchange_public() {
-        let files: Vec<_> = rust_files(&exchange_dir())
-            .into_iter()
-            .filter(|p| !p.starts_with(exchange_dir().join("public")) && p.file_name().is_some_and(|n| n != "static_checks.rs"))
-            .collect();
-        assert!(files.len() >= 5, "scanned only {files:?}");
+    fn production_hosts_appear_only_in_endpoints_and_public_clients_across_all_of_src() {
+        let files = rust_files(&src_dir());
+        assert!(files.len() >= 100, "scanned only {} files", files.len());
+        for dir in ["engine", "store", "ui", "funding", "exchange"] {
+            assert!(files.iter().any(|f| f.starts_with(src_dir().join(dir))), "{dir}/ must be scanned");
+        }
         let mut violations = Vec::new();
         for f in &files {
-            for v in scan_production_hosts(&std::fs::read_to_string(f).unwrap()) {
-                if f == &okx_home() && endpoints_home_may_name(&v) {
-                    continue;
-                }
-                violations.push(format!("{}: {v:?}", f.display()));
-            }
+            let rel = f.strip_prefix(src_dir()).unwrap().to_string_lossy().replace('\\', "/");
+            violations.extend(production_host_rule_violations(&rel, &std::fs::read_to_string(f).unwrap()));
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn a_production_host_string_in_any_other_file_is_caught() {
+        for h in PRODUCTION_HOSTS {
+            let src = format!("pub const X: &str = \"https://{h}/x\";");
+            for rel in ["engine/actor.rs", "store/db.rs", "ui/live.rs", "main.rs", "exchange/health/gated.rs", "exchange/signed/binance.rs", "exchange/execution/http.rs", "funding/fetch.rs", "ports.rs"] {
+                assert!(!production_host_rule_violations(rel, &src).is_empty(), "{h} in {rel} not caught");
+            }
+        }
+        // the two homes, and test-only mentions
+        assert!(production_host_rule_violations("exchange/public/endpoints.rs", "const A: &str = \"https://fapi.binance.com\";").is_empty());
+        assert!(production_host_rule_violations("exchange/signed/endpoints.rs", "const A: &str = \"fapi.binance.com\"; const B: &str = \"api.bybit.com\"; const C: &str = \"openapi.okx.com\";").is_empty());
+        assert!(!production_host_rule_violations("exchange/signed/endpoints.rs", "const A: &str = \"www.okx.com\";").is_empty(), "endpoints.rs holds the live + OKX signed hosts only");
+        assert!(production_host_rule_violations("engine/actor.rs", "// fapi.binance.com in a comment\n#[cfg(test)]\nmod t { const A: &str = \"fapi.binance.com\"; }").is_empty());
     }
 
     /// Order-mutating fns (place / cancel / ...) may exist only in `execution/` (change
