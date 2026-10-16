@@ -15,7 +15,7 @@ use tong_funding_core::types::Decimal;
 
 use super::classify::{BINANCE_NOT_FOUND_CODES, LeverageOutcome, Reply, SubmitClass, binance_reply, binance_state, leverage_outcome, query_outcome, submit_class};
 use super::endpoints::{BINANCE_LEVERAGE_PATH, BINANCE_ORDER_PATH, BINANCE_POSITION_MODE_PATH, BINANCE_RESP_TYPE, BINANCE_USER_TRADES_PATH};
-use super::http::{DemoEnv, Method, OrderHttpRequest, OrderTransport};
+use super::http::{DemoEnv, DemoOrderTransport, Method, OrderHttpRequest, OrderTransport};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderStatus, QueryOutcome};
 use crate::exchange::error::AdapterError;
@@ -46,10 +46,13 @@ fn side_param(side: OrderSide) -> &'static str {
     }
 }
 
-impl<T: OrderTransport> BinanceOrderClient<T> {
+impl<T: DemoOrderTransport> BinanceOrderClient<T> {
     pub fn new(transport: Arc<T>, creds: Arc<Credentials>, demo_env: BinanceHost) -> Self {
         BinanceOrderClient { transport, creds, env: demo_env }
     }
+}
+
+impl<T: OrderTransport> BinanceOrderClient<T> {
 
     /// Signs `params` (+ `timestamp`, `recvWindow`) and builds the request.
     fn signed(&self, method: Method, path: &str, mut params: Vec<(&str, String)>, timestamp: i64) -> Result<OrderHttpRequest, AdapterError> {

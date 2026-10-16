@@ -21,7 +21,7 @@ use tong_funding_core::types::Decimal;
 use super::binance::ModeReading;
 use super::classify::{LeverageOutcome, OKX_NOT_FOUND_CODES, Reply, SubmitClass, leverage_outcome, okx_is_env_mismatch, okx_reply, okx_state, query_outcome, submit_class};
 use super::endpoints::{OKX_ACCOUNT_CONFIG_PATH, OKX_CANCEL_PATH, OKX_ORDER_PATH, OKX_SET_LEVERAGE_PATH};
-use super::http::{DemoEnv, Method, OrderHttpRequest, OrderTransport};
+use super::http::{DemoEnv, DemoOrderTransport, Method, OrderHttpRequest, OrderTransport};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderState, OrderStatus, QueryOutcome};
 use crate::exchange::error::AdapterError;
@@ -147,10 +147,13 @@ fn side_param(side: OrderSide) -> &'static str {
     }
 }
 
-impl<T: OrderTransport> OkxOrderClient<T> {
+impl<T: DemoOrderTransport> OkxOrderClient<T> {
     pub fn new(transport: Arc<T>, creds: Arc<Credentials>, demo_env: OkxHost) -> Self {
         OkxOrderClient { transport, creds, env: demo_env, demo_proven: AtomicBool::new(false), latch: OkxLatch::new(), pending: Mutex::new(HashMap::new()), refused: Mutex::new(HashMap::new()) }
     }
+}
+
+impl<T: OrderTransport> OkxOrderClient<T> {
 
     /// Shares an `OkxLatch` with the other OKX clients: `50101` anywhere disables OKX everywhere.
     pub fn with_latch(mut self, latch: Arc<OkxLatch>) -> Self {

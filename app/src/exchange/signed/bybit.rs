@@ -20,7 +20,7 @@ use super::signing::{
 /// Bybit `retCode` for "Too many visits" (rate limit), delivered with HTTP 200.
 const BYBIT_RATE_LIMIT_RET_CODE: i64 = 10006;
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{HttpRequest, HttpTransport};
+use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
 /// Bybit `accountType` of `wallet-balance`. `.env.example`: UNIFIED is the default for new demo
@@ -42,9 +42,7 @@ pub struct BybitSignedClient<T> {
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: HttpTransport> BybitSignedClient<T> {
-    pub const EXCHANGE: Exchange = Exchange::Bybit;
-
+impl<T: DemoSignedTransport> BybitSignedClient<T> {
     /// `clock` + `offset` produce the calibrated exchange time used for signing and `fetched_at`;
     /// `resync` is called once when a timestamp is rejected.
     pub fn new(
@@ -57,6 +55,10 @@ impl<T: HttpTransport> BybitSignedClient<T> {
     ) -> Self {
         BybitSignedClient { transport, secrets, clock, offset, resync, host: demo_env, account_type: BybitAccountType::Unified, reason: Mutex::new(None) }
     }
+}
+
+impl<T: HttpTransport> BybitSignedClient<T> {
+    pub const EXCHANGE: Exchange = Exchange::Bybit;
 
     /// Why the most recent signed call answered `NotConnected` (`None` if it did not, or no call yet).
     pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {

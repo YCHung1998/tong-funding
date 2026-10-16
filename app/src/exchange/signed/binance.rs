@@ -13,7 +13,7 @@ use super::signing::{
     is_timestamp_rejected, require_offset,
 };
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{HttpRequest, HttpResponse, HttpTransport};
+use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpResponse, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
 pub struct BinanceSignedClient<T> {
@@ -26,9 +26,7 @@ pub struct BinanceSignedClient<T> {
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: HttpTransport> BinanceSignedClient<T> {
-    pub const EXCHANGE: Exchange = Exchange::Binance;
-
+impl<T: DemoSignedTransport> BinanceSignedClient<T> {
     /// `clock` + `offset` produce the calibrated exchange time used for signing and `fetched_at`;
     /// `resync` is called once when a timestamp is rejected; `demo_env` selects one of the
     /// compile-time demo/testnet hosts (there is no way to pass a URL).
@@ -42,6 +40,10 @@ impl<T: HttpTransport> BinanceSignedClient<T> {
     ) -> Self {
         BinanceSignedClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None) }
     }
+}
+
+impl<T: HttpTransport> BinanceSignedClient<T> {
+    pub const EXCHANGE: Exchange = Exchange::Binance;
 
     /// Why the most recent signed call answered `NotConnected` (`None` if it did not, or no call yet).
     pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {

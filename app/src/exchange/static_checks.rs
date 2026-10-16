@@ -549,6 +549,24 @@ pub fn scan_production_hosts(src: &str) -> Vec<Violation> {
     scan_production_hosts_in(&production_code(src))
 }
 
+/// change live-process 2.4: production host names may appear (in non-test code) only in
+/// `exchange/public/**` (public clients), `exchange/static_checks.rs` (this file) and, for the live
+/// and OKX signed hosts, `exchange/signed/endpoints.rs`. `rel_path` is relative to `src/`.
+pub fn production_host_rule_violations(rel_path: &str, src: &str) -> Vec<String> {
+    if rel_path.starts_with("exchange/public/") || rel_path == "exchange/static_checks.rs" {
+        return Vec::new();
+    }
+    let signed_home = rel_path == "exchange/signed/endpoints.rs";
+    scan_production_hosts(src)
+        .into_iter()
+        .filter(|v| {
+            let Violation::ProductionHost(h) = v else { return true };
+            !(signed_home && (h == OKX_SIGNED_HOST || crate::exchange::signed::endpoints::LIVE_SIGNED_HOSTS.contains(&h.as_str())))
+        })
+        .map(|v| format!("{rel_path}: {v:?}"))
+        .collect()
+}
+
 /// Lower-cased text of every string literal in production code (comments and test modules excluded).
 pub fn production_literals(src: &str) -> Vec<String> {
     let prod = production(src);
@@ -891,36 +909,56 @@ const LATE: &str = "api.bybit.com";
             for v in scan_signed_source(&src) {
                 // `signed/endpoints.rs` is the one file that names the OKX signed host (it is also a
                 // production host: demo and production share it, see `OkxHost`).
-                if f == &okx_home() && v == Violation::ProductionHost(OKX_SIGNED_HOST.to_string()) {
+                if f == &okx_home() && endpoints_home_may_name(&v) {
                     continue;
                 }
                 violations.push(format!("{}: {v:?}", f.display()));
             }
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    /// `signed/endpoints.rs` is the one non-public file that spells production host names: the OKX
+    /// signed host and the two live hosts (change live-process).
+    fn endpoints_home_may_name(v: &Violation) -> bool {
+        matches!(v, Violation::ProductionHost(h) if h == OKX_SIGNED_HOST || crate::exchange::signed::endpoints::LIVE_SIGNED_HOSTS.contains(&h.as_str()))
     }
 
     fn okx_home() -> PathBuf {
         exchange_dir().join("signed").join("endpoints.rs")
     }
 
+    /// change live-process 2.4: the scan covers the WHOLE `src` (non-test code), not just
+    /// `src/exchange`. Only `exchange/public/` (the public clients) and `exchange/signed/endpoints.rs`
+    /// (the live and OKX signed hosts) may spell a production host.
     #[test]
-    fn production_hosts_appear_only_under_exchange_public() {
-        let files: Vec<_> = rust_files(&exchange_dir())
-            .into_iter()
-            .filter(|p| !p.starts_with(exchange_dir().join("public")) && p.file_name().is_some_and(|n| n != "static_checks.rs"))
-            .collect();
-        assert!(files.len() >= 5, "scanned only {files:?}");
+    fn production_hosts_appear_only_in_endpoints_and_public_clients_across_all_of_src() {
+        let files = rust_files(&src_dir());
+        assert!(files.len() >= 100, "scanned only {} files", files.len());
+        for dir in ["engine", "store", "ui", "funding", "exchange"] {
+            assert!(files.iter().any(|f| f.starts_with(src_dir().join(dir))), "{dir}/ must be scanned");
+        }
         let mut violations = Vec::new();
         for f in &files {
-            for v in scan_production_hosts(&std::fs::read_to_string(f).unwrap()) {
-                if f == &okx_home() && v == Violation::ProductionHost(OKX_SIGNED_HOST.to_string()) {
-                    continue;
-                }
-                violations.push(format!("{}: {v:?}", f.display()));
-            }
+            let rel = f.strip_prefix(src_dir()).unwrap().to_string_lossy().replace('\\', "/");
+            violations.extend(production_host_rule_violations(&rel, &std::fs::read_to_string(f).unwrap()));
         }
         assert!(violations.is_empty(), "violations:\n{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn a_production_host_string_in_any_other_file_is_caught() {
+        for h in PRODUCTION_HOSTS {
+            let src = format!("pub const X: &str = \"https://{h}/x\";");
+            for rel in ["engine/actor.rs", "store/db.rs", "ui/live.rs", "main.rs", "exchange/health/gated.rs", "exchange/signed/binance.rs", "exchange/execution/http.rs", "funding/fetch.rs", "ports.rs"] {
+                assert!(!production_host_rule_violations(rel, &src).is_empty(), "{h} in {rel} not caught");
+            }
+        }
+        // the two homes, and test-only mentions
+        assert!(production_host_rule_violations("exchange/public/endpoints.rs", "const A: &str = \"https://fapi.binance.com\";").is_empty());
+        assert!(production_host_rule_violations("exchange/signed/endpoints.rs", "const A: &str = \"fapi.binance.com\"; const B: &str = \"api.bybit.com\"; const C: &str = \"openapi.okx.com\";").is_empty());
+        assert!(!production_host_rule_violations("exchange/signed/endpoints.rs", "const A: &str = \"www.okx.com\";").is_empty(), "endpoints.rs holds the live + OKX signed hosts only");
+        assert!(production_host_rule_violations("engine/actor.rs", "// fapi.binance.com in a comment\n#[cfg(test)]\nmod t { const A: &str = \"fapi.binance.com\"; }").is_empty());
     }
 
     /// Order-mutating fns (place / cancel / ...) may exist only in `execution/` (change
@@ -1151,7 +1189,7 @@ const LATE: &str = "api.bybit.com";
         assert!(violations.is_empty(), "{violations:?}");
         // the factory is built on the plain order transport in ui/live.rs
         let live = production_code(&std::fs::read_to_string(app.join("src/ui/live.rs")).unwrap());
-        let from = live.find("ReqwestOrderTransport::signed_demo()").expect("live.rs builds the order transport");
+        let from = live.find("SignedDemoOrderTransport::new()").expect("live.rs builds the order transport");
         let to = live[from..].find("DemoExecutorFactory::new").expect("and passes it to the factory") + from;
         assert!(!live[from..to].contains("Gated"), "the order transport must reach the factory ungated: {}", &live[from..to]);
     }
@@ -1400,5 +1438,71 @@ const LATE: &str = "api.bybit.com";
         ] {
             assert!(!has(ok, |v| matches!(v, Violation::ExternalBaseUrl(_))), "wrongly flagged: {ok}");
         }
+    }
+
+    // ------------------------------------------------ live-process 2.3: transport marker traits
+
+    fn src_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// Every signed / order client constructor sits alone in an `impl<T: Marker>` block, so a
+    /// public (or live) transport cannot be passed to a demo client: the compiler enforces the bound,
+    /// this test pins that nobody weakens it back to plain `HttpTransport` / `OrderTransport`.
+    #[test]
+    fn signed_client_constructors_require_the_matching_transport_marker() {
+        const CASES: [(&str, &str); 10] = [
+            ("exchange/signed/binance.rs", "impl<T: DemoSignedTransport> BinanceSignedClient<T> {"),
+            ("exchange/signed/bybit.rs", "impl<T: DemoSignedTransport> BybitSignedClient<T> {"),
+            ("exchange/signed/okx.rs", "impl<T: DemoSignedTransport> OkxSignedClient<T> {"),
+            ("exchange/signed/ledger.rs", "impl<T: DemoSignedTransport> BinanceLedgerClient<T> {"),
+            ("exchange/signed/ledger.rs", "impl<T: DemoSignedTransport> BybitLedgerClient<T> {"),
+            ("exchange/execution/binance.rs", "impl<T: DemoOrderTransport> BinanceOrderClient<T> {"),
+            ("exchange/execution/bybit.rs", "impl<T: DemoOrderTransport> BybitOrderClient<T> {"),
+            ("exchange/execution/okx.rs", "impl<T: DemoOrderTransport> OkxOrderClient<T> {"),
+            ("exchange/execution/factory.rs", "impl<T: DemoOrderTransport + 'static> DemoExecutorFactory<T> {"),
+            ("exchange/execution/http.rs", "pub trait DemoOrderTransport: OrderTransport"),
+        ];
+        for (file, needle) in CASES {
+            let code = production_code(&std::fs::read_to_string(src_dir().join(file)).unwrap());
+            let at = code.find(needle).unwrap_or_else(|| panic!("{file}: missing `{needle}`"));
+            if needle.starts_with("impl<T: Demo") {
+                let block: String = code[at..].chars().take(700).collect();
+                assert!(block.contains("pub fn new("), "{file}: `pub fn new(` must be inside `{needle}`");
+            }
+        }
+    }
+
+    /// The marker traits are implemented, in production code, only by the thin transport wrappers
+    /// in their two homes. (Test fakes implement them inside `#[cfg(test)]` modules, which this
+    /// scan skips.)
+    #[test]
+    fn transport_marker_traits_are_implemented_only_by_the_wrapper_homes() {
+        let homes = [src_dir().join("exchange/reqwest_transport.rs"), src_dir().join("exchange/execution/http.rs")];
+        let mut seen_in_homes = 0;
+        for f in rust_files(&src_dir()) {
+            // `*_tests.rs` files are `#[cfg(test)] mod x;` declarations: wholly test code.
+            if f.file_name().is_some_and(|n| n == "static_checks.rs" || n.to_string_lossy().ends_with("_tests.rs")) {
+                continue;
+            }
+            let code = production_code(&std::fs::read_to_string(&f).unwrap());
+            for marker in ["DemoSignedTransport for", "LiveSignedTransport for", "DemoOrderTransport for", "LiveOrderTransport for"] {
+                let n = code.matches(&format!("impl {marker}")).count();
+                if homes.contains(&f) {
+                    seen_in_homes += n;
+                } else {
+                    assert_eq!(n, 0, "{}: `impl {marker}` outside the wrapper homes", f.display());
+                }
+            }
+        }
+        assert_eq!(seen_in_homes, 4, "exactly the four wrappers implement the markers (demo/live x read/order)");
+    }
+
+    #[test]
+    fn marker_impl_scan_catches_a_stray_impl() {
+        let code = production_code("impl DemoSignedTransport for PublicTransport {}");
+        assert!(code.contains("impl DemoSignedTransport for"));
+        let test_only = production_code("#[cfg(test)]\nmod t { impl DemoSignedTransport for Fake {} }");
+        assert!(!test_only.contains("impl DemoSignedTransport for"), "test modules are skipped");
     }
 }

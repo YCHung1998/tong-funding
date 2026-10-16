@@ -138,16 +138,52 @@ pub trait OrderTransport: Send + Sync {
     fn send(&self, req: OrderHttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send;
 }
 
-/// The real transport on `reqwest` + rustls, restricted to the signed demo/testnet hosts.
+/// Marker: an order transport bound to the demo / testnet hosts. The demo order clients and the
+/// demo executor factory accept only this. In production code only [`SignedDemoOrderTransport`]
+/// implements it (static check).
+pub trait DemoOrderTransport: OrderTransport {}
+
+/// Marker: an order transport bound to the live hosts. Only [`SignedLiveOrderTransport`] implements
+/// it; no demo order client accepts it.
+pub trait LiveOrderTransport: OrderTransport {}
+
+/// The real transport on `reqwest` + rustls. Its constructors are private: callers use the two
+/// wrapper types below, so the TYPE says which hosts the transport may reach.
 pub struct ReqwestOrderTransport {
     client: reqwest::Client,
     policy: HostPolicy,
 }
 
+/// Order transport restricted (by `HostPolicy::SignedDemo`) to the demo / testnet hosts.
+pub struct SignedDemoOrderTransport(ReqwestOrderTransport);
+
+/// Order transport restricted (by `HostPolicy::SignedLive`) to the live Binance / Bybit hosts.
+pub struct SignedLiveOrderTransport(ReqwestOrderTransport);
+
+macro_rules! order_wrapper {
+    ($name:ident, $policy:expr) => {
+        impl $name {
+            pub fn new() -> Result<Self, AdapterError> {
+                ReqwestOrderTransport::with_policy($policy).map($name)
+            }
+            pub fn policy(&self) -> HostPolicy {
+                self.0.policy
+            }
+        }
+        impl OrderTransport for $name {
+            fn send(&self, req: OrderHttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {
+                self.0.send(req)
+            }
+        }
+    };
+}
+order_wrapper!(SignedDemoOrderTransport, HostPolicy::SignedDemo);
+order_wrapper!(SignedLiveOrderTransport, HostPolicy::SignedLive);
+
+impl DemoOrderTransport for SignedDemoOrderTransport {}
+impl LiveOrderTransport for SignedLiveOrderTransport {}
+
 impl ReqwestOrderTransport {
-    pub fn signed_demo() -> Result<Self, AdapterError> {
-        Self::with_policy(HostPolicy::SignedDemo)
-    }
 
     fn with_policy(policy: HostPolicy) -> Result<Self, AdapterError> {
         let client = reqwest::Client::builder()
@@ -202,6 +238,8 @@ impl OrderTransport for ReqwestOrderTransport {
 #[cfg(test)]
 mod local {
     use super::*;
+
+    impl DemoOrderTransport for ReqwestOrderTransport {}
 
     impl ReqwestOrderTransport {
         /// Policy `LocalOkxTest`: plain http to 127.0.0.1, the OKX header rule applies.
@@ -294,6 +332,8 @@ pub mod fake {
             self.inner.log.lock().unwrap().clone()
         }
     }
+
+    impl DemoOrderTransport for FakeOrderTransport {}
 
     impl OrderTransport for FakeOrderTransport {
         fn send(&self, req: OrderHttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {
@@ -520,10 +560,66 @@ mod tests {
     #[tokio::test]
     async fn the_real_transport_refuses_a_host_outside_the_allow_list_without_connecting() {
         // Build a request by hand for a non-demo host (only possible inside this module).
-        let t = ReqwestOrderTransport::signed_demo().unwrap();
+        let t = SignedDemoOrderTransport::new().unwrap();
         let mut r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "/v5/order/create", Duration::from_millis(50));
         r.url = "https://example.invalid/v5/order/create".into();
         assert_eq!(t.send(r).await, Err(AdapterError::network("host not allowed")));
+    }
+
+    // ---- live-process 2.3: order transport types are disjoint ----
+
+    struct Probe<T>(std::marker::PhantomData<T>);
+    trait NotImplemented {
+        fn is_demo_order(&self) -> bool {
+            false
+        }
+        fn is_live_order(&self) -> bool {
+            false
+        }
+    }
+    impl<T> NotImplemented for Probe<T> {}
+    impl<T: DemoOrderTransport> Probe<T> {
+        fn is_demo_order(&self) -> bool {
+            true
+        }
+    }
+    impl<T: LiveOrderTransport> Probe<T> {
+        fn is_live_order(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn only_the_matching_order_transport_type_satisfies_each_order_marker() {
+        let demo = Probe::<SignedDemoOrderTransport>(std::marker::PhantomData);
+        assert!(demo.is_demo_order() && !demo.is_live_order());
+        let live = Probe::<SignedLiveOrderTransport>(std::marker::PhantomData);
+        assert!(live.is_live_order() && !live.is_demo_order(), "a live order transport must not feed a demo order client");
+    }
+
+    #[test]
+    fn order_wrapper_constructors_carry_their_policy() {
+        assert_eq!(SignedDemoOrderTransport::new().unwrap().policy(), HostPolicy::SignedDemo);
+        assert_eq!(SignedLiveOrderTransport::new().unwrap().policy(), HostPolicy::SignedLive);
+    }
+
+    #[tokio::test]
+    async fn a_demo_order_transport_refuses_live_hosts_and_a_live_one_refuses_demo_hosts_before_any_connection() {
+        let demo = SignedDemoOrderTransport::new().unwrap();
+        let live = SignedLiveOrderTransport::new().unwrap();
+        let mk = |host: &str| {
+            let mut r = OrderHttpRequest::to_demo(Method::Post, DemoEnv::Bybit(BybitHost::Demo), "/v5/order/create", Duration::from_secs(30));
+            r.url = format!("https://{host}/v5/order/create");
+            r
+        };
+        let started = std::time::Instant::now();
+        for h in ["fapi.binance.com", "api.bybit.com"] {
+            assert_eq!(demo.send(mk(h)).await, Err(AdapterError::network("host not allowed")), "{h} via demo");
+        }
+        for h in ["demo-fapi.binance.com", "testnet.binancefuture.com", "api-demo.bybit.com", "openapi.okx.com"] {
+            assert_eq!(live.send(mk(h)).await, Err(AdapterError::network("host not allowed")), "{h} via live");
+        }
+        assert!(started.elapsed() < Duration::from_millis(500), "no DNS, no connection: {:?}", started.elapsed());
     }
 
     // ---- round 2: R7 (the fake runs the real admission rule), R8 (token-only names), S3 (real transport) ----
@@ -554,7 +650,7 @@ mod tests {
     /// it comes back immediately. (A request that would pass is never sent here.)
     #[tokio::test]
     async fn the_real_order_transport_refuses_the_real_okx_host_without_the_flag_before_any_connection() {
-        let t = ReqwestOrderTransport::signed_demo().unwrap();
+        let t = SignedDemoOrderTransport::new().unwrap();
         for method in [Method::Get, Method::Post, Method::Delete] {
             let mut r = OrderHttpRequest::to_demo(method, DemoEnv::Okx(OkxHost::Demo), "/api/v5/trade/order", Duration::from_secs(30));
             r.headers.clear();

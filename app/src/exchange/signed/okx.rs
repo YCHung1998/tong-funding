@@ -20,7 +20,7 @@ use super::signing::{
     parse_json, require_offset, sanitize_error,
 };
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{HttpRequest, HttpTransport};
+use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
 const OKX_CONFIG_PATH: &str = "/api/v5/account/config";
@@ -112,12 +112,14 @@ pub struct OkxSignedClient<T> {
     latch: Arc<OkxLatch>,
 }
 
-impl<T: HttpTransport> OkxSignedClient<T> {
-    pub const EXCHANGE: Exchange = Exchange::Okx;
-
+impl<T: DemoSignedTransport> OkxSignedClient<T> {
     pub fn new(transport: Arc<T>, secrets: Arc<dyn SecretProvider>, clock: Arc<dyn Clock>, offset: Arc<dyn ClockOffsetSource>, resync: Arc<dyn Resync>, demo_env: OkxHost) -> Self {
         OkxSignedClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None), mode: Mutex::new(None), latch: OkxLatch::new() }
     }
+}
+
+impl<T: HttpTransport> OkxSignedClient<T> {
+    pub const EXCHANGE: Exchange = Exchange::Okx;
 
     /// Shares the production `OkxLatch` (owned by the executor factory) with the order client.
     pub fn with_latch(mut self, latch: Arc<OkxLatch>) -> Self {
@@ -543,6 +545,8 @@ mod tests {
             self.refused.load(Ordering::SeqCst)
         }
     }
+    impl DemoSignedTransport for PolicyTransport {}
+
     impl HttpTransport for PolicyTransport {
         fn get(&self, req: HttpRequest) -> impl Future<Output = Result<HttpResponse, AdapterError>> + Send {
             let url = reqwest::Url::parse(&req.url).unwrap();
@@ -1024,18 +1028,18 @@ mod tests {
     fn okx_live_read_probe() {
         use crate::exchange::health::clock_sync::ClockSync;
         use crate::exchange::public::endpoints::OKX_HOST;
-        use crate::exchange::reqwest_transport::ReqwestTransport;
+        use crate::exchange::reqwest_transport::{PublicTransport, SignedDemoTransport};
         use crate::ports::SystemClock;
         use crate::store::secrets::BundleSecrets;
         use tong_funding_core::types::Exchange as Ex;
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let clock = Arc::new(SystemClock);
-            let public = ReqwestTransport::public_production().expect("public transport");
+            let public = PublicTransport::new().expect("public transport");
             let sync = ClockSync::new(clock.clone());
             let off = sync.sync_once(&public, Ex::Okx, OKX_HOST).await.expect("OKX time").offset_ms;
             let client = OkxSignedClient::new(
-                Arc::new(ReqwestTransport::signed_demo().expect("signed transport")),
+                Arc::new(SignedDemoTransport::new().expect("signed transport")),
                 Arc::new(BundleSecrets::system()),
                 clock,
                 Arc::new(move || Some(off)),

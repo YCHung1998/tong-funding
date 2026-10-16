@@ -28,6 +28,48 @@ pub const OKX_DEMO_HOST: &str = "openapi.okx.com";
 /// Every host name a signed request may ever be sent to.
 pub const ALLOWED_SIGNED_HOSTS: [&str; 4] = [BINANCE_TESTNET_HOST, BINANCE_DEMO_HOST, BYBIT_DEMO_HOST, OKX_DEMO_HOST];
 
+/// Live (production) hosts that may receive signed requests: Binance and Bybit only (OKX has no
+/// live path). Kept apart from [`ALLOWED_SIGNED_HOSTS`]; the Demo policy must never list these.
+pub const BINANCE_LIVE_HOST: &str = "fapi.binance.com";
+pub const BYBIT_LIVE_HOST: &str = "api.bybit.com";
+pub const LIVE_SIGNED_HOSTS: [&str; 2] = [BINANCE_LIVE_HOST, BYBIT_LIVE_HOST];
+
+/// A live signed-request host. Deliberately NOT a variant of [`BinanceHost`] / [`BybitHost`]: no
+/// demo code path (and no environment variable) can name it by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveHost {
+    Binance,
+    Bybit,
+}
+
+impl LiveHost {
+    pub const ALL: [LiveHost; 2] = [LiveHost::Binance, LiveHost::Bybit];
+    pub fn host(self) -> &'static str {
+        match self {
+            LiveHost::Binance => BINANCE_LIVE_HOST,
+            LiveHost::Bybit => BYBIT_LIVE_HOST,
+        }
+    }
+    pub fn base_url(self) -> &'static str {
+        match self {
+            LiveHost::Binance => "https://fapi.binance.com",
+            LiveHost::Bybit => "https://api.bybit.com",
+        }
+    }
+}
+
+/// Header names that only a signed request carries (case-insensitive): Binance `X-MBX-APIKEY`,
+/// the whole Bybit `X-BAPI-*` family (key, signature, timestamp, recv window) and OKX `OK-ACCESS-*`.
+pub fn is_exchange_auth_header(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "x-mbx-apikey" || n.starts_with("x-bapi-") || n.starts_with(OKX_AUTH_HEADER_PREFIX)
+}
+
+/// Query parameter names that carry a request signature (Binance `signature`, `sign`), any casing.
+pub fn is_signature_param(name: &str) -> bool {
+    name.eq_ignore_ascii_case("signature") || name.eq_ignore_ascii_case("sign")
+}
+
 /// The only places the OKX demo flag and the OKX auth header family are spelled out.
 const SIMULATED_TRADING_HEADER: &str = "x-simulated-trading";
 const SIMULATED_TRADING_VALUE: &str = "1";
@@ -254,5 +296,47 @@ mod tests {
             assert_eq!(url, format!("https://{host}"));
             assert!(ALLOWED_SIGNED_HOSTS.contains(&host));
         }
+    }
+
+    // ---- live hosts (change live-process 2.1): one source, never mixed with the demo lists ----
+
+    #[test]
+    fn live_hosts_list_constants_and_base_urls_come_from_one_source() {
+        assert_eq!(LIVE_SIGNED_HOSTS, [BINANCE_LIVE_HOST, BYBIT_LIVE_HOST]);
+        assert_eq!(LiveHost::ALL.map(LiveHost::host), LIVE_SIGNED_HOSTS);
+        assert_eq!(BINANCE_LIVE_HOST, "fapi.binance.com");
+        assert_eq!(BYBIT_LIVE_HOST, "api.bybit.com");
+        for h in LiveHost::ALL {
+            assert_eq!(h.base_url(), format!("https://{}", h.host()));
+        }
+        // the public module spells the same two production hosts; they must agree
+        use crate::exchange::public::endpoints::{BINANCE_HOST, BYBIT_HOST};
+        assert_eq!(BINANCE_HOST, LiveHost::Binance.base_url());
+        assert_eq!(BYBIT_HOST, LiveHost::Bybit.base_url());
+    }
+
+    #[test]
+    fn live_hosts_are_disjoint_from_every_demo_host_and_list() {
+        for h in LIVE_SIGNED_HOSTS {
+            assert!(!ALLOWED_SIGNED_HOSTS.contains(&h), "{h} leaked into the demo allow-list");
+            assert!(![BinanceHost::Testnet.host(), BinanceHost::Demo.host(), BybitHost::Demo.host()].contains(&h));
+        }
+        for h in ALLOWED_SIGNED_HOSTS {
+            assert!(!LIVE_SIGNED_HOSTS.contains(&h), "{h} leaked into the live list");
+        }
+    }
+
+    // ---- authentication spellings (change live-process 2.2) ----
+
+    #[test]
+    fn exchange_auth_headers_cover_all_three_exchanges_case_insensitively() {
+        for n in ["X-MBX-APIKEY", "x-mbx-apikey", "X-BAPI-API-KEY", "X-BAPI-SIGN", "x-bapi-timestamp", "X-BAPI-RECV-WINDOW", "OK-ACCESS-KEY", "ok-access-sign"] {
+            assert!(is_exchange_auth_header(n), "{n}");
+        }
+        for n in ["Content-Type", "Accept", "x-mbx-used-weight-1m", "x-bapi", "User-Agent"] {
+            assert!(!is_exchange_auth_header(n), "{n}");
+        }
+        assert!(is_signature_param("signature") && is_signature_param("SIGN") && is_signature_param("Sign"));
+        assert!(!is_signature_param("symbol") && !is_signature_param("signed") && !is_signature_param("sig"));
     }
 }

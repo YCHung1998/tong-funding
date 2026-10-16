@@ -14,7 +14,7 @@ use tong_funding_core::types::Exchange;
 use super::binance::BinanceOrderClient;
 use super::bybit::BybitOrderClient;
 use super::executor::{DemoExecutor, IntentLedger};
-use super::http::OrderTransport;
+use super::http::DemoOrderTransport;
 use super::okx::{OkxLimitsSource, OkxOrderClient};
 use crate::engine::ports::{Executor, ExecutorFactory, ServerOffsets};
 use crate::exchange::health::ratelimit::RateLimiter;
@@ -37,7 +37,7 @@ pub struct DemoExecutorFactory<T> {
     okx_latch: Arc<OkxLatch>,
 }
 
-impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
+impl<T: DemoOrderTransport + 'static> DemoExecutorFactory<T> {
     /// `binance_env` picks one of the two compile-time Binance demo hosts (design Open Question 1:
     /// which one accepts the user's key is decided in task 4.2). Bybit has a single demo host.
     pub fn new(
@@ -94,7 +94,7 @@ impl<T: OrderTransport + 'static> DemoExecutorFactory<T> {
     }
 }
 
-impl<T: OrderTransport + 'static> ExecutorFactory for DemoExecutorFactory<T> {
+impl<T: DemoOrderTransport + 'static> ExecutorFactory for DemoExecutorFactory<T> {
     fn create(&self, mode: ExecutionMode) -> Result<Arc<dyn Executor>, String> {
         match mode {
             ExecutionMode::ExchangeDemo => Ok(Arc::new(self.build()?)),

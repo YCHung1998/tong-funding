@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use super::binance::ModeReading;
 use super::classify::{BYBIT_LEVERAGE_UNCHANGED_CODES, BYBIT_NOT_FOUND_CODES, LeverageOutcome, Reply, SubmitClass, bybit_reply, bybit_state, leverage_outcome, query_outcome, submit_class};
 use super::endpoints::{BYBIT_CANCEL_PATH, BYBIT_CREATE_PATH, BYBIT_HISTORY_PATH, BYBIT_POSITION_PATH, BYBIT_REALTIME_PATH, BYBIT_SET_LEVERAGE_PATH};
-use super::http::{DemoEnv, Method, OrderHttpRequest, OrderTransport};
+use super::http::{DemoEnv, DemoOrderTransport, Method, OrderHttpRequest, OrderTransport};
 use super::order::{ClientOrderId, OrderRef, ValidOrder};
 use crate::engine::ports::{OrderSide, OrderState, OrderStatus, QueryOutcome};
 use crate::exchange::error::AdapterError;
@@ -40,10 +40,13 @@ fn side_param(side: OrderSide) -> &'static str {
     }
 }
 
-impl<T: OrderTransport> BybitOrderClient<T> {
+impl<T: DemoOrderTransport> BybitOrderClient<T> {
     pub fn new(transport: Arc<T>, creds: Arc<Credentials>, demo_env: BybitHost) -> Self {
         BybitOrderClient { transport, creds, env: demo_env }
     }
+}
+
+impl<T: OrderTransport> BybitOrderClient<T> {
 
     fn sign_headers(&self, req: OrderHttpRequest, timestamp: i64, payload: &str) -> Result<OrderHttpRequest, AdapterError> {
         let signature = bybit_signature(&self.creds.api_secret, timestamp, &self.creds.api_key, RECV_WINDOW_MS, payload)?;

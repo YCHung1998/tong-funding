@@ -28,7 +28,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 use super::account::DemoAccountView;
 use super::factory::DemoExecutorFactory;
 use super::okx::{OkxLimits, OkxLimitsSource, check_size};
-use super::http::ReqwestOrderTransport;
+use super::http::SignedDemoOrderTransport;
 use crate::engine::ids::{IdPrefix, client_order_id};
 use crate::engine::intent;
 use crate::engine::latency::{LatencyReport, ORDER_LATENCY, latency_payload};
@@ -36,7 +36,7 @@ use crate::engine::ports::{AccountView, Executor, Leg, OrderAction, OrderRequest
 use crate::exchange::error::AdapterError;
 use crate::exchange::health::clock_sync::ClockSync;
 use crate::exchange::health::ratelimit::RateLimiter;
-use crate::exchange::reqwest_transport::ReqwestTransport;
+use crate::exchange::reqwest_transport::{PublicTransport, SignedDemoTransport};
 use crate::exchange::signed::binance::BinanceSignedClient;
 use crate::exchange::signed::bybit::BybitSignedClient;
 use crate::exchange::public::adapter::{ExchangeAdapter, RulesLookup};
@@ -237,7 +237,7 @@ async fn live_demo_probe() {
     let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
 
     // Clock offsets from the demo hosts' public time endpoints.
-    let reads = Arc::new(ReqwestTransport::signed_demo().expect("transport"));
+    let reads = Arc::new(SignedDemoTransport::new().expect("transport"));
     let sync_b = ClockSync::new(clock.clone());
     let sync_y = ClockSync::new(clock.clone());
     let b = sync_b.sync_once(reads.as_ref(), Exchange::Binance, binance_host.base_url()).await.expect("Binance serverTime");
@@ -247,7 +247,7 @@ async fn live_demo_probe() {
     let (mut okx_offset, mut okx_contracts, mut okx_limits) = (0i64, qty, std::collections::HashMap::new());
     let mut okx_limit: Option<OkxLimits> = None;
     if uses_okx {
-        let public = Arc::new(ReqwestTransport::public_production().expect("public transport"));
+        let public = Arc::new(PublicTransport::new().expect("public transport"));
         okx_offset = ClockSync::new(clock.clone()).sync_once(public.as_ref(), Exchange::Okx, OKX_HOST).await.expect("OKX time").offset_ms;
         let adapter = OkxAdapter::new(public, clock.clone());
         let rules = match adapter.instrument_rules(&symbol).await.expect("OKX instruments") {
@@ -268,7 +268,7 @@ async fn live_demo_probe() {
     let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms, okx: okx_offset });
 
     let factory = DemoExecutorFactory::new(
-        Arc::new(ReqwestOrderTransport::signed_demo().expect("order transport")),
+        Arc::new(SignedDemoOrderTransport::new().expect("order transport")),
         secrets.clone(),
         clock.clone(),
         offsets.clone(),
@@ -395,12 +395,12 @@ async fn live_leverage_probe() {
     let clock = Arc::new(SystemClock);
     let db = Db::open(std::path::Path::new("/tmp/tong-leverage-probe.db"), clock.clone());
     let secrets: Arc<dyn SecretProvider> = Arc::new(BundleSecrets::system());
-    let reads = Arc::new(ReqwestTransport::signed_demo().expect("transport"));
+    let reads = Arc::new(SignedDemoTransport::new().expect("transport"));
     let b = ClockSync::new(clock.clone()).sync_once(reads.as_ref(), Exchange::Binance, binance_host.base_url()).await.expect("Binance serverTime");
     let y = ClockSync::new(clock.clone()).sync_once(reads.as_ref(), Exchange::Bybit, BybitHost::Demo.base_url()).await.expect("Bybit time");
     let offsets = Arc::new(Offsets { binance: b.offset_ms, bybit: y.offset_ms, okx: 0 }); // (this probe trades Binance + Bybit only)
     let factory = DemoExecutorFactory::new(
-        Arc::new(ReqwestOrderTransport::signed_demo().expect("order transport")),
+        Arc::new(SignedDemoOrderTransport::new().expect("order transport")),
         secrets.clone(),
         clock.clone(),
         offsets,

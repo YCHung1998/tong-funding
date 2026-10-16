@@ -22,7 +22,7 @@ use super::signing::{
     encode_query, is_timestamp_rejected, load_credentials, parse_json, require_offset, sanitize_error,
 };
 use crate::exchange::error::AdapterError;
-use crate::exchange::transport::{HttpRequest, HttpResponse, HttpTransport};
+use crate::exchange::transport::{DemoSignedTransport, HttpRequest, HttpResponse, HttpTransport};
 use crate::ports::{Clock, SecretProvider};
 
 /// `GET /fapi/v1/income` (USER_DATA, weight 30 per the docs).
@@ -160,7 +160,7 @@ pub struct BinanceLedgerClient<T> {
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: HttpTransport> BinanceLedgerClient<T> {
+impl<T: DemoSignedTransport> BinanceLedgerClient<T> {
     pub fn new(
         transport: Arc<T>,
         secrets: Arc<dyn SecretProvider>,
@@ -171,6 +171,9 @@ impl<T: HttpTransport> BinanceLedgerClient<T> {
     ) -> Self {
         BinanceLedgerClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None) }
     }
+}
+
+impl<T: HttpTransport> BinanceLedgerClient<T> {
 
     pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {
         self.reason.lock().ok().and_then(|g| *g)
@@ -259,7 +262,7 @@ pub struct BybitLedgerClient<T> {
     reason: Mutex<Option<NotConnectedReason>>,
 }
 
-impl<T: HttpTransport> BybitLedgerClient<T> {
+impl<T: DemoSignedTransport> BybitLedgerClient<T> {
     pub fn new(
         transport: Arc<T>,
         secrets: Arc<dyn SecretProvider>,
@@ -270,6 +273,9 @@ impl<T: HttpTransport> BybitLedgerClient<T> {
     ) -> Self {
         BybitLedgerClient { transport, secrets, clock, offset, resync, host: demo_env, reason: Mutex::new(None) }
     }
+}
+
+impl<T: HttpTransport> BybitLedgerClient<T> {
 
     pub fn last_not_connected_reason(&self) -> Option<NotConnectedReason> {
         self.reason.lock().ok().and_then(|g| *g)
@@ -632,17 +638,17 @@ mod tests {
     fn okx_live_bills_probe() {
         use crate::exchange::health::clock_sync::ClockSync;
         use crate::exchange::public::endpoints::OKX_HOST;
-        use crate::exchange::reqwest_transport::ReqwestTransport;
+        use crate::exchange::reqwest_transport::{PublicTransport, SignedDemoTransport};
         use crate::ports::SystemClock;
         use crate::store::secrets::BundleSecrets;
         let symbol = std::env::var("TONG_OKX_SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         rt.block_on(async {
             let clock = Arc::new(SystemClock);
-            let public = ReqwestTransport::public_production().expect("public transport");
+            let public = PublicTransport::new().expect("public transport");
             let off = ClockSync::new(clock.clone()).sync_once(&public, Exchange::Okx, OKX_HOST).await.expect("OKX time").offset_ms;
             let signed = OkxSignedClient::new(
-                Arc::new(ReqwestTransport::signed_demo().expect("signed transport")),
+                Arc::new(SignedDemoTransport::new().expect("signed transport")),
                 Arc::new(BundleSecrets::system()),
                 clock.clone(),
                 Arc::new(move || Some(off)),
