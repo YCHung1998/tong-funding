@@ -1,6 +1,6 @@
 ## 1. 設定與身分進入引擎
 
-- [ ] 1.1 `core/src/risk.rs`：新增 `live_max_leg_notional_usdt`、`live_max_pairs_per_arming`、程式內建天花板常數與驗證；Live 未填 → 設定不完整；Demo 忽略；紅色測試先行
+- [x] 1.1 `core/src/risk.rs`：新增 `live_max_leg_notional_usdt`、`live_max_pairs_per_arming`、程式內建天花板常數與驗證；Live 未填 → 設定不完整；Demo 忽略；紅色測試先行
 - [x] 1.2 `EngineDeps` 新增 `identity`（`ProcessIdentity`）；Demo 的所有新行為關閉；既有測試全綠
 
 ## 2. 鎖定與武裝
