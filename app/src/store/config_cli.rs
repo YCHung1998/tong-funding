@@ -114,6 +114,11 @@ fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, e
         let _ = writeln!(err, "store is halted, nothing was changed: {}", redact_secrets(&reason.to_string()));
         return 1;
     }
+    // live-guardrails 3.5: a database this tool just created in the live world starts with the safe defaults
+    if let Err(why) = crate::store::live_init::apply_if_fresh(&db) {
+        let _ = writeln!(err, "{why}");
+        return 1;
+    }
     match cmd {
         Cmd::Show => show(&db, out, err),
         Cmd::Set { key, value } => set(&db, &key, value, out, err),
@@ -154,18 +159,65 @@ fn show(db: &Db, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     0
 }
 
-fn set(db: &Db, key: &str, value: Value, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    if let Err(why) = validate(key, &value) {
-        let _ = writeln!(err, "refused, nothing was written: {why}");
-        return 1;
+/// live-guardrails 3.6: the `risk` fields the command line may not write on a LIVE database. They
+/// are changed only through the app (frozen at arming, audited).
+pub const LIVE_PROTECTED_FIELDS: [&str; 5] = ["live_max_leg_notional_usdt", "live_max_pairs_per_arming", "max_leverage", "max_concurrent_pairs", "trigger_mode"];
+
+/// On a live database: refuses a value that carries a protected field, and keeps the stored values of
+/// those fields when `risk` is replaced (a replace must not reset caps or the trigger mode).
+fn guard_live_value(db: &Db, key: &str, value: Value, stored: Option<&Value>) -> Result<Value, String> {
+    let refuse = |field: &str| format!("refused, nothing was written: `{field}` cannot be set from the command line on a live database (change it in the app)");
+    match (key, value) {
+        (KEY_RISK, Value::Object(mut incoming)) => {
+            if let Some(f) = LIVE_PROTECTED_FIELDS.iter().find(|f| incoming.contains_key(**f)) {
+                return Err(refuse(f));
+            }
+            if let Some(Value::Object(old)) = stored {
+                for f in LIVE_PROTECTED_FIELDS {
+                    if let Some(v) = old.get(f) {
+                        incoming.insert(f.to_string(), v.clone());
+                    }
+                }
+            }
+            Ok(Value::Object(incoming))
+        }
+        (KEY_RISK_OVERRIDES, Value::Object(map)) => {
+            if map.values().any(|o| o.get("max_leverage").is_some()) {
+                return Err(refuse("max_leverage"));
+            }
+            Ok(Value::Object(map))
+        }
+        (_, v) => {
+            let _ = db;
+            Ok(v)
+        }
     }
-    let version = match db.config_get(key) {
-        Ok(e) => e.map(|e| e.version),
+}
+
+fn set(db: &Db, key: &str, value: Value, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let current = match db.config_get(key) {
+        Ok(e) => e,
         Err(e) => {
             let _ = writeln!(err, "cannot read {key}: {}", redact_secrets(&e.to_string()));
             return 1;
         }
     };
+    let version = current.as_ref().map(|e| e.version);
+    let value = if db.identity().is_live() {
+        match guard_live_value(db, key, value, current.as_ref().map(|e| &e.value)) {
+            Ok(v) => v,
+            Err(why) => {
+                let _ = writeln!(err, "{why}");
+                return 1;
+            }
+        }
+    } else {
+        value
+    };
+    if let Err(why) = validate(key, &value) {
+        let _ = writeln!(err, "refused, nothing was written: {why}");
+        return 1;
+    }
     let new_version = match db.config_set(key, &value, version) {
         Ok(v) => v,
         Err(e) => {
@@ -333,7 +385,7 @@ mod tests {
         // And the live tool still works on its own database.
         let (code, out, _) = call_live(&p, &["show"]);
         assert_eq!(code, 0);
-        assert!(out.contains("risk (version 1)"), "{out}");
+        assert!(out.contains("risk (version 2)"), "defaults (v1) then the user set (v2): {out}");
     }
 
     #[test]
@@ -355,6 +407,66 @@ mod tests {
         assert_eq!(code, 1);
         assert!(err.contains("environment"), "{err}");
         assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    // ---- live-guardrails 3.6: the command line cannot move the live caps ------------------------
+
+    fn live_stored(db: &std::path::Path, key: &str) -> Option<Value> {
+        let db = Db::open_for(ProcessIdentity::Live, db, Arc::new(ManualClock::new(1)));
+        db.config_get(key).unwrap().map(|e| e.value)
+    }
+
+    #[test]
+    fn on_a_live_database_the_cap_and_mode_fields_cannot_be_written_from_the_command_line() {
+        for field in ["live_max_leg_notional_usdt", "live_max_pairs_per_arming", "max_leverage", "max_concurrent_pairs", "trigger_mode"] {
+            let dir = tempdir();
+            let p = dir.path().join("funding-live.db");
+            let mut v: Value = serde_json::from_str(FULL).unwrap();
+            v[field] = json!("3");
+            let (code, _, err) = call_live(&p, &["set", "risk", &v.to_string()]);
+            assert_eq!(code, 1, "{field}");
+            assert!(err.contains(field) && err.contains("live"), "{field}: {err}");
+            // nothing was written
+            assert!(live_stored(&p, KEY_RISK).is_none_or(|r| r.get(field) != Some(&json!("3"))), "{field}");
+        }
+        // risk_overrides may not carry a leverage either
+        let dir = tempdir();
+        let p = dir.path().join("funding-live.db");
+        let (code, _, err) = call_live(&p, &["set", "risk_overrides", r#"{"Bybit":{"max_leverage":"20"}}"#]);
+        assert_eq!(code, 1, "{err}");
+        assert!(err.contains("max_leverage"), "{err}");
+    }
+
+    #[test]
+    fn a_live_set_of_fees_keeps_the_stored_caps_and_mode_instead_of_resetting_them() {
+        let dir = tempdir();
+        let p = dir.path().join("funding-live.db");
+        {
+            let db = Db::open_for(ProcessIdentity::Live, &p, Arc::new(ManualClock::new(1)));
+            let mut stored: Value = serde_json::from_str(FULL).unwrap();
+            stored["live_max_leg_notional_usdt"] = json!("10");
+            stored["live_max_pairs_per_arming"] = json!(2);
+            stored["trigger_mode"] = json!("MANUAL");
+            stored["max_leverage"] = json!("3");
+            db.config_set(KEY_RISK, &stored, None).unwrap();
+        }
+        let (code, _, err) = call_live(&p, &["set", "risk", &FULL.replace("0.01", "0.02")]);
+        assert_eq!(code, 0, "{err}");
+        let after = live_stored(&p, KEY_RISK).unwrap();
+        assert_eq!(after["net_edge_threshold_pct"], json!("0.02"), "the fee edit went through");
+        assert_eq!((after["live_max_leg_notional_usdt"].clone(), after["live_max_pairs_per_arming"].clone(), after["trigger_mode"].clone(), after["max_leverage"].clone()), (json!("10"), json!(2), json!("MANUAL"), json!("3")));
+    }
+
+    #[test]
+    fn the_same_fields_stay_writable_on_a_demo_database() {
+        let dir = tempdir();
+        let p = dir.path().join("funding.db");
+        let mut v: Value = serde_json::from_str(FULL).unwrap();
+        v["max_leverage"] = json!("3");
+        v["trigger_mode"] = json!("MANUAL");
+        let (code, _, err) = call(&p, &["set", "risk", &v.to_string()]);
+        assert_eq!(code, 0, "{err}");
+        assert_eq!(stored(&p, KEY_RISK).unwrap().0["trigger_mode"], json!("MANUAL"));
     }
 
     #[test]

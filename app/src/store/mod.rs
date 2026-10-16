@@ -11,6 +11,7 @@ pub mod funding_ledger;
 pub mod funding_slots;
 pub mod import_cli;
 pub mod legacy_import;
+pub mod live_init;
 pub mod scan_buffer;
 pub mod schema;
 pub mod secrets;

@@ -59,6 +59,12 @@ fn main() {
                     std::process::exit(1);
                 }
                 let db = store::db::Db::open_default_for(identity, std::sync::Arc::new(ports::SystemClock)).ok();
+                // live-guardrails 3.5: a brand-new live database starts with the safe defaults
+                if let Some(db) = &db
+                    && let Err(why) = store::live_init::apply_if_fresh(db)
+                {
+                    eprintln!("{why}");
+                }
                 let live = ui::live::LiveSource::start(db, identity);
                 let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = live.clone();
                 let sink: std::sync::Arc<dyn ui::bridge::CommandSink> = live;
