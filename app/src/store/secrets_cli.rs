@@ -2,11 +2,15 @@
 //! without `.env` files, shell history or the repository (spec: secret-storage).
 //!
 //! ```text
-//! tong-funding secrets set <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)
-//! tong-funding secrets import-env <path/to/.env>   (the Python version's .env format)
-//! tong-funding secrets status
-//! tong-funding secrets delete <binance|bybit|okx> <api-key|api-secret|passphrase>
+//! tong-funding secrets set [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)
+//! tong-funding secrets import-env <path/to/.env>   (the Python version's .env format; demo only)
+//! tong-funding secrets status [--live]
+//! tong-funding secrets delete [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>
 //! ```
+//!
+//! `--live` (anywhere after the subcommand) selects the live Keychain item (`tong-funding-live`);
+//! without it only the existing demo item is touched. `import-env` refuses `--live` outright, so a
+//! `.env` file can never become a live credential: use `secrets set --live`.
 //!
 //! Everything lives in one Keychain item (see `store::secrets::BundleSecrets`); each subcommand
 //! reads it once and writes it back at most once.
@@ -19,12 +23,26 @@ use std::io::{BufRead, Write};
 use tong_funding_core::redact::redact_secrets;
 use tong_funding_core::types::Exchange;
 
+use crate::identity::ProcessIdentity;
 use crate::ports::{SecretName, SecretProvider};
 use crate::store::secrets::{BundleSecrets, KeyStore, needed};
 
 pub const SUBCOMMAND: &str = "secrets";
 
-const USAGE: &str = "usage:\n  tong-funding secrets set <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)\n  tong-funding secrets import-env <path/to/.env>\n  tong-funding secrets status\n  tong-funding secrets delete <binance|bybit|okx> <api-key|api-secret|passphrase>";
+const USAGE: &str = "usage:\n  tong-funding secrets set [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)\n  tong-funding secrets import-env <path/to/.env>   (demo only)\n  tong-funding secrets status [--live]\n  tong-funding secrets delete [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>";
+
+const LIVE_FLAG: &str = "--live";
+
+/// Splits `--live` (any casing, any position) out of the arguments. More than one is ambiguous
+/// and refused.
+fn take_live(args: &[String]) -> Result<(ProcessIdentity, Vec<String>), String> {
+    let is_flag = |a: &String| a.eq_ignore_ascii_case(LIVE_FLAG);
+    match args.iter().filter(|a| is_flag(a)).count() {
+        0 => Ok((ProcessIdentity::Demo, args.to_vec())),
+        1 => Ok((ProcessIdentity::Live, args.iter().filter(|a| !is_flag(a)).cloned().collect())),
+        _ => Err(format!("`{LIVE_FLAG}` given more than once")),
+    }
+}
 
 fn parse_exchange(s: &str) -> Option<Exchange> {
     match s.to_ascii_lowercase().as_str() {
@@ -66,16 +84,37 @@ fn target(args: &[String]) -> Result<(Exchange, SecretName), String> {
     }
 }
 
-/// Runs the subcommand on the real Keychain; returns the process exit code.
+/// Runs the subcommand on the real Keychain; returns the process exit code. Building the two
+/// `BundleSecrets` touches nothing: an item is read only when a subcommand needs it.
 pub fn run(args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    run_with(&BundleSecrets::system(), args, stdin, out, err)
+    let (demo, live) = (BundleSecrets::system_for(ProcessIdentity::Demo), BundleSecrets::system_for(ProcessIdentity::Live));
+    run_for(&|id| if id.is_live() { &live } else { &demo }, args, stdin, out, err)
 }
 
+/// Demo-only entry used by the older tests.
+#[cfg(test)]
 fn run_with<S: KeyStore>(secrets: &BundleSecrets<S>, args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    run_for(&|_| secrets, args, stdin, out, err)
+}
+
+fn run_for<'s, S: KeyStore + 's>(secrets_for: &dyn Fn(ProcessIdentity) -> &'s BundleSecrets<S>, args: &[String], stdin: &mut dyn BufRead, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let usage = |err: &mut dyn Write, msg: &str| {
         let _ = writeln!(err, "{msg}\n{USAGE}");
         2
     };
+    let (identity, args) = match args.split_first() {
+        Some((cmd, rest)) => match take_live(rest) {
+            Ok((id, rest)) => (id, std::iter::once(cmd.clone()).chain(rest).collect::<Vec<_>>()),
+            Err(e) => return usage(err, &e),
+        },
+        None => (ProcessIdentity::Demo, Vec::new()),
+    };
+    if identity.is_live() && args.first().is_some_and(|c| c == "import-env") {
+        // Decided before any Keychain access: nothing is read, nothing is written.
+        let _ = writeln!(err, "import-env cannot be used with --live: a .env file must never become a live credential; use `tong-funding secrets set --live <exchange> <name>`");
+        return 2;
+    }
+    let secrets = secrets_for(identity);
     match args.split_first() {
         Some((cmd, rest)) if cmd == "set" => {
             let (ex, name) = match target(rest) {
@@ -359,5 +398,98 @@ mod tests {
         assert_eq!(s.get(Exchange::Bybit, SecretName::ApiKey).unwrap().as_deref(), Some("new-key"));
         assert_eq!(s.get(Exchange::Binance, SecretName::ApiKey).unwrap().as_deref(), Some("a1"));
         assert_eq!(*raw.1.lock().unwrap(), 2);
+    }
+
+    // ---- live-process 4.1: `--live` selects the live Keychain item; `import-env` never writes it ----
+
+    use crate::identity::ProcessIdentity;
+    use crate::store::secrets::test_support::{FakeKeychain, ServiceStore};
+    use std::sync::Arc;
+
+    const DEMO_SERVICE: &str = "tong-funding";
+    const LIVE_SERVICE: &str = "tong-funding-live";
+
+    /// Both identities' secrets over one fake Keychain (so every access shows in its log).
+    fn two(kc: &Arc<FakeKeychain>) -> (BundleSecrets<ServiceStore>, BundleSecrets<ServiceStore>) {
+        let mk = |id: ProcessIdentity| {
+            let kc = kc.clone();
+            BundleSecrets::for_identity_with(id, move |service| ServiceStore::new(&kc, service))
+        };
+        (mk(ProcessIdentity::Demo), mk(ProcessIdentity::Live))
+    }
+
+    fn call_for(kc: &Arc<FakeKeychain>, args: &[&str], stdin: &str) -> (i32, String, String) {
+        let (demo, live) = two(kc);
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = run_for(&|id| if id.is_live() { &live } else { &demo }, &args, &mut stdin.as_bytes(), &mut out, &mut err);
+        (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+    }
+
+    fn bundle(kc: &FakeKeychain, service: &str) -> Option<serde_json::Value> {
+        kc.item(service, "credentials").map(|j| serde_json::from_str(&j).unwrap())
+    }
+
+    #[test]
+    fn set_with_live_changes_only_the_live_item_wherever_the_flag_sits() {
+        for args in [&["set", "--live", "Bybit", "api_key"][..], &["set", "Bybit", "api_key", "--live"], &["set", "Bybit", "--live", "api_key"]] {
+            let kc = Arc::new(FakeKeychain::default());
+            kc.seed(DEMO_SERVICE, "credentials", r#"{"Binance:api_key":"demo-bk"}"#);
+            let (code, out, err) = call_for(&kc, args, "live-yk-1234\n");
+            assert_eq!(code, 0, "{args:?}: {out}{err}");
+            assert_eq!(bundle(&kc, LIVE_SERVICE), Some(serde_json::json!({"Bybit:api_key": "live-yk-1234"})), "{args:?}");
+            assert_eq!(kc.item(DEMO_SERVICE, "credentials").as_deref(), Some(r#"{"Binance:api_key":"demo-bk"}"#), "{args:?}: the existing item is unchanged");
+            assert!(!kc.touched(DEMO_SERVICE), "{args:?}: --live must not even read the demo item: {:?}", kc.log());
+            assert!(!out.contains("live-yk") && !err.contains("live-yk"), "value printed");
+        }
+    }
+
+    #[test]
+    fn without_live_only_the_existing_item_is_used() {
+        let kc = Arc::new(FakeKeychain::default());
+        kc.seed(LIVE_SERVICE, "credentials", r#"{"Binance:api_key":"live-bk"}"#);
+        assert_eq!(call_for(&kc, &["set", "Bybit", "api_key"], "demo-yk-1234\n").0, 0);
+        assert_eq!(call_for(&kc, &["status"], "").0, 0);
+        assert_eq!(call_for(&kc, &["delete", "Bybit", "api_key"], "").0, 0);
+        assert!(!kc.touched(LIVE_SERVICE), "no live access without --live: {:?}", kc.log());
+        assert_eq!(kc.item(LIVE_SERVICE, "credentials").as_deref(), Some(r#"{"Binance:api_key":"live-bk"}"#));
+    }
+
+    #[test]
+    fn status_and_delete_with_live_target_the_live_item_only() {
+        let kc = Arc::new(FakeKeychain::default());
+        kc.seed(DEMO_SERVICE, "credentials", r#"{"Binance:api_key":"demo-bk","Bybit:api_key":"demo-yk"}"#);
+        kc.seed(LIVE_SERVICE, "credentials", r#"{"Binance:api_key":"live-bk","Bybit:api_key":"live-yk"}"#);
+        let (code, out, _) = call_for(&kc, &["status", "--live"], "");
+        assert_eq!(code, 0);
+        assert!(out.contains("Binance  api-key     present") && out.contains("Binance  api-secret  missing"), "{out}");
+        assert_eq!(call_for(&kc, &["delete", "--live", "Binance", "api-key"], "").0, 0);
+        assert_eq!(bundle(&kc, LIVE_SERVICE), Some(serde_json::json!({"Bybit:api_key": "live-yk"})));
+        assert_eq!(kc.item(DEMO_SERVICE, "credentials").as_deref(), Some(r#"{"Binance:api_key":"demo-bk","Bybit:api_key":"demo-yk"}"#));
+        assert!(!kc.touched(DEMO_SERVICE), "{:?}", kc.log());
+    }
+
+    #[test]
+    fn import_env_with_live_fails_with_zero_keychain_access_and_points_to_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(".env");
+        std::fs::write(&p, "BINANCE_API_KEY=bk-AAAA1111\nBINANCE_API_SECRET=bs-BBBB2222\n").unwrap();
+        let path = p.to_str().unwrap();
+        for args in [vec!["import-env", "--live", path], vec!["import-env", path, "--live"], vec!["import-env", "--LIVE", path]] {
+            let kc = Arc::new(FakeKeychain::default());
+            let (code, out, err) = call_for(&kc, &args, "");
+            assert_ne!(code, 0, "{args:?}");
+            assert!(err.contains("secrets set --live"), "the message names the alternative: {err}");
+            assert!(kc.log().is_empty(), "{args:?}: not a single Keychain access (read or write): {:?}", kc.log());
+            assert!(!out.contains("AAAA1111") && !err.contains("AAAA1111") && !out.contains("stored"), "{out}{err}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_live_flag_is_a_usage_error_not_silently_accepted() {
+        let kc = Arc::new(FakeKeychain::default());
+        let (code, _, err) = call_for(&kc, &["set", "--live", "--live", "Bybit", "api_key"], "k-1234567\n");
+        assert_eq!(code, 2, "{err}");
+        assert!(kc.log().is_empty());
     }
 }

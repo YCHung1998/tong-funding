@@ -18,7 +18,7 @@
 
 ## 4. 金鑰與訂單 ID
 
-- [ ] 4.1 `BundleSecrets` 依身分選鑰匙圈 service；`secrets` 子命令 `--live`；`import-env` 與 `--live` 互斥；測試用假 `KeyStore`：Live 不讀 demo 項目且不退回、Demo 不讀 live 項目、`import-env --live` 失敗且零寫入
+- [x] 4.1 `BundleSecrets` 依身分選鑰匙圈 service；`secrets` 子命令 `--live`；`import-env` 與 `--live` 互斥；測試用假 `KeyStore`：Live 不讀 demo 項目且不退回、Demo 不讀 live 項目、`import-env --live` 失敗且零寫入
 - [ ] 4.2 `IdPrefix::Live` 與 `recovery` 辨識；測試：ID 前綴為 `live`、長度 ≤ 36、重啟對帳辨識 live 單
 
 ## 5. 組合根與 OKX

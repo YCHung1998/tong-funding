@@ -13,6 +13,7 @@ use serde_json::Value;
 use tong_funding_core::redact::{PLACEHOLDER, is_sensitive_name, redact_secrets, register_secret};
 use tong_funding_core::types::Exchange;
 
+use crate::identity::ProcessIdentity;
 use crate::ports::{SecretError, SecretName, SecretProvider};
 
 /// Keychain service name under which every account is stored.
@@ -61,6 +62,15 @@ impl KeychainStore {
     /// real credentials).
     pub fn with_service(service: &str) -> Self {
         KeychainStore { service: service.to_string() }
+    }
+
+    /// The Keychain item of one process identity: `tong-funding` (Demo) or `tong-funding-live`.
+    pub fn for_identity(identity: ProcessIdentity) -> Self {
+        Self::with_service(identity.keychain_service())
+    }
+
+    pub fn service(&self) -> &str {
+        &self.service
     }
 }
 
@@ -112,17 +122,33 @@ pub fn needed(exchange: Exchange) -> &'static [SecretName] {
 pub struct BundleSecrets<S: KeyStore = KeychainStore> {
     store: S,
     cache: Mutex<Option<Result<Bundle, SecretError>>>,
+    /// Fold the legacy per-account items into the bundle when it does not exist yet. Demo only: a
+    /// live item is never built from anything but an explicit `secrets set --live`.
+    migrate_legacy: bool,
 }
 
 impl BundleSecrets<KeychainStore> {
+    /// The Demo identity's Keychain item (`tong-funding`).
     pub fn system() -> Self {
-        BundleSecrets::new(KeychainStore::new())
+        Self::system_for(ProcessIdentity::Demo)
+    }
+
+    /// The Keychain item of `identity`: Demo `tong-funding`, Live `tong-funding-live`.
+    pub fn system_for(identity: ProcessIdentity) -> Self {
+        Self::for_identity_with(identity, KeychainStore::with_service)
     }
 }
 
 impl<S: KeyStore> BundleSecrets<S> {
     pub fn new(store: S) -> Self {
-        BundleSecrets { store, cache: Mutex::new(None) }
+        BundleSecrets { store, cache: Mutex::new(None), migrate_legacy: true }
+    }
+
+    /// Opens the store of `identity` through `open`, which receives the identity's Keychain service
+    /// name. A Live bundle never reads or migrates the demo item or legacy per-account items, and
+    /// a missing live item is simply "not set" (no fallback to demo credentials).
+    pub fn for_identity_with(identity: ProcessIdentity, open: impl FnOnce(&str) -> S) -> Self {
+        BundleSecrets { store: open(identity.keychain_service()), cache: Mutex::new(None), migrate_legacy: !identity.is_live() }
     }
 
     /// Reads the bundle; when the item does not exist yet, migrates the legacy per-account items
@@ -133,6 +159,7 @@ impl<S: KeyStore> BundleSecrets<S> {
             Some(json) => serde_json::from_str::<Bundle>(&json).map_err(|_| {
                 SecretError::Unavailable("credentials item is not valid JSON; rewrite it with `secrets import-env`".into())
             }),
+            None if !self.migrate_legacy => Ok(Bundle::new()),
             None => {
                 let mut bundle = Bundle::new();
                 for ex in Exchange::ALL {
@@ -315,6 +342,70 @@ fn safe_at(value: Value, depth: usize) -> Value {
             )
         }
         other => other,
+    }
+}
+
+/// A whole fake Keychain: items keyed by (service, account), plus a log of EVERY access, so tests
+/// can prove which services an identity touched (change live-process 4.1).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use super::KeyStore;
+    use crate::ports::SecretError;
+
+    #[derive(Default)]
+    pub(crate) struct FakeKeychain {
+        items: Mutex<HashMap<(String, String), String>>,
+        log: Mutex<Vec<String>>,
+    }
+
+    impl FakeKeychain {
+        pub(crate) fn seed(&self, service: &str, account: &str, value: &str) {
+            self.items.lock().unwrap().insert((service.into(), account.into()), value.into());
+        }
+        pub(crate) fn item(&self, service: &str, account: &str) -> Option<String> {
+            self.items.lock().unwrap().get(&(service.to_string(), account.to_string())).cloned()
+        }
+        /// `"<op> <service> <account>"` per access, in order.
+        pub(crate) fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+        pub(crate) fn writes(&self) -> Vec<String> {
+            self.log().into_iter().filter(|l| !l.starts_with("get ")).collect()
+        }
+        pub(crate) fn touched(&self, service: &str) -> bool {
+            self.log().iter().any(|l| l.split(' ').nth(1) == Some(service))
+        }
+    }
+
+    pub(crate) struct ServiceStore {
+        kc: Arc<FakeKeychain>,
+        service: String,
+    }
+
+    impl ServiceStore {
+        pub(crate) fn new(kc: &Arc<FakeKeychain>, service: &str) -> Self {
+            ServiceStore { kc: kc.clone(), service: service.to_string() }
+        }
+    }
+
+    impl KeyStore for ServiceStore {
+        fn get(&self, account: &str) -> Result<Option<String>, SecretError> {
+            self.kc.log.lock().unwrap().push(format!("get {} {account}", self.service));
+            Ok(self.kc.item(&self.service, account))
+        }
+        fn set(&self, account: &str, value: &str) -> Result<(), SecretError> {
+            self.kc.log.lock().unwrap().push(format!("set {} {account}", self.service));
+            self.kc.seed(&self.service, account, value);
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> Result<(), SecretError> {
+            self.kc.log.lock().unwrap().push(format!("delete {} {account}", self.service));
+            self.kc.items.lock().unwrap().remove(&(self.service.clone(), account.to_string()));
+            Ok(())
+        }
     }
 }
 
@@ -894,6 +985,101 @@ mod tests {
         assert_eq!(s.store.gets(), vec![BUNDLE.to_string()], "no legacy fallback");
         assert!(s.set_secret(Exchange::Binance, SecretName::ApiKey, "new").is_err(), "must not overwrite a bundle it cannot read");
         assert!(s.store.sets().is_empty());
+    }
+
+    // ---- live-process 4.1: one Keychain item per identity ----
+
+    use std::sync::Arc;
+
+    use super::test_support::{FakeKeychain, ServiceStore};
+    use crate::identity::ProcessIdentity;
+
+    const DEMO_SERVICE: &str = "tong-funding";
+    const LIVE_SERVICE: &str = "tong-funding-live";
+
+    fn secrets_for(kc: &Arc<FakeKeychain>, id: ProcessIdentity) -> BundleSecrets<ServiceStore> {
+        let kc = kc.clone();
+        BundleSecrets::for_identity_with(id, move |service| ServiceStore::new(&kc, service))
+    }
+
+    fn all_names() -> Vec<(Exchange, SecretName)> {
+        Exchange::ALL.into_iter().flat_map(|e| needed(e).iter().map(move |&n| (e, n))).collect()
+    }
+
+    #[test]
+    fn each_identity_opens_the_keychain_service_of_its_own() {
+        let seen = Mutex::new(Vec::new());
+        for id in [ProcessIdentity::Demo, ProcessIdentity::Live] {
+            let _ = BundleSecrets::for_identity_with(id, |service| {
+                seen.lock().unwrap().push(service.to_string());
+                MemStore::default()
+            });
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![DEMO_SERVICE.to_string(), LIVE_SERVICE.to_string()]);
+        assert_eq!(SERVICE, DEMO_SERVICE);
+        assert_eq!(KeychainStore::for_identity(ProcessIdentity::Demo).service(), DEMO_SERVICE);
+        assert_eq!(KeychainStore::for_identity(ProcessIdentity::Live).service(), LIVE_SERVICE);
+        assert_eq!(BundleSecrets::system_for(ProcessIdentity::Live).store.service(), LIVE_SERVICE);
+        assert_eq!(BundleSecrets::system_for(ProcessIdentity::Demo).store.service(), DEMO_SERVICE);
+    }
+
+    #[test]
+    fn live_does_not_read_the_demo_item_and_does_not_fall_back_to_it() {
+        let kc = Arc::new(FakeKeychain::default());
+        // a complete demo bundle AND legacy per-account demo items exist; the live item does not
+        kc.seed(DEMO_SERVICE, BUNDLE_ACCOUNT, r#"{"Binance:api_key":"demo-bk","Binance:api_secret":"demo-bs","Bybit:api_key":"demo-yk","Bybit:api_secret":"demo-ys"}"#);
+        kc.seed(DEMO_SERVICE, "OKX:api_key", "demo-legacy-ok");
+        let live = secrets_for(&kc, ProcessIdentity::Live);
+        for (e, n) in all_names() {
+            assert_eq!(live.get(e, n), Ok(None), "{e:?} {n:?} must read as not set");
+        }
+        assert!(!kc.touched(DEMO_SERVICE), "the live identity touched the demo item: {:?}", kc.log());
+        assert_eq!(kc.log(), vec![format!("get {LIVE_SERVICE} {BUNDLE_ACCOUNT}")], "exactly one read, of the live bundle");
+    }
+
+    #[test]
+    fn live_never_migrates_legacy_per_account_items() {
+        let kc = Arc::new(FakeKeychain::default());
+        // legacy-style per-account items under the LIVE service must be ignored, not folded into a bundle
+        kc.seed(LIVE_SERVICE, "Binance:api_key", "stray-legacy");
+        let live = secrets_for(&kc, ProcessIdentity::Live);
+        assert_eq!(live.get(Exchange::Binance, SecretName::ApiKey), Ok(None));
+        assert!(kc.writes().is_empty(), "no migration write: {:?}", kc.log());
+        assert_eq!(kc.log(), vec![format!("get {LIVE_SERVICE} {BUNDLE_ACCOUNT}")], "no per-account reads either");
+        // control: the demo identity still migrates (existing behaviour is unchanged)
+        let kc = Arc::new(FakeKeychain::default());
+        kc.seed(DEMO_SERVICE, "Binance:api_key", "legacy-bk");
+        let demo = secrets_for(&kc, ProcessIdentity::Demo);
+        assert_eq!(demo.get(Exchange::Binance, SecretName::ApiKey), Ok(Some("legacy-bk".to_string())));
+        assert!(kc.item(DEMO_SERVICE, BUNDLE_ACCOUNT).is_some(), "demo migrated into its bundle");
+    }
+
+    #[test]
+    fn demo_never_touches_the_live_item() {
+        let kc = Arc::new(FakeKeychain::default());
+        kc.seed(LIVE_SERVICE, BUNDLE_ACCOUNT, r#"{"Binance:api_key":"live-bk","Binance:api_secret":"live-bs"}"#);
+        let demo = secrets_for(&kc, ProcessIdentity::Demo);
+        for (e, n) in all_names() {
+            assert_eq!(demo.get(e, n), Ok(None), "{e:?} {n:?}: the live key must not appear in demo");
+        }
+        demo.set_secret(Exchange::Bybit, SecretName::ApiKey, "demo-yk").unwrap();
+        demo.delete_secret(Exchange::Bybit, SecretName::ApiKey).unwrap();
+        assert!(!kc.touched(LIVE_SERVICE), "the demo identity touched the live item: {:?}", kc.log());
+        assert_eq!(kc.item(LIVE_SERVICE, BUNDLE_ACCOUNT).as_deref(), Some(r#"{"Binance:api_key":"live-bk","Binance:api_secret":"live-bs"}"#), "live item unchanged");
+    }
+
+    #[test]
+    fn live_reads_and_writes_its_own_item_in_the_same_bundle_format() {
+        let kc = Arc::new(FakeKeychain::default());
+        kc.seed(LIVE_SERVICE, BUNDLE_ACCOUNT, r#"{"Binance:api_key":"live-bk"}"#);
+        kc.seed(DEMO_SERVICE, BUNDLE_ACCOUNT, r#"{"Binance:api_key":"demo-bk"}"#);
+        let live = secrets_for(&kc, ProcessIdentity::Live);
+        assert_eq!(live.get(Exchange::Binance, SecretName::ApiKey), Ok(Some("live-bk".to_string())));
+        live.set_secret(Exchange::Bybit, SecretName::ApiSecret, "live-ys").unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&kc.item(LIVE_SERVICE, BUNDLE_ACCOUNT).unwrap()).unwrap();
+        assert_eq!(stored, json!({"Binance:api_key": "live-bk", "Bybit:api_secret": "live-ys"}));
+        assert_eq!(kc.item(DEMO_SERVICE, BUNDLE_ACCOUNT).as_deref(), Some(r#"{"Binance:api_key":"demo-bk"}"#), "demo item unchanged");
+        assert!(!kc.touched(DEMO_SERVICE));
     }
 
     /// Real Keychain round trip. Pops a macOS authorization dialog and writes to the user's real
