@@ -2806,6 +2806,7 @@ impl Actor {
             state: view.state,
             reason,
             simulated: view.simulated,
+            identity: self.identity,
         };
         let (notifier, events, transition_id) = (self.notifier.clone(), self.events.clone(), entry.transition_id);
         // Off the actor: a notifier may block; its failure changes nothing but one event.

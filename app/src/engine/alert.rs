@@ -18,6 +18,11 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use tong_funding_core::risk::ExecutionMode;
+
+use crate::identity::ProcessIdentity;
+use crate::ui::env_label::EnvLabel;
+
 use serde_json::Value;
 use tong_funding_core::pair::PairState;
 use tong_funding_core::redact::redact_secrets;
@@ -133,6 +138,8 @@ pub struct AlertNotice {
     pub state: PairState,
     pub reason: AlertReason,
     pub simulated: bool,
+    /// Which world the process lives in (live-banners): the notice names it, never guesses it.
+    pub identity: ProcessIdentity,
 }
 
 impl AlertNotice {
@@ -140,7 +147,7 @@ impl AlertNotice {
         format!("tong-funding: {} {}", self.symbol, self.state)
     }
     pub fn body(&self) -> String {
-        let mode = if self.simulated { "SIMULATION" } else { "EXCHANGE_DEMO" };
+        let mode = EnvLabel::of(self.identity, if self.simulated { ExecutionMode::Simulation } else { ExecutionMode::ExchangeDemo }).env_name();
         redact_secrets(&format!("{} ({mode}) needs a manual decision: {}. Nothing is done automatically.", self.pair_id, self.reason.as_str()))
     }
 }
@@ -288,8 +295,29 @@ mod tests {
             state: PairState::PartialFailure,
             reason: AlertReason::SubmitRejected,
             simulated: false,
+            identity: ProcessIdentity::Demo,
         };
         assert!(n.title().contains("BTCUSDT") && n.title().contains("PARTIAL_FAILURE"));
         assert!(n.body().contains("SUBMIT_REJECTED") && n.body().contains("EXCHANGE_DEMO"));
+    }
+
+    fn notice(simulated: bool, identity: ProcessIdentity) -> AlertNotice {
+        AlertNotice { pair: "u1".into(), pair_id: "pid-u1".into(), symbol: "BTCUSDT".into(), state: PairState::PartialFailure, reason: AlertReason::SubmitRejected, simulated, identity }
+    }
+
+    // live-banners: the wording of the environment comes from the process identity.
+    #[test]
+    fn a_live_partial_failure_notice_says_live_not_demo() {
+        let body = notice(false, ProcessIdentity::Live).body();
+        assert!(body.contains("(LIVE)"), "{body}");
+        assert!(!body.contains("EXCHANGE_DEMO") && !body.contains("DEMO"), "{body}");
+    }
+
+    #[test]
+    fn demo_and_simulation_notices_keep_their_words() {
+        assert!(notice(false, ProcessIdentity::Demo).body().contains("(EXCHANGE_DEMO)"));
+        assert!(notice(true, ProcessIdentity::Demo).body().contains("(SIMULATION)"));
+        let live_sim = notice(true, ProcessIdentity::Live).body();
+        assert!(live_sim.contains("(LIVE SIMULATION)"), "{live_sim}");
     }
 }
