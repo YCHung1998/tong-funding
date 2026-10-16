@@ -316,9 +316,14 @@ pub struct LiveSource {
     gate: RefreshGate,
     refresh_tx: mpsc::UnboundedSender<RefreshGuard>,
     db: Option<Db>,
+    identity: crate::identity::ProcessIdentity,
 }
 
 impl ReadOnlyDataSource for LiveSource {
+    fn identity(&self) -> crate::identity::ProcessIdentity {
+        self.identity
+    }
+
     fn drain_updates(&self) -> Vec<SourceUpdate> {
         std::mem::take(&mut *self.shared.updates.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
@@ -443,17 +448,17 @@ impl LiveSource {
 
     /// Starts every feed and the engine on a background runtime over the ONE store instance the
     /// composition root opened (`None` = no store: the engine does not start). Never blocks the UI.
-    pub fn start(db: Option<Db>) -> Arc<LiveSource> {
+    pub fn start(db: Option<Db>, identity: crate::identity::ProcessIdentity) -> Arc<LiveSource> {
         let clock: Arc<SystemClock> = Arc::new(SystemClock);
         let shared = Arc::new(Shared { updates: Mutex::new(Vec::new()), engine: std::sync::OnceLock::new(), rules_tx: std::sync::OnceLock::new(), cap_tx: std::sync::OnceLock::new(), cap_asked: Mutex::new(HashMap::new()) });
         let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
         let gate = RefreshGate::default();
-        let source = Arc::new(LiveSource { shared: shared.clone(), gate: gate.clone(), refresh_tx, db: db.clone() });
+        let source = Arc::new(LiveSource { shared: shared.clone(), gate: gate.clone(), refresh_tx, db: db.clone(), identity });
 
         std::thread::Builder::new()
             .name("tong-funding-data".into())
             .spawn(move || match tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build() {
-                Ok(rt) => rt.block_on(run(shared, db, gate, refresh_rx, clock)),
+                Ok(rt) => rt.block_on(run(shared, db, gate, refresh_rx, clock, identity)),
                 Err(e) => eprintln!("data runtime failed to start: {e}"),
             })
             .ok();
@@ -482,6 +487,8 @@ struct Ctx {
     last_accounts: Mutex<BTreeMap<Exchange, (AccountData, i64)>>,
     /// Simulator price book and the engine's market watch, once the engine runs.
     feed: std::sync::OnceLock<(Arc<SimPriceBook>, watch::Sender<MarketPrices>)>,
+    /// live-banners: the process identity, handed to the engine.
+    identity: crate::identity::ProcessIdentity,
 }
 
 struct NullSink;
@@ -489,7 +496,7 @@ impl EventSink for NullSink {
     fn emit(&self, _: &str, _: Option<&str>, _: serde_json::Value) {}
 }
 
-async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh_rx: mpsc::UnboundedReceiver<RefreshGuard>, clock: Arc<SystemClock>) {
+async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh_rx: mpsc::UnboundedReceiver<RefreshGuard>, clock: Arc<SystemClock>, identity: crate::identity::ProcessIdentity) {
     let time: Arc<dyn TimeSource> = clock.clone();
     let events = db.clone().map(EventStore::new);
     let sink: Arc<dyn EventSink> = match &events {
@@ -524,6 +531,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
         enabled: Mutex::new(settings.risk.allowed_exchanges.iter().copied().collect()),
         last_accounts: Mutex::new(BTreeMap::new()),
         feed: std::sync::OnceLock::new(),
+        identity,
     });
 
     let public = match PublicTransport::new() {
@@ -935,7 +943,7 @@ where
         sim_account: sim_account.clone(),
         reconciler: Some(reconciler),
         notifier: Arc::new(LogNotifier),
-        identity: crate::identity::ProcessIdentity::Demo,
+        identity: ctx.identity,
     };
     let handle = engine_actor::start(deps);
     let _ = ctx.feed.set((prices, handle.market.clone()));

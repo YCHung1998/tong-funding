@@ -9,7 +9,9 @@ use serde_json::Value;
 use tong_funding_core::pnl::{CompareItem, Comparison, Component, FundingFetchState, PnlBreakdown, SlotState, match_slots};
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
+use super::env_label::EnvLabel;
 use super::format::{self, DASH};
+use crate::identity::ProcessIdentity;
 use crate::funding::pnl_record::{assemble, latest_pnl, pair_events};
 use crate::funding::{FETCH_ERROR, FUNDING_LEDGER_FETCHED, PNL_RECONCILIATION, PNL_RETRY_WINDOW_MS};
 use crate::store::db::Db;
@@ -385,9 +387,10 @@ fn money_or_dash(b: &PnlBreakdown, c: Component, v: Decimal) -> String {
 }
 
 /// The "預期對實際" panel of a pair, `None` while no PnL exists.
-pub fn pnl_panel(f: &PairFunding) -> Option<PnlPanel> {
+pub fn pnl_panel(f: &PairFunding, identity: ProcessIdentity) -> Option<PnlPanel> {
+    let mode = EnvLabel::of_pair(identity, f.simulated).env_name().to_string();
     if f.simulated {
-        return Some(PnlPanel { mode: "SIMULATION".into(), status_line: Some(SIMULATED_NO_PNL.into()), lines: Vec::new(), safety_margin: None, settlement_note: None, breakdown: Vec::new() });
+        return Some(PnlPanel { mode, status_line: Some(SIMULATED_NO_PNL.into()), lines: Vec::new(), safety_margin: None, settlement_note: None, breakdown: Vec::new() });
     }
     let p = f.pnl.as_ref()?;
     let status_line = (p.status != "COMPLETE").then(|| format!("{} · {}", p.status, p.reasons.join("；")));
@@ -441,7 +444,7 @@ pub fn pnl_panel(f: &PairFunding) -> Option<PnlPanel> {
         }
         None => Vec::new(),
     };
-    Some(PnlPanel { mode: "EXCHANGE_DEMO".into(), status_line, lines, safety_margin, settlement_note, breakdown })
+    Some(PnlPanel { mode, status_line, lines, safety_margin, settlement_note, breakdown })
 }
 
 #[cfg(test)]

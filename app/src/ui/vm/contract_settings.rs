@@ -4,10 +4,10 @@
 //! quantity from a stale price or from missing rules.
 
 use tong_funding_core::quantity::{MatchedLeg, Quantity, QuantityError, matched_quantity};
-use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{CommandSink, ContractTemplate, Settings, UiSnapshot};
+use super::env_label::EnvLabel;
 use super::format;
 use crate::engine::command::Command;
 use crate::engine::ports::OrderRules;
@@ -73,16 +73,15 @@ fn parse_positive(label: &str, raw: &str, errors: &mut Vec<String>) -> Option<De
     }
 }
 
-fn mode_text(mode: Option<ExecutionMode>) -> &'static str {
-    match mode {
-        Some(ExecutionMode::Simulation) => "SIMULATION",
-        Some(ExecutionMode::ExchangeDemo) => "EXCHANGE_DEMO",
+fn mode_text(env: Option<EnvLabel>) -> &'static str {
+    match env {
+        Some(l) => l.env_name(),
         None => "未知",
     }
 }
 
 /// Evaluates the form. Pure.
-pub fn evaluate(form: &ContractForm, settings: &Settings, mode: Option<ExecutionMode>) -> ContractVm {
+pub fn evaluate(form: &ContractForm, settings: &Settings, env: Option<EnvLabel>) -> ContractVm {
     let mut errors = Vec::new();
     let notional = parse_positive("Target Notional", &form.notional, &mut errors);
     let (leverage, margin, formula) = match form.mode {
@@ -122,7 +121,7 @@ pub fn evaluate(form: &ContractForm, settings: &Settings, mode: Option<Execution
         can_save: errors.is_empty() && notional.is_some() && leverage.is_some(),
         errors,
         leverage_warning,
-        mode_label: mode_text(mode),
+        mode_label: mode_text(env),
     }
 }
 

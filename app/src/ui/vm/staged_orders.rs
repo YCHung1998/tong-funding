@@ -21,6 +21,7 @@ use super::contract_settings::{pair_quantity, QuoteCell};
 use super::leverage_cap::{self, CapCheck};
 use super::positions::{spread_view, SpreadView};
 use super::engine_view::{blocker_text, refusing_blockers};
+use super::env_label::{ConfirmKind, EnvLabel};
 use super::risk_settings::missing_display;
 use crate::engine::command::{Blocker, Command, PairView};
 use crate::engine::ports::OrderSide;
@@ -51,6 +52,8 @@ pub struct StagedRow {
     pub selected: bool,
     /// Time until the entry trigger (`T − entry_lead`), if still ahead.
     pub entry_in_ms: Option<i64>,
+    /// live-banners: `LIVE` in a Live process.
+    pub badge: Option<&'static str>,
 }
 
 /// The cost estimate of one pair, or why there is none (no number is shown without its inputs).
@@ -161,7 +164,19 @@ pub struct PendingConfirm {
     pub pairs: Vec<String>,
     pub legs: Vec<ConfirmLeg>,
     pub mode: ExecutionMode,
+    pub env: EnvLabel,
     pub env_text: String,
+}
+
+impl PendingConfirm {
+    /// The environment and the total amount of every leg listed, repeated in the confirmation.
+    pub fn env_line(&self) -> String {
+        self.env.confirm_env_line(Some(self.legs.iter().map(|l| l.notional).sum()))
+    }
+
+    pub fn button(&self) -> &'static str {
+        self.env.confirm_button(ConfirmKind::Enter)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +245,9 @@ pub struct ManualHandling {
     pub symbol: String,
     pub state: PairState,
     pub simulated: bool,
+    /// The world of this pair (live-banners) and its two legs' notional from the scan snapshot.
+    pub env: EnvLabel,
+    pub notional: Option<Decimal>,
     /// Per leg: exchange and the latest position read (signed).
     pub legs: Vec<(Exchange, Result<Decimal, String>)>,
     /// "人工要求平倉": the non-flat legs, or why the positions are not known.
@@ -250,6 +268,19 @@ pub struct CloseConfirm {
     pub uuid: String,
     pub symbol: String,
     pub legs: Vec<CloseLeg>,
+    pub env: EnvLabel,
+    /// Both legs' notional from the scan snapshot, when known.
+    pub notional: Option<Decimal>,
+}
+
+impl CloseConfirm {
+    pub fn env_line(&self) -> String {
+        self.env.confirm_env_line(self.notional)
+    }
+
+    pub fn button(&self) -> &'static str {
+        self.env.confirm_button(ConfirmKind::Close)
+    }
 }
 
 /// A RECONCILED pair (exit countdown / close now).
@@ -260,11 +291,22 @@ pub struct RunningRow {
     pub exit_in_ms: i64,
     /// MANUAL: "立即平倉" is offered (with its own confirmation).
     pub close_now: bool,
+    pub env: EnvLabel,
+    /// Both legs' notional from the scan snapshot, when known.
+    pub notional: Option<Decimal>,
     /// spread-position-tag: live positive / negative / neutral tag; `None` = not shown (price missing / stale).
     pub spread: Option<SpreadView>,
 }
 
 impl RunningRow {
+    pub fn env_line(&self) -> String {
+        self.env.confirm_env_line(self.notional)
+    }
+
+    pub fn button(&self) -> &'static str {
+        self.env.confirm_button(ConfirmKind::Close)
+    }
+
     pub fn action_text(&self) -> &'static str {
         if self.close_now { "立即平倉" } else { "自動" }
     }
@@ -278,6 +320,7 @@ pub struct StagedVm {
     pub summary: Summary,
     pub disabled: Vec<DisabledReason>,
     pub mode: Option<ExecutionMode>,
+    pub identity: crate::identity::ProcessIdentity,
     pub trigger_mode: Option<TriggerMode>,
     /// Binance / Bybit available margin text (never 0 for unknown).
     pub margins: Vec<(Exchange, String)>,
@@ -289,8 +332,7 @@ pub struct StagedVm {
 impl StagedVm {
     pub fn mode_label(&self) -> &'static str {
         match self.mode {
-            Some(ExecutionMode::Simulation) => "SIMULATION",
-            Some(ExecutionMode::ExchangeDemo) => "EXCHANGE_DEMO",
+            Some(m) => EnvLabel::of(self.identity, m).env_name(),
             None => "未知",
         }
     }
@@ -390,6 +432,11 @@ fn cost_of(snap: &UiSnapshot, p: &PairView, leverage: Option<Decimal>, long_qty:
     })
 }
 
+/// Both legs' notional of a pair, from its scan snapshot.
+fn pair_notional(snap: &UiSnapshot, uuid: &str) -> Option<Decimal> {
+    snap.pair_entries.get(uuid).and_then(|e| dec_of(e, "notional_usdt")).map(|n| n * Decimal::from(2))
+}
+
 fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms: i64) -> StagedRow {
     let empty = Value::Null;
     let entry = snap.pair_entries.get(&p.internal_uuid).unwrap_or(&empty);
@@ -437,6 +484,7 @@ fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms:
         short_qty,
         cap,
         entry_in_ms: (entry_at > now_ms).then_some(entry_at - now_ms),
+        badge: EnvLabel::from_snapshot(snap).badge(),
     }
 }
 
@@ -506,6 +554,8 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         .iter()
         .filter(|p| p.state == PairState::Reconciled)
         .map(|p| RunningRow {
+            env: EnvLabel::of_pair(snap.identity, p.simulated),
+            notional: pair_notional(snap, &p.internal_uuid),
             uuid: p.internal_uuid.clone(),
             symbol: p.symbol.clone(),
             exit_in_ms: p.settlement_ms + exit_delay - now_ms,
@@ -520,6 +570,7 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         summary,
         disabled,
         mode: engine.map(|e| e.execution_mode),
+        identity: snap.identity,
         trigger_mode,
         margins,
         last_results: last_results(snap, 5),
@@ -536,13 +587,6 @@ pub fn select_all(vm: &StagedVm) -> BTreeSet<String> {
 /// "全不選".
 pub fn select_none() -> BTreeSet<String> {
     BTreeSet::new()
-}
-
-pub fn env_text(mode: ExecutionMode) -> &'static str {
-    match mode {
-        ExecutionMode::Simulation => "SIMULATION：由模擬器成交，不會送出真實訂單",
-        ExecutionMode::ExchangeDemo => "EXCHANGE_DEMO：將對 demo / testnet 帳戶真實下單",
-    }
 }
 
 fn confirm_legs(r: &StagedRow) -> Option<[ConfirmLeg; 2]> {
@@ -563,7 +607,8 @@ pub fn open_confirm(vm: &StagedVm) -> Option<PendingConfirm> {
         legs.extend(confirm_legs(r)?);
         pairs.push(r.uuid.clone());
     }
-    (!pairs.is_empty()).then(|| PendingConfirm { pairs, legs, mode, env_text: env_text(mode).into() })
+    let env = EnvLabel::of(vm.identity, mode);
+    (!pairs.is_empty()).then(|| PendingConfirm { pairs, legs, mode, env, env_text: env.staged_env_text().into() })
 }
 
 /// The user confirmed: pairs that left PREPARED meanwhile are excluded; the rest go in ONE command.
@@ -653,6 +698,8 @@ fn handling(snap: &UiSnapshot, p: &PairView) -> ManualHandling {
         symbol: p.symbol.clone(),
         state: p.state,
         simulated: p.simulated,
+        env: EnvLabel::of_pair(snap.identity, p.simulated),
+        notional: pair_notional(snap, &p.internal_uuid),
         legs: reads.into_iter().map(|(ex, r)| (ex, r.map(|(q, _)| q))).collect(),
         close,
         confirm_closed,
@@ -661,7 +708,7 @@ fn handling(snap: &UiSnapshot, p: &PairView) -> ManualHandling {
 
 /// Opens the "人工要求平倉" confirmation (the legs and actual positions); sends nothing.
 pub fn request_close(h: &ManualHandling) -> Option<CloseConfirm> {
-    h.close.as_ref().ok().map(|legs| CloseConfirm { uuid: h.uuid.clone(), symbol: h.symbol.clone(), legs: legs.clone() })
+    h.close.as_ref().ok().map(|legs| CloseConfirm { uuid: h.uuid.clone(), symbol: h.symbol.clone(), legs: legs.clone(), env: h.env, notional: h.notional })
 }
 
 /// After its confirmation: the engine re-reads positions and closes reduce-only.
@@ -755,7 +802,7 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
             let alert_state = matches!(state.as_str(), "PARTIAL_FAILURE" | "IMBALANCED" | "UNRESOLVED");
             let leg_failed = legs.iter().any(|l| matches!(l.status, LegStatus::Rejected(_) | LegStatus::Unknown(_)));
             let needs_manual = alert_state || leg_failed;
-            let mode_label = if simulated { "SIMULATION" } else { "EXCHANGE_DEMO" };
+            let mode_label = EnvLabel::of_pair(snap.identity, simulated).env_name();
             let headline = if needs_manual {
                 format!("{mode_label} · {symbol} · 需人工處理（目前狀態 {state}）")
             } else if !failed_checks.is_empty() {

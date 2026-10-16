@@ -43,6 +43,8 @@ pub mod risk_settings;
 pub mod staged_orders;
 #[path = "vm/dashboard.rs"]
 pub mod dashboard;
+#[path = "vm/env_label.rs"]
+pub mod env_label;
 #[path = "vm/engine_view.rs"]
 pub mod engine_view;
 #[path = "vm/format.rs"]
@@ -71,6 +73,8 @@ mod risk_help_ui_tests;
 mod auto_add_ui_tests;
 #[cfg(test)]
 mod notifications_ui_tests;
+#[cfg(test)]
+mod env_banner_ui_tests;
 #[cfg(test)]
 mod scan_table_ui_tests;
 #[cfg(test)]

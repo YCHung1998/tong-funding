@@ -697,3 +697,75 @@ mod okx {
         assert_eq!(vm.margins.iter().find(|m| m.0 == Exchange::Okx).unwrap().1, "4,640.50 USDT");
     }
 }
+
+// ---- live-banners 3.1 / 3.3 / 3.4 -------------------------------------------------------------------
+
+fn live_snap(mode: ExecutionMode) -> UiSnapshot {
+    let mut s = snap();
+    s.identity = crate::identity::ProcessIdentity::Live;
+    eng(&mut s).execution_mode = mode;
+    if mode == ExecutionMode::ExchangeDemo {
+        put_caps(&mut s, "BTCUSDT", "20", "10");
+    }
+    s
+}
+
+#[test]
+fn a_live_confirmation_repeats_the_environment_and_the_amount() {
+    let vm = build(&live_snap(ExecutionMode::ExchangeDemo), &sel(&["u-BTCUSDT"]), NOW);
+    let p = open_confirm(&vm).unwrap();
+    assert!(p.env_text.starts_with("LIVE 真錢"), "{}", p.env_text);
+    assert!(p.env_line().contains("LIVE 真錢") && p.env_line().contains("2,400.00"), "two legs of 1,200: {}", p.env_line());
+    assert_eq!(p.button(), "以真錢下單");
+}
+
+#[test]
+fn a_demo_confirmation_has_no_real_money_wording() {
+    let mut s = snap();
+    eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
+    put_caps(&mut s, "BTCUSDT", "20", "10");
+    let p = open_confirm(&build(&s, &sel(&["u-BTCUSDT"]), NOW)).unwrap();
+    assert!(p.env_line().contains("DEMO") && p.env_line().contains("2,400.00"));
+    assert!(!p.env_line().contains("真錢") && !p.env_line().contains("LIVE") && !p.env_text.contains("LIVE"));
+    assert_eq!(p.button(), "確認送出");
+}
+
+#[test]
+fn staged_vm_and_rows_name_the_live_world() {
+    let vm = build(&live_snap(ExecutionMode::ExchangeDemo), &BTreeSet::new(), NOW);
+    assert_eq!(vm.mode_label(), "LIVE");
+    assert!(vm.rows.iter().all(|r| r.badge == Some("LIVE")));
+    let demo = build(&snap(), &BTreeSet::new(), NOW);
+    assert!(demo.rows.iter().all(|r| r.badge.is_none()));
+    assert_eq!(build(&live_snap(ExecutionMode::Simulation), &BTreeSet::new(), NOW).mode_label(), "LIVE SIMULATION");
+}
+
+#[test]
+fn a_live_result_and_its_headline_say_live() {
+    let mut s = live_snap(ExecutionMode::ExchangeDemo);
+    s.trade_events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "accepted", "client_order_id": "livedso1", "exchange_order_id": "b-77"}), "RECONCILED");
+    let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
+    assert_eq!(a.mode_label, "LIVE");
+    assert!(a.headline.starts_with("LIVE"), "{}", a.headline);
+}
+
+#[test]
+fn close_now_and_manual_close_confirmations_say_real_money_in_a_live_process() {
+    let mut s = live_snap(ExecutionMode::ExchangeDemo);
+    eng(&mut s).pairs[0] = pv("u-BTCUSDT", "BTCUSDT", PairState::Reconciled, false);
+    eng(&mut s).pairs[1] = pv("u-ETHUSDT", "ETHUSDT", PairState::PartialFailure, false);
+    let vm = build(&s, &BTreeSet::new(), NOW);
+    let run = vm.running.iter().find(|r| r.symbol == "BTCUSDT").unwrap();
+    assert!(run.env_line().contains("LIVE 真錢") && run.env_line().contains("2,400.00"), "{}", run.env_line());
+    assert_eq!(run.button(), "以真錢平倉");
+    let h = vm.manual.iter().find(|h| h.symbol == "ETHUSDT").unwrap();
+    assert_eq!(h.env.env_name(), "LIVE");
+    let c = CloseConfirm { uuid: h.uuid.clone(), symbol: h.symbol.clone(), legs: vec![], env: h.env, notional: h.notional };
+    assert!(c.env_line().contains("LIVE 真錢"));
+    assert_eq!(c.button(), "以真錢平倉");
+    // The same pair in a Demo process keeps the old words.
+    s.identity = crate::identity::ProcessIdentity::Demo;
+    let demo = build(&s, &BTreeSet::new(), NOW);
+    assert_eq!(demo.running.iter().find(|r| r.symbol == "BTCUSDT").unwrap().button(), "確認平倉");
+    assert_eq!(demo.manual[0].env.env_name(), "EXCHANGE_DEMO");
+}

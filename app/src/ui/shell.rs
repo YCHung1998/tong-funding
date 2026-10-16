@@ -24,7 +24,8 @@ use super::pages::{self, ClickFn, ScannerTable, small, text};
 use super::positions::{self, PositionsVm};
 use super::scan_view::{ScanColumn, ScanEvent, ScanViewState, table_rows};
 use super::scanner::{self, RowsView, ScannerVm, TableState as ScanState};
-use super::status::{Connection, StatusModel, ENVIRONMENT_LABEL};
+use super::env_label::{BannerTone, EnvBanner, EnvLabel};
+use super::status::{Connection, StatusModel};
 use super::system_log::{self, LogFilter, LogRow, SystemLogVm};
 use super::theme;
 use super::units::{fs, rx};
@@ -127,7 +128,9 @@ fn wall_ms() -> i64 {
 impl Shell {
     pub fn new(source: Arc<dyn ReadOnlyDataSource>, sink: Arc<dyn CommandSink>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let now_ms = wall_ms();
-        let snap = UiSnapshot::default();
+        // The process identity is fixed before the first frame (live-banners): never a flash of DEMO.
+        let identity = source.identity();
+        let snap = UiSnapshot { identity, ..UiSnapshot::default() };
         let trading = TradingState::new(window, cx);
         let scan_events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let table = cx.new(|cx| TableState::new(ScannerTable::new(now_ms, trading.toggles.clone(), scan_events.clone()), window, cx).col_movable(false).col_resizable(false).col_selectable(false));
@@ -140,7 +143,7 @@ impl Shell {
             source,
             sink,
             trading,
-            bridge: Bridge::default(),
+            bridge: Bridge::with_identity(identity),
             scanner: scanner::build(&snap, now_ms),
             dashboard: dashboard::build(&snap, now_ms),
             positions: positions::build(&snap, &positions::Filter::default(), now_ms),
@@ -254,6 +257,7 @@ impl Shell {
 
     fn status_model(&self) -> StatusModel {
         let mut s = StatusModel::default();
+        s.identity = self.snap.identity;
         // The badge shows the engine's mode (SIMULATION while the engine is not running).
         s.mode = match self.snap.engine.as_ref().map(|e| e.execution_mode) {
             Some(tong_funding_core::risk::ExecutionMode::ExchangeDemo) => super::status::ExecutionMode::ExchangeDemo,
@@ -330,7 +334,7 @@ impl Shell {
                     .items_center()
                     .gap_3()
                     .child(div().text_color(rgb(theme::ACCENT)).text_size(fs(14.0)).child("◈ Funding Monitor"))
-                    .child(div().px_2().py_1().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::WARNING)).child(ENVIRONMENT_LABEL)),
+                    .child(div().px_2().py_1().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(if self.snap.identity == crate::identity::ProcessIdentity::Live { theme::NEGATIVE } else { theme::WARNING })).child(EnvLabel::header_chip(self.snap.identity))),
             )
             .child(
                 div()
@@ -353,6 +357,18 @@ impl Shell {
     pub(crate) fn notification_state(&self) -> (usize, usize, usize, bool, usize) {
         let a = self.attention();
         (a.critical.len(), a.notices.len(), a.reviews.len(), self.drawer_open, self.acks.len())
+    }
+
+    /// Test view of the environment banner as drawn (live-banners smoke test).
+    #[cfg(test)]
+    pub(crate) fn env_banner_state(&self) -> EnvBanner {
+        EnvBanner::of_snapshot(&self.snap)
+    }
+
+    /// Test view of the identity the status bar badge uses.
+    #[cfg(test)]
+    pub(crate) fn status_identity(&self) -> crate::identity::ProcessIdentity {
+        self.status.identity
     }
 
     pub(crate) fn toggle_drawer(&mut self) {
@@ -436,6 +452,33 @@ impl Shell {
                 cx.notify();
             })),
         ))
+    }
+
+    /// The fixed environment banner (live-banners): always present, no handler, text AND colour.
+    fn env_banner(&self) -> Div {
+        let b = EnvBanner::of_snapshot(&self.snap);
+        let (bg, fg) = theme::banner_colors(b.tone);
+        let mut row = div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .w_full()
+            .h(rx(28.0))
+            .px_4()
+            .bg(rgb(bg))
+            .text_color(rgb(fg))
+            .text_size(fs(13.0))
+            .font_weight(FontWeight::BOLD)
+            .child(b.text);
+        if let Some(k) = b.kill_switch_text {
+            row = row.child(format!("· {k}"));
+        }
+        // Referenced so a new tone cannot be added without choosing its colours here too.
+        match b.tone {
+            BannerTone::Live | BannerTone::Demo | BannerTone::Simulation => row,
+        }
     }
 
     fn banner(&self, cx: &mut Context<Self>) -> Option<Div> {
@@ -739,7 +782,7 @@ impl Shell {
             }
             cx.notify();
         }));
-        pages::system_log_page(self.log_vm.as_ref(), self.log_error.as_ref(), &selected, &on_type, on_older)
+        pages::system_log_page(self.log_vm.as_ref(), self.log_error.as_ref(), &selected, &on_type, on_older, self.snap.identity)
     }
 
     fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -771,7 +814,7 @@ impl Shell {
             .border_t_1()
             .border_color(rgb(theme::BORDER))
             .text_size(fs(10.0));
-        let mut left = div().flex().items_center().gap_4().child(div().px_2().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::ACCENT)).child(self.status.mode.label()));
+        let mut left = div().flex().items_center().gap_4().child(div().px_2().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::ACCENT)).child(self.status.mode.label(self.status.identity)));
         for (name, conn) in &self.status.exchanges {
             let dot = if *conn == Connection::Connected { theme::POSITIVE } else { theme::TEXT_MUTED };
             left = left.child(
@@ -820,6 +863,7 @@ impl Render for Shell {
         // Region order comes from the tested `banner::layout`: the banner is on every page.
         for region in banner::layout(self.page) {
             root = match region {
+                Region::EnvBanner => root.child(self.env_banner()),
                 Region::Header => root.child(self.header(cx)),
                 Region::Banner => match self.banner(cx) {
                     Some(b) => root.child(b),

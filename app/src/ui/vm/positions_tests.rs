@@ -344,3 +344,25 @@ fn a_locked_card_shows_the_tag_only_while_a_leg_is_held() {
     let vm = build(&s, &Filter::default(), NOW);
     assert_eq!(btc_card(&vm).spread, None);
 }
+
+// ---- live-banners 3.4: the LIVE badge on pair cards ----------------------------------------------
+
+#[test]
+fn live_pair_cards_carry_the_live_badge_and_demo_ones_do_not() {
+    let mut s = four();
+    s.identity = crate::identity::ProcessIdentity::Live;
+    let vm = build(&s, &Filter::default(), NOW);
+    assert!(!vm.pair_cards.is_empty() && vm.pair_cards.iter().all(|c| c.badge == Some("LIVE")));
+    s.identity = crate::identity::ProcessIdentity::Demo;
+    assert!(build(&s, &Filter::default(), NOW).pair_cards.iter().all(|c| c.badge.is_none()));
+}
+
+#[test]
+fn locked_pair_cards_carry_the_badge_too() {
+    let mut s = four();
+    s.identity = crate::identity::ProcessIdentity::Live;
+    s.pairs.push(pair("p3", "SOLUSDT", Binance, Bybit, PairState::PartialFailure));
+    let vm = build(&s, &Filter::default(), NOW);
+    let locked = vm.pair_cards.iter().find(|c| c.symbol == "SOLUSDT").expect("locked pair card");
+    assert_eq!(locked.badge, Some("LIVE"));
+}

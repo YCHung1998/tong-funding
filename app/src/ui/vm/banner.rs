@@ -13,6 +13,8 @@ use crate::ui::nav::Page;
 /// Vertical regions of the main window, top to bottom.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Region {
+    /// live-banners: the fixed environment banner, above everything and not dismissable.
+    EnvBanner,
     Header,
     Banner,
     Content,
@@ -20,9 +22,9 @@ pub enum Region {
 }
 
 /// Window layout for a page: the banner is always directly under the header.
-pub fn layout(_page: Page) -> [Region; 4] {
-    // Deliberately independent of the page: the banner never depends on page data.
-    [Region::Header, Region::Banner, Region::Content, Region::StatusBar]
+pub fn layout(_page: Page) -> [Region; 5] {
+    // Deliberately independent of the page: the banners never depend on page data.
+    [Region::EnvBanner, Region::Header, Region::Banner, Region::Content, Region::StatusBar]
 }
 
 fn age_text(category: Category, ms: i64) -> String {

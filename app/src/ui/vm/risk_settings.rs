@@ -11,6 +11,8 @@ use tong_funding_core::risk::{effective_for_pair, EffectiveConfig, ExecutionMode
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{CommandSink, Settings};
+use super::env_label::EnvLabel;
+use crate::identity::ProcessIdentity;
 use crate::engine::command::Command;
 
 /// One editable number on the page.
@@ -560,18 +562,12 @@ pub fn save(vm: &RiskVm, sink: &dyn CommandSink) -> bool {
 /// The only two modes the page offers (no LIVE).
 pub const MODE_OPTIONS: [ExecutionMode; 2] = [ExecutionMode::Simulation, ExecutionMode::ExchangeDemo];
 
-pub fn mode_label(m: ExecutionMode) -> &'static str {
-    match m {
-        ExecutionMode::Simulation => "SIMULATION",
-        ExecutionMode::ExchangeDemo => "EXCHANGE_DEMO",
-    }
+pub fn mode_label(identity: ProcessIdentity, m: ExecutionMode) -> &'static str {
+    EnvLabel::mode_option_name(identity, m)
 }
 
-pub fn mode_description(m: ExecutionMode) -> &'static str {
-    match m {
-        ExecutionMode::Simulation => "跑完整流程與送單前檢查，訂單由模擬器成交，不送到任何交易所；不涉及真錢。",
-        ExecutionMode::ExchangeDemo => "對 demo / testnet 帳戶真實下單，會真的改變帳戶內的倉位；不涉及真錢。",
-    }
+pub fn mode_description(identity: ProcessIdentity, m: ExecutionMode) -> &'static str {
+    EnvLabel::of(identity, m).mode_description()
 }
 
 /// Why `EXCHANGE_DEMO` cannot be chosen now (`Ok` = it can).
@@ -600,7 +596,7 @@ pub enum ModeStep {
 }
 
 /// The user picked `target`. `Err` = refused with the reason (nothing sent).
-pub fn request_mode(current: ExecutionMode, target: ExecutionMode, settings: &Settings, demo_keys: Option<&Result<(), String>>, sink: &dyn CommandSink) -> Result<ModeStep, String> {
+pub fn request_mode(identity: ProcessIdentity, current: ExecutionMode, target: ExecutionMode, settings: &Settings, demo_keys: Option<&Result<(), String>>, sink: &dyn CommandSink) -> Result<ModeStep, String> {
     if current == target {
         return Ok(ModeStep::Unchanged);
     }
@@ -610,15 +606,15 @@ pub fn request_mode(current: ExecutionMode, target: ExecutionMode, settings: &Se
             Ok(ModeStep::Confirm(target))
         }
         ExecutionMode::Simulation => {
-            send_mode(target, sink);
+            send_mode(identity, target, sink);
             Ok(ModeStep::Sent)
         }
     }
 }
 
 /// After the confirmation: the engine switches (and records `EXECUTION_MODE_CHANGED`).
-pub fn send_mode(target: ExecutionMode, sink: &dyn CommandSink) {
-    sink.send(format!("切換模式 → {}", mode_label(target)), Command::SetExecutionMode(target));
+pub fn send_mode(identity: ProcessIdentity, target: ExecutionMode, sink: &dyn CommandSink) {
+    sink.send(format!("切換模式 → {}", mode_label(identity, target)), Command::SetExecutionMode(target));
 }
 
 #[cfg(test)]

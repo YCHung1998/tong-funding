@@ -2,6 +2,7 @@
 use tong_funding_core::types::Exchange;
 
 use super::*;
+use crate::identity::ProcessIdentity;
 use crate::ui::testkit::obs;
 
 fn ws_frame(symbol: &str, rate: &str, at: i64) -> SourceUpdate {
@@ -142,4 +143,21 @@ fn the_bybit_websocket_switch_is_kept() {
     assert!(!s.bybit_ws_disabled);
     apply_update(&mut s, SourceUpdate::BybitWsDisabled);
     assert!(s.bybit_ws_disabled);
+}
+
+// ---- live-banners: the process identity reaches the snapshot from the first one on ------------
+
+#[test]
+fn a_bridge_started_with_an_identity_hands_it_to_every_snapshot() {
+    for identity in [ProcessIdentity::Demo, ProcessIdentity::Live] {
+        let mut bridge = Bridge::with_identity(identity);
+        let runs = run(&mut bridge, &[(0, ws_frame("BTCUSDT", "0.0001", 0))], 1_000);
+        assert!(!runs.is_empty());
+        assert!(runs.iter().all(|(_, s)| s.identity == identity), "{identity:?}");
+    }
+}
+
+#[test]
+fn the_default_snapshot_is_demo() {
+    assert_eq!(UiSnapshot::default().identity, ProcessIdentity::Demo);
 }

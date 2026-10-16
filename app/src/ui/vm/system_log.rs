@@ -8,7 +8,10 @@ use crate::store::event_query::{EventPage, EventQuery, PAGE_SIZE, StoredEvent};
 use crate::store::events::SCAN_RUN;
 use crate::store::scan_buffer::ScanRecord;
 
+use super::env_label::EnvLabel;
 use super::format;
+use crate::identity::ProcessIdentity;
+use tong_funding_core::risk::ExecutionMode;
 
 pub const SCAN_RUN_NOTE: &str = "重啟後不保留";
 pub const SCAN_RUN_TAG: &str = "僅本次運行";
@@ -38,6 +41,15 @@ impl LogRow {
     pub fn time_text(&self) -> String {
         format::utc_ms(self.ts_ms)
     }
+}
+
+/// live-banners: the `LIVE` badge of a row that concerns a pair or an order, in a Live process.
+pub fn live_badge(row: &LogRow, identity: ProcessIdentity) -> Option<&'static str> {
+    let related = row.pair_id.is_some() || row.event_type.contains("ORDER");
+    if !related {
+        return None;
+    }
+    EnvLabel::of(identity, ExecutionMode::ExchangeDemo).badge()
 }
 
 /// Type filter: `None` = every type (default).

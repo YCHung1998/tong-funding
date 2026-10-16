@@ -65,6 +65,17 @@ impl Tone {
     }
 }
 
+/// Environment banner colours `(background, text)` by tone (live-banners). Live shares the loss
+/// red on purpose; the words and the fixed place at the very top tell the two apart.
+pub fn banner_colors(tone: crate::ui::env_label::BannerTone) -> (u32, u32) {
+    use crate::ui::env_label::BannerTone;
+    match tone {
+        BannerTone::Live => (NEGATIVE, BG_DEEPEST),
+        BannerTone::Demo => (WARNING, BG_DEEPEST),
+        BannerTone::Simulation => (TEXT_MUTED, BG_DEEPEST),
+    }
+}
+
 /// Funding rate color: > 0 positive, < 0 negative, 0 (or unordered, e.g. NaN) neutral.
 pub fn funding_tone<T: PartialOrd + Default>(rate: T) -> Tone {
     let zero = T::default();

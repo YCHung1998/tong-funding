@@ -12,6 +12,7 @@ use tong_funding_core::spread_tag::{spread_tag, SpreadKind, SpreadTag};
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
 use super::bridge::{AccountState, PairInfo, UiSnapshot, ACCOUNT_EXCHANGES};
+use super::env_label::EnvLabel;
 use super::format::{self, DASH};
 use super::funding::{self as fv, PairFunding, PnlPanel, TimelineRow};
 use crate::exchange::signed::models::Position;
@@ -111,6 +112,7 @@ pub fn spread_view(snap: &UiSnapshot, long_ex: Exchange, short_ex: Exchange, sym
 /// Cards: every grouped (`RECONCILED`) pair, then every locked pair with whatever legs exist.
 fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
     let mut cards = Vec::new();
+    let badge = EnvLabel::from_snapshot(snap).badge();
     for grp in &g.grouping.groups {
         let info = &g.pairs[grp.pair_index];
         let (long, short) = (leg(&g.rows[grp.long_row]), leg(&g.rows[grp.short_row]));
@@ -118,7 +120,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
         let pct = imbalance_pct(long.quantity, short.quantity);
         let imbalanced = pct > tolerance;
         let spread = long.pnl.zip(short.pnl).map(|(l, s)| l + s);
-        let funding = FundingView::of(snap.funding.get(&info.pair_id), spread);
+        let funding = FundingView::of(snap.identity, snap.funding.get(&info.pair_id), spread);
         cards.push(PairCard {
             symbol: info.symbol.clone(),
             label: Some(format!("{} · {}% IMBALANCE", if imbalanced { "IMBALANCED" } else { "HEDGED" }, format::fixed(pct, 2))),
@@ -130,6 +132,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
             funding,
             pair_id: info.pair_id.clone(),
             spread: spread_view(snap, info.long_exchange, info.short_exchange, &info.symbol, now_ms),
+            badge,
         });
     }
     for p in &snap.pairs {
@@ -142,10 +145,10 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
         let (long, short) = (find(p.long_exchange, Side::Long), find(p.short_exchange, Side::Short));
         let pnl = long.as_ref().zip(short.as_ref()).map(|(l, s)| pnl_text(l, s));
         let spread = long.as_ref().and_then(|l| l.pnl).zip(short.as_ref().and_then(|s| s.pnl)).map(|(l, s)| l + s);
-        let funding = FundingView::of(snap.funding.get(&p.pair_id), spread);
+        let funding = FundingView::of(snap.identity, snap.funding.get(&p.pair_id), spread);
         // a locked pair shows the tag only while at least one leg still holds a position
         let spread = (long.is_some() || short.is_some()).then(|| spread_view(snap, p.long_exchange, p.short_exchange, &p.symbol, now_ms)).flatten();
-        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding, pair_id: p.pair_id.clone(), spread });
+        cards.push(PairCard { symbol: p.symbol.clone(), label: None, imbalanced: false, long, short, pnl_text: pnl, state_warning: Some(warning), funding, pair_id: p.pair_id.clone(), spread, badge });
     }
     cards
 }
@@ -234,6 +237,8 @@ pub struct PairCard {
     pub pair_id: String,
     /// spread-position-tag: live positive / negative / neutral tag and spread %; `None` = not shown.
     pub spread: Option<SpreadView>,
+    /// live-banners: `LIVE` in a Live process, so a screenshot alone shows the world.
+    pub badge: Option<&'static str>,
 }
 
 /// The funding part of a pair card (settlement-timeline).
@@ -254,7 +259,7 @@ pub struct FundingView {
 }
 
 impl FundingView {
-    fn of(f: Option<&PairFunding>, spread_unrealized: Option<Decimal>) -> FundingView {
+    fn of(identity: crate::identity::ProcessIdentity, f: Option<&PairFunding>, spread_unrealized: Option<Decimal>) -> FundingView {
         match f {
             None => FundingView {
                 text: format!("Funding 收到 {DASH}（尚未取得）"),
@@ -273,7 +278,7 @@ impl FundingView {
                     tone,
                     running_total: fv::running_total_text(f, spread_unrealized),
                     timeline: fv::timeline_rows(f),
-                    panel: fv::pnl_panel(f),
+                    panel: fv::pnl_panel(f, identity),
                     alerts: f.alerts.iter().map(|a| (a.event_id, format!("{}（事件 #{}）", a.text, a.event_id))).collect(),
                     tracing: fv::tracing_lines(f),
                     recheckable: fv::recheckable(f),

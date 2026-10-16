@@ -213,3 +213,20 @@ fn a_full_buffer_shows_where_its_coverage_starts() {
     let vm = build(&page, &buffer, 200, &f, &first_query(&f), &[]);
     assert_eq!(vm.buffer_note, None);
 }
+
+// ---- live-banners 3.4: pair / order rows of a Live process carry the badge ------------------------
+
+fn log_row(event_type: &str, pair_id: Option<&str>) -> LogRow {
+    LogRow { ts_ms: 1, event_type: event_type.into(), pair_id: pair_id.map(String::from), detail: String::new(), tags: vec![], origin: Origin::Buffer }
+}
+
+#[test]
+fn pair_and_order_rows_get_the_live_badge_only_in_a_live_process() {
+    use crate::identity::ProcessIdentity::{Demo, Live};
+    assert_eq!(live_badge(&log_row("PAIR_TRANSITION", Some("p1")), Live), Some("LIVE"));
+    assert_eq!(live_badge(&log_row("MANUAL_ORDER_RESULT", None), Live), Some("LIVE"));
+    assert_eq!(live_badge(&log_row("ORDER_CANCEL_RESULT", None), Live), Some("LIVE"));
+    assert_eq!(live_badge(&log_row("SCAN_RUN", None), Live), None, "not pair / order related");
+    assert_eq!(live_badge(&log_row("PAIR_TRANSITION", Some("p1")), Demo), None);
+    assert_eq!(live_badge(&log_row("MANUAL_ORDER_RESULT", None), Demo), None);
+}
