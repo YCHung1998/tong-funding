@@ -120,7 +120,7 @@ impl FrameRecorder {
     }
 }
 
-fn wall_ms() -> i64 {
+pub(crate) fn wall_ms() -> i64 {
     // The UI is the one place allowed to read the wall clock (engine and view-models get it injected).
     SystemClock.now_ms()
 }

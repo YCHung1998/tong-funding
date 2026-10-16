@@ -24,6 +24,8 @@ pub mod wiring;
 // module paths stay `ui::<page>` so `cargo test -p tong-funding ui::<page>` selects them.
 #[path = "vm/alerts.rs"]
 pub mod alerts;
+#[path = "vm/arming.rs"]
+pub mod arming;
 #[path = "vm/banner.rs"]
 pub mod banner;
 #[path = "vm/bridge.rs"]

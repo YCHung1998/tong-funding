@@ -14,6 +14,7 @@ use gpui_kit::*;
 use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::Exchange;
 
+use super::arming;
 use super::bridge::{Settings, SourceUpdate, UiSnapshot};
 use super::candidates::{self, CandidateList};
 use super::contract_settings::{self, CalcMode, ContractForm};
@@ -88,6 +89,10 @@ pub struct TradingState {
     pending_manual: Option<ManualPrefill>,
     pending_cancel: Option<CancelPrefill>,
     pub manual_confirm: Option<ManualConfirm>,
+    /// Arming panel (Live only): the sentence the operator types, the ticked checklist and the last refusal.
+    a_confirm: In,
+    pub a_checked: [bool; arming::CHECKLIST.len()],
+    pub a_note: Option<String>,
 }
 
 fn new_input(window: &mut Window, cx: &mut Context<Shell>, value: &str) -> In {
@@ -153,6 +158,9 @@ impl TradingState {
             pending_manual: None,
             pending_cancel: None,
             manual_confirm: None,
+            a_confirm: new_input(window, cx, ""),
+            a_checked: [false; arming::CHECKLIST.len()],
+            a_note: None,
         }
     }
 
@@ -399,6 +407,53 @@ fn opt_money(d: Option<tong_funding_core::types::Decimal>) -> String {
 }
 
 impl Shell {
+    /// The arming panel (live-guardrails 4.2); `None` outside a Live process. Every enabled/disabled
+    /// decision and sentence comes from `arming::evaluate`; this only draws it.
+    fn arming_card(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        let form = arming::ArmingForm { checked: self.trading.a_checked, confirmation: val(&self.trading.a_confirm, cx) };
+        let vm = arming::evaluate(&self.snap, &form, super::shell::wall_ms())?;
+        let (status_color, status_title) = if vm.armed { (theme::POSITIVE, "交易武裝") } else { (theme::WARNING, "交易武裝") };
+        let mut c = card().child(text(status_title, theme::TEXT_PRIMARY)).child(text(vm.status_text.clone(), status_color));
+        // Preflight.
+        c = c.child(div().flex().gap_2().items_center().child(btn("arm-preflight", "執行預檢", vm.can_run_preflight, self.click(cx, |this, cx| {
+            let form = arming::ArmingForm { checked: this.trading.a_checked, confirmation: val(&this.trading.a_confirm, cx) };
+            this.trading.a_note = arming::evaluate(&this.snap, &form, super::shell::wall_ms()).and_then(|vm| arming::run_preflight(&vm, this.sink.as_ref()).err());
+        }))).child(small(vm.preflight_summary.clone(), theme::TEXT_SECONDARY)));
+        for l in &vm.preflight_lines {
+            c = c.child(small(l.text.clone(), if l.pass { theme::POSITIVE } else { theme::NEGATIVE }));
+        }
+        // Caps.
+        c = c.child(text(vm.caps_title, theme::TEXT_PRIMARY));
+        for l in &vm.caps_lines {
+            c = c.child(small(l.clone(), theme::TEXT_SECONDARY));
+        }
+        // Manual checklist and the typed sentence (not offered once armed).
+        if !vm.armed {
+            for (i, item) in vm.checklist.iter().enumerate() {
+                let on = self.trading.a_checked[i];
+                c = c.child(btn(SharedString::from(format!("arm-check-{i}")), format!("{} {item}", if on { "☑" } else { "☐" }), true, self.click(cx, move |this, _| this.trading.a_checked[i] = !this.trading.a_checked[i])));
+            }
+            c = c
+                .child(small(format!("請手動輸入以下文字後才能武裝：{}", vm.confirmation_phrase), theme::WARNING))
+                .child(div().w(rx(420.0)).child(Input::new(&self.trading.a_confirm)));
+            c = c.child(btn("arm-arm", "武裝", vm.can_arm, self.click(cx, |this, cx| {
+                let form = arming::ArmingForm { checked: this.trading.a_checked, confirmation: val(&this.trading.a_confirm, cx) };
+                this.trading.a_note = arming::arm(&this.snap, &form, super::shell::wall_ms(), this.sink.as_ref()).err();
+            })));
+            for b in &vm.arm_blockers {
+                c = c.child(small(format!("尚不能武裝：{b}"), theme::TEXT_MUTED));
+            }
+        }
+        c = c.child(btn("arm-lock", "立即鎖定", vm.can_lock, self.click(cx, |this, cx| {
+            let form = arming::ArmingForm { checked: this.trading.a_checked, confirmation: val(&this.trading.a_confirm, cx) };
+            this.trading.a_note = arming::evaluate(&this.snap, &form, super::shell::wall_ms()).and_then(|vm| arming::lock_now(&vm, this.sink.as_ref()).err());
+        })));
+        if let Some(n) = &self.trading.a_note {
+            c = c.child(small(n.clone(), theme::NEGATIVE));
+        }
+        Some(c)
+    }
+
     fn click(&self, cx: &mut Context<Self>, f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> ClickFn {
         Box::new(cx.listener(move |this: &mut Shell, _: &ClickEvent, _, cx| {
             f(this, cx);
@@ -842,6 +897,9 @@ impl Shell {
             .child(text("?", theme::ACCENT))
             .on_click(|_, window, cx| open_risk_help(window, cx));
         let mut page = div().flex().flex_col().gap_3().child(div().flex().items_center().gap_3().child(title("風控設定", "Risk Management")).child(help_btn));
+        if let Some(c) = self.arming_card(cx) {
+            page = page.child(c);
+        }
         if let Some(t) = &vm.incomplete_text {
             page = page.child(warn_box(vec![t.clone(), EnvLabel::incomplete_settings_text(self.snap.identity)]));
         }
