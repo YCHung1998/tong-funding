@@ -21,13 +21,21 @@ fn main() {
     if args.get(1).map(String::as_str) == Some(store::config_cli::SUBCOMMAND) {
         std::process::exit(store::config_cli::run(&args[2..], &mut std::io::stdout(), &mut std::io::stderr()));
     }
+    // The GUI process identity (live-process): a refused command line stops here, before any window.
+    let identity = match identity::ProcessIdentity::from_args(&args) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     gpui_kit::application().run(move |cx| {
         gpui_kit::init(cx);
         ui::component_theme::apply(cx);
         ui::fonts::register(cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1600.0), px(1000.0)), cx))),
-            titlebar: Some(TitlebarOptions { title: Some("Funding Monitor".into()), ..Default::default() }),
+            titlebar: Some(TitlebarOptions { title: Some(ui::env_label::EnvLabel::window_title(identity).into()), ..Default::default() }),
             ..Default::default()
         };
         // Developer-only spikes (bootstrap-gpui-shell tasks 4.1 / 4.2); see ui/bench.rs.
@@ -45,7 +53,7 @@ fn main() {
                 // Composition root: ONE store instance for the data source and the engine; the
                 // engine starts with the window (headless subcommands above never reach this).
                 let db = store::db::Db::open_default(std::sync::Arc::new(ports::SystemClock)).ok();
-                let live = ui::live::LiveSource::start(db);
+                let live = ui::live::LiveSource::start(db, identity);
                 let source: std::sync::Arc<dyn ui::bridge::ReadOnlyDataSource> = live.clone();
                 let sink: std::sync::Arc<dyn ui::bridge::CommandSink> = live;
                 ui::zoom_ui::install(source.clone(), cx);

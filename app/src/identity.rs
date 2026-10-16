@@ -5,8 +5,9 @@
 #![allow(dead_code)]
 
 /// Which world this process lives in. `Demo` also covers pure SIMULATION.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ProcessIdentity {
+    #[default]
     Demo,
     Live,
 }

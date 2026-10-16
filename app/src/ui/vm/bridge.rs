@@ -347,6 +347,8 @@ pub struct UiSnapshot {
     /// The Bybit WebSocket is switched off on purpose (`TONG_FUNDING_BYBIT_FEED=rest`): its health is
     /// then not expected and no notice is raised.
     pub bybit_ws_disabled: bool,
+    /// live-banners: which world this process is (fixed at start; `Demo` only for a bare default).
+    pub identity: crate::identity::ProcessIdentity,
 }
 
 impl UiSnapshot {
@@ -561,6 +563,13 @@ impl Bridge {
         Bridge { working: UiSnapshot::default(), coalescer: Coalescer::new(max_hz), recomputes: 0 }
     }
 
+    /// A bridge whose every snapshot carries the process identity (live-banners).
+    pub fn with_identity(identity: crate::identity::ProcessIdentity) -> Self {
+        let mut b = Bridge::default();
+        b.working.identity = identity;
+        b
+    }
+
     pub fn push(&mut self, update: SourceUpdate) {
         apply_update(&mut self.working, update);
         self.coalescer.mark_dirty();
@@ -602,6 +611,10 @@ pub enum RefreshRequest {
 /// Where the UI gets its data. The production implementation runs the adapters, feeds and
 /// account polls; tests use scripted fakes.
 pub trait ReadOnlyDataSource: Send + Sync {
+    /// Which world this process is. Defaults to `Demo` for sources that are not the live one.
+    fn identity(&self) -> crate::identity::ProcessIdentity {
+        crate::identity::ProcessIdentity::Demo
+    }
     /// Pending updates since the last call (non-blocking).
     fn drain_updates(&self) -> Vec<SourceUpdate>;
     /// "Refresh now": re-fetch every enabled market source (bypassing the poll schedule).

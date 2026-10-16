@@ -106,6 +106,20 @@ fn text_has_at_least_4_5_contrast_on_every_table_background() {
     }
 }
 
+// ---- live-banners: environment banner colours ----
+
+#[test]
+fn banner_colours_are_distinct_legible_and_live_shares_the_loss_red() {
+    use super::env_label::BannerTone;
+    let (live, demo, sim) = (banner_colors(BannerTone::Live), banner_colors(BannerTone::Demo), banner_colors(BannerTone::Simulation));
+    assert_eq!(live.0, NEGATIVE, "Live uses the red of a loss (open question in design.md: same red, told apart by text and place)");
+    assert_eq!(demo.0, WARNING);
+    assert!(live.0 != demo.0 && demo.0 != sim.0 && live.0 != sim.0);
+    for (bg, fg) in [live, demo, sim] {
+        assert!(contrast(fg, bg) >= 4.5, "{fg:06X} on {bg:06X} = {}", contrast(fg, bg));
+    }
+}
+
 // ---- risk-settings-guidance: strictness badge colours ----
 
 #[test]

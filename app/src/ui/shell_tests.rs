@@ -2,6 +2,7 @@
 use super::clock::read_clock;
 use super::nav::{Page, DEBUG_WARNING};
 use super::status::*;
+use crate::identity::ProcessIdentity;
 
 // ---- sidebar navigation -------------------------------------------------
 
@@ -80,7 +81,7 @@ fn clock_taipei_is_always_utc_plus_8_across_midnight() {
 fn first_launch_default_mode_is_simulation() {
     let s = StatusModel::default();
     assert_eq!(s.mode, ExecutionMode::Simulation);
-    assert_eq!(s.mode.label(), "SIMULATION");
+    assert_eq!(s.mode.label(ProcessIdentity::Demo), "SIMULATION");
 }
 
 #[test]
@@ -101,10 +102,25 @@ fn kill_switch_slot_shows_not_enabled() {
 
 #[test]
 fn environment_label_is_demo_testnet_and_no_live_wording_anywhere() {
-    assert!(ENVIRONMENT_LABEL.contains("Demo / Testnet"));
-    let strings = all_ui_strings();
+    let strings = all_ui_strings(ProcessIdentity::Demo);
+    assert!(strings.iter().any(|s| s == "Demo / Testnet"), "the Demo chip is missing");
     assert!(!strings.is_empty(), "string collector returned nothing");
     for s in &strings {
         assert!(!s.to_uppercase().contains("LIVE"), "found LIVE wording in {s:?}");
     }
+}
+
+#[test]
+fn live_identity_shows_live_and_no_demo_testnet_chip() {
+    let strings = all_ui_strings(ProcessIdentity::Live);
+    assert!(strings.iter().any(|s| s == "LIVE"));
+    assert!(strings.iter().all(|s| !s.contains("Demo / Testnet") && !s.contains("EXCHANGE_DEMO")), "{strings:?}");
+}
+
+#[test]
+fn the_mode_badge_names_the_world_not_just_the_mode() {
+    assert_eq!(ExecutionMode::ExchangeDemo.label(ProcessIdentity::Live), "LIVE");
+    assert_eq!(ExecutionMode::Simulation.label(ProcessIdentity::Live), "LIVE SIMULATION");
+    assert_eq!(ExecutionMode::ExchangeDemo.label(ProcessIdentity::Demo), "EXCHANGE_DEMO");
+    assert_eq!(ExecutionMode::Simulation.label(ProcessIdentity::Demo), "SIMULATION");
 }

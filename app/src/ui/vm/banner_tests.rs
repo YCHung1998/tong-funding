@@ -25,7 +25,8 @@ fn finding(source: &str, event_id: i64, event_ms: i64) -> Alert {
 #[test]
 fn banner_is_directly_under_the_header_on_all_eight_pages() {
     for page in Page::ALL {
-        assert_eq!(layout(page), [Region::Header, Region::Banner, Region::Content, Region::StatusBar], "{page:?}");
+        // live-banners: the environment banner is the topmost region of every page.
+        assert_eq!(layout(page), [Region::EnvBanner, Region::Header, Region::Banner, Region::Content, Region::StatusBar], "{page:?}");
     }
     assert_eq!(Page::ALL.len(), 8);
 }
