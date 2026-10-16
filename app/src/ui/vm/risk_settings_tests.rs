@@ -422,3 +422,132 @@ fn the_mode_switch_label_in_a_live_process_says_live() {
     send_mode(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo, &sink);
     assert_eq!(*sink.0.borrow(), vec!["切換模式 → LIVE".to_string(), "切換模式 → EXCHANGE_DEMO".to_string()]);
 }
+
+// ---- live-guardrails 4.2b: the live caps are editable on the page (Live only) ------------------
+
+mod live_caps {
+    use super::*;
+    use crate::identity::ProcessIdentity::{Demo, Live};
+
+    fn live_form(s: &Settings) -> RiskForm {
+        RiskForm::from_settings_for(s, Live)
+    }
+
+    fn saved_risk(vm: &RiskVm) -> RiskConfig {
+        let sink = Sink::default();
+        assert!(save(vm, &sink), "{:?}", vm.field_errors);
+        let cmds = sink.0.borrow();
+        let Command::SaveRiskSettings { risk, .. } = &cmds[0] else { panic!("expected SaveRiskSettings, got {:?}", cmds[0]) };
+        RiskConfig::from_json(&risk.to_string()).expect("the saved JSON is a valid RiskConfig")
+    }
+
+    #[test]
+    fn the_live_page_lists_both_caps_and_the_demo_page_does_not() {
+        let keys = |id| global_fields(id).iter().map(|f| f.key()).collect::<Vec<_>>();
+        let live = keys(Live);
+        assert!(live.contains(&"live_max_leg_notional_usdt".to_string()) && live.contains(&"live_max_pairs_per_arming".to_string()), "{live:?}");
+        assert_eq!(global_fields(Demo), GLOBAL_FIELDS.to_vec(), "the Demo page is unchanged");
+        assert!(GLOBAL_FIELDS.iter().all(|f| !LIVE_FIELDS.contains(f)));
+        assert!(LIVE_FIELDS.iter().all(|f| !OVERRIDE_FIELDS.contains(f)), "global only: never overridable per leg");
+    }
+
+    #[test]
+    fn unset_caps_show_blank_set_caps_show_their_value() {
+        let s = complete_settings("0.01");
+        let f = live_form(&s);
+        assert_eq!((f.value(Field::LiveMaxLegNotionalUsdt), f.value(Field::LiveMaxPairsPerArming)), (String::new(), String::new()));
+        let mut s2 = s.clone();
+        s2.risk.live_max_leg_notional_usdt = Some(d("10"));
+        s2.risk.live_max_pairs_per_arming = Some(2);
+        let f = live_form(&s2);
+        assert_eq!((f.value(Field::LiveMaxLegNotionalUsdt), f.value(Field::LiveMaxPairsPerArming)), ("10".to_string(), "2".to_string()));
+    }
+
+    #[test]
+    fn typing_10_and_2_saves_them_and_completes_the_live_settings() {
+        let s = complete_settings("0.01");
+        let mut f = live_form(&s);
+        assert!(evaluate(&f, &s).missing.iter().any(|m| m == "live_max_leg_notional_usdt"), "unset caps are listed as missing on the Live page");
+        f.set(Field::LiveMaxLegNotionalUsdt, "10");
+        f.set(Field::LiveMaxPairsPerArming, "2");
+        let vm = evaluate(&f, &s);
+        assert!(vm.can_save && vm.missing.is_empty(), "{:?} {:?}", vm.field_errors, vm.missing);
+        let cfg = saved_risk(&vm);
+        assert_eq!((cfg.live_max_leg_notional_usdt, cfg.live_max_pairs_per_arming), (Some(d("10")), Some(2)));
+        assert!(cfg.is_live_complete());
+    }
+
+    #[test]
+    fn values_outside_the_ceilings_or_not_numbers_are_refused_by_field_name() {
+        let s = complete_settings("0.01");
+        for (field, bad) in [
+            (Field::LiveMaxLegNotionalUsdt, "100.01"),
+            (Field::LiveMaxLegNotionalUsdt, "1000"),
+            (Field::LiveMaxLegNotionalUsdt, "0"),
+            (Field::LiveMaxLegNotionalUsdt, "-5"),
+            (Field::LiveMaxLegNotionalUsdt, "abc"),
+            (Field::LiveMaxPairsPerArming, "6"),
+            (Field::LiveMaxPairsPerArming, "0"),
+            (Field::LiveMaxPairsPerArming, "1.5"),
+            (Field::LiveMaxPairsPerArming, "-1"),
+            (Field::LiveMaxPairsPerArming, "x"),
+        ] {
+            let mut f = live_form(&s);
+            f.set(field, bad);
+            let vm = evaluate(&f, &s);
+            assert!(!vm.can_save, "{bad} must be refused");
+            let msg = vm.field_errors.get(&field.key()).unwrap_or_else(|| panic!("{bad}: no error under {}: {:?}", field.key(), vm.field_errors));
+            assert!(msg.contains(&field.key()), "{msg}");
+            let sink = Sink::default();
+            assert!(!save(&vm, &sink) && sink.0.borrow().is_empty());
+        }
+        for (field, ok) in [(Field::LiveMaxLegNotionalUsdt, "100"), (Field::LiveMaxLegNotionalUsdt, "0.5"), (Field::LiveMaxPairsPerArming, "5"), (Field::LiveMaxPairsPerArming, "1")] {
+            let mut f = live_form(&s);
+            f.set(field, ok);
+            assert!(evaluate(&f, &s).can_save, "{ok}");
+        }
+    }
+
+    #[test]
+    fn blank_means_unset_and_a_save_of_other_fields_keeps_stored_caps() {
+        let mut s = complete_settings("0.01");
+        s.risk.live_max_leg_notional_usdt = Some(d("10"));
+        s.risk.live_max_pairs_per_arming = Some(2);
+        let mut f = live_form(&s);
+        f.set(Field::MaxLeverage, "3");
+        let cfg = saved_risk(&evaluate(&f, &s));
+        assert_eq!((cfg.max_leverage, cfg.live_max_leg_notional_usdt, cfg.live_max_pairs_per_arming), (d("3"), Some(d("10")), Some(2)), "other fields saved, caps kept");
+        f.set(Field::LiveMaxLegNotionalUsdt, "  ");
+        let cfg = saved_risk(&evaluate(&f, &s));
+        assert_eq!(cfg.live_max_leg_notional_usdt, None, "blank = not set (never 0)");
+        assert_eq!(cfg.live_max_pairs_per_arming, Some(2));
+    }
+
+    #[test]
+    fn the_demo_page_never_touches_the_caps() {
+        let mut s = complete_settings("0.01");
+        s.risk.live_max_leg_notional_usdt = Some(d("10"));
+        s.risk.live_max_pairs_per_arming = Some(2);
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::LiveMaxLegNotionalUsdt, "99"); // ignored: this form is not a Live form
+        f.set(Field::MaxLeverage, "3");
+        let vm = evaluate(&f, &s);
+        assert!(vm.missing.iter().all(|m| !m.starts_with("live_")), "Demo completeness ignores the caps");
+        let cfg = saved_risk(&vm);
+        assert_eq!((cfg.live_max_leg_notional_usdt, cfg.live_max_pairs_per_arming), (Some(d("10")), Some(2)));
+        let mut unset = complete_settings("0.01");
+        unset.risk.live_max_leg_notional_usdt = None;
+        assert!(evaluate(&RiskForm::from_settings(&unset), &unset).missing.is_empty(), "Demo: unset caps are not 'missing'");
+    }
+
+    #[test]
+    fn the_caps_have_text_help_strictness_and_units() {
+        for f in LIVE_FIELDS {
+            let h = f.help();
+            assert!(!h.meaning.is_empty() && !h.affects.is_empty(), "{f:?}");
+            assert_eq!(f.strictness(), Strictness::LowerStricter);
+            assert!(f.label().contains("Live"));
+        }
+        assert_eq!((Field::LiveMaxLegNotionalUsdt.unit(), Field::LiveMaxPairsPerArming.unit()), ("USDT", "筆"));
+    }
+}

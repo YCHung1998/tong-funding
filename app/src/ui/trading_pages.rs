@@ -24,7 +24,7 @@ use super::format::{self, DASH};
 use super::manual_order::{self, CancelForm, CancelPrefill, ManualConfirm, ManualForm, ManualPrefill, PickState};
 use super::nav::{Page, DEBUG_WARNING};
 use super::pages::{card, small, text, title, ClickFn};
-use super::risk_settings::{self, Field, RiskForm, Strictness, GLOBAL_FIELDS, MODE_OPTIONS, OVERRIDE_FIELDS};
+use super::risk_settings::{self, Field, RiskForm, Strictness, GLOBAL_FIELDS, LIVE_FIELDS, MODE_OPTIONS, OVERRIDE_FIELDS};
 use super::scanner::ScanRow;
 use super::shell::Shell;
 use super::staged_orders::{self, CloseConfirm, CostView, PendingConfirm, RunningRow};
@@ -114,7 +114,8 @@ fn set_val(i: &In, v: String, window: &mut Window, cx: &mut Context<Shell>) {
 
 impl TradingState {
     pub fn new(window: &mut Window, cx: &mut Context<Shell>) -> TradingState {
-        let r_fields = GLOBAL_FIELDS.iter().map(|f| (*f, new_input(window, cx, ""))).collect();
+        // the two Live caps get an input too; only a Live page renders or reads it
+        let r_fields = GLOBAL_FIELDS.iter().chain(LIVE_FIELDS.iter()).map(|f| (*f, new_input(window, cx, ""))).collect();
         let mut r_over = BTreeMap::new();
         for ex in Exchange::ALL {
             for f in OVERRIDE_FIELDS {
@@ -235,7 +236,7 @@ impl TradingState {
             self.contract_loaded = true;
         }
         if !self.risk_loaded {
-            let form = RiskForm::from_settings(&snap.settings);
+            let form = RiskForm::from_settings_for(&snap.settings, snap.identity);
             for (f, i) in &self.r_fields {
                 set_val(i, form.value(*f), window, cx);
             }
@@ -259,8 +260,8 @@ impl TradingState {
         ContractForm { notional: val(&self.c_notional, cx), leverage: val(&self.c_leverage, cx), margin: val(&self.c_margin, cx), mode: self.c_mode }
     }
 
-    fn risk_form(&self, base: &Settings, cx: &App) -> RiskForm {
-        let mut form = RiskForm::from_settings(base);
+    fn risk_form(&self, base: &Settings, identity: crate::identity::ProcessIdentity, cx: &App) -> RiskForm {
+        let mut form = RiskForm::from_settings_for(base, identity);
         for (f, i) in &self.r_fields {
             form.set(*f, &val(i, cx));
         }
@@ -934,7 +935,7 @@ impl Shell {
 
     pub(crate) fn risk_settings_page(&mut self, cx: &mut Context<Self>) -> Div {
         let base = self.snap.settings.clone();
-        let form = self.trading.risk_form(&base, cx);
+        let form = self.trading.risk_form(&base, self.snap.identity, cx);
         let vm = risk_settings::evaluate(&form, &base);
         let help_btn = div()
             .id("risk-help")
@@ -958,7 +959,8 @@ impl Shell {
             page = page.child(warn_box(vec![format!("已儲存的風控設定讀取失敗：{e}")]));
         }
         let mut global = card().child(text("Global Limits · Layer 1 · Net Edge", theme::TEXT_PRIMARY));
-        for f in GLOBAL_FIELDS {
+        let shown = risk_settings::global_fields(self.snap.identity);
+        for f in shown.iter().copied() {
             let label = match f {
                 Field::TakerFee(e) => format!("{} Taker 費率 · 必填（請依帳戶手續費等級實填）", e.name()),
                 Field::NetEdgeThresholdPct | Field::EstSlippagePct => format!("{} · 必填", f.label()),
@@ -987,13 +989,13 @@ impl Shell {
         }
         global = global.child(allowed).child(pick_row("allowed_coins（可多選，空白 = 不限制）", self.trading.r_coins.element("不限制"), self.trading.r_coins.loaded(), "行情", Some(self.trading.r_coins.unlisted(cx).join(", ")).filter(|u| !u.is_empty()))).child(small(vm.formula.clone(), theme::TEXT_SECONDARY));
         for (k, e) in &vm.field_errors {
-            if !GLOBAL_FIELDS.iter().any(|f| &f.key() == k) {
+            if !shown.iter().any(|f| &f.key() == k) {
                 global = global.child(small(e.clone(), theme::NEGATIVE));
             }
         }
         global = global.child(btn("risk-save", "儲存風控設定", vm.can_save, self.click(cx, |this, cx| {
             let base = this.snap.settings.clone();
-            let vm = risk_settings::evaluate(&this.trading.risk_form(&base, cx), &base);
+            let vm = risk_settings::evaluate(&this.trading.risk_form(&base, this.snap.identity, cx), &base);
             risk_settings::save(&vm, this.sink.as_ref());
         })));
         page = page.child(global);

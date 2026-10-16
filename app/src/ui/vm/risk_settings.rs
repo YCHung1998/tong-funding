@@ -32,6 +32,9 @@ pub enum Field {
     TakerFee(Exchange),
     /// leg-early-exit: global only, 0 = disabled.
     EarlyExitMinMovePct,
+    /// live-guardrails 4.2b: Live only (never shown or parsed by a Demo page); blank = not set.
+    LiveMaxLegNotionalUsdt,
+    LiveMaxPairsPerArming,
 }
 
 /// Which way a field tightens the risk gate. The source of truth is the conservative merge in
@@ -113,6 +116,17 @@ pub const GLOBAL_FIELDS: [Field; 15] = [
     Field::EarlyExitMinMovePct,
 ];
 
+/// The two caps a Live process must fill in (live-guardrails 4.2b); global only, not overridable.
+pub const LIVE_FIELDS: [Field; 2] = [Field::LiveMaxLegNotionalUsdt, Field::LiveMaxPairsPerArming];
+
+/// The global fields the page of `identity` shows: Demo = `GLOBAL_FIELDS` unchanged, Live adds the caps.
+pub fn global_fields(identity: ProcessIdentity) -> Vec<Field> {
+    match identity {
+        ProcessIdentity::Demo => GLOBAL_FIELDS.to_vec(),
+        ProcessIdentity::Live => GLOBAL_FIELDS.iter().chain(LIVE_FIELDS.iter()).copied().collect(),
+    }
+}
+
 /// Exactly the nine overridable fields of `risk-config` (`min_expected_net_pnl_pct` is global only).
 pub const OVERRIDE_FIELDS: [Field; 9] = [
     Field::MaxLeverage,
@@ -142,6 +156,8 @@ impl Field {
             Field::SafetyMarginPct => "safety_margin_pct".into(),
             Field::TakerFee(e) => format!("{} taker_fee_pct", e.name()),
             Field::EarlyExitMinMovePct => "early_exit_min_move_pct".into(),
+            Field::LiveMaxLegNotionalUsdt => "live_max_leg_notional_usdt".into(),
+            Field::LiveMaxPairsPerArming => "live_max_pairs_per_arming".into(),
         }
     }
 
@@ -160,6 +176,8 @@ impl Field {
             Field::SafetyMarginPct => "安全邊際",
             Field::TakerFee(_) => "Taker 費率",
             Field::EarlyExitMinMovePct => "提早平倉最小有利幅度（0 = 停用）",
+            Field::LiveMaxLegNotionalUsdt => "每腿名目上限 USDT（Live，天花板 100）",
+            Field::LiveMaxPairsPerArming => "每次武裝最多進場筆數（Live，天花板 5）",
         }
     }
 
@@ -169,7 +187,8 @@ impl Field {
             Field::StaleDataThresholdMs => "ms",
             Field::MaxConcurrentPairs => "pairs",
             Field::OrderTimeoutSeconds => "秒",
-            Field::Min24hVolumeUsdt => "USDT",
+            Field::Min24hVolumeUsdt | Field::LiveMaxLegNotionalUsdt => "USDT",
+            Field::LiveMaxPairsPerArming => "筆",
             Field::MaxPriceDriftPct
             | Field::MaxLegImbalancePct
             | Field::MinExpectedNetPnlPct
@@ -184,7 +203,7 @@ impl Field {
     pub fn strictness(self) -> Strictness {
         match self {
             Field::NetEdgeThresholdPct | Field::MinExpectedNetPnlPct | Field::SafetyMarginPct | Field::EstSlippagePct | Field::Min24hVolumeUsdt | Field::EarlyExitMinMovePct => Strictness::HigherStricter,
-            Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs => Strictness::LowerStricter,
+            Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => Strictness::LowerStricter,
             Field::TakerFee(_) => Strictness::Fact,
         }
     }
@@ -218,12 +237,22 @@ impl Field {
                 formula: Some("多單：(目前價 − 開倉均價) ÷ 開倉均價 × 100 ≥ 門檻；空單：(開倉均價 − 目前價) ÷ 開倉均價 × 100 ≥ 門檻"),
                 affects: &[Execution],
             },
+            Field::LiveMaxLegNotionalUsdt => FieldHelp {
+                meaning: "Live 才有：每一腿名目（USDT）的硬上限；引擎在加入交易單、儲存合約模板、進場與每一筆非平倉單送出前都會檢查（數量 × 最差保護價，含 1% 緩衝，所以合約模板名目要設在上限的 99% 以下，例如上限 10 設 9）。內建天花板 100，空白＝未設定（未設定就無法武裝）；已武裝時只能調低。",
+                formula: Some("數量 × max(基準價, 掃描價, 送單前價, 最新價) × 1.01 ≤ 上限"),
+                affects: &[Pretrade, Execution],
+            },
+            Field::LiveMaxPairsPerArming => FieldHelp {
+                meaning: "Live 才有：一次武裝最多進場的配對筆數；達到後自動鎖定，要再交易必須重新預檢與武裝。內建天花板 5，空白＝未設定（未設定就無法武裝）；已武裝時只能調低。",
+                formula: None,
+                affects: &[Pretrade, Execution],
+            },
         }
     }
 
     /// Required without a default: blank = not set (the config is then incomplete).
     pub fn optional(self) -> bool {
-        matches!(self, Field::NetEdgeThresholdPct | Field::EstSlippagePct | Field::TakerFee(_))
+        matches!(self, Field::NetEdgeThresholdPct | Field::EstSlippagePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming)
     }
 }
 
@@ -247,6 +276,8 @@ pub fn field_text(cfg: &RiskConfig, f: Field) -> String {
         Field::SafetyMarginPct => dtext(cfg.safety_margin_pct),
         Field::TakerFee(e) => cfg.taker_fee_pct.get(&e).copied().map(dtext).unwrap_or_default(),
         Field::EarlyExitMinMovePct => dtext(cfg.early_exit_min_move_pct),
+        Field::LiveMaxLegNotionalUsdt => cfg.live_max_leg_notional_usdt.map(dtext).unwrap_or_default(),
+        Field::LiveMaxPairsPerArming => cfg.live_max_pairs_per_arming.map(|n| n.to_string()).unwrap_or_default(),
     }
 }
 
@@ -259,11 +290,19 @@ pub struct RiskForm {
     pub allowed_exchanges: BTreeSet<Exchange>,
     /// Comma separated coins; empty = no restriction.
     pub allowed_coins: String,
+    /// A Live page: the two caps are inputs (and parsed on evaluate). A Demo form ignores them, so a
+    /// Demo save carries the stored caps through untouched.
+    live: bool,
 }
 
 impl RiskForm {
+    /// The Demo form (`GLOBAL_FIELDS` only).
     pub fn from_settings(s: &Settings) -> RiskForm {
-        let values = GLOBAL_FIELDS.iter().map(|f| (*f, field_text(&s.risk, *f))).collect();
+        RiskForm::from_settings_for(s, ProcessIdentity::Demo)
+    }
+
+    pub fn from_settings_for(s: &Settings, identity: ProcessIdentity) -> RiskForm {
+        let values = global_fields(identity).iter().map(|f| (*f, field_text(&s.risk, *f))).collect();
         let mut overrides = BTreeMap::new();
         for (ex, o) in &s.overrides {
             for f in OVERRIDE_FIELDS {
@@ -272,7 +311,7 @@ impl RiskForm {
                 }
             }
         }
-        RiskForm { values, overrides, allowed_exchanges: s.risk.allowed_exchanges.iter().copied().collect(), allowed_coins: s.risk.allowed_coins.join(", ") }
+        RiskForm { values, overrides, allowed_exchanges: s.risk.allowed_exchanges.iter().copied().collect(), allowed_coins: s.risk.allowed_coins.join(", "), live: identity.is_live() }
     }
 
     pub fn value(&self, f: Field) -> String {
@@ -280,6 +319,9 @@ impl RiskForm {
     }
 
     pub fn set(&mut self, f: Field, text: &str) {
+        if LIVE_FIELDS.contains(&f) && !self.live {
+            return;
+        }
         self.values.insert(f, text.to_string());
     }
 
@@ -318,7 +360,7 @@ fn override_value_of(o: &RiskOverride, f: Field) -> Option<String> {
         Field::NetEdgeThresholdPct => o.net_edge_threshold_pct.map(dtext),
         Field::EstSlippagePct => o.est_slippage_pct.map(dtext),
         Field::SafetyMarginPct => o.safety_margin_pct.map(dtext),
-        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) => None,
+        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => None,
     }
 }
 
@@ -346,7 +388,16 @@ pub struct RiskVm {
 
 /// `taker_fee_pct.Bybit` → `Bybit taker_fee_pct` (the one completeness source: `missing_fields`).
 pub fn missing_display(cfg: &RiskConfig) -> Vec<String> {
-    cfg.missing_fields()
+    display_missing(cfg.missing_fields())
+}
+
+/// The same for a Live page: also names the two caps while they are unset.
+pub fn missing_display_live(cfg: &RiskConfig) -> Vec<String> {
+    display_missing(cfg.missing_live_fields())
+}
+
+fn display_missing(fields: Vec<String>) -> Vec<String> {
+    fields
         .into_iter()
         .map(|f| match f.strip_prefix("taker_fee_pct.") {
             Some(ex) => {
@@ -451,6 +502,26 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
             }
         }
     }
+    if form.live {
+        for f in LIVE_FIELDS {
+            let text = form.value(f);
+            let t = text.trim();
+            match f {
+                Field::LiveMaxLegNotionalUsdt => {
+                    if let Some(v) = parse_dec(f, &text, &mut errors, "") {
+                        cfg.live_max_leg_notional_usdt = v;
+                    }
+                }
+                Field::LiveMaxPairsPerArming if t.is_empty() => cfg.live_max_pairs_per_arming = None,
+                Field::LiveMaxPairsPerArming => {
+                    if let Some(v) = parse_int::<u32>(f, &text, &mut errors, "") {
+                        cfg.live_max_pairs_per_arming = Some(v);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     cfg.allowed_exchanges = Exchange::ALL.into_iter().filter(|e| form.allowed_exchanges.contains(e)).collect();
     cfg.allowed_coins = form.allowed_coins.split(',').map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty()).collect();
     if errors.is_empty()
@@ -483,7 +554,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                     Field::NetEdgeThresholdPct => o.net_edge_threshold_pct = v,
                     Field::EstSlippagePct => o.est_slippage_pct = v,
                     Field::SafetyMarginPct => o.safety_margin_pct = v,
-                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) => {}
+                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => {}
                 }
             }
         }
@@ -495,7 +566,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
         }
     }
 
-    let missing = missing_display(&cfg);
+    let missing = if form.live { missing_display_live(&cfg) } else { missing_display(&cfg) };
     let incomplete_text = (!missing.is_empty()).then(|| format!("設定不完整：{}", missing.join("、")));
     let preview = [(Exchange::Binance, Exchange::Bybit), (Exchange::Binance, Exchange::Okx), (Exchange::Bybit, Exchange::Okx)]
         .into_iter()

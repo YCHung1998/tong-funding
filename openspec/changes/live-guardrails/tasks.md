@@ -22,6 +22,7 @@
 
 - [x] 4.1 「前往交易所」連結的純函式（網址只含公開資訊）與測試；配對卡與橫幅按鈕（與 `live-banners` 的頁面框架整合，整合階段完成）（純函式 `engine::exchange_links` 與測試已完成；按鈕與開啟瀏覽器留給整合階段）
 - [x] 4.2 武裝對話框（輸入確認字串、勾選人工清單、顯示預檢結果與上限，整合階段完成）
+- [x] 4.2b 修正：風控設定頁在 Live 身分加入兩個上限輸入欄（`live_max_leg_notional_usdt`、`live_max_pairs_per_arming`；Demo 頁不變）。原先的實作與 runbook 都寫「在風控設定頁填」，但頁面沒有這兩個欄位、`config set` 又拒絕寫入受保護欄位，實際上 Live 完全無法設定上限（使用者的預檢因此 3 項失敗：設定不完整＋兩所保證金「caps unknown」）。測試：`ui::vm::risk_settings_tests::live_caps::*`、引擎 `live_guardrail_tests` 的 `caps_saved_from_the_page_...`
 
 ## 5. 驗證
 

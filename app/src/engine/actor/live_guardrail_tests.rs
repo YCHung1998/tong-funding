@@ -297,6 +297,51 @@ async fn an_account_with_an_open_position_cannot_be_armed_and_unset_caps_make_th
     assert!(rep.id.is_none() && rep.caps_hash.is_none());
 }
 
+/// live-guardrails 4.2b, the user's real situation: a fresh live database has no caps, the preflight
+/// fails three items (settings, and both margin checks because the caps are unknown). Typing 10 and 2
+/// into the risk page (vm form -> `SaveRiskSettings` -> engine) clears all three; 9 USDT per leg then
+/// passes and the stored caps are what the engine freezes at arming.
+#[tokio::test(start_paused = true)]
+async fn caps_saved_from_the_risk_page_clear_the_three_preflight_failures_and_a_9_usdt_leg_fits_a_10_cap() {
+    use crate::ui::bridge::{CommandSink, Settings};
+    use crate::ui::risk_settings::{self, Field, RiskForm};
+    #[derive(Default)]
+    struct Sink(std::sync::Mutex<Vec<Command>>);
+    impl CommandSink for Sink {
+        fn send(&self, _label: String, command: Command) {
+            self.0.lock().unwrap().push(command);
+        }
+    }
+
+    let (rig, h, _p) = live_started(&risk()).await; // the caps are not set
+    let rep = preflight(&h).await;
+    let failures = rep.failures();
+    assert_eq!(failures.len(), 3, "{failures:?}");
+    assert!(failures.iter().any(|f| f.starts_with("settings_complete") && f.contains("live_max_leg_notional_usdt") && f.contains("live_max_pairs_per_arming")), "{failures:?}");
+    for ex in ["Binance", "Bybit"] {
+        assert!(failures.iter().any(|f| f.starts_with(&format!("margin_sufficient[{ex}]")) && f.contains("caps unknown")), "{failures:?}");
+    }
+
+    let settings = Settings { risk: risk(), ..Settings::default() };
+    let mut form = RiskForm::from_settings_for(&settings, ProcessIdentity::Live);
+    form.set(Field::LiveMaxLegNotionalUsdt, "10");
+    form.set(Field::LiveMaxPairsPerArming, "2");
+    let vm = risk_settings::evaluate(&form, &settings);
+    let sink = Sink::default();
+    assert!(risk_settings::save(&vm, &sink), "{:?}", vm.field_errors);
+    let cmd = sink.0.lock().unwrap().remove(0);
+    assert_eq!(ask(&h, cmd).await, CommandReply::Accepted);
+    assert_eq!(count(&rig.db, RISK_CONFIG_UPDATED), 1);
+
+    let rep = preflight(&h).await;
+    assert!(rep.passed() && rep.id.is_some(), "{:?}", rep.failures());
+    assert_eq!(ask(&h, Command::SaveContractTemplate { notional_usdt: dec("9"), leverage: dec("5") }).await, CommandReply::Accepted, "9 fits a cap of 10");
+    assert_eq!(ask(&h, Command::AddPrepared(pair_n("nine", SYM, "9"))).await, CommandReply::Accepted);
+    assert_eq!(ask(&h, arm_cmd(&rep)).await, CommandReply::Accepted);
+    let f = h.live.borrow().frozen.clone().unwrap();
+    assert_eq!((f.leg_notional_usdt, f.pairs_per_arming), (dec("10"), 2), "what the page saved is what gets frozen");
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_live_engine_started_without_probes_can_never_be_armed() {
     let (rig, deps) = live_deps("MANUAL", &live_risk());
