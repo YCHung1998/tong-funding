@@ -16,7 +16,7 @@
 
 ### Requirement: 衝突、OKX 與貼錯金鑰整批拒絕
 
-同一個秘密以前綴與無前綴名稱出現且值不同，或同名重複且值不同時，匯入 SHALL 整批拒絕且零寫入，訊息只列變數名。Live 匯入 SHALL NOT 寫入 OKX 憑證，`LIVE_OKX_*` 名稱 SHALL 導致整批拒絕。Live 匯入若某個值等於 demo 項目同一格的現值，SHALL 整批拒絕且零寫入，且 SHALL NOT 寫入 demo 項目。Live 匯入沒有任何可寫入的值時 SHALL 以非零結束。檔案權限對群組或其他人可讀時 SHALL 印出警告但不拒絕。
+同一個秘密以前綴與無前綴名稱出現且值不同，或同名重複且值不同時，匯入 SHALL 整批拒絕且零寫入，訊息只列變數名。Live 匯入 SHALL NOT 寫入 OKX 憑證，`LIVE_OKX_*` 名稱 SHALL 導致整批拒絕。Live 匯入若某個值等於 demo 項目同一格的現值，SHALL 整批拒絕且零寫入，且 SHALL NOT 寫入 demo 項目。匯入（demo 或 live）沒有任何可寫入的值時 SHALL 以非零結束。檔案權限對群組或其他人可讀時 SHALL 印出警告但不拒絕（demo 與 live 皆然）。
 
 #### Scenario: live 值與 demo 相同
 

@@ -1,3 +1,6 @@
 /target
 .claude/worktrees/
-.env
+
+# credentials: never commit
+.env*
+!.env.example

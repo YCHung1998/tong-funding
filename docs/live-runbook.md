@@ -9,6 +9,25 @@
 4. 詳細步驟見 `docs/real-trading-plan.md` 第 9 節。
 
 ## 1. 把金鑰放進 live 的鑰匙圈（只有你輸入，不要貼給任何人）
+### 1a. 從檔案匯入（建議）
+複製 `.env.example` 成 `.env`（或分成 `.env-demo`、`.env-real`），填入真值，`chmod 600`，然後在專案根目錄：
+
+```
+# 同一個檔案、兩個區塊（DEMO_ 與 LIVE_ 前綴）
+cargo run -p tong-funding -- secrets import-env .env           # 只讀 DEMO_ 區塊，寫 demo
+cargo run -p tong-funding -- secrets import-env --live .env    # 只讀 LIVE_ 區塊，寫 live
+# 或兩個檔案
+cargo run -p tong-funding -- secrets import-env .env-demo
+cargo run -p tong-funding -- secrets import-env --live .env-real
+cargo run -p tong-funding -- secrets status
+cargo run -p tong-funding -- secrets status --live
+```
+
+- 無前綴名稱（`BINANCE_API_KEY`…）跟著你選的身分走：`.env-real` 一定要加 `--live`，否則真錢金鑰會被寫進 demo。不確定就用 `LIVE_` 前綴。
+- 兩個名稱對同一個秘密給不同的值、live 的值和 demo 鑰匙圈相同、或出現 `LIVE_OKX_*`，整批拒絕且不寫入。
+- 輸出只列變數名與 `stored/ignored/skipped`，不印值；檔案權限太寬會警告。匯入後建議刪除檔案。
+
+### 1b. 逐一輸入（不經過檔案）
 在專案根目錄（用你自己的終端機，值從標準輸入讀，不會出現在指令列或歷史紀錄）：
 
 ```
@@ -21,8 +40,8 @@ cargo run -p tong-funding -- secrets status --live
 
 - 每個指令執行後輸入該值再按 Enter。
 - `secrets status --live` 只顯示「已設定／未設定」，不顯示值。
-- live 金鑰存在獨立的鑰匙圈項目 `tong-funding-live`；demo 金鑰項目不受影響；`secrets import-env` 不能寫 live（刻意設計）。
-- 不要把 live 金鑰放進 `.env`、不要貼進對話。
+- live 金鑰存在獨立的鑰匙圈項目 `tong-funding-live`；demo 金鑰項目不受影響；`import-env --live` 只寫 live 項目（為了比對貼錯金鑰，只會唯讀 demo 項目）。
+- `.env*` 已被 `.gitignore` 忽略，但仍不要貼進對話或截圖；執行中的程式不會讀 `.env`。
 
 ## 2. 啟動 live 程式
 ```

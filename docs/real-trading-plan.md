@@ -67,7 +67,7 @@ v1 經 skeptic（正確性）、red-team（安全）、simplifier（過度設計
 5. 修改 `app-shell` 規格的「不出現 LIVE 字樣」為「live 程式必須顯示 LIVE；demo／模擬程式不得顯示」。
 
 ### 2.7 金鑰
-1. live 金鑰存在獨立的 Keychain 項目（service `tong-funding-live`），只有 `--live` 程式會讀；`secrets import-env` 不寫 live，另有需明確指定環境的指令。
+1. live 金鑰存在獨立的 Keychain 項目（service `tong-funding-live`），只有 `--live` 程式會讀；`secrets import-env --live <檔案>` 只讀 `LIVE_*` 與無前綴名稱並寫入 live 項目（使用者後來決定允許；有衝突、OKX、與 demo 相同值的防護，見 `secrets-import-live`），不帶 `--live` 則只寫 demo。
 2. 預檢（MVP）：用 live 主機讀一次餘額與持倉（失敗即封閉，也就證明不是 demo 金鑰）；其餘列為**人工勾選清單**（提領已關閉、IP 白名單、單向持倉、逐倉、子帳戶限額、手續費率從交易所頁面抄下並手動填入設定）。
 3. 金鑰指紋只顯示 API key 的末 4 碼，不取自 secret，且**不寫入事件**；預檢結果只存布林摘要，不存交易所原始回應（Bybit 的回應含使用者 IP）。
 

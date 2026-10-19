@@ -3,14 +3,15 @@
 //!
 //! ```text
 //! tong-funding secrets set [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)
-//! tong-funding secrets import-env <path/to/.env>   (the Python version's .env format; demo only)
+//! tong-funding secrets import-env [--live] <path/to/.env>   (the Python version's .env format)
 //! tong-funding secrets status [--live]
 //! tong-funding secrets delete [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>
 //! ```
 //!
 //! `--live` (anywhere after the subcommand) selects the live Keychain item (`tong-funding-live`);
-//! without it only the existing demo item is touched. `import-env` refuses `--live` outright, so a
-//! `.env` file can never become a live credential: use `secrets set --live`.
+//! without it only the existing demo item is touched. `import-env` reads the names of the selected
+//! identity only (see [`import_env`]); this is a hand-run command, the running app never reads a
+//! `.env` file or environment variable for credentials.
 //!
 //! Everything lives in one Keychain item (see `store::secrets::BundleSecrets`); each subcommand
 //! reads it once and writes it back at most once.
@@ -29,7 +30,7 @@ use crate::store::secrets::{BundleSecrets, KeyStore, needed};
 
 pub const SUBCOMMAND: &str = "secrets";
 
-const USAGE: &str = "usage:\n  tong-funding secrets set [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)\n  tong-funding secrets import-env <path/to/.env>   (demo only)\n  tong-funding secrets status [--live]\n  tong-funding secrets delete [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>";
+const USAGE: &str = "usage:\n  tong-funding secrets set [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>   (value on stdin)\n  tong-funding secrets import-env [--live] <path/to/.env>\n  tong-funding secrets status [--live]\n  tong-funding secrets delete [--live] <binance|bybit|okx> <api-key|api-secret|passphrase>";
 
 const LIVE_FLAG: &str = "--live";
 
@@ -109,11 +110,6 @@ fn run_for<'s, S: KeyStore + 's>(secrets_for: &dyn Fn(ProcessIdentity) -> &'s Bu
         },
         None => (ProcessIdentity::Demo, Vec::new()),
     };
-    if identity.is_live() && args.first().is_some_and(|c| c == "import-env") {
-        // Decided before any Keychain access: nothing is read, nothing is written.
-        let _ = writeln!(err, "import-env cannot be used with --live: a .env file must never become a live credential; use `tong-funding secrets set --live <exchange> <name>`");
-        return 2;
-    }
     let secrets = secrets_for(identity);
     match args.split_first() {
         Some((cmd, rest)) if cmd == "set" => {
@@ -163,7 +159,11 @@ fn run_for<'s, S: KeyStore + 's>(secrets_for: &dyn Fn(ProcessIdentity) -> &'s Bu
             }
         }
         Some((cmd, rest)) if cmd == "import-env" => match rest {
-            [path] => import_env(secrets, path, out, err),
+            [path] => {
+                // Only a live import reads the demo item (to catch pasted demo keys); it never writes it.
+                let demo = identity.is_live().then(|| secrets_for(ProcessIdentity::Demo));
+                import_env(identity, secrets, demo, path, out, err)
+            }
             _ => usage(err, "expected <path/to/.env>"),
         },
         Some((cmd, rest)) if cmd == "status" && rest.is_empty() => {
@@ -187,7 +187,8 @@ fn run_for<'s, S: KeyStore + 's>(secrets_for: &dyn Fn(ProcessIdentity) -> &'s Bu
     }
 }
 
-/// `.env` variable names of the Python version and the secret each one holds.
+/// Unprefixed `.env` names of the Python version (valid for whichever identity the command selects)
+/// and the secret each one holds. `OKX_DEMO_*` are demo-only: a live import ignores them.
 const ENV_KEYS: [(&str, Exchange, SecretName); 7] = [
     ("BINANCE_API_KEY", Exchange::Binance, SecretName::ApiKey),
     ("BINANCE_API_SECRET", Exchange::Binance, SecretName::ApiSecret),
@@ -198,9 +199,35 @@ const ENV_KEYS: [(&str, Exchange, SecretName); 7] = [
     ("OKX_DEMO_PASSPHRASE", Exchange::Okx, SecretName::Passphrase),
 ];
 
-/// Stores every known credential of a Python-style `.env` file. Values are never printed: the
-/// report names only variables and secrets. Other variables (base URLs, account type) are ignored.
-fn import_env<S: KeyStore>(secrets: &BundleSecrets<S>, path: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+/// Names after a `DEMO_` / `LIVE_` prefix.
+const PREFIXED_KEYS: [(&str, Exchange, SecretName); 7] = [
+    ("BINANCE_API_KEY", Exchange::Binance, SecretName::ApiKey),
+    ("BINANCE_API_SECRET", Exchange::Binance, SecretName::ApiSecret),
+    ("BYBIT_API_KEY", Exchange::Bybit, SecretName::ApiKey),
+    ("BYBIT_API_SECRET", Exchange::Bybit, SecretName::ApiSecret),
+    ("OKX_API_KEY", Exchange::Okx, SecretName::ApiKey),
+    ("OKX_API_SECRET", Exchange::Okx, SecretName::ApiSecret),
+    ("OKX_PASSPHRASE", Exchange::Okx, SecretName::Passphrase),
+];
+
+/// One variable of the file that holds a value for the selected identity.
+struct Candidate<'a> {
+    name: &'a str,
+    ex: Exchange,
+    secret: SecretName,
+    value: &'a str,
+}
+
+/// Stores the credentials of a Python-style `.env` file into the item of `identity`.
+///
+/// Names read: `DEMO_<EX>_<NAME>` (demo only), `LIVE_<EX>_<NAME>` (live only) and the unprefixed
+/// names of [`ENV_KEYS`] (whichever identity is selected). Everything else, including the other
+/// identity's prefix, is reported as `ignored <NAME>` and never read. Live never stores OKX:
+/// `LIVE_OKX_*` refuses the whole file. The whole import is refused, with nothing written, when two
+/// names give the same secret different values, or (live) when a value equals the demo item's value
+/// for the same secret (a pasted demo key). Values are never printed: the report names only
+/// variables and secrets. Other variables (base URLs, account type) are ignored.
+fn import_env<S: KeyStore>(identity: ProcessIdentity, secrets: &BundleSecrets<S>, demo: Option<&BundleSecrets<S>>, path: &str, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -208,7 +235,11 @@ fn import_env<S: KeyStore>(secrets: &BundleSecrets<S>, path: &str, out: &mut dyn
             return 1;
         }
     };
-    let mut found: Vec<(Exchange, SecretName, &str)> = Vec::new();
+    warn_if_readable_by_others(path, err);
+    let live = identity.is_live();
+    let (own, other) = if live { ("LIVE_", "DEMO_") } else { ("DEMO_", "LIVE_") };
+    let mut found: Vec<Candidate> = Vec::new();
+    let mut refused_names: Vec<String> = Vec::new();
     for line in text.lines() {
         let line = line.trim_end_matches('\r').trim();
         if line.is_empty() || line.starts_with('#') {
@@ -221,20 +252,73 @@ fn import_env<S: KeyStore>(secrets: &BundleSecrets<S>, path: &str, out: &mut dyn
             (Some('"'), Some('"')) | (Some('\''), Some('\'')) if raw.len() >= 2 => &raw[1..raw.len() - 1],
             _ => raw,
         };
-        let Some(&(_, ex, secret)) = ENV_KEYS.iter().find(|(k, _, _)| *k == name) else {
+        let known = if let Some(rest) = name.strip_prefix(own) {
+            PREFIXED_KEYS.iter().find(|(k, _, _)| *k == rest)
+        } else if name.strip_prefix(other).is_some_and(|rest| PREFIXED_KEYS.iter().any(|(k, _, _)| *k == rest)) {
+            None
+        } else {
+            ENV_KEYS.iter().find(|(k, _, _)| *k == name)
+        };
+        let Some(&(_, ex, secret)) = known else {
             let _ = writeln!(out, "ignored {name}");
             continue;
         };
+        if live && ex == Exchange::Okx {
+            // a live OKX credential does not exist: the legacy demo-only names are just not read,
+            // an explicit LIVE_OKX_* name is a mistake worth stopping for
+            if name.starts_with(own) {
+                refused_names.push(name.to_string());
+            } else {
+                let _ = writeln!(out, "ignored {name}");
+            }
+            continue;
+        }
         if value.is_empty() {
             let _ = writeln!(out, "skipped {} {} (empty)", ex.name(), name_str(secret));
             continue;
         }
-        found.push((ex, secret, value));
+        found.push(Candidate { name, ex, secret, value });
+    }
+    if !refused_names.is_empty() {
+        let _ = writeln!(err, "nothing stored: live has no OKX credentials, remove {} from the file", refused_names.join(", "));
+        return 1;
+    }
+    // one value per secret: two names with different values are ambiguous, refuse the whole file
+    for (i, a) in found.iter().enumerate() {
+        if let Some(b) = found[..i].iter().find(|b| b.ex == a.ex && b.secret == a.secret && b.value != a.value) {
+            let _ = writeln!(err, "nothing stored: {} and {} give {} {} different values; keep one", b.name, a.name, a.ex.name(), name_str(a.secret));
+            return 1;
+        }
+    }
+    let mut unique: Vec<(Exchange, SecretName, &str)> = Vec::new();
+    for c in &found {
+        if !unique.iter().any(|(e, s, _)| *e == c.ex && *s == c.secret) {
+            unique.push((c.ex, c.secret, c.value));
+        }
+    }
+    if unique.is_empty() {
+        let _ = writeln!(err, "nothing to store: the file has no {} credentials for {}", if live { "live" } else { "demo" }, if live { "--live" } else { "the demo item" });
+        return 1;
+    }
+    if let Some(demo) = demo {
+        // read only: a live value identical to the demo value is almost surely a pasted demo key
+        for (ex, secret, value) in &unique {
+            match demo.get(*ex, *secret) {
+                Ok(Some(existing)) if existing == *value => {
+                    let _ = writeln!(err, "nothing stored: the live {} {} is identical to the demo one; paste the live key, not the demo key", ex.name(), name_str(*secret));
+                    return 1;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    let _ = writeln!(out, "note: the demo item could not be read, the same-as-demo check was skipped");
+                }
+            }
+        }
     }
     // one bundle write for everything
-    match secrets.set_many(&found) {
+    match secrets.set_many(&unique) {
         Ok(()) => {
-            for (ex, secret, _) in &found {
+            for (ex, secret, _) in &unique {
                 let _ = writeln!(out, "stored {} {}", ex.name(), name_str(*secret));
             }
             0
@@ -243,6 +327,15 @@ fn import_env<S: KeyStore>(secrets: &BundleSecrets<S>, path: &str, out: &mut dyn
             let _ = writeln!(err, "nothing stored: {e}");
             1
         }
+    }
+}
+
+/// A credentials file that group or others can read is worth a warning, not a refusal.
+fn warn_if_readable_by_others(path: &str, err: &mut dyn Write) {
+    use std::os::unix::fs::PermissionsExt;
+    let shared = std::fs::metadata(path).map(|m| m.permissions().mode() & 0o077 != 0).unwrap_or(false);
+    if shared {
+        let _ = writeln!(err, "warning: {path} can be read by other users; run `chmod 600 {path}`");
     }
 }
 
@@ -469,20 +562,173 @@ mod tests {
         assert!(!kc.touched(DEMO_SERVICE), "{:?}", kc.log());
     }
 
+    // ---- secrets-import-live: `import-env [--live]` fills the selected identity's item only ----
+
+    fn env_file(dir: &tempfile::TempDir, name: &str, text: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.path().join(name);
+        std::fs::write(&p, text).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        p.to_str().unwrap().to_string()
+    }
+
+    const BOTH: &str = "DEMO_BINANCE_API_KEY=demo-bk-1111\nDEMO_BINANCE_API_SECRET=demo-bs-2222\nDEMO_BYBIT_API_KEY=demo-yk-3333\nDEMO_OKX_API_KEY=demo-ok-4444\nDEMO_OKX_PASSPHRASE=demo pass\nLIVE_BINANCE_API_KEY=live-bk-5555\nLIVE_BINANCE_API_SECRET=live-bs-6666\nLIVE_BYBIT_API_KEY=live-yk-7777\nLIVE_BYBIT_API_SECRET=live-ys-8888\n";
+
     #[test]
-    fn import_env_with_live_fails_with_zero_keychain_access_and_points_to_set() {
+    fn one_file_fills_each_identity_from_its_own_block_only() {
         let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join(".env");
-        std::fs::write(&p, "BINANCE_API_KEY=bk-AAAA1111\nBINANCE_API_SECRET=bs-BBBB2222\n").unwrap();
-        let path = p.to_str().unwrap();
-        for args in [vec!["import-env", "--live", path], vec!["import-env", path, "--live"], vec!["import-env", "--LIVE", path]] {
+        let path = env_file(&dir, ".env", BOTH);
+        let kc = Arc::new(FakeKeychain::default());
+        let (code, out, err) = call_for(&kc, &["import-env", &path], "");
+        assert_eq!(code, 0, "{out}{err}");
+        assert_eq!(
+            bundle(&kc, DEMO_SERVICE),
+            Some(serde_json::json!({"Binance:api_key": "demo-bk-1111", "Binance:api_secret": "demo-bs-2222", "Bybit:api_key": "demo-yk-3333", "OKX:api_key": "demo-ok-4444", "OKX:passphrase": "demo pass"}))
+        );
+        assert!(!kc.touched(LIVE_SERVICE), "demo import must not touch the live item: {:?}", kc.log());
+        assert!(out.contains("ignored LIVE_BINANCE_API_KEY"), "{out}");
+        let (code, out, err) = call_for(&kc, &["import-env", "--live", &path], "");
+        assert_eq!(code, 0, "{out}{err}");
+        assert_eq!(
+            bundle(&kc, LIVE_SERVICE),
+            Some(serde_json::json!({"Binance:api_key": "live-bk-5555", "Binance:api_secret": "live-bs-6666", "Bybit:api_key": "live-yk-7777", "Bybit:api_secret": "live-ys-8888"}))
+        );
+        assert!(out.contains("ignored DEMO_BINANCE_API_KEY") && out.contains("stored Bybit api-secret"), "{out}");
+        for v in ["demo-bk", "live-bk", "live-ys", "demo pass"] {
+            assert!(!out.contains(v) && !err.contains(v), "value {v} printed:\n{out}{err}");
+        }
+    }
+
+    #[test]
+    fn live_flag_may_sit_anywhere_and_unprefixed_names_follow_the_selected_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = env_file(&dir, ".env-real", "BINANCE_API_KEY=real-bk-1\nBINANCE_API_SECRET=real-bs-2\nBINANCE_BASE_URL=https://example.invalid\n");
+        for args in [vec!["import-env", "--live", &path], vec!["import-env", &path, "--live"], vec!["import-env", "--LIVE", &path]] {
             let kc = Arc::new(FakeKeychain::default());
             let (code, out, err) = call_for(&kc, &args, "");
-            assert_ne!(code, 0, "{args:?}");
-            assert!(err.contains("secrets set --live"), "the message names the alternative: {err}");
-            assert!(kc.log().is_empty(), "{args:?}: not a single Keychain access (read or write): {:?}", kc.log());
-            assert!(!out.contains("AAAA1111") && !err.contains("AAAA1111") && !out.contains("stored"), "{out}{err}");
+            assert_eq!(code, 0, "{args:?}: {out}{err}");
+            assert_eq!(bundle(&kc, LIVE_SERVICE), Some(serde_json::json!({"Binance:api_key": "real-bk-1", "Binance:api_secret": "real-bs-2"})), "{args:?}");
+            assert_eq!(kc.item(DEMO_SERVICE, "credentials"), None, "{args:?}: nothing written to demo");
+            assert!(kc.writes().iter().all(|w| w.contains(LIVE_SERVICE)), "{args:?}: only the live item is written: {:?}", kc.log());
+            assert!(out.contains("ignored BINANCE_BASE_URL") && !out.contains("real-b"), "{out}");
         }
+    }
+
+    #[test]
+    fn prefixed_and_unprefixed_names_that_disagree_are_refused_with_zero_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        for (live, text, names) in [
+            (false, "BINANCE_API_KEY=aaa-1111\nDEMO_BINANCE_API_KEY=bbb-2222\nDEMO_BYBIT_API_KEY=ok-3333\n", ("BINANCE_API_KEY", "DEMO_BINANCE_API_KEY")),
+            (true, "BINANCE_API_KEY=aaa-1111\nLIVE_BINANCE_API_KEY=bbb-2222\n", ("BINANCE_API_KEY", "LIVE_BINANCE_API_KEY")),
+            (false, "BYBIT_API_KEY=aaa-1111\nBYBIT_API_KEY=bbb-2222\n", ("BYBIT_API_KEY", "BYBIT_API_KEY")),
+        ] {
+            let path = env_file(&dir, "conflict.env", text);
+            let kc = Arc::new(FakeKeychain::default());
+            let mut args = vec!["import-env", path.as_str()];
+            if live {
+                args.push("--live");
+            }
+            let (code, out, err) = call_for(&kc, &args, "");
+            assert_ne!(code, 0, "{text}");
+            assert!(kc.writes().is_empty(), "{text}: nothing written: {:?}", kc.log());
+            assert!(err.contains(names.0) && err.contains(names.1), "the message names the variables: {err}");
+            for v in ["aaa-1111", "bbb-2222", "ok-3333"] {
+                assert!(!out.contains(v) && !err.contains(v), "value {v} printed:\n{out}{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_same_value_twice_is_not_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = env_file(&dir, ".env", "BINANCE_API_KEY=same-1234\nDEMO_BINANCE_API_KEY=same-1234\n");
+        let kc = Arc::new(FakeKeychain::default());
+        let (code, out, err) = call_for(&kc, &["import-env", &path], "");
+        assert_eq!(code, 0, "{out}{err}");
+        assert_eq!(bundle(&kc, DEMO_SERVICE), Some(serde_json::json!({"Binance:api_key": "same-1234"})));
+        assert_eq!(out.matches("stored Binance api-key").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn live_never_stores_okx_and_a_live_okx_name_refuses_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let kc = Arc::new(FakeKeychain::default());
+        let path = env_file(&dir, "a.env", "LIVE_BINANCE_API_KEY=live-bk-1\nLIVE_OKX_API_KEY=live-ok-2\n");
+        let (code, out, err) = call_for(&kc, &["import-env", "--live", &path], "");
+        assert_ne!(code, 0);
+        assert!(err.contains("LIVE_OKX_API_KEY"), "{err}");
+        assert!(kc.writes().is_empty(), "{:?}", kc.log());
+        assert!(!out.contains("live-ok") && !err.contains("live-ok"));
+        // the legacy demo-only OKX names are simply not live credentials
+        let path = env_file(&dir, "b.env", "BINANCE_API_KEY=real-bk-1\nOKX_DEMO_API_KEY=demo-ok-2\nOKX_DEMO_PASSPHRASE=demo pass\n");
+        let (code, out, err) = call_for(&kc, &["import-env", "--live", &path], "");
+        assert_eq!(code, 0, "{out}{err}");
+        assert_eq!(bundle(&kc, LIVE_SERVICE), Some(serde_json::json!({"Binance:api_key": "real-bk-1"})));
+        assert!(out.contains("ignored OKX_DEMO_API_KEY"), "{out}");
+    }
+
+    #[test]
+    fn live_value_equal_to_the_demo_value_refuses_everything_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = env_file(&dir, ".env", "LIVE_BINANCE_API_KEY=fresh-live-1\nLIVE_BYBIT_API_KEY=pasted-demo-key\n");
+        let kc = Arc::new(FakeKeychain::default());
+        kc.seed(DEMO_SERVICE, "credentials", r#"{"Bybit:api_key":"pasted-demo-key"}"#);
+        let (code, out, err) = call_for(&kc, &["import-env", "--live", &path], "");
+        assert_ne!(code, 0);
+        assert!(err.contains("Bybit") && err.contains("demo"), "{err}");
+        assert!(kc.writes().is_empty(), "no write to any item: {:?}", kc.log());
+        assert_eq!(kc.item(DEMO_SERVICE, "credentials").as_deref(), Some(r#"{"Bybit:api_key":"pasted-demo-key"}"#));
+        for v in ["pasted-demo-key", "fresh-live-1"] {
+            assert!(!out.contains(v) && !err.contains(v), "value {v} printed:\n{out}{err}");
+        }
+    }
+
+    #[test]
+    fn live_import_only_reads_the_demo_item_and_demo_import_never_touches_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = env_file(&dir, ".env", BOTH);
+        let kc = Arc::new(FakeKeychain::default());
+        kc.seed(DEMO_SERVICE, "credentials", r#"{"Binance:api_key":"older-demo"}"#);
+        assert_eq!(call_for(&kc, &["import-env", "--live", &path], "").0, 0);
+        assert!(!kc.writes().is_empty() && kc.writes().iter().all(|w| w.split(' ').nth(1) == Some(LIVE_SERVICE)), "writes: {:?}", kc.writes());
+        let kc = Arc::new(FakeKeychain::default());
+        assert_eq!(call_for(&kc, &["import-env", &path], "").0, 0);
+        assert!(!kc.touched(LIVE_SERVICE), "{:?}", kc.log());
+    }
+
+    #[test]
+    fn an_import_that_finds_nothing_for_the_identity_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = env_file(&dir, ".env", "DEMO_BINANCE_API_KEY=demo-bk-1\nSOMETHING=x\n");
+        let kc = Arc::new(FakeKeychain::default());
+        let (code, _, err) = call_for(&kc, &["import-env", "--live", &path], "");
+        assert_ne!(code, 0);
+        assert!(err.contains("nothing") && !err.contains("demo-bk"), "{err}");
+        assert!(kc.writes().is_empty(), "{:?}", kc.log());
+    }
+
+    #[test]
+    fn a_world_readable_file_is_warned_about_but_still_imported() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = env_file(&dir, ".env", "LIVE_BINANCE_API_KEY=live-bk-5555\n");
+        let kc = Arc::new(FakeKeychain::default());
+        let (_, _, err) = call_for(&kc, &["import-env", "--live", &path], "");
+        assert!(!err.contains("chmod"), "a 0600 file gets no warning: {err}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (code, out, err) = call_for(&kc, &["import-env", "--live", &path], "");
+        assert_eq!(code, 0, "{out}{err}");
+        assert!(err.contains("chmod 600") && !err.contains("live-bk"), "{err}");
+        assert_eq!(bundle(&kc, LIVE_SERVICE), Some(serde_json::json!({"Binance:api_key": "live-bk-5555"})));
+    }
+
+    #[test]
+    fn import_env_usage_mentions_live() {
+        let kc = Arc::new(FakeKeychain::default());
+        let (code, _, err) = call_for(&kc, &["import-env"], "");
+        assert_eq!(code, 2);
+        assert!(err.contains("import-env [--live]"), "{err}");
+        assert!(kc.log().is_empty());
     }
 
     #[test]
