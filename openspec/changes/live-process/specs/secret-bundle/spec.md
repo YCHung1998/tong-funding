@@ -14,14 +14,9 @@ Live 身分的憑證 SHALL 儲存在獨立的鑰匙圈項目（service `tong-fun
 - **WHEN** Demo 身分啟動
 - **THEN** 對 `tong-funding-live` 的鑰匙圈存取次數為 0
 
-### Requirement: secrets 子命令以 --live 指定目標且 import-env 不寫 live
+### Requirement: secrets 子命令以 --live 指定目標
 
-`secrets set`、`delete`、`status` SHALL 接受 `--live` 以操作 live 項目，未帶 `--live` 時只操作既有項目。`secrets import-env` SHALL 拒絕與 `--live` 一起使用（避免把 `.env` 中的金鑰匯入 live），並說明改用 `secrets set --live`。
-
-#### Scenario: import-env 拒絕 live
-
-- **WHEN** 執行 `secrets import-env --live`
-- **THEN** 命令失敗並說明原因，鑰匙圈沒有任何寫入
+`secrets set`、`delete`、`status` SHALL 接受 `--live` 以操作 live 項目，未帶 `--live` 時只操作既有項目。`secrets import-env` 的 `--live` 行為由變更 `secrets-import-live` 定義。
 
 #### Scenario: set 以 --live 寫入 live 項目
 

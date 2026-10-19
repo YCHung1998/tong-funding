@@ -12,7 +12,7 @@
 - **主機常數單一來源**：live 主機字串只出現在 `signed/endpoints.rs`；靜態檢查擴大到整個 `src` 掃描正式主機字串，只放行該檔案與既有的公開客戶端。
 - **限頻分類改依呼叫端型別**，不再用「主機是否在簽名白名單」判斷（live 簽名與公開行情同一台主機，主機判斷會失準）。
 - **資料庫與身分綁定**：live 身分使用 `funding-live.db`；資料庫寫入不可變的環境中繼資料，開檔時與程式身分比對，不符就停機；schema 版本提升，讓舊版程式拒絕開啟。
-- **鑰匙圈**：live 身分只讀獨立的鑰匙圈項目（service `tong-funding-live`）；demo 身分永遠不讀它；`secrets` 子命令以 `--live` 指定目標，且 `import-env` 拒絕寫入 live。
+- **鑰匙圈**：live 身分只讀獨立的鑰匙圈項目（service `tong-funding-live`）；demo 身分永遠不讀它；`secrets` 子命令以 `--live` 指定目標，`import-env` 的 live 行為見 `secrets-import-live`。
 - **客戶端依身分選主機**：帳戶、持倉、槓桿上限、資金費流水、費率來源、時鐘校時、下單，在 live 身分下全部走 live 主機，且**不會建立任何 demo 客戶端**（反之亦然）。
 - **訂單 ID 前綴**新增 `live`，讓重啟對帳辨識 live 單。
 - **live 身分排除 OKX**：引擎拒絕含 OKX 腿的配對，執行器只建 Binance 與 Bybit，掃幣可交易清單只含這兩所。
@@ -26,7 +26,7 @@
 
 ### Modified Capabilities
 
-- `secret-bundle`：新增 live 專用的鑰匙圈項目與 CLI 的 `--live` 行為，`import-env` 不得寫入 live。
+- `secret-bundle`：新增 live 專用的鑰匙圈項目與 CLI 的 `--live` 行為，`import-env` 的 live 行為見 `secrets-import-live`。
 
 ## Impact
 

@@ -30,7 +30,7 @@
 5. **主機字串單一來源**：`PRODUCTION_HOSTS` 掃描擴大為整個 `src`（非測試程式碼），只放行 `signed/endpoints.rs` 與公開客戶端；`HostPolicy::SignedLive` 的清單與 `endpoints.rs` 的常數同源，並加一個測試確認兩者一致。
 6. **限頻分類改依客戶端型別**：`RateLimiter` 的呼叫端（簽名客戶端／公開批次／公開單一）直接傳入分類，`classify_request` 只保留給無法得知型別的舊呼叫（逐步移除並有測試覆蓋）。平倉專用的權重保留與 418／429 自動鎖定屬於 `live-guardrails`，本變更只確保分類正確。
 7. **資料庫環境中繼資料**：寫入 `system_flags`（或獨立的 meta 表）一個唯讀語意的 `db_venue`，schema 提升到 5；開檔順序：開檔 → 讀 schema 版本（過新即 `SchemaTooNew`）→ 讀 `db_venue` → 與身分比對（不符即新的 `HaltReason::VenueMismatch`）。路徑：Live → `funding-live.db`，Demo → `funding.db`，同一個資料目錄。`config`／`import` 等命令列工具走同一個開檔函式，因此 `--db` 也受約束。
-8. **鑰匙圈**：`BundleSecrets` 依身分選 `KeychainStore::with_service("tong-funding")` 或 `with_service("tong-funding-live")`；Live 不做舊分項遷移、不退回 demo 項目；`secrets_cli` 的 `--live` 旗標選擇目標，`import-env` 與 `--live` 互斥。
+8. **鑰匙圈**：`BundleSecrets` 依身分選 `KeychainStore::with_service("tong-funding")` 或 `with_service("tong-funding-live")`；Live 不做舊分項遷移、不退回 demo 項目；`secrets_cli` 的 `--live` 旗標選擇目標，`import-env` 的 live 行為見 `secrets-import-live`（原本互斥，已被使用者推翻）。
 9. **單一實例鎖**：在資料目錄建立 `tong-funding.lock`，以作業系統的檔案鎖（程序結束或當機自動釋放）取得；取不到就在開資料庫與啟動引擎之前結束。
 10. **客戶端依身分選主機**：`live.rs` 的組合根依 `ProcessIdentity` 建立一組「環境套件」（時鐘校時主機、帳戶／流水／費率／槓桿客戶端、下單傳輸）；Live 套件只含 live 項目，Demo 套件只含 demo 項目；用假傳輸記錄所有目標主機的測試證明兩邊不交叉。環境變數 `TONG_FUNDING_BINANCE_HOST` 只對 Demo 身分有效。
 11. **`IdPrefix::Live`**：字串 `live`，與 `demo` 等長（4 個字元），總長度維持在 36 以內；`recovery` 以前綴辨識 live 單。
