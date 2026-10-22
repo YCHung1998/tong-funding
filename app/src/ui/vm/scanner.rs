@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use tong_funding_core::edge_kind::{EdgeKind, classify_edge};
+use tong_funding_core::edge_kind::{EdgeClassification, EdgeKind, classify_edge};
 use tong_funding_core::funding::{DataStatus, FundingObservation, equivalent_8h_rate, is_consistent_listed};
 use tong_funding_core::net_edge::{NetEdgeParams, best_opportunity_with, legs_settle_together, meets_min_expected_net_pnl};
 use tong_funding_core::risk::{EffectiveConfig, RiskConfig, RiskOverrides, effective_for_pair};
@@ -165,10 +165,9 @@ pub struct ScanRow {
     pub intervals_differ: bool,
     pub net_edge: NetEdgeCell,
     pub qualified: Qualified,
-    /// Where the income comes from (display only; `None` = no income or unknown interval).
-    pub edge_kind: Option<EdgeKind>,
-    /// `(r_S / h_S − r_L / h_L) × 100` of the shown pair, display only.
-    pub hourly_spread: Option<Decimal>,
+    /// Core's classification of the shown pair (display only): where the income comes from and the
+    /// hourly rate spread. `None` = no pair, or core could not classify it (unknown interval, overflow).
+    pub edge: Option<EdgeClassification>,
     /// Settlement target and the exchange whose clock it is on.
     pub countdown_target: Option<(i64, Exchange)>,
 }
@@ -186,21 +185,21 @@ impl ScanRow {
     pub fn gross_text(&self) -> String {
         self.gross_spread.map_or_else(|| DASH.into(), format::rate_pct)
     }
-    /// Opportunity-kind tag (`週期錯位`, `費率差`); none when the kind is `None`.
+    /// Opportunity-kind tag (`週期錯位`, `費率差`); none when there is no classification or no income.
     pub fn edge_kind_label(&self) -> Option<&'static str> {
-        self.edge_kind.map(|k| match k {
+        self.edge.as_ref()?.kind.map(|k| match k {
             EdgeKind::IntervalMismatch => "週期錯位",
             EdgeKind::RateGap => "費率差",
         })
     }
     /// Tooltip of the tag: what the kind means plus the hourly rate spread.
     pub fn edge_kind_hint(&self) -> Option<String> {
-        let meaning = match self.edge_kind? {
+        let edge = self.edge.as_ref()?;
+        let meaning = match edge.kind? {
             EdgeKind::IntervalMismatch => "收入多半來自兩所結算週期不同，而非每小時費率差",
             EdgeKind::RateGap => "收入主要來自每小時費率差",
         };
-        let hourly = self.hourly_spread.map_or_else(|| DASH.into(), |v| format::fixed(v, 4));
-        Some(format!("{meaning}\n每小時費率差 {hourly} %/h（僅供顯示）"))
+        Some(format!("{meaning}\n每小時費率差 {} %/h（僅供顯示）", format::fixed(edge.hourly_spread_pct_per_hour, 4)))
     }
 }
 
@@ -546,8 +545,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> ScannerVm {
             intervals_differ: false,
             net_edge: NetEdgeCell::NotApplicable,
             qualified: Qualified::NotApplicable,
-            edge_kind: None,
-            hourly_spread: None,
+            edge: None,
             countdown_target: earliest(&listed),
         };
         if candidates.len() >= 2 {
@@ -557,10 +555,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> ScannerVm {
                 row.gross_spread = Some((s.funding_rate - l.funding_rate).abs());
                 row.intervals_differ = l.funding_interval_secs != s.funding_interval_secs;
                 row.countdown_target = earliest(&[l, s]);
-                if let Some(c) = classify_edge(l, s) {
-                    row.edge_kind = c.kind;
-                    row.hourly_spread = Some(c.hourly_spread_pct_per_hour);
-                }
+                row.edge = classify_edge(l, s);
             }
             row.net_edge = p.net;
             row.qualified = p.qualified;

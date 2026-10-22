@@ -1,13 +1,14 @@
-//! cost-attribution task 2.1: the split of a pair's price PnL into entry slippage, holding drift and
-//! exit slippage (spec cost-attribution). Hand-computed cases; identities are pinned against `compute_pnl`.
+//! cost-attribution 6.1 (spec cost-attribution): the two values the PnL `breakdown` does not
+//! carry, `entry_slippage` and `notional_per_leg`. Hand-computed cases; the parts the spec derives
+//! from `breakdown` (exit slippage, drift) are pinned against `compute_pnl`.
 //! Run: `cargo test -p tong-funding-core --test cost_attribution`.
 
 use std::str::FromStr;
 
 use serde_json::json;
-use tong_funding_core::cost_attribution::{attribute_costs, CostAttribution};
+use tong_funding_core::cost_attribution::{entry_slippage, notional_per_leg};
 use tong_funding_core::pnl::{
-    compute_pnl, FillAction, FillRecord, FundingFetchState, FundingLedgerEntry, LegInput, PairInput,
+    compute_pnl, Component, FillAction, FillRecord, FundingFetchState, FundingLedgerEntry, LegInput, PairInput,
 };
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
@@ -42,6 +43,15 @@ fn pair(legs: Vec<LegInput>) -> PairInput {
     PairInput { legs, ambiguous_attribution: false, reconciliation_mismatch: false }
 }
 
+/// A leg with nothing but the given opening fills (the closing side does not matter to the entry values).
+fn opening(exchange: Exchange, side: Side, fills: Vec<FillRecord>) -> LegInput {
+    leg(exchange, side, fills, vec![])
+}
+
+fn open_fill(id: &str, qty: &str, expected: &str, actual: &str) -> FillRecord {
+    fill(id, FillAction::Open, qty, Some(expected), actual, "0")
+}
+
 /// The spec's 100 / 100.1 / 100.5 / 100.4 case; fees 0.1 per fill, funding +0.5 on the long leg.
 fn spec_pair() -> PairInput {
     pair(vec![
@@ -66,129 +76,157 @@ fn spec_pair() -> PairInput {
     ])
 }
 
-fn usdt(a: &Option<tong_funding_core::cost_attribution::Amount>) -> Decimal {
-    a.as_ref().expect("known").usdt
-}
-
 #[test]
-fn cost_attribution_spec_numbers_split_entry_and_exit_per_leg_and_in_total() {
-    let a = attribute_costs(&spec_pair());
-    assert_eq!(usdt(&a.entry_slippage), d("2.0"), "long 1.0 + short 1.0");
-    assert_eq!(usdt(&a.exit_slippage), d("2.0"), "long 1.0 + short 1.0");
-    assert!(a.unknown.is_empty(), "{:?}", a.unknown);
-}
-
-#[test]
-fn cost_attribution_identities_hold_against_compute_pnl() {
+fn cost_attribution_spec_numbers_entry_slippage_notional_and_the_derived_exit_slippage() {
     let input = spec_pair();
-    let (a, b) = (attribute_costs(&input), compute_pnl(&input));
-    assert_eq!(usdt(&a.entry_slippage) + usdt(&a.exit_slippage), b.total.slippage, "entry + exit = slippage");
-    assert_eq!(usdt(&a.drift), b.total.price_ref, "drift = price_ref");
-    assert_eq!(usdt(&a.funding), b.total.funding);
-    assert_eq!(usdt(&a.fees), b.total.opening_fee + b.total.closing_fee);
-    let net = usdt(&a.funding) + usdt(&a.drift) - usdt(&a.entry_slippage) - usdt(&a.exit_slippage) - usdt(&a.fees);
-    assert_eq!(net, b.total.net, "funding + drift - entry - exit - fees = net");
-    assert_eq!(usdt(&a.net), b.total.net);
-}
+    let entry = entry_slippage(&input).expect("known");
+    assert_eq!(entry, d("2.0"), "long 1.0 + short 1.0");
+    assert_eq!(notional_per_leg(&input), Some(d("1001")), "10 x 100.1 on both legs");
+    assert_eq!((entry.to_string(), notional_per_leg(&input).unwrap().to_string()), ("2".to_string(), "1001".to_string()), "normalised");
 
-#[test]
-fn cost_attribution_pct_is_of_the_average_open_notional_per_leg() {
-    // open notionals 10 x 100.1 = 1001 and 10 x 100.1 = 1001; entry slippage 2.0
-    let a = attribute_costs(&spec_pair());
-    assert_eq!(a.notional_per_leg, Some(d("1001")));
-    assert_eq!(a.entry_slippage.as_ref().unwrap().pct, Some(d("2.0") / d("1001") * d("100")));
-
-    // spec scenario: notionals 1000 and 990 -> 995; the percentage is the drift over 995 (full precision, no rounding)
-    let input = pair(vec![
-        leg(
-            Exchange::Binance,
-            Side::Long,
-            vec![fill("l-open", FillAction::Open, "10", Some("100"), "100", "0"), fill("l-close", FillAction::Close, "10", Some("99.9"), "99.9", "0")],
-            vec![],
-        ),
-        leg(
-            Exchange::Bybit,
-            Side::Short,
-            vec![fill("s-open", FillAction::Open, "10", Some("99"), "99", "0"), fill("s-close", FillAction::Close, "10", Some("99"), "99", "0")],
-            vec![],
-        ),
-    ]);
-    let a = attribute_costs(&input);
-    assert_eq!(a.notional_per_leg, Some(d("995")));
-    // long reference PnL (99.9 - 100) x 10 = -1, short 0
-    let drift = a.drift.as_ref().unwrap();
-    assert_eq!(drift.usdt, d("-1"));
-    assert_eq!(drift.pct, Some(d("-1") / d("995") * d("100")));
-}
-
-#[test]
-fn cost_attribution_missing_close_reference_makes_exit_and_drift_unknown_not_zero() {
-    let mut input = spec_pair();
-    input.legs[0].fills[1].expected_price = None;
-    let a = attribute_costs(&input);
-    assert!(a.exit_slippage.is_none() && a.drift.is_none(), "{a:?}");
-    assert!(a.unknown.contains(&"exit_slippage".to_string()) && a.unknown.contains(&"drift".to_string()), "{:?}", a.unknown);
-    assert_eq!(usdt(&a.entry_slippage), d("2.0"), "entry is unaffected");
-    assert!(a.funding.is_some() && a.fees.is_some(), "funding and fees still shown");
-    assert!(a.net.is_none(), "net is incomplete when a component is missing");
-    // the existing breakdown is unchanged by the missing close reference: slippage stays flagged, not zeroed
+    // the rest is derived from the breakdown, not stored (spec): exit slippage and drift
     let b = compute_pnl(&input);
-    assert!(b.missing.contains(&tong_funding_core::pnl::Component::Slippage));
+    assert_eq!(b.total.slippage, d("4.0"));
+    assert_eq!(b.total.slippage - entry, d("2.0"), "exit slippage = slippage - entry slippage");
+    assert_eq!(b.total.price_ref, d("1.0"), "drift = price_ref");
 }
 
 #[test]
-fn cost_attribution_missing_open_reference_makes_entry_and_drift_unknown() {
+fn cost_attribution_entry_slippage_is_positive_when_adverse_for_both_sides() {
+    let one = |side: Side, expected: &str, actual: &str| entry_slippage(&pair(vec![opening(Exchange::Binance, side, vec![open_fill("o", "10", expected, actual)])]));
+    // buying the long leg above the reference, selling the short leg below it: adverse = a cost
+    assert_eq!(one(Side::Long, "100", "100.1"), Some(d("1.0")));
+    assert_eq!(one(Side::Short, "100", "99.9"), Some(d("1.0")));
+    // the other way round is a gain
+    assert_eq!(one(Side::Long, "100", "99.9"), Some(d("-1.0")));
+    assert_eq!(one(Side::Short, "100", "100.1"), Some(d("-1.0")));
+}
+
+#[test]
+fn cost_attribution_adds_up_several_opening_orders_of_a_leg() {
+    // long: 4 @ 100.1 and 6 @ 100.3 against the reference 100 -> 0.4 + 1.8 = 2.2; value 400.4 + 601.8 = 1002.2
+    // short: 10 @ 100.1 against 100.2 -> 1.0; value 1001
+    let input = pair(vec![
+        opening(Exchange::Binance, Side::Long, vec![open_fill("l1", "4", "100", "100.1"), open_fill("l2", "6", "100", "100.3")]),
+        opening(Exchange::Bybit, Side::Short, vec![open_fill("s1", "10", "100.2", "100.1")]),
+    ]);
+    assert_eq!(entry_slippage(&input), Some(d("3.2")));
+    assert_eq!(notional_per_leg(&input), Some(d("1001.6")), "(1002.2 + 1001) / 2");
+}
+
+#[test]
+fn cost_attribution_partial_close_keeps_the_entry_values_known() {
+    // the long leg opened 10 but only 6 were closed: the breakdown flags slippage and price_ref as missing
+    let mut input = spec_pair();
+    input.legs[0].fills[1].quantity = d("6");
+    assert_eq!(entry_slippage(&input), Some(d("2.0")));
+    assert_eq!(notional_per_leg(&input), Some(d("1001")));
+    let missing = compute_pnl(&input).missing;
+    assert!(missing.contains(&Component::Slippage) && missing.contains(&Component::PriceRef), "{missing:?}");
+}
+
+#[test]
+fn cost_attribution_a_leg_that_never_opened_contributes_zero_and_is_not_averaged() {
+    // the short leg's order failed: no fill at all
+    let mut input = pair(vec![
+        opening(Exchange::Binance, Side::Long, vec![open_fill("l-open", "10", "100", "100.1")]),
+        opening(Exchange::Bybit, Side::Short, vec![]),
+    ]);
+    assert_eq!(entry_slippage(&input), Some(d("1.0")), "only the leg that traded");
+    assert_eq!(notional_per_leg(&input), Some(d("1001")), "that leg's opening value, not halved");
+
+    // a fill record with nothing filled (zero quantity, no prices) is no opening fill either
+    let mut nothing = fill("s-open", FillAction::Open, "0", None, "0", "0");
+    nothing.actual_price = None;
+    input.legs[1].fills = vec![nothing];
+    assert_eq!(entry_slippage(&input), Some(d("1.0")));
+    assert_eq!(notional_per_leg(&input), Some(d("1001")));
+}
+
+#[test]
+fn cost_attribution_no_opening_fill_on_any_leg_is_unknown_not_zero() {
+    assert_eq!((entry_slippage(&pair(vec![])), notional_per_leg(&pair(vec![]))), (None, None), "no legs");
+    let close = |id: &str| fill(id, FillAction::Close, "10", Some("100"), "100", "0");
+    let only_closes = pair(vec![
+        opening(Exchange::Binance, Side::Long, vec![close("l-close")]),
+        opening(Exchange::Bybit, Side::Short, vec![close("s-close")]),
+    ]);
+    assert_eq!((entry_slippage(&only_closes), notional_per_leg(&only_closes)), (None, None), "closing fills are no entry");
+}
+
+#[test]
+fn cost_attribution_missing_opening_reference_makes_both_unknown_and_leaves_the_breakdown_as_it_is() {
     let mut input = spec_pair();
     input.legs[1].fills[0].expected_price = None;
-    let a = attribute_costs(&input);
-    assert!(a.entry_slippage.is_none() && a.drift.is_none());
-    assert_eq!(usdt(&a.exit_slippage), d("2.0"));
+    assert_eq!((entry_slippage(&input), notional_per_leg(&input)), (None, None));
+    let missing = compute_pnl(&input).missing;
+    assert!(missing.contains(&Component::PriceRef) && missing.contains(&Component::Slippage), "{missing:?}");
+
+    // any opening fill of a leg counts, not only the first
+    let mut input = pair(vec![
+        opening(Exchange::Binance, Side::Long, vec![open_fill("l1", "4", "100", "100.1"), open_fill("l2", "6", "100", "100.3")]),
+        opening(Exchange::Bybit, Side::Short, vec![open_fill("s1", "10", "100.2", "100.1")]),
+    ]);
+    input.legs[0].fills[1].expected_price = None;
+    assert_eq!((entry_slippage(&input), notional_per_leg(&input)), (None, None));
 }
 
 #[test]
-fn cost_attribution_missing_fee_makes_only_fees_and_net_unknown() {
-    let mut input = spec_pair();
-    input.legs[0].fills[0].fee = None;
-    let a = attribute_costs(&input);
-    assert!(a.fees.is_none() && a.net.is_none());
-    assert_eq!(usdt(&a.entry_slippage), d("2.0"));
-    assert_eq!(usdt(&a.drift), compute_pnl(&input).total.price_ref);
-}
-
-#[test]
-fn cost_attribution_without_open_fill_prices_has_no_notional_and_no_pct() {
+fn cost_attribution_missing_opening_fill_price_makes_both_unknown() {
     let mut input = spec_pair();
     input.legs[0].fills[0].actual_price = None;
-    let a = attribute_costs(&input);
-    assert!(a.notional_per_leg.is_none());
-    assert!(a.unknown.contains(&"notional_per_leg".to_string()));
-    assert_eq!(a.exit_slippage.as_ref().unwrap().pct, None, "pct unknown without a notional, usdt still shown");
-    assert_eq!(usdt(&a.exit_slippage), d("2.0"));
+    assert_eq!((entry_slippage(&input), notional_per_leg(&input)), (None, None));
 }
 
 #[test]
-fn cost_attribution_no_fills_is_all_unknown() {
-    let input = pair(vec![leg(Exchange::Binance, Side::Long, vec![], vec![]), leg(Exchange::Bybit, Side::Short, vec![], vec![])]);
-    let a = attribute_costs(&input);
-    assert!(a.entry_slippage.is_none() && a.exit_slippage.is_none() && a.drift.is_none() && a.fees.is_none() && a.net.is_none());
-}
-
-#[test]
-fn cost_attribution_unconverted_okx_fill_is_unknown_not_zero() {
+fn cost_attribution_unconverted_okx_opening_fill_makes_both_unknown() {
+    // the quantity is in contracts, not coins: nothing built on it is a number of USDT
     let mut input = spec_pair();
-    input.legs[1].fills[1].contract_value_missing = true;
-    let a = attribute_costs(&input);
-    assert!(a.exit_slippage.is_none() && a.drift.is_none());
-    assert_eq!(usdt(&a.entry_slippage), d("2.0"));
+    input.legs[1].fills[0].contract_value_missing = true;
+    assert_eq!((entry_slippage(&input), notional_per_leg(&input)), (None, None));
 }
 
 #[test]
-fn cost_attribution_serialises_decimals_as_strings_and_unknown_as_null() {
+fn cost_attribution_closing_fills_do_not_change_the_entry_values() {
     let mut input = spec_pair();
-    input.legs[0].fills[1].expected_price = None;
-    let v = serde_json::to_value(attribute_costs(&input)).unwrap();
-    assert_eq!(v["entry_slippage"]["usdt"], json!("2"));
-    assert!(v["exit_slippage"].is_null() && v["drift"].is_null());
-    assert_eq!(v["unknown"], json!(["drift", "exit_slippage", "net"]));
-    let _: CostAttribution = serde_json::from_value(v).unwrap();
+    input.legs[0].fills[1].expected_price = None; // close reference missing
+    input.legs[1].fills[1].actual_price = None; // close price missing
+    assert_eq!(entry_slippage(&input), Some(d("2.0")));
+    assert_eq!(notional_per_leg(&input), Some(d("1001")));
+    input.legs[0].fills[1].contract_value_missing = true; // an unconverted close
+    assert_eq!(entry_slippage(&input), Some(d("2.0")));
+    assert_eq!(notional_per_leg(&input), Some(d("1001")));
+}
+
+#[test]
+fn cost_attribution_overflow_is_unknown_and_never_panics() {
+    let max = Decimal::MAX.to_string();
+    let one = |side: Side, qty: &str, expected: &str, actual: &str| opening(Exchange::Binance, side, vec![open_fill("o", qty, expected, actual)]);
+    let known = |input: &PairInput| (entry_slippage(input), notional_per_leg(input));
+
+    // (reference - actual) x quantity does not fit
+    let product = pair(vec![one(Side::Short, "10", &max, "1")]);
+    assert_eq!(known(&product).0, None, "product");
+    // reference - actual does not fit
+    let difference = pair(vec![one(Side::Short, "1", &max, "-1")]);
+    assert_eq!(known(&difference).0, None, "difference");
+    // each leg's slippage fits (+6e28), their sum (1.2e29) does not
+    let sixty = "60000000000000000000000000001"; // 6e28 + 1
+    let sum = pair(vec![one(Side::Long, "1", "1", sixty), one(Side::Short, "1", sixty, "1")]);
+    assert_eq!(known(&sum).0, None, "sum of the legs");
+    // the opening value (price x quantity) does not fit; the slippage of the same fill is 0
+    let value = pair(vec![one(Side::Long, "2", &max, &max)]);
+    assert_eq!(known(&value), (Some(Decimal::ZERO), None), "value of a fill");
+    // each value fits (5e28), their sum does not
+    let fifty = "50000000000000000000000000000";
+    let total = pair(vec![one(Side::Long, "1", fifty, fifty), one(Side::Short, "1", fifty, fifty)]);
+    assert_eq!(known(&total), (Some(Decimal::ZERO), None), "sum of the values");
+}
+
+#[test]
+fn cost_attribution_a_notional_that_is_not_positive_is_unknown() {
+    // a notional is the denominator of every percentage: never 0 or negative
+    let input = pair(vec![opening(Exchange::Binance, Side::Long, vec![open_fill("l-open", "10", "100", "0")])]);
+    assert_eq!(notional_per_leg(&input), None);
+    assert_eq!(entry_slippage(&input), Some(d("-1000")), "the slippage itself is still computed");
 }

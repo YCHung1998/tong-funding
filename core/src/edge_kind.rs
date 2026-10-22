@@ -24,23 +24,26 @@ pub struct EdgeClassification {
 }
 
 /// Classifies an already-assigned (long, short) pair. `None` when either settlement interval is
-/// unknown (never guessed). The income uses Net Edge's own definition ([`expected_income_rate`]).
+/// unknown (never guessed) or a computation overflows: this runs on the order path and must never
+/// panic. The model income uses Net Edge's own definition ([`expected_income_rate`]); the rate-gap
+/// income is the hourly spread held for the longer of the two settlement periods.
 pub fn classify_edge(long: &FundingObservation, short: &FundingObservation) -> Option<EdgeClassification> {
     let secs = |o: &FundingObservation| o.funding_interval_secs.filter(|s| *s > 0);
     let (secs_l, secs_s) = (secs(long)?, secs(short)?);
-    let hours = |s: i64| Decimal::from(s) / Decimal::from(3600);
+    let hours = |s: i64| Decimal::from(s).checked_div(Decimal::from(3600));
+    let (hours_l, hours_s) = (hours(secs_l)?, hours(secs_s)?);
     let hundred = Decimal::ONE_HUNDRED;
-    let hourly_spread_pct_per_hour = (short.funding_rate / hours(secs_s) - long.funding_rate / hours(secs_l)) * hundred;
-    let model_income_pct = expected_income_rate(long, short) * hundred;
+    let hourly_spread_pct_per_hour = short.funding_rate.checked_div(hours_s)?.checked_sub(long.funding_rate.checked_div(hours_l)?)?.checked_mul(hundred)?;
+    // `expected_income_rate` adds the two rates unchecked and r_S − r_L is the largest sum it can
+    // reach: refuse a pair whose rates do not fit, instead of letting it panic.
+    short.funding_rate.checked_sub(long.funding_rate)?;
+    let model_income_pct = expected_income_rate(long, short).checked_mul(hundred)?;
     let kind = if model_income_pct <= Decimal::ZERO {
         None
     } else {
-        let rate_gap_income_pct = hourly_spread_pct_per_hour * hours(secs_l.min(secs_s));
-        Some(if secs_l != secs_s && rate_gap_income_pct < INTERVAL_MISMATCH_SHARE * model_income_pct {
-            EdgeKind::IntervalMismatch
-        } else {
-            EdgeKind::RateGap
-        })
+        let rate_gap_income_pct = hourly_spread_pct_per_hour.checked_mul(hours_l.max(hours_s))?;
+        let mismatch_below = INTERVAL_MISMATCH_SHARE.checked_mul(model_income_pct)?;
+        Some(if secs_l != secs_s && rate_gap_income_pct < mismatch_below { EdgeKind::IntervalMismatch } else { EdgeKind::RateGap })
     };
     Some(EdgeClassification { kind, hourly_spread_pct_per_hour })
 }

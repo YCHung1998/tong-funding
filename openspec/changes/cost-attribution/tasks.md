@@ -23,10 +23,10 @@
 
 ## 6. 審查後修正（skeptic / red-team / simplifier 第一輪）
 
-- [ ] 6.1 core：`attribution` 改為只算 `entry_slippage` 與 `notional_per_leg`（沒有開倉成交的腿貢獻 0、checked 運算、溢位為未知）；刪除 `Amount`、`CostAttribution`、`unknown`、`Deserialize`；測試涵蓋 spec 四個情境（含部分平倉、單腿配對）與溢位
-- [ ] 6.2 app：`pnl_payload` 的 `attribution` 改為兩個值；刪除 `REFERENCE_SOURCES`；刪除只驗證實作細節的測試（payload 鍵數、與既有測試重複的去重測試）
-- [ ] 6.3 core：`classify_edge` 的費率差收入改用 `max(h_L, h_S)`、checked 運算；測試涵蓋 spec 全部情境（含長週期費率大、短週期接近 0）
-- [ ] 6.4 UI：`ScanRow` 的兩個欄位合併為 `edge: Option<EdgeClassification>`；tooltip 元素 id 改用幣種（避免重排後殘留）
+- [x] 6.1 core：`attribution` 改為只算 `entry_slippage` 與 `notional_per_leg`（沒有開倉成交的腿貢獻 0、checked 運算、溢位為未知）；刪除 `Amount`、`CostAttribution`、`unknown`、`Deserialize`；測試涵蓋 spec 四個情境（含部分平倉、單腿配對）與溢位
+- [x] 6.2 app：`pnl_payload` 的 `attribution` 改為兩個值；刪除 `REFERENCE_SOURCES`；刪除只驗證實作細節的測試（payload 鍵數、與既有測試重複的去重測試）
+- [x] 6.3 core：`classify_edge` 的費率差收入改用 `max(h_L, h_S)`、checked 運算；測試涵蓋 spec 全部情境（含長週期費率大、短週期接近 0）
+- [x] 6.4 UI：`ScanRow` 的兩個欄位合併為 `edge: Option<EdgeClassification>`；tooltip 元素 id 改用幣種（避免重排後殘留）
 - [ ] 6.5 報表：其餘項目由 `breakdown` 推導；還原規則與引擎一致（最後一筆快照、依 `client_order_id` 加總、缺 `expected_price` 或 OKX 為未知）；只用最新 PnL 事件
 - [ ] 6.6 報表：URI 正確編碼；immutable 只在「無法開啟」且 `-wal`／`-shm` 皆不存在時使用並標示，讀取前後檢查檔案狀態；列出略過的配對；不利成本佔比；提前出場標記；市場限制說明；建議值的樣本內回測
 - [ ] 6.7 以副本資料庫重跑 Rust 與報表的逐筆比對（17 筆），確認一致

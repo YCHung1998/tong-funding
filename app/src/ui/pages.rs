@@ -697,9 +697,12 @@ impl TableDelegate for ScannerTable {
                     d = d.child(small("週期不同", theme::WARNING));
                 }
                 if let (Some(label), Some(hint)) = (r.edge_kind_label(), r.edge_kind_hint()) {
+                    // The id follows the symbol, not the row index: gpui keeps tooltip state per element id, so an
+                    // index would show the previous row's text on whatever symbol a re-sort puts there.
                     d = d.child(
                         div()
-                            .id(("edge-kind", row))
+                            .id(SharedString::from(format!("edge-kind-{}", r.symbol)))
+                            .test_support()
                             .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
                             .child(small(label, theme::TEXT_SECONDARY)),
                     );
