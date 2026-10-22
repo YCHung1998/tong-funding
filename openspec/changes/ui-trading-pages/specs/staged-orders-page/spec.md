@@ -115,7 +115,7 @@ engine 回報某配對 BLOCK 時，頁面 SHALL 列出該配對所有未通過�
 
 「上次執行結果」區塊 SHALL 同時涵蓋 `SIMULATION` 與 `EXCHANGE_DEMO` 兩種模式，並 SHALL 如實標示該次執行當時的模式；結果 SHALL 取自不可變事件，使重啟後仍可顯示。
 每一腿 SHALL 顯示交易所、方向、狀態（成功、失敗、未送出）與 order id；`SIMULATION` 的結果 SHALL 標示為模擬且 order id SHALL NOT 以真實 order id 的樣式呈現。
-任一腿失敗時，區塊 SHALL 明確顯示「需人工處理」及該配對目前的狀態，SHALL NOT 顯示「已平倉回滾」或任何暗示系統已自動補救的文字。
+任一腿失敗時，區塊 SHALL 明確顯示「需人工處理」及該配對目前的狀態，SHALL NOT 顯示「已平倉回滾」或任何暗示系統已自動補救的文字；唯一的例外是單腿看門狗（`naked-leg-watchdog`，授權 B）確實已送出並完成平倉時，SHALL 如實寫出系統做了什麼（哪一腿、數量），並仍提示需人工確認已平倉。
 區塊 SHALL 標示結果為歷史紀錄，並非目前已選項目的送單結果。
 
 #### Scenario: SIMULATION 結果
