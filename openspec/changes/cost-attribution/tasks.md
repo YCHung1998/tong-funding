@@ -18,7 +18,7 @@
 
 ## 5. 報表
 
-- [ ] 5.1 `issue/tools/cost_report.py`：逐筆表、佔比、分位數、建議值、樣本數警示、唯讀；合成資料庫測試（含「不寫入」與「舊資料還原與新欄位一致」）
+- [x] 5.1 `issue/tools/cost_report.py`：逐筆表、佔比、分位數、建議值、樣本數警示、唯讀；合成資料庫測試（含「不寫入」與「舊資料還原與新欄位一致」）
 - [ ] 5.2 以目前的 `funding.db` 實跑一次（唯讀），把輸出寫成 `issue/007-cost-attribution-baseline.md` 並更新 `issue/README.md`
 
 ## 6. 驗證
