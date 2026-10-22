@@ -22,6 +22,7 @@ use std::str::FromStr;
 
 use rusqlite::params;
 use serde_json::{Value, json};
+use tong_funding_core::cost_attribution::{entry_slippage, notional_per_leg};
 use tong_funding_core::pnl::{
     Attribution, Comparison, ExpectedSnapshot, FillAction, FillRecord, FundingFetchState, IncompleteReason, LegInput, LegWindow, PairInput,
     PnlBreakdown, attribute, compare_expected, compute_pnl, expected_settlements, slippage_summary,
@@ -426,7 +427,15 @@ pub fn pnl_payload(a: &PairPnlInput, b: &PnlBreakdown, now_ms: i64) -> Value {
         "ledger_keys": a.ledger_keys,
         "fill_ids": a.fill_ids,
         "computed_at_ms": now_ms,
+        "attribution": attribution_json(a),
     })
+}
+
+/// The two values `breakdown` lacks (spec cost-attribution), as normalised decimal strings, `null`
+/// = unknown. The rest of the cost split (exit slippage, drift) is derived from `breakdown`. Built
+/// from the same input as `breakdown`, so it is not part of the dedup comparison in `record`.
+fn attribution_json(a: &PairPnlInput) -> Value {
+    json!({ "entry_slippage": entry_slippage(&a.input), "notional_per_leg": notional_per_leg(&a.input) })
 }
 
 /// Writes `PAIR_PNL_COMPUTED` (none yet) or `PAIR_PNL_RECOMPUTED` (the result changed); returns

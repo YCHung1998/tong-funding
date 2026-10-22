@@ -463,3 +463,81 @@ fn a_missing_settlement_time_is_not_synchronized() {
     let vm = build(&s, NOW);
     assert_eq!(row(&vm, "BTCUSDT").qualified, Qualified::NotSynchronized);
 }
+
+// ---- cost-attribution: opportunity-kind tag (scanner-threshold-breakdown) -------------------
+
+fn kind_snap(rows: &[(Exchange, &str, &str, i64)]) -> UiSnapshot {
+    let mut s = snap(complete_settings("0.01"), &[]);
+    for (e, sym, rate, interval) in rows {
+        s.market.get_mut(e).unwrap().observations.push(obs(*e, sym, rate, *interval, T8, NOW));
+    }
+    s
+}
+
+#[test]
+fn interval_mismatch_row_shows_the_tag_and_hourly_spread_in_the_hint() {
+    let vm = build(&kind_snap(&[(Bybit, "KAIAUSDT", "-0.007337", 28_800), (Binance, "KAIAUSDT", "-0.003346", 14_400)]), NOW);
+    let r = row(&vm, "KAIAUSDT");
+    assert_eq!(r.direction, Some((Bybit, Binance)));
+    assert_eq!(r.edge, Some(EdgeClassification { kind: Some(EdgeKind::IntervalMismatch), hourly_spread_pct_per_hour: d("0.0080625") }));
+    assert_eq!(r.edge_kind_label(), Some("週期錯位"));
+    assert!(r.edge_kind_hint().unwrap().contains("每小時費率差 0.0081 %/h"), "{:?}", r.edge_kind_hint());
+}
+
+#[test]
+fn rate_gap_row_shows_the_rate_gap_tag() {
+    let vm = build(&kind_snap(&[(Bybit, "ETHUSDT", "-0.002", 28_800), (Binance, "ETHUSDT", "0.001", 28_800)]), NOW);
+    let r = row(&vm, "ETHUSDT");
+    assert_eq!(r.edge_kind_label(), Some("費率差"));
+    assert!(r.edge_kind_hint().unwrap().contains("每小時費率差 0.0375 %/h"), "{:?}", r.edge_kind_hint());
+}
+
+#[test]
+fn a_long_period_exchange_carrying_the_rate_is_a_rate_gap_not_an_interval_mismatch() {
+    // 4 h leg pays -0.951% per period, the 1 h leg -0.0044%: holding one 4 h period keeps almost all of the income
+    let vm = build(&kind_snap(&[(Binance, "BIRBUSDT", "-0.00951", 14_400), (Bybit, "BIRBUSDT", "-0.000044", 3_600)]), NOW);
+    let r = row(&vm, "BIRBUSDT");
+    assert_eq!(r.direction, Some((Binance, Bybit)));
+    assert_eq!(r.edge_kind_label(), Some("費率差"));
+    assert!(r.edge_kind_hint().unwrap().contains("每小時費率差 0.2334 %/h"), "{:?}", r.edge_kind_hint());
+}
+
+#[test]
+fn no_income_row_has_no_tag_but_keeps_the_hourly_spread() {
+    let vm = build(&kind_snap(&[(Bybit, "XRPUSDT", "0.001", 28_800), (Binance, "XRPUSDT", "0.001", 28_800)]), NOW);
+    let r = row(&vm, "XRPUSDT");
+    assert_eq!(r.edge, Some(EdgeClassification { kind: None, hourly_spread_pct_per_hour: d("0") }));
+    assert_eq!(r.edge_kind_label(), None);
+    assert_eq!(r.edge_kind_hint(), None);
+}
+
+#[test]
+fn a_row_without_a_pair_has_no_classification() {
+    let vm = build(&kind_snap(&[(Binance, "SOLUSDT", "-0.002", 28_800)]), NOW);
+    let r = row(&vm, "SOLUSDT");
+    assert_eq!((r.direction, r.edge.clone()), (None, None));
+    assert_eq!((r.edge_kind_label(), r.edge_kind_hint()), (None, None));
+}
+
+#[test]
+fn kind_does_not_change_the_qualified_filter_or_the_default_order() {
+    let vm = build(
+        &kind_snap(&[
+            (Bybit, "KAIAUSDT", "-0.007337", 28_800),
+            (Binance, "KAIAUSDT", "-0.003346", 14_400),
+            (Bybit, "ETHUSDT", "-0.002", 28_800),
+            (Binance, "ETHUSDT", "0.001", 28_800),
+        ]),
+        NOW,
+    );
+    let kind = |sym: &str| row(&vm, sym).edge.as_ref().map(|e| e.kind);
+    assert_ne!(kind("KAIAUSDT"), kind("ETHUSDT"));
+    assert!(vm.rows.iter().all(|r| r.qualified == Qualified::Yes));
+    let RowsView::Rows(shown) = vm.visible(true) else { panic!("both qualify") };
+    let by_net: Vec<_> = {
+        let mut v: Vec<_> = vm.rows.iter().collect();
+        v.sort_by_key(|r| std::cmp::Reverse(r.net_edge.value()));
+        v.iter().map(|r| r.symbol.clone()).collect()
+    };
+    assert_eq!(shown.iter().map(|r| r.symbol.clone()).collect::<Vec<_>>(), by_net);
+}

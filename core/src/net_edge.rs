@@ -57,6 +57,20 @@ pub struct Opportunity {
     pub qualifies: bool,
 }
 
+/// Expected funding income per unit notional (a fraction) of one (long, short) pairing under the
+/// single-settlement model: only the leg(s) settling at the pair's `T` earn or pay.
+pub fn expected_income_rate(long: &FundingObservation, short: &FundingObservation) -> Decimal {
+    let settle = pair_settlement(long, short);
+    let mut income_rate = Decimal::ZERO;
+    if settle.long_settles {
+        income_rate -= long.funding_rate;
+    }
+    if settle.short_settles {
+        income_rate += short.funding_rate;
+    }
+    income_rate
+}
+
 /// Computes Net Edge for an already-assigned (long, short) pair with per-leg notional `notional`.
 pub fn compute_net_edge(
     long: &FundingObservation,
@@ -79,14 +93,7 @@ pub fn compute_net_edge(
     let slippage_pct = params.est_slippage_pct.ok_or(NetEdgeError::MissingEstSlippage)?;
 
     let hundred = Decimal::ONE_HUNDRED;
-    let settle = pair_settlement(long, short);
-    let mut income_rate = Decimal::ZERO;
-    if settle.long_settles {
-        income_rate -= long.funding_rate;
-    }
-    if settle.short_settles {
-        income_rate += short.funding_rate;
-    }
+    let income_rate = expected_income_rate(long, short);
     let funding_income_usdt = notional * income_rate;
     let fee_usdt = notional * Decimal::TWO * (fee_l + fee_s) / hundred;
     let slippage_usdt = notional * Decimal::from(4) * slippage_pct / hundred;

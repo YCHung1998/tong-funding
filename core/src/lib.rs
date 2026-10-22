@@ -1,5 +1,7 @@
 //! Pure domain logic. No I/O, no GPUI, no system clock (time is always passed in).
 
+pub mod edge_kind;
+pub mod cost_attribution;
 pub mod funding;
 pub mod grouping;
 pub mod net_edge;

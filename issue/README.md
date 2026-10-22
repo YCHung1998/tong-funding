@@ -10,5 +10,6 @@
 | [004](004-trades-2026-10-15-0400.md) | 2026-10-15 04:00 四筆實單整理（Binance demo 04:00 無結算、SIREN 的 Bybit 手續費為兩倍） | 已整理；4 筆皆 COMPLETE | 未修改程式 |
 | [005](005-spread-tag-check.md) | 價差標籤（spread-position-tag）對 8 筆實單的並列核對 | 已呈現；不推論因果 | 未修改程式 |
 | [006](006-sync-rule-replay.md) | 「兩腿結算時間必須相同」規則重放 8 筆實單（3 筆被擋） | 已呈現 | 未修改程式 |
+| [007](007-cost-attribution-baseline.md) | 17 筆實單的成本拆解基準：價格損益與資金費同量級、結算後多腿所在交易所相對下跌（方向確認、機制未知） | 已量測並經三方審查；機制未知 | 新增紀錄、型態標籤與唯讀報表（`cost-attribution`），不改交易邏輯 |
 
-制式分析表與產生工具：[template-trade-table.md](template-trade-table.md)、`tools/trade_table.py`。
+制式分析表與產生工具：[template-trade-table.md](template-trade-table.md)、`tools/trade_table.py`；成本拆解與校準報表：`tools/cost_report.py`。

@@ -275,6 +275,72 @@ fn pnl_record_a_demo_round_with_close_references_and_funding_is_complete() {
     assert_eq!(latest.payload["breakdown"]["total"]["slippage"], json!("0.08"));
 }
 
+/// cost-attribution 3.1: a complete demo round (same fixture as above) with funding and references.
+fn complete_round() -> Fx {
+    let fx = opened_round();
+    close_with_reference(&fx, T + 15_000, "long", Exchange::Binance, "59997.5", Ok("60000"));
+    close_with_reference(&fx, T + 15_000, "short", Exchange::Bybit, "60000", Ok("60001"));
+    fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_fetched(&fx);
+    fx.clock.set(T + 80_000);
+    fx
+}
+
+#[test]
+fn pnl_record_payload_carries_entry_slippage_and_notional_per_leg_and_they_match_core() {
+    let fx = complete_round();
+    settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    let p = latest_pnl(&fx.db, "p1").unwrap().unwrap().payload;
+    // entry: long open 0.02 x (60002.5 - 60000) = 0.05, the short opened at its reference price (0);
+    // notional: long 0.02 x 60002.5 = 1200.05, short 0.02 x 60000 = 1200, average 1200.025
+    assert_eq!(p["attribution"], json!({ "entry_slippage": "0.05", "notional_per_leg": "1200.025" }), "{p}");
+    // the same values as the core functions on the same input
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    assert_eq!(p["attribution"], json!({ "entry_slippage": entry_slippage(&a.input), "notional_per_leg": notional_per_leg(&a.input) }));
+    // the exit slippage is derived from the breakdown (spec): slippage 0.08 - entry slippage 0.05
+    let total = |v: &Value| d(v.as_str().unwrap());
+    assert_eq!(total(&p["slippage"]["total"]) - total(&p["attribution"]["entry_slippage"]), d("0.03"));
+}
+
+#[test]
+fn pnl_record_attribution_leaves_the_existing_payload_values_unchanged() {
+    let fx = complete_round();
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    let b = tong_funding_core::pnl::compute_pnl(&a.input);
+    let p = pnl_payload(&a, &b, T + 80_000);
+    assert_eq!(p["breakdown"], serde_json::to_value(&b).unwrap());
+    assert_eq!(p["status"], json!(b.status.as_str()));
+    assert_eq!(p["slippage"], serde_json::to_value(tong_funding_core::pnl::slippage_summary(&b)).unwrap());
+    let reasons: Vec<String> = b.status.reasons().iter().map(|r| r.label()).collect();
+    assert_eq!(p["reasons"], json!(reasons));
+    let keys: Vec<&str> = p.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    for k in ["status", "reasons", "funding_tracing", "breakdown", "slippage", "expected_vs_actual", "no_expected_snapshot", "settlement_slots", "ledger_keys", "fill_ids", "computed_at_ms", "attribution"] {
+        assert!(keys.contains(&k), "{k} missing from {keys:?}");
+    }
+}
+
+#[test]
+fn pnl_record_attribution_is_null_when_the_entry_reference_is_missing_not_zero() {
+    let fx = scenario(false); // no entry snapshot: the opening fills have no reference price
+    both_fetched(&fx);
+    settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    let p = latest_pnl(&fx.db, "p1").unwrap().unwrap().payload;
+    assert_eq!(p["attribution"], json!({ "entry_slippage": null, "notional_per_leg": null }), "{p}");
+    assert!(p["breakdown"]["missing"].as_array().unwrap().contains(&json!("Slippage")), "the breakdown still names it: {}", p["breakdown"]);
+}
+
+#[test]
+fn pnl_record_an_unknown_exit_leaves_the_entry_values_known() {
+    let fx = scenario(true); // closes without reference prices: exit slippage and drift are unknown
+    fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_fetched(&fx);
+    settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    let p = latest_pnl(&fx.db, "p1").unwrap().unwrap().payload;
+    let missing = p["breakdown"]["missing"].as_array().unwrap();
+    assert!(missing.contains(&json!("Slippage")) && missing.contains(&json!("PriceRef")), "{missing:?}");
+    assert_eq!(p["attribution"], json!({ "entry_slippage": "0.05", "notional_per_leg": "1200.025" }), "{p}");
+}
+
 #[test]
 fn pnl_record_a_missing_close_reference_keeps_the_result_incomplete_with_the_reason() {
     let fx = opened_round();
@@ -364,6 +430,7 @@ fn okx_fills_without_a_contract_value_are_unknown_and_named() {
     assert!(matches!(&r, PnlAttempt::Recorded { status, .. } if status == "INCOMPLETE"), "{r:?}");
     let latest = latest_pnl(&fx.db, "p1").unwrap().unwrap();
     assert!(latest.payload["reasons"].to_string().contains("OKX 成交缺合約面值"), "{}", latest.payload["reasons"]);
+    assert_eq!(latest.payload["attribution"], json!({ "entry_slippage": null, "notional_per_leg": null }), "contracts are not coins");
 }
 
 pub(crate) fn both_okx_fetched(fx: &Fx) {

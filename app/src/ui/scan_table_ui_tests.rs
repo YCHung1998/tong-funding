@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AppContext, Entity, ScrollDelta, TestAppContext, WindowHandle, base::Root, point, px, size};
+use gpui_kit::{AppContext, Entity, Pixels, ScrollDelta, SharedString, TestAppContext, WindowHandle, base::Root, point, px, size};
 use tong_funding_core::types::Exchange;
 
 use super::bridge::{CommandSink, ReadOnlyDataSource, RefreshRequest, SourceUpdate};
@@ -239,6 +239,30 @@ fn the_add_cell_belongs_to_the_row_that_is_drawn(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert_eq!(&*toggles.borrow(), &["AAAUSDT".to_string()], "row 0 as drawn, not the default-order first row");
+}
+
+#[gpui_kit::test]
+fn the_edge_kind_tag_belongs_to_its_symbol_not_to_the_row_position(cx: &mut TestAppContext) {
+    // The tag's tooltip state is keyed by the element id. An id built from the row index would keep an
+    // old row's tooltip (another symbol's text) on whatever symbol is drawn there after a re-sort.
+    let rig = open(cx);
+    let top_to_bottom = |cx: &mut TestAppContext| -> Vec<String> {
+        cx.update_window(rig.window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let mut tops: Vec<(String, Pixels)> = ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT"]
+                .iter()
+                .map(|s| (s.to_string(), window.find(SharedString::from(format!("edge-kind-{s}"))).bounds().origin.y))
+                .collect();
+            tops.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            tops.into_iter().map(|t| t.0).collect()
+        })
+        .unwrap()
+    };
+    assert_eq!(top_to_bottom(cx), ["DDDUSDT", "BBBUSDT", "CCCUSDT", "AAAUSDT"], "the default order");
+    rig.click(("scan-th", idx(ScanColumn::Symbol)), cx); // descending
+    rig.click(("scan-th", idx(ScanColumn::Symbol)), cx); // ascending
+    assert_eq!(rig.view(cx).2, ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT"]);
+    assert_eq!(top_to_bottom(cx), ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT"], "each symbol's tag moved with its row");
 }
 
 #[gpui_kit::test]
