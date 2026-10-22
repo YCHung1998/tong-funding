@@ -56,5 +56,5 @@
 十進位字串；`null` = 未知。
 
 ```json
-{ "entry_slippage": "0.3", "notional_per_leg": "995.0" }
+{ "entry_slippage": "0.3", "notional_per_leg": "995" }
 ```

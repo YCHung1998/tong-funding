@@ -19,7 +19,7 @@
 ## 5. 報表
 
 - [x] 5.1 `issue/tools/cost_report.py`：逐筆表、佔比、分位數、建議值、樣本數警示、唯讀；合成資料庫測試（含「不寫入」與「舊資料還原與新欄位一致」）
-- [ ] 5.2 以目前的 `funding.db` 實跑一次（唯讀），把輸出寫成 `issue/007-cost-attribution-baseline.md` 並更新 `issue/README.md`
+- [x] 5.2 以目前的 `funding.db` 實跑一次（唯讀），把輸出寫成 `issue/007-cost-attribution-baseline.md` 並更新 `issue/README.md`
 
 ## 6. 審查後修正（skeptic / red-team / simplifier 第一輪）
 
@@ -29,8 +29,8 @@
 - [x] 6.4 UI：`ScanRow` 的兩個欄位合併為 `edge: Option<EdgeClassification>`；tooltip 元素 id 改用幣種（避免重排後殘留）
 - [x] 6.5 報表：其餘項目由 `breakdown` 推導；還原規則與引擎一致（最後一筆快照、依 `client_order_id` 加總、缺 `expected_price` 或 OKX 為未知）；只用最新 PnL 事件
 - [x] 6.6 報表：URI 正確編碼；immutable 只在「無法開啟」且 `-wal`／`-shm` 皆不存在時使用並標示，讀取前後檢查檔案狀態；列出略過的配對；不利成本佔比；提前出場標記；市場限制說明；建議值的樣本內回測
-- [ ] 6.7 以副本資料庫重跑 Rust 與報表的逐筆比對（17 筆），確認一致
+- [x] 6.7 以副本資料庫重跑 Rust 與報表的逐筆比對（17 筆），確認一致
 
 ## 7. 驗證
 
-- [ ] 7.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate cost-attribution --strict` 通過
+- [x] 7.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate cost-attribution --strict` 通過

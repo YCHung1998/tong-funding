@@ -16,7 +16,7 @@
 
 未知規則：
 
-- 沒有任何開倉成交的腿貢獻 0（它沒有交易），不使未知。
+- 沒有任何開倉成交的腿貢獻 0（它沒有交易），不使未知；但兩腿都沒有開倉成交時，兩個值皆為 `null`（沒有進場，不能報 0）。
 - 任一開倉成交缺參考價、缺成交價、或數量不是幣數（OKX 未換算），`entry_slippage` 與 `notional_per_leg` 為 `null`，SHALL NOT 以 0 代替。
 - 計算溢位時為 `null`，SHALL NOT panic。
 - 此欄位 SHALL 只增加資訊，不改變既有 `breakdown`、`status`、`slippage` 的值與事件去重行為。
