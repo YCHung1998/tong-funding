@@ -7,7 +7,7 @@ Usage:
 
 Per FINALIZED pair the latest PAIR_PNL_COMPUTED / PAIR_PNL_RECOMPUTED payload's `attribution` is used.
 Older events have none: the numbers are then restored from the raw events (entry reference = the T-10
-snapshot mark price, fills = ORDER_FILL, close reference = ORDER_SUBMITTED reference_price) and the row
+snapshot expected_price, i.e. its mark price, fills = ORDER_FILL, close reference = ORDER_SUBMITTED reference_price) and the row
 is marked 還原值. Formulas follow openspec/changes/cost-attribution (dir: long open -1 / close +1, short opposite):
   entry slippage = sum(open fills) dir*(ref-act)*q      (positive = unfavourable)
   exit slippage  = sum(close fills) dir*(ref-act)*q     (positive = unfavourable)
@@ -31,7 +31,16 @@ HEADER = "【說明】demo 環境的數字不代表正式環境；建議值僅�
 
 
 def connect(path):
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    """Read-only. The app keeps the database in WAL mode and its SQLite deletes the -wal / -shm files
+    on a clean close; mode=ro cannot create the -shm file, so the open then fails ("unable to open
+    database file"). Nothing has the file open in that state, so it is read as immutable instead."""
+    db = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        db.execute("select 1 from sqlite_master limit 1").fetchall()
+        return db
+    except sqlite3.OperationalError:
+        db.close()
+        return sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
 
 
 def dec(x):
@@ -65,8 +74,9 @@ def restore(pid, events, pnl):
                  if e == "ORDER_SUBMITTED" and p.get("action") == "close"}
 
     def ref(side, action):
-        if action == "open":
-            return dec((snap.get(side) or {}).get("mark_price"))
+        if action == "open":  # the engine's open reference is expected_price (= the mark price)
+            leg = snap.get(side) or {}
+            return dec(leg.get("expected_price") or leg.get("mark_price"))
         r = close_ref.get((side, action))
         if r is None and (side, action) in fills:
             r = fills[(side, action)].get("reference_price")

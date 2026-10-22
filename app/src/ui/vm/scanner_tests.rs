@@ -515,7 +515,7 @@ fn kind_does_not_change_the_qualified_filter_or_the_default_order() {
     let RowsView::Rows(shown) = vm.visible(true) else { panic!("both qualify") };
     let by_net: Vec<_> = {
         let mut v: Vec<_> = vm.rows.iter().collect();
-        v.sort_by(|a, b| b.net_edge.value().cmp(&a.net_edge.value()));
+        v.sort_by_key(|r| std::cmp::Reverse(r.net_edge.value()));
         v.iter().map(|r| r.symbol.clone()).collect()
     };
     assert_eq!(shown.iter().map(|r| r.symbol.clone()).collect::<Vec<_>>(), by_net);

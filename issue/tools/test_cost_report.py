@@ -45,11 +45,13 @@ def schema(db):
     db.execute("create table events (id integer primary key autoincrement, ts_ms integer, event_type text, pair_id text, payload text)")
 
 
-def add_pair(db, pid, legs=LEGS, attribution=None, close_ref=True, scale=1):
+def add_pair(db, pid, legs=LEGS, attribution=None, close_ref=True, scale=1, expected=None):
     def ev(ts, kind, payload):
         db.execute("insert into events (ts_ms, event_type, pair_id, payload) values (?,?,?,?)", (ts, kind, pid, json.dumps(payload)))
 
     snap = {side: {"exchange": "Bybit" if side == "long" else "Binance", "mark_price": legs[side][0]} for side in legs}
+    for side, price in (expected or {}).items():
+        snap[side]["expected_price"] = price
     ev(S - 9_000, "PAIR_TRANSITION", {"from": "PRE_TRADE_CHECK", "to": "ORDER_SUBMIT", "detail": {"entry_snapshot": snap}})
     for side, (_, ao, rc, ac) in ((s, (None, v[1], v[2], v[3])) for s, v in legs.items()):
         ev(S - 8_000, "ORDER_FILL", {"leg": side, "action": "open", "filled_quantity": "10", "avg_price": ao, "fee": "0.05"})
@@ -67,8 +69,10 @@ def add_pair(db, pid, legs=LEGS, attribution=None, close_ref=True, scale=1):
     ev(S + 20_000, "PAIR_PNL_COMPUTED", payload)
 
 
-def make_db(path=":memory:", **kw):
+def make_db(path=":memory:", wal=False, **kw):
     db = sqlite3.connect(path)
+    if wal:
+        db.execute("pragma journal_mode=wal")
     schema(db)
     add_pair(db, "p-1", **kw)
     db.commit()
@@ -152,6 +156,35 @@ class CostReport(unittest.TestCase):
                 cr.main()
             self.assertIn("p-1", out.getvalue())
             self.assertEqual(before, digest())
+
+    def test_entry_reference_is_the_snapshot_expected_price_like_the_engine(self):
+        # the engine's open reference is entry_snapshot.<leg>.expected_price; mark_price is only a fallback
+        row = cr.load_pairs(make_db(expected={"long": "100.05", "short": "100.2"}))[0]
+        # long open: -1 x (100.05 - 100.1) x 10 = 0.5 ; short open: +1 x (100.2 - 100.1) x 10 = 1.0
+        self.assertEqual(row["entry_slippage"]["usdt"], D("1.5"))
+
+    def test_a_closed_wal_database_still_opens_read_only(self):
+        # the app keeps funding.db in WAL mode; once it is closed the -wal / -shm files are gone and a
+        # plain mode=ro open fails ("unable to open database file")
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "funding.db")
+            db = make_db(path, wal=True)
+            db.execute("pragma wal_checkpoint(TRUNCATE)")
+            db.close()
+            # the app's bundled SQLite deletes both files on a clean close; macOS's system SQLite (used
+            # by Python here) keeps them, so remove them to get the state the app leaves behind
+            for ext in ("-wal", "-shm"):
+                if os.path.exists(path + ext):
+                    os.remove(path + ext)
+            with open(path, "rb") as f:
+                before = hashlib.sha256(f.read()).hexdigest()
+            db = cr.connect(path)
+            self.assertEqual(len(cr.load_pairs(db)), 1)
+            with self.assertRaises(sqlite3.OperationalError):
+                db.execute("insert into events (ts_ms, event_type, pair_id, payload) values (1,'X','p','{}')")
+            db.close()
+            with open(path, "rb") as f:
+                self.assertEqual(before, hashlib.sha256(f.read()).hexdigest())
 
 
 if __name__ == "__main__":

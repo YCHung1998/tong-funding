@@ -36,6 +36,11 @@
 - **WHEN** 預期 funding 收入為 0 或負
 - **THEN** 型態為 `None`，每小時費率差仍輸出
 
+#### Scenario: 週期未知不分類
+
+- **WHEN** 任一腿沒有有效的結算週期
+- **THEN** 不分類也不猜測：掃幣列不顯示標籤；進場快照寫 `edge_kind: "None"`、`hourly_spread_pct_per_hour: null`（送單前檢查已要求兩腿皆有週期，正常流程不會出現）
+
 ### Requirement: 型態寫入進場快照
 
 進場檢查通過時寫入的 `entry_snapshot.net_edge` SHALL 增加 `edge_kind` 與 `hourly_spread_pct_per_hour`；既有欄位與值不變。
