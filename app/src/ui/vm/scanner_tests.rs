@@ -463,3 +463,60 @@ fn a_missing_settlement_time_is_not_synchronized() {
     let vm = build(&s, NOW);
     assert_eq!(row(&vm, "BTCUSDT").qualified, Qualified::NotSynchronized);
 }
+
+// ---- cost-attribution: opportunity-kind tag (scanner-threshold-breakdown) -------------------
+
+fn kind_snap(rows: &[(Exchange, &str, &str, i64)]) -> UiSnapshot {
+    let mut s = snap(complete_settings("0.01"), &[]);
+    for (e, sym, rate, interval) in rows {
+        s.market.get_mut(e).unwrap().observations.push(obs(*e, sym, rate, *interval, T8, NOW));
+    }
+    s
+}
+
+#[test]
+fn interval_mismatch_row_shows_the_tag_and_hourly_spread_in_the_hint() {
+    let vm = build(&kind_snap(&[(Bybit, "KAIAUSDT", "-0.007337", 28_800), (Binance, "KAIAUSDT", "-0.003346", 14_400)]), NOW);
+    let r = row(&vm, "KAIAUSDT");
+    assert_eq!(r.direction, Some((Bybit, Binance)));
+    assert_eq!(r.edge_kind_label(), Some("週期錯位"));
+    assert!(r.edge_kind_hint().unwrap().contains("0.0081"), "{:?}", r.edge_kind_hint());
+}
+
+#[test]
+fn rate_gap_row_shows_the_rate_gap_tag() {
+    let vm = build(&kind_snap(&[(Bybit, "ETHUSDT", "-0.002", 28_800), (Binance, "ETHUSDT", "0.001", 28_800)]), NOW);
+    let r = row(&vm, "ETHUSDT");
+    assert_eq!(r.edge_kind_label(), Some("費率差"));
+    assert!(r.edge_kind_hint().unwrap().contains("0.0375"), "{:?}", r.edge_kind_hint());
+}
+
+#[test]
+fn no_income_row_has_no_tag() {
+    let vm = build(&kind_snap(&[(Bybit, "XRPUSDT", "0.001", 28_800), (Binance, "XRPUSDT", "0.001", 28_800)]), NOW);
+    let r = row(&vm, "XRPUSDT");
+    assert_eq!(r.edge_kind_label(), None);
+    assert_eq!(r.edge_kind_hint(), None);
+}
+
+#[test]
+fn kind_does_not_change_the_qualified_filter_or_the_default_order() {
+    let vm = build(
+        &kind_snap(&[
+            (Bybit, "KAIAUSDT", "-0.007337", 28_800),
+            (Binance, "KAIAUSDT", "-0.003346", 14_400),
+            (Bybit, "ETHUSDT", "-0.002", 28_800),
+            (Binance, "ETHUSDT", "0.001", 28_800),
+        ]),
+        NOW,
+    );
+    assert_ne!(row(&vm, "KAIAUSDT").edge_kind, row(&vm, "ETHUSDT").edge_kind);
+    assert!(vm.rows.iter().all(|r| r.qualified == Qualified::Yes));
+    let RowsView::Rows(shown) = vm.visible(true) else { panic!("both qualify") };
+    let by_net: Vec<_> = {
+        let mut v: Vec<_> = vm.rows.iter().collect();
+        v.sort_by(|a, b| b.net_edge.value().cmp(&a.net_edge.value()));
+        v.iter().map(|r| r.symbol.clone()).collect()
+    };
+    assert_eq!(shown.iter().map(|r| r.symbol.clone()).collect::<Vec<_>>(), by_net);
+}

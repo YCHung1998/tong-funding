@@ -1186,6 +1186,9 @@ async fn order_submit_carries_the_entry_snapshot_and_order_events_carry_fill_det
     for k in ["net_edge_pct", "net_edge_usdt", "funding_income_usdt", "fee_usdt", "slippage_usdt", "safety_margin_usdt", "gross_spread"] {
         assert!(snap["net_edge"][k].is_string(), "{k} missing: {submit}");
     }
+    // cost-attribution: edge kind and hourly spread are recorded next to the unchanged fields.
+    assert_eq!(snap["net_edge"]["edge_kind"], json!("RateGap"), "{submit}");
+    assert_eq!(snap["net_edge"]["hourly_spread_pct_per_hour"], json!("0.025"), "{submit}");
     assert_eq!(submit["detail"]["simulated"], json!(true));
 
     let orders: Vec<Value> = events(&rig.db).into_iter().filter(|(_, l, _)| l == ORDER_SUBMITTED).map(|(_, _, p)| p).collect();

@@ -27,6 +27,8 @@ fn row(rank: usize, symbol: &str) -> ScanRow {
         intervals_differ: false,
         net_edge: NetEdgeCell::NotApplicable,
         qualified: Qualified::No,
+        edge_kind: None,
+        hourly_spread: None,
         countdown_target: None,
     }
 }

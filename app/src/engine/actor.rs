@@ -40,6 +40,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, MissedTickBehavior, sleep_until};
+use tong_funding_core::edge_kind::{classify_edge, EdgeKind};
 use tong_funding_core::pair::{Event as PairEvent, ManualEvent, PairState, SystemEvent};
 use tong_funding_core::risk::{
     EffectiveConfig, ExecutionMode, RiskConfig, RiskOverrides, TriggerMode, effective_for_pair, parse_overrides,
@@ -3125,16 +3126,25 @@ fn entry_snapshot_json(
         })
     };
     let net_edge = match node0::net_edge_with_threshold(&pretrade[0].funding, &pretrade[1].funding, entry.notional_usdt, eff) {
-        Ok((e, threshold)) => json!({
-            "net_edge_pct": dstr(e.net_edge_pct),
-            "net_edge_usdt": dstr(e.net_edge_usdt),
-            "funding_income_usdt": dstr(e.funding_income_usdt),
-            "fee_usdt": dstr(e.fee_usdt),
-            "slippage_usdt": dstr(e.slippage_usdt),
-            "safety_margin_usdt": dstr(e.safety_margin_usdt),
-            "gross_spread": dstr(e.gross_spread),
-            "threshold_pct": dstr(threshold),
-        }),
+        Ok((e, threshold)) => {
+            let class = classify_edge(&pretrade[0].funding, &pretrade[1].funding);
+            json!({
+                "net_edge_pct": dstr(e.net_edge_pct),
+                "net_edge_usdt": dstr(e.net_edge_usdt),
+                "funding_income_usdt": dstr(e.funding_income_usdt),
+                "fee_usdt": dstr(e.fee_usdt),
+                "slippage_usdt": dstr(e.slippage_usdt),
+                "safety_margin_usdt": dstr(e.safety_margin_usdt),
+                "gross_spread": dstr(e.gross_spread),
+                "threshold_pct": dstr(threshold),
+                "edge_kind": match class.as_ref().and_then(|c| c.kind) {
+                    Some(EdgeKind::IntervalMismatch) => "IntervalMismatch",
+                    Some(EdgeKind::RateGap) => "RateGap",
+                    None => "None",
+                },
+                "hourly_spread_pct_per_hour": class.map(|c| dstr(c.hourly_spread_pct_per_hour)),
+            })
+        }
         Err(why) => json!({ "unavailable": why }),
     };
     json!({

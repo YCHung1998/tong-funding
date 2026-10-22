@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use gpui_kit::component::chart::PieChart;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::*;
 use tong_funding_core::types::{Decimal, Exchange};
@@ -694,6 +695,14 @@ impl TableDelegate for ScannerTable {
                 let mut d = div().flex().gap_1().child(small(r.gross_text(), theme::TEXT_SECONDARY));
                 if r.intervals_differ {
                     d = d.child(small("週期不同", theme::WARNING));
+                }
+                if let (Some(label), Some(hint)) = (r.edge_kind_label(), r.edge_kind_hint()) {
+                    d = d.child(
+                        div()
+                            .id(("edge-kind", row))
+                            .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+                            .child(small(label, theme::TEXT_SECONDARY)),
+                    );
                 }
                 d
             }
