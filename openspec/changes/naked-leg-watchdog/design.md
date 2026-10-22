@@ -24,8 +24,8 @@
 4. **重試**：送出的平倉單在既有平倉確認流程中被拒或逾時未成交 → 5 秒後重新查證並再送，總共最多 3 次；用完 → `Unknown("auto flatten failed 3 times")`。
 5. **Unknown 的處置**：寫 `NAKED_LEG_WATCHDOG`（含原因），`set_kill_switch_with_event(true, "NAKED_LEG_WATCHDOG_LOCK", …)`（Live 同時解除武裝），並通知；之後不再自動送單，直到使用者處理（人工確認已平倉或人工要求平倉）。
 6. **適用範圍**：配對的執行器與目前模式一致（`executor_mismatch` 為否）；SIMULATION、EXCHANGE_DEMO、Live 皆適用。kill switch ON 時照常運作（平倉不開新倉）。
-8. **既有規格的配合**：`ui-trading-pages` 的 staged-orders-page 規格原本禁止顯示「暗示系統已自動補救」的文字；看門狗確實平倉後必須如實說明，因此同一 change 修改該句，加入此唯一例外（該 change 尚未封存，直接改其 delta）。頁面本身仍不提供或觸發自動平倉的按鈕。
 7. **頁面揭露**：風控頁固定區塊、人工處理卡與通知共用同一份文案產生函式（數字取實際的 `order_timeout_seconds`、緩衝 5 秒、重試 3 次），避免三處說法不一致。
+8. **既有規格的配合**：`ui-trading-pages` 的 staged-orders-page 規格原本禁止顯示「暗示系統已自動補救」的文字；看門狗確實平倉後必須如實說明，因此同一 change 修改該句，加入此唯一例外（該 change 尚未封存，直接改其 delta）。頁面本身仍不提供或觸發自動平倉的按鈕。
 
 ## Risks / Trade-offs
 
