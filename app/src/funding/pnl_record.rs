@@ -22,6 +22,7 @@ use std::str::FromStr;
 
 use rusqlite::params;
 use serde_json::{Value, json};
+use tong_funding_core::cost_attribution::attribute_costs;
 use tong_funding_core::pnl::{
     Attribution, Comparison, ExpectedSnapshot, FillAction, FillRecord, FundingFetchState, IncompleteReason, LegInput, LegWindow, PairInput,
     PnlBreakdown, attribute, compare_expected, compute_pnl, expected_settlements, slippage_summary,
@@ -403,6 +404,12 @@ fn waiting_helps(r: &IncompleteReason) -> bool {
     }
 }
 
+/// Where the two reference prices of the cost attribution come from (change cost-attribution 1.1):
+/// both are the exchange's mark price. The entry reference is the pre-trade refetch's mark price
+/// (`entry_snapshot.expected_price`, `FreshQuote.price` = `FundingObservation.mark_price`); the close
+/// reference is the single-symbol refetch right before the closes, through the same `fresh_quote`.
+const REFERENCE_SOURCES: (&str, &str) = ("mark(entry_snapshot)", "mark(refetch_before_close)");
+
 /// The event payload of a computed result.
 pub fn pnl_payload(a: &PairPnlInput, b: &PnlBreakdown, now_ms: i64) -> Value {
     let comparison = compare_expected(a.expected.as_ref(), b, a.actual_settlements);
@@ -426,7 +433,16 @@ pub fn pnl_payload(a: &PairPnlInput, b: &PnlBreakdown, now_ms: i64) -> Value {
         "ledger_keys": a.ledger_keys,
         "fill_ids": a.fill_ids,
         "computed_at_ms": now_ms,
+        "attribution": attribution_json(a),
     })
+}
+
+/// The cost split of the pair (core `attribute_costs`) with the sources of its reference prices.
+/// Derived from the same input as `breakdown`, so it is not part of the dedup comparison in `record`.
+fn attribution_json(a: &PairPnlInput) -> Value {
+    let mut v = serde_json::to_value(attribute_costs(&a.input)).unwrap_or(Value::Null);
+    v["reference_sources"] = json!({ "open": REFERENCE_SOURCES.0, "close": REFERENCE_SOURCES.1 });
+    v
 }
 
 /// Writes `PAIR_PNL_COMPUTED` (none yet) or `PAIR_PNL_RECOMPUTED` (the result changed); returns

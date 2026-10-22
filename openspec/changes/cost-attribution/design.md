@@ -41,7 +41,11 @@
 
 ## Open Questions
 
-- 平倉前重抓的價格是 mark、last 還是 ticker？與進場快照的 `expected_price`（mark）是否同源？實作第一步查清楚並寫回本節。
+- 已查證（1.1）：開倉 `expected_price` 與平倉 `reference_price` **同為各所的 mark price，同源**，不是 last 或 ticker。
+  - 開倉：`actor.rs:1394` 下單前以 `market.refetch` 重抓 → `PretradeFetched`；`entry_snapshot_json` 的 `expected_price` = `pre.price`（`actor.rs:3117`）。
+  - 平倉：`actor.rs:1949-1953` 平倉前 `market.refetch` → `close_reference`（`actor.rs:2400`）→ `add_close_reference` 寫入事件的 `reference_price`（`actor.rs:2111`，`reference_source = refetch_before_close`）；提前出場路徑同樣取 `input.price`（`actor.rs:1182`、`1216`）。
+  - 兩條路徑都經 `PublicMarketData::refetch`（`ui/wiring.rs:52-60`）→ `fresh_quote`，`price = o.mark_price`（`ui/wiring.rs:28-30`）。mark 價來源：Binance `premiumIndex.markPrice`（`exchange/public/binance.rs:128`）、Bybit tickers `markPrice`（`bybit.rs:255`）、OKX `mark-price.markPx`（`okx.rs:233`）。
+  - 差異只在時間：開倉是 T−10 前後的下單前重抓，平倉是平倉前重抓；`attribution.reference_sources` 如實寫 `mark(entry_snapshot)` 與 `mark(refetch_before_close)`。實際成交價是真實成交（非 mark），所以滑價含「成交價相對 mark」的系統性差，這是預期內的。
 - 型態閾值 0.5 是否合適？先以資料觀察，不在本 change 調整。
 
 ## Payload 形狀（`attribution`）
@@ -58,6 +62,6 @@
   "fees":           { "usdt": "1.8959", "pct": "0.1905" },
   "net":            { "usdt": "-1.1503", "pct": "-0.1156" },
   "unknown": [],
-  "reference_sources": { "open": "mark(entry_snapshot)", "close": "refetch_before_close" }
+  "reference_sources": { "open": "mark(entry_snapshot)", "close": "mark(refetch_before_close)" }
 }
 ```

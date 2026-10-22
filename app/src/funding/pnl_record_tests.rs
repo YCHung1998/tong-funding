@@ -275,6 +275,77 @@ fn pnl_record_a_demo_round_with_close_references_and_funding_is_complete() {
     assert_eq!(latest.payload["breakdown"]["total"]["slippage"], json!("0.08"));
 }
 
+/// cost-attribution 3.1: a complete demo round (same fixture as above) with funding and references.
+fn complete_round() -> Fx {
+    let fx = opened_round();
+    close_with_reference(&fx, T + 15_000, "long", Exchange::Binance, "59997.5", Ok("60000"));
+    close_with_reference(&fx, T + 15_000, "short", Exchange::Bybit, "60000", Ok("60001"));
+    fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_fetched(&fx);
+    fx.clock.set(T + 80_000);
+    fx
+}
+
+#[test]
+fn pnl_record_payload_carries_the_cost_attribution_and_it_matches_the_breakdown() {
+    let fx = complete_round();
+    settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    let p = latest_pnl(&fx.db, "p1").unwrap().unwrap().payload;
+    let at = &p["attribution"];
+    // entry: long open 0.02 x 2.5 = 0.05, short open 0; exit: long close 0.05, short close 0.02 x (−1) = −0.02
+    assert_eq!(at["entry_slippage"]["usdt"], json!("0.05"), "{at}");
+    assert_eq!(at["exit_slippage"]["usdt"], json!("0.03"), "{at}");
+    assert_eq!(at["drift"]["usdt"], p["breakdown"]["total"]["price_ref"], "drift = price_ref");
+    assert_eq!(at["funding"]["usdt"], p["breakdown"]["total"]["funding"]);
+    assert_eq!(at["net"]["usdt"], p["breakdown"]["total"]["net"]);
+    assert_eq!(at["unknown"], json!([]));
+    // entry + exit = the existing total slippage
+    assert_eq!(p["slippage"]["total"], json!("0.08"));
+    // both references are mark prices: the entry snapshot's pre-trade mark and the pre-close refetch's mark
+    assert_eq!(at["reference_sources"], json!({ "open": "mark(entry_snapshot)", "close": "mark(refetch_before_close)" }));
+}
+
+#[test]
+fn pnl_record_attribution_leaves_the_existing_payload_values_unchanged() {
+    let fx = complete_round();
+    let a = assemble(&fx.db, "p1", T + 80_000).unwrap();
+    let b = tong_funding_core::pnl::compute_pnl(&a.input);
+    let p = pnl_payload(&a, &b, T + 80_000);
+    assert_eq!(p["breakdown"], serde_json::to_value(&b).unwrap());
+    assert_eq!(p["status"], json!(b.status.as_str()));
+    assert_eq!(p["slippage"], serde_json::to_value(tong_funding_core::pnl::slippage_summary(&b)).unwrap());
+    let reasons: Vec<String> = b.status.reasons().iter().map(|r| r.label()).collect();
+    assert_eq!(p["reasons"], json!(reasons));
+    let keys: Vec<&str> = p.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    for k in ["status", "reasons", "funding_tracing", "breakdown", "slippage", "expected_vs_actual", "no_expected_snapshot", "settlement_slots", "ledger_keys", "fill_ids", "computed_at_ms", "attribution"] {
+        assert!(keys.contains(&k), "{k} missing from {keys:?}");
+    }
+    assert_eq!(keys.len(), 12, "only `attribution` was added: {keys:?}");
+}
+
+#[test]
+fn pnl_record_the_same_input_never_writes_another_event_because_of_attribution() {
+    let fx = complete_round();
+    settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    assert_eq!(count(&fx.db, PAIR_PNL_COMPUTED), 1);
+    assert_eq!(recompute_if_changed(&fx.db, "p1", T + 90_000).unwrap(), None, "unchanged input: nothing written");
+    settle_pnl(&fx.db, "p1", T + 95_000, false).unwrap();
+    assert_eq!(count(&fx.db, PAIR_PNL_COMPUTED), 1);
+    assert_eq!(count(&fx.db, PAIR_PNL_RECOMPUTED), 0);
+}
+
+#[test]
+fn pnl_record_an_incomplete_result_lists_unknown_attribution_parts_not_zero() {
+    let fx = scenario(true); // closes without references
+    fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+    both_fetched(&fx);
+    settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+    let at = latest_pnl(&fx.db, "p1").unwrap().unwrap().payload["attribution"].clone();
+    assert!(at["exit_slippage"].is_null() && at["drift"].is_null() && at["net"].is_null(), "{at}");
+    assert!(at["entry_slippage"]["usdt"].is_string(), "entry slippage is still known: {at}");
+    assert!(at["unknown"].as_array().unwrap().contains(&json!("exit_slippage")), "{at}");
+}
+
 #[test]
 fn pnl_record_a_missing_close_reference_keeps_the_result_incomplete_with_the_reason() {
     let fx = opened_round();
