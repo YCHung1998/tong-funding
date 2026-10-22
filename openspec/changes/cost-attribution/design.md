@@ -1,67 +1,60 @@
 ## Context
 
-`core/src/pnl.rs` 已經算出 `price_ref`（只用參考價的價格損益）、`price_actual`、合併的 `slippage = price_ref − price_actual` 與費用。
-開倉的 `expected_price` 來自 T−10 進場快照的 mark 價，平倉的參考價來自平倉前的單一標的重抓（`reference_source = refetch_before_close`，`app/src/engine/actor.rs`）。
-所以「持倉漂移」就是既有的 `price_ref`，缺的只是：(1) 把 `slippage` 拆成進場與出場、(2) 以每腿名目 % 表示、(3) 對照模型假設的報表、(4) 機會型態標示。
+`core/src/pnl.rs` 已經算出 `price_ref`（只用參考價的價格損益）、`price_actual`、合併的 `slippage = price_ref − price_actual` 與費用，並寫進每筆 PnL 事件的 `breakdown`。
+所以「持倉漂移」就是既有的 `price_ref`；真正缺的只有兩個值：**進場滑價**（才能把 `slippage` 拆成進場與出場）與**每腿名目**（才能換算成 %）。
 
-基準觀察（`funding.db`，17 筆已平倉，用原始事件還原；平均／中位，每腿名目 %）：
-進場滑價 −0.07／−0.04、持倉漂移 −0.24／−0.15、出場滑價 −0.18／−0.16、手續費 0.22／0.19；15/17 漂移為負。
-注意：這 17 筆含 10-14 的壓力測試（刻意放寬門檻），demo 的訂單簿與正式環境不同，且進場參考價與平倉參考價是否同為 mark 價尚未確認（見 Open Questions）。
+**參考價與成交的市場（1.1 查證，經審查修正）：**
+- 開倉與平倉的參考價都是**正式環境的 mark 價**：開倉 = 下單前重抓（`actor.rs:1394` → `entry_snapshot.expected_price`，`actor.rs:3117`）；平倉 = 平倉前重抓（`actor.rs:1949-1953` → `reference_price`，`actor.rs:2111`）；提前出場 = 觸發時的價格（`actor.rs:1182`、`1216`）。三者都經 `PublicMarketData::refetch`（`ui/wiring.rs:52-60`）→ `fresh_quote`，`price = mark_price`（`ui/wiring.rs:28-30`），主機是正式環境（`exchange/public/endpoints.rs:5,12`）。
+- 成交：Demo 在 demo 主機（`exchange/signed/endpoints.rs:24-25`），Live 在正式環境。
+- 所以兩個參考價彼此同源（漂移是正式環境兩所 mark 價的相對變化），但**在 Demo，滑價 = demo 成交價 − 正式 mark 價，含 demo 與正式盤的價差**，不能當成正式環境滑價。審查量到 demo 成交對正式 mark 的平均偏差：Binance 0.16～0.18%（最大 0.71%），Bybit 0.09～0.15%。Live 的參考價與成交才是同一個市場。
+
+**基準（`funding.db`，17 筆已平倉，報表輸出）：**
+平均（每腿名目 %）：進場滑價 0.067、漂移 −0.235、出場滑價 0.177、手續費 0.218；15/17 漂移為負。
+17 筆合計（USDT）：資金費 +61.21、價格損益 −75.64、手續費 −34.98、淨 −49.40。
+限制：自 10-14 起門檻幾乎為 0（0.0021% 或 0.00021%）、`safety_margin` 0、`est_slippage` 0.005%，所以樣本是「幾乎所有極端費率機會」；10 個幣、11 個結算時點；4 筆有提前出場（佔漂移總和 46%）。
 
 ## Goals / Non-Goals
 
 **Goals:**
-- 每筆 PnL 事件自帶可驗證的成本拆解（恆等式、未知不當 0）。
-- 一份唯讀報表，把實際成本分布與目前模型假設並排，給出建議值。
-- 每個機會都標示「錢從哪來」：週期錯位或費率差。
+- 每筆 PnL 事件補上拆解所缺的兩個值，其餘由 `breakdown` 推導（單一來源、未知不當 0）。
+- 一份唯讀報表，如實標示樣本與市場限制，把實際成本分布、建議值與**建議值的樣本內回測**並排。
+- 每個機會標示「錢從哪來」：週期錯位或費率差。
 
 **Non-Goals:**
 - 不改 Net Edge 公式、不套用任何建議值、不改預設值。
-- 不做深度（多檔）滑價估算（`trade-cost-estimate` 範圍，等量測後再決定）。
+- 不做深度（多檔）滑價估算、不記錄正式環境的 T±60 秒價格路徑（區分「除息式回吐」等假設所需的資料，另議）。
 - 不改 PnL 頁的畫面；不新增事件類型或資料表。
-- 不處理單腿風險與熔斷（另一個 change）。
+- 不處理單腿風險、熔斷與提前出場的觸發價問題（另一個 change）。
 
 ## Decisions
 
-1. **拆解放進既有 PnL payload，不新增事件。** PnL 事件已是事實紀錄且只增不改；多一個 `attribution` 欄位不影響既有消費者（`record` 的去重比對只看 `breakdown`/`status`/`reasons`/`expected_vs_actual`，而 `attribution` 由同一份輸入導出，結果一致）。
-   - 替代：新事件 `PAIR_COST_ATTRIBUTION` → 多一種事件要維護、重算時要同步，且與 PnL 可能不一致。
-2. **純函式放 core，輸入沿用 `PairInput`。** 不重算價格損益，直接分 action 累加每筆成交的 `dir × (ref − act) × q`，並以測試固定恆等式。
-3. **漂移直接取 `price_ref`。** 不另發明定義，與既有 PnL 一致；報表和畫面說明「兩所參考價在持倉期間的相對變化」。
-4. **型態用一個可解釋的閾值（一半）。** `rate_gap_income < 0.5 × model_income` 為週期錯位。閾值寫成常數並記錄「只用於顯示」，之後可依資料調整而不影響交易。
-   - 替代：只用「兩腿週期是否不同」→ 過粗，KAIA 這類週期不同但費率差真實存在的會被錯分。
-5. **報表以 Python 寫在 `issue/tools/`（專案既有慣例）。** 優先讀 `attribution`；舊事件由原始事件還原並標「還原值」。為避免兩套邏輯分岔，測試必須用同一筆合成配對驗證兩條路徑的結果一致。
-6. **建議值只輸出不套用。** `est_slippage_pct` = 總滑價（進場＋出場）分位數 ÷ 4；`safety_margin_pct` = 不利漂移（漂移為負時的絕對值）分位數。預設顯示 p50 / p75 / p90，由使用者決定用哪一個。
+1. **`attribution` 只存 `breakdown` 沒有的兩個值（`entry_slippage`、`notional_per_leg`）。** 出場滑價 = `slippage − entry_slippage`，漂移 = `price_ref`，手續費、資金費、淨額直接取 `breakdown`；是否未知看 `breakdown.missing`。
+   - 替代（最初版本）：把每項都存成 `{usdt, pct}` 並加 `unknown`、`reference_sources` → 與 `breakdown` 重複、pct 可由名目推出、`reference_sources` 是寫死常數且沒有讀取者；審查（simplifier）判定過度設計。
+   - 替代：新事件類型 → 多一種事件要維護，且可能與 PnL 不一致。
+2. **未知規則跟著資料走。** 沒有開倉成交的腿貢獻 0（單腿配對的進場滑價仍已知）；有開倉成交但缺參考價、缺成交價或 OKX 未換算時為未知；部分平倉時 `breakdown` 已把 `Slippage`、`PriceRef` 標為缺漏，所以推導的出場滑價與漂移為未知，進場滑價仍已知。運算用 checked 版本，溢位為未知、不 panic（`classify_edge` 在送單路徑上、`attribute` 在 PnL gate 內，actor panic 不會自動重啟）。
+3. **漂移直接取 `price_ref`。** 不另發明定義；報表說明它是「正式環境兩所 mark 價在持倉期間的相對變化」。
+4. **型態閾值 0.5，費率差收入以 `max(h_L, h_S)` 計。** 比較「這次單一結算的收入」與「持有一個完整較長週期時每小時費率差能賺的」；後者不到前者一半才算週期錯位。
+   - 替代（最初版本）：以 `min(h)` 計 → 會把「長週期那所費率大、短週期那所接近 0」（例：BIRB Binance −0.951%/4h 對 Bybit −0.0044%/1h，持有 4h 仍保留 99% 收入）誤標為週期錯位；審查在 17 筆中找到 4 筆。
+   - 替代：只看兩腿週期是否不同 → 更粗。
+5. **報表只還原舊事件缺的兩個值，其餘讀 `breakdown`。** 還原規則與引擎一致：最後一筆進場快照的 `expected_price`；開倉成交依 `client_order_id` 取各單最後一筆累計成交再加總；缺 `expected_price` 或 OKX 腿為未知（不以 mark 價代替）。舊的 `breakdown` 與目前 Rust 重算的結果在 17 筆上完全一致（已逐筆比對）。
+6. **建議值只輸出不套用，並附樣本內回測。** `est_slippage_pct` = 總滑價分位數 ÷ 4；`safety_margin_pct` = 不利漂移分位數。每組都以進場快照重算 Net Edge，列出仍會進場的筆數與其實際淨損益；審查已指出在這 17 筆上套用 p50 後仍會進場的 8 筆淨損益合計為負，所以報表必須把這個結果放在建議值旁邊。
 
 ## Risks / Trade-offs
 
-- **參考價來源不一致會讓「漂移」帶偏差**（開倉 mark、平倉重抓價）→ 實作時先查清楚並記錄於本文件；若不同源，`attribution` 加 `reference_sources` 欄位如實標示，報表在來源不同時加警示。
-- **樣本小且含壓力測試**（17 筆）→ 報表強制標示樣本數與「樣本不足」，建議值不自動套用。
-- **demo 數字不能代表正式環境** → 報表開頭固定說明；本 change 的價值是流程與可見性，不是具體數字。
-- **新欄位讓 PnL 事件變大** → 欄位僅十餘個數字，可忽略。
+- **[Demo 的滑價含 demo 與正式盤的價差]** → 報表開頭固定說明；只有 Live 資料可以用來校準滑價。漂移是正式環境 mark 價的變化，受此影響較小，但可能受 mark 價公式（例如含「費率 × 距下次結算時間」的項）在結算瞬間的跳動影響——未驗證。
+- **[提前出場造成約 10 秒單腿曝險，且 Demo 觸發用正式 mark 對 demo 開倉均價]** → 報表標記提前出場的配對；觸發價問題與單腿曝險移到風險 change 處理。
+- **[樣本小、門檻幾乎為 0、集中在少數幣與時點]** → 強制標示樣本數與「樣本不足」；分位數的 bootstrap 區間很寬（例：safety p90 約 0.20～0.75），建議值只供參考。
+- **[immutable 讀取與 App 同時啟動的競態]** → 只在 App 已關閉的狀態（`-wal`、`-shm` 皆不存在）使用，讀取前後檢查檔案狀態，變動即中止。
 
 ## Open Questions
 
-- 已查證（1.1）：開倉 `expected_price` 與平倉 `reference_price` **同為各所的 mark price，同源**，不是 last 或 ticker。
-  - 開倉：`actor.rs:1394` 下單前以 `market.refetch` 重抓 → `PretradeFetched`；`entry_snapshot_json` 的 `expected_price` = `pre.price`（`actor.rs:3117`）。
-  - 平倉：`actor.rs:1949-1953` 平倉前 `market.refetch` → `close_reference`（`actor.rs:2400`）→ `add_close_reference` 寫入事件的 `reference_price`（`actor.rs:2111`，`reference_source = refetch_before_close`）；提前出場路徑同樣取 `input.price`（`actor.rs:1182`、`1216`）。
-  - 兩條路徑都經 `PublicMarketData::refetch`（`ui/wiring.rs:52-60`）→ `fresh_quote`，`price = o.mark_price`（`ui/wiring.rs:28-30`）。mark 價來源：Binance `premiumIndex.markPrice`（`exchange/public/binance.rs:128`）、Bybit tickers `markPrice`（`bybit.rs:255`）、OKX `mark-price.markPx`（`okx.rs:233`）。
-  - 差異只在時間：開倉是 T−10 前後的下單前重抓，平倉是平倉前重抓；`attribution.reference_sources` 如實寫 `mark(entry_snapshot)` 與 `mark(refetch_before_close)`。實際成交價是真實成交（非 mark），所以滑價含「成交價相對 mark」的系統性差，這是預期內的。
+- 結算後「多腿所在交易所 mark 價相對下跌」（15/17，方向穩定）的機制未知：除息式回吐、付費方避費、跨所基差收斂、mark 公式、demo 市場自身結算、tick 與價差、領先落後都可能。區分需要正式環境 T±60 秒的 index / mark / last / 買賣一檔、主動成交方向、未平倉量，以及非結算時段的對照視窗。
 - 型態閾值 0.5 是否合適？先以資料觀察，不在本 change 調整。
 
 ## Payload 形狀（`attribution`）
 
-數值皆為十進位字串；`null` = 未知。符號：`funding`、`drift`、`net` 為損益（正＝賺）；`entry_slippage`、`exit_slippage`、`fees` 為成本（正＝付出／不利）。
+十進位字串；`null` = 未知。
 
 ```json
-{
-  "notional_per_leg": "995.0",
-  "funding":        { "usdt": "4.0064", "pct": "0.4026" },
-  "drift":          { "usdt": "-2.3542", "pct": "-0.2366" },
-  "entry_slippage": { "usdt": "0.3000", "pct": "0.0301" },
-  "exit_slippage":  { "usdt": "0.9000", "pct": "0.0905" },
-  "fees":           { "usdt": "1.8959", "pct": "0.1905" },
-  "net":            { "usdt": "-1.1503", "pct": "-0.1156" },
-  "unknown": [],
-  "reference_sources": { "open": "mark(entry_snapshot)", "close": "mark(refetch_before_close)" }
-}
+{ "entry_slippage": "0.3", "notional_per_leg": "995.0" }
 ```
