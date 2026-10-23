@@ -315,16 +315,7 @@ impl Actor {
             "simulated": view.simulated,
             "reason": reason,
         });
-        if let Err(e) = self.db.set_kill_switch_with_event(true, wd::NAKED_LEG_WATCHDOG_LOCK, &payload)
-            && !self.db.is_halted()
-        {
-            self.db.halt(HaltReason::KillSwitchReadFailed(format!("watchdog lock could not be written: {e}")));
-        }
-        if self.live_on() {
-            self.live.last_lock_reason = Some(format!("naked-leg watchdog: {reason}"));
-            self.live_disarm();
-        }
-        self.dirty = true;
+        self.lock_new_entries(wd::NAKED_LEG_WATCHDOG_LOCK, &payload, format!("naked-leg watchdog: {reason}"));
         let sent = self.flows.get(&view.internal_uuid).and_then(|f| f.watchdog.as_ref()).map(|w| w.sent.clone()).unwrap_or_default();
         self.notify_watchdog(view, alert::WatchdogOutcome::Locked { reason: reason.to_string(), sent });
     }

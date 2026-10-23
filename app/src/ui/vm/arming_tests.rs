@@ -154,7 +154,7 @@ fn once_armed_the_panel_says_so_and_offers_lock_not_arm() {
     let (mut s, f) = ready();
     s.live.armed = true;
     s.live.pairs_entered = 1;
-    s.live.frozen = Some(FrozenCaps { leg_notional_usdt: d("10"), pairs_per_arming: 2, max_concurrent_pairs: 3, max_leverage: d("5") });
+    s.live.frozen = Some(FrozenCaps { leg_notional_usdt: d("10"), pairs_per_arming: 2, max_concurrent_pairs: 3, max_leverage: d("5"), loss_breaker_max_loss_usdt: d("5"), loss_breaker_max_consecutive_losses: 2 });
     let vm = evaluate(&s, &f, NOW).unwrap();
     assert_eq!(vm.status_text, "已武裝：本次已進場 1 / 上限 2 筆");
     assert!(vm.armed && !vm.can_arm && vm.can_lock && !vm.can_run_preflight);

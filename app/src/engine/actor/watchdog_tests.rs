@@ -863,3 +863,27 @@ async fn an_aborted_flatten_counts_as_an_attempt_survives_a_restart_and_three_of
     });
     assert!(matches!(d, wd::Decision::Unknown { .. }), "{d:?}");
 }
+
+// ---- review round 1, A2: a pair the user confirmed by hand after the watchdog counts for the breaker ----
+
+#[tokio::test(start_paused = true)]
+async fn a_pair_flattened_by_the_watchdog_and_confirmed_by_hand_is_counted_by_the_breaker() {
+    let (rig, deps) = rig(Opts { demo: true, ..Opts::default() });
+    let entered = rig.clock.now_ms() - 1_000;
+    seed_demo_bare_long(&rig, entered);
+    let h = start(deps);
+    run_until(&rig.clock, entered + 8_000).await;
+    assert_eq!(rig.demo.requests.lock().unwrap().len(), 1, "the watchdog flattened the bare long leg");
+    assert!(!rig.db.kill_switch_halted(), "nothing tripped yet: the pair has not been confirmed");
+    // the exchange now shows nothing; the user confirms
+    rig.demo.positions.lock().unwrap().clear();
+    assert_eq!(ask(&h, Command::ConfirmClosed { pair: UUID.into(), verified_flat: true }).await, CommandReply::Accepted);
+    run_until(&rig.clock, rig.clock.now_ms() + 3_000).await;
+    assert_eq!(status(&rig.db, UUID), "FINALIZED");
+    assert_eq!(count(&rig.db, CLOSE_CONFIRMED), 0, "a hand confirmation writes no CLOSE_CONFIRMED");
+    // counted at once: the amount cannot be told here (the fake exchange records no fees) -> the breaker stops entries
+    assert!(rig.db.kill_switch_halted(), "{:?}", labels(&rig.db));
+    let tripped = payloads(&rig.db, "LOSS_BREAKER_TRIPPED");
+    assert_eq!(tripped.len(), 1, "{tripped:?}");
+    assert_eq!(tripped[0]["pairs"][0]["pair"], json!(UUID), "the pair is on the list that tripped it");
+}

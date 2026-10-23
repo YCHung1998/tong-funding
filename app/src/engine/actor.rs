@@ -668,8 +668,10 @@ impl Actor {
         // Pairs already in an alert state at startup: banner from their state; PAIR_ALERT /
         // notification only for an entry that has none yet (never again after a restart).
         actor.sync_alerts();
-        // loss-circuit-breaker: the interval start (the baseline on a first start) and a first look.
-        actor.breaker_check(true);
+        // loss-circuit-breaker: an old Live database gets the Live limits first, then the interval start
+        // (the baseline on a first start) and a first look.
+        actor.live_backfill_breaker_defaults();
+        actor.breaker_check();
         let (snapshot_tx, snapshots) = watch::channel(actor.snapshot());
         actor.snapshot_tx = snapshot_tx;
         actor.publish_live();
@@ -689,8 +691,9 @@ impl Actor {
                 },
                 Some(ev) = self.event_rx.recv() => self.on_event(ev),
                 _ = tick.tick() => {
+                    // trip first, then enter: a close or a settings change seen now stops the entries of this very tick
+                    self.breaker_check();
                     let _ = self.dispatch(Command::Tick);
-                    self.breaker_check(false);
                 }
                 changed = self.market_rx.changed(), if self.market_open => match changed {
                     Ok(()) => self.dirty = true,
@@ -2113,12 +2116,11 @@ impl Actor {
                 }
                 // The confirmation is recorded before FINALIZED; without it nothing is finalized.
                 if self.events.append(CLOSE_CONFIRMED, Some(pair), payload).is_ok() {
-                    // loss-circuit-breaker: the closed pair counts from this event on (price PnL minus fees)
-                    self.breaker_check(true);
                     // funding-pnl: FINALIZED also needs "PnL computed" (pnl_gate).
                     self.begin_pnl_wait(pair);
-                    // ... and again with the PnL it may have written just now
-                    self.breaker_check(false);
+                    // loss-circuit-breaker: the closed pair counts from its CLOSE_CONFIRMED on (price PnL minus
+                    // fees), with the PnL `begin_pnl_wait` may have written just now
+                    self.breaker_check();
                 }
             }
             // Position updates may lag: re-checked on the next tick until the close timeout.

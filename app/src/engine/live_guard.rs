@@ -65,6 +65,9 @@ pub struct FrozenCaps {
     pub pairs_per_arming: u32,
     pub max_concurrent_pairs: u32,
     pub max_leverage: Decimal,
+    /// loss-circuit-breaker: while armed the breaker may be made stricter, never looser.
+    pub loss_breaker_max_loss_usdt: Decimal,
+    pub loss_breaker_max_consecutive_losses: u32,
 }
 
 impl FrozenCaps {
@@ -83,6 +86,8 @@ impl FrozenCaps {
             pairs_per_arming: pairs,
             max_concurrent_pairs: risk.max_concurrent_pairs,
             max_leverage: risk.max_leverage,
+            loss_breaker_max_loss_usdt: risk.loss_breaker_max_loss_usdt,
+            loss_breaker_max_consecutive_losses: risk.loss_breaker_max_consecutive_losses,
         })
     }
 
@@ -100,6 +105,12 @@ impl FrozenCaps {
         }
         if new.max_leverage > self.max_leverage {
             return Some("max_leverage");
+        }
+        if new.loss_breaker_max_loss_usdt > self.loss_breaker_max_loss_usdt {
+            return Some("loss_breaker_max_loss_usdt");
+        }
+        if new.loss_breaker_max_consecutive_losses > self.loss_breaker_max_consecutive_losses {
+            return Some("loss_breaker_max_consecutive_losses");
         }
         None
     }
@@ -376,6 +387,17 @@ mod tests {
         assert_eq!(f.first_raised_by(&RiskConfig { max_concurrent_pairs: r.max_concurrent_pairs + 1, ..r.clone() }), Some("max_concurrent_pairs"));
         assert_eq!(f.first_raised_by(&RiskConfig { max_leverage: r.max_leverage + d("1"), ..r.clone() }), Some("max_leverage"));
         assert_eq!(f.first_raised_by(&RiskConfig::default()), Some("live_max_leg_notional_usdt"), "removing a cap is raising it");
+    }
+
+    #[test]
+    fn the_two_breaker_limits_are_frozen_too_and_only_raising_them_is_detected() {
+        // review round 1 (A4): armed, the breaker may be made stricter, never looser
+        let r = RiskConfig { loss_breaker_max_loss_usdt: d("5"), loss_breaker_max_consecutive_losses: 2, ..risk("10", 2) };
+        let f = FrozenCaps::from_risk(&r).unwrap();
+        assert_eq!((f.loss_breaker_max_loss_usdt, f.loss_breaker_max_consecutive_losses), (d("5"), 2));
+        assert_eq!(f.first_raised_by(&RiskConfig { loss_breaker_max_loss_usdt: d("4.99"), loss_breaker_max_consecutive_losses: 1, ..r.clone() }), None);
+        assert_eq!(f.first_raised_by(&RiskConfig { loss_breaker_max_loss_usdt: d("5.01"), ..r.clone() }), Some("loss_breaker_max_loss_usdt"));
+        assert_eq!(f.first_raised_by(&RiskConfig { loss_breaker_max_consecutive_losses: 3, ..r.clone() }), Some("loss_breaker_max_consecutive_losses"));
     }
 
     #[test]

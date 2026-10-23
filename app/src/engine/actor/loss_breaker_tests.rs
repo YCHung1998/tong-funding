@@ -19,7 +19,7 @@ fn ids(db: &Db) -> Vec<(i64, String)> {
 
 /// A tick: the actor looks again when one of the watched events moved.
 fn tick(actor: &mut Actor) {
-    actor.breaker_check(false);
+    actor.breaker_check();
 }
 
 // ---- 2.3: when it looks and what a trip does ------------------------------------------------
@@ -56,7 +56,6 @@ async fn the_third_losing_close_trips_once_with_the_kill_switch_and_the_record_i
 
     // once per interval: a fourth loss and many more looks write nothing new
     closed(&rig.db, &rig.clock, "p3", rig.clock.now_ms() + 1_000, "-1");
-    actor.breaker_check(true);
     tick(&mut actor);
     assert_eq!((count(&rig.db, LOSS_BREAKER_TRIPPED), rig.notifier.breaker_calls().len()), (1, 1));
 }
@@ -148,7 +147,8 @@ async fn a_pnl_result_written_elsewhere_is_picked_up_on_the_next_look_and_its_ne
 }
 
 #[tokio::test(start_paused = true)]
-async fn when_the_kill_switch_is_already_on_nothing_is_written_and_reopening_starts_a_new_interval() {
+async fn a_limit_reached_while_the_kill_switch_is_already_on_is_still_recorded_notified_and_named_in_the_status() {
+    // review round 1 (A5): the user stopped by hand, then the losses of pairs already running reach the limit
     let (rig, deps) = rig(Opts::default());
     let (mut actor, _h) = Actor::new(deps);
     rig.db.set_kill_switch(true).unwrap(); // the user stopped by hand
@@ -156,8 +156,15 @@ async fn when_the_kill_switch_is_already_on_nothing_is_written_and_reopening_sta
         closed(&rig.db, &rig.clock, &format!("m{i}"), rig.clock.now_ms() + 1_000, "-1");
     }
     tick(&mut actor);
-    assert!(tripped(&rig.db).is_empty(), "already stopped: no second lock, no notification");
-    assert!(actor.breaker.as_ref().unwrap().tripped, "but the numbers are shown as over the limit");
+    assert_eq!(tripped(&rig.db).len(), 1, "the trip is on record although the switch was already ON");
+    assert_eq!(tripped(&rig.db)[0]["reason"], json!("CONSECUTIVE_LOSSES"));
+    assert!(actor.breaker.as_ref().unwrap().tripped, "and the numbers are shown as over the limit");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(rig.notifier.breaker_calls().len(), 1, "the user is told");
+    assert_eq!(actor.snapshot().status.stop_reason, Some(StopReason::LossBreaker), "the status bar says 熔斷, not 手動");
+    tick(&mut actor);
+    tick(&mut actor);
+    assert_eq!((tripped(&rig.db).len(), rig.notifier.breaker_calls().len()), (1, 1), "once per interval");
     // the user opens trading again: the count starts from zero and the old losses do not trip
     rig.clock.advance(5_000);
     rig.db.set_kill_switch(false).unwrap();
@@ -169,7 +176,7 @@ async fn when_the_kill_switch_is_already_on_nothing_is_written_and_reopening_sta
         closed(&rig.db, &rig.clock, &format!("n{i}"), rig.clock.now_ms() + 1_000, "-1");
     }
     tick(&mut actor);
-    assert!(locked(&rig) && tripped(&rig.db).len() == 1);
+    assert!(locked(&rig) && tripped(&rig.db).len() == 2);
 }
 
 #[tokio::test(start_paused = true)]
@@ -300,4 +307,143 @@ async fn pairs_in_the_three_alert_states_are_counted_as_needing_handling() {
     }
     let (actor, _h) = Actor::new(deps);
     assert_eq!(actor.snapshot().status.needs_handling, 3);
+}
+
+// ---- review round 1 -----------------------------------------------------------------------------
+
+fn save_cmd(cfg: &RiskConfig) -> Command {
+    Command::SaveRiskSettings { risk: serde_json::to_value(cfg).unwrap(), overrides: json!({}) }
+}
+
+/// A4: new limits are looked at at once, and the number in the status bar follows them.
+#[tokio::test(start_paused = true)]
+async fn saving_lower_limits_re_evaluates_at_once_and_the_snapshot_shows_the_new_numbers() {
+    let (rig, deps) = rig(Opts::default());
+    let (mut actor, _h) = Actor::new(deps);
+    for i in 0..2 {
+        closed(&rig.db, &rig.clock, &format!("p{i}"), rig.clock.now_ms() + 1_000, "-1");
+    }
+    tick(&mut actor);
+    assert!(!locked(&rig), "2 USDT lost, limits 15 and 3");
+    assert_eq!(actor.breaker.as_ref().unwrap().max_loss, dec("15"));
+    let lower = RiskConfig { loss_breaker_max_loss_usdt: dec("2"), ..risk() };
+    assert_eq!(actor.dispatch(save_cmd(&lower)), CommandReply::Accepted);
+    tick(&mut actor);
+    let v = actor.breaker.clone().unwrap();
+    assert_eq!((v.max_loss, v.tripped), (dec("2"), true), "the new limit is in the numbers and it is exceeded: {v:?}");
+    assert!(locked(&rig) && tripped(&rig.db).len() == 1, "tripped without waiting for another close");
+    assert_eq!(tripped(&rig.db)[0]["reason"], json!("MAX_LOSS"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn saving_higher_limits_updates_the_numbers_too() {
+    let (rig, deps) = rig(Opts::default());
+    let (mut actor, _h) = Actor::new(deps);
+    tick(&mut actor);
+    let higher = RiskConfig { loss_breaker_max_loss_usdt: dec("40"), loss_breaker_max_consecutive_losses: 9, ..risk() };
+    assert_eq!(actor.dispatch(save_cmd(&higher)), CommandReply::Accepted);
+    tick(&mut actor);
+    let v = actor.breaker.clone().unwrap();
+    assert_eq!((v.max_loss, v.max_consecutive), (dec("40"), 9));
+    assert!(!locked(&rig));
+}
+
+/// A4: while armed the two breaker limits are frozen like the other caps: lowering is allowed, raising is refused.
+#[tokio::test(start_paused = true)]
+async fn while_armed_the_breaker_limits_can_only_be_lowered() {
+    let cfg = RiskConfig { loss_breaker_max_loss_usdt: dec("5"), loss_breaker_max_consecutive_losses: 2, ..live_risk() };
+    let (rig, mut actor, _h) = armed_actor(live_deps("MANUAL", &cfg));
+    let raise_loss = RiskConfig { loss_breaker_max_loss_usdt: dec("6"), ..cfg.clone() };
+    let r = actor.dispatch(save_cmd(&raise_loss));
+    assert!(why(&r).contains("loss_breaker_max_loss_usdt") && why(&r).contains("cannot be raised"), "{r:?}");
+    let raise_run = RiskConfig { loss_breaker_max_consecutive_losses: 3, ..cfg.clone() };
+    let r = actor.dispatch(save_cmd(&raise_run));
+    assert!(why(&r).contains("loss_breaker_max_consecutive_losses") && why(&r).contains("cannot be raised"), "{r:?}");
+    let lower = RiskConfig { loss_breaker_max_loss_usdt: dec("4"), loss_breaker_max_consecutive_losses: 1, ..cfg.clone() };
+    assert_eq!(actor.dispatch(save_cmd(&lower)), CommandReply::Accepted, "lowering is allowed");
+    assert!(actor.armed() && !locked(&rig));
+}
+
+/// A3: an existing Live database whose stored settings predate the breaker gets 5 / 2 once.
+fn strip_breaker_keys(db: &Db, keep_loss: Option<&str>) {
+    let entry = db.config_get(CONFIG_RISK).unwrap().unwrap();
+    let mut v = entry.value.clone();
+    let m = v.as_object_mut().unwrap();
+    m.remove("loss_breaker_max_loss_usdt");
+    m.remove("loss_breaker_max_consecutive_losses");
+    if let Some(l) = keep_loss {
+        m.insert("loss_breaker_max_loss_usdt".into(), json!(l));
+    }
+    db.config_set(CONFIG_RISK, &v, Some(entry.version)).unwrap();
+}
+
+fn stored_breaker(db: &Db) -> (Value, Value) {
+    let v = db.config_get(CONFIG_RISK).unwrap().unwrap().value;
+    (v["loss_breaker_max_loss_usdt"].clone(), v["loss_breaker_max_consecutive_losses"].clone())
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_existing_live_database_without_the_breaker_fields_gets_the_live_defaults_once_with_a_record() {
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    strip_breaker_keys(&rig.db, None);
+    assert_eq!(stored_breaker(&rig.db), (Value::Null, Value::Null), "an old Live settings row");
+    let before = count(&rig.db, "RISK_CONFIG_UPDATED");
+    let (actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    assert_eq!(stored_breaker(&rig.db), (json!("5"), json!(2)), "the stricter Live values, not the looser 15 / 3 of a missing field");
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2));
+    let updates = payloads(&rig.db, "RISK_CONFIG_UPDATED");
+    assert_eq!(updates.len(), before + 1, "written through the settings path, with a record");
+    let u = updates.last().unwrap();
+    assert!(u["before"]["risk"]["loss_breaker_max_loss_usdt"].is_null(), "before: {u}");
+    assert_eq!((u["after"]["risk"]["loss_breaker_max_loss_usdt"].clone(), u["after"]["risk"]["loss_breaker_max_consecutive_losses"].clone()), (json!("5"), json!(2)), "after: {u}");
+    // a second start finds both and writes nothing
+    drop(actor);
+    let (_a2, _h2) = Actor::with_probes(restarted_live(&rig), crate::engine::preflight::fakes::FakeProbes::green());
+    assert_eq!(count(&rig.db, "RISK_CONFIG_UPDATED"), before + 1);
+}
+
+fn restarted_live(rig: &Rig) -> EngineDeps {
+    let mut d = restarted(rig, Arc::new(RecordingNotifier::default()));
+    d.identity = crate::identity::ProcessIdentity::Live;
+    d
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_value_the_user_already_set_is_never_touched_by_the_live_backfill() {
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    strip_breaker_keys(&rig.db, Some("8"));
+    let (_actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    assert_eq!(stored_breaker(&rig.db), (json!("8"), json!(2)), "only the missing field is filled");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_demo_database_is_not_touched_by_the_live_backfill() {
+    let (rig, deps) = rig(Opts::default());
+    strip_breaker_keys(&rig.db, None);
+    let before = count(&rig.db, "RISK_CONFIG_UPDATED");
+    let (actor, _h) = Actor::new(deps);
+    assert_eq!(stored_breaker(&rig.db), (Value::Null, Value::Null));
+    assert_eq!(count(&rig.db, "RISK_CONFIG_UPDATED"), before);
+    assert_eq!(actor.breaker_limits(), (dec("15"), 3), "Demo keeps the defaults of a missing field");
+}
+
+/// A12: a breaker that cannot read the events locks, tells the user and says why.
+#[tokio::test(start_paused = true)]
+async fn when_the_events_cannot_be_read_the_breaker_locks_a_live_engine_tells_the_user_and_names_the_reason() {
+    let cfg = live_risk();
+    let (rig, mut actor, _h) = armed_actor(live_deps("MANUAL", &cfg));
+    assert!(actor.armed() && !locked(&rig));
+    rig.db.with_raw_conn_for_tests(|c| Ok(c.execute_batch("ALTER TABLE events RENAME TO events_unreadable")?)).unwrap();
+    tick(&mut actor);
+    assert!(locked(&rig) && !actor.armed(), "fail closed: entries stopped and the engine disarmed");
+    let reason = actor.live_status().last_lock_reason.expect("the lock reason is shown with the arming panel");
+    assert!(reason.contains("loss circuit breaker") && reason.contains("無法評估熔斷"), "{reason}");
+    sleep(Duration::from_millis(50)).await;
+    let notices = rig.notifier.breaker_calls();
+    assert_eq!(notices.len(), 1, "told once");
+    assert!(notices[0].body().contains("無法評估熔斷") && !notices[0].body().contains("已虧 0.00"), "{}", notices[0].body());
+    let v = actor.breaker.clone().expect("the status bar has something to say");
+    assert!(v.tripped && v.reason == Some(tong_funding_core::loss_breaker::TripReason::Unreadable), "{v:?}");
+    tick(&mut actor);
+    assert_eq!(rig.notifier.breaker_calls().len(), 1, "and not again on every tick");
 }

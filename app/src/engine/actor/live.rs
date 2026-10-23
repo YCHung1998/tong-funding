@@ -337,6 +337,23 @@ impl Actor {
         CommandReply::Accepted
     }
 
+    /// The ONE way an automatic safeguard stops new entries (the watchdog, the breaker's trip, the breaker
+    /// that cannot read): kill switch ON together with its reason event in one transaction (a write
+    /// that fails halts the store: fail closed), a Live engine disarmed with `last_lock_reason` set so
+    /// the arming panel says why. Closing and manual handling stay open.
+    pub(super) fn lock_new_entries(&mut self, event_type: &str, payload: &Value, live_reason: String) {
+        if let Err(e) = self.db.set_kill_switch_with_event(true, event_type, payload)
+            && !self.db.is_halted()
+        {
+            self.db.halt(HaltReason::KillSwitchReadFailed(format!("{event_type} lock could not be written: {e}")));
+        }
+        if self.live_on() {
+            self.live.last_lock_reason = Some(live_reason);
+            self.live_disarm();
+        }
+        self.dirty = true;
+    }
+
     /// `SetKillSwitch { on: true }` by hand: disarmed in memory too.
     pub(super) fn live_disarm(&mut self) {
         if self.live_on() {

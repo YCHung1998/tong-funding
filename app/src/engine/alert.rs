@@ -219,6 +219,12 @@ impl BreakerNotice {
 
     pub fn body(&self) -> String {
         let env = EnvLabel::of(self.identity, ExecutionMode::ExchangeDemo).env_name();
+        if self.reason == tong_funding_core::loss_breaker::TripReason::Unreadable {
+            return redact_secrets(&format!(
+                "{env}：{}。無法判斷累計損益與連虧，為保守起見已停止開新倉（進行中的配對提前出場會暫停、排程出場照常）；要繼續交易請自行重新開放交易（會重新計算）。",
+                self.reason.text()
+            ));
+        }
         let basis = if self.provisional { "（暫計：價格損益扣手續費，不含資金費）" } else { "" };
         let used = format!("{:.2}", self.loss_used);
         redact_secrets(&format!(

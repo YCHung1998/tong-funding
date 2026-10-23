@@ -224,3 +224,14 @@ mod pair_amount {
         assert_eq!(amount_of(&compute_pnl(&input)), PairAmount::Provisional(d("-3.9")));
     }
 }
+
+#[test]
+fn an_unreadable_interval_has_its_own_code_and_words_and_is_never_the_result_of_an_evaluation() {
+    use tong_funding_core::loss_breaker::TripReason;
+    assert_eq!((TripReason::Unreadable.code(), TripReason::Unreadable.text()), ("UNREADABLE", "無法評估熔斷"));
+    // nothing an evaluation can see produces it
+    for amounts in [vec![], vec![None], vec![Some(Decimal::from(-100))]] {
+        let s = evaluate(&amounts, Decimal::from(5), 2);
+        assert_ne!(s.reason, Some(TripReason::Unreadable));
+    }
+}

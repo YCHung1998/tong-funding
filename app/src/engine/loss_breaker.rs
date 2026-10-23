@@ -23,7 +23,7 @@ pub const LOSS_BREAKER_TRIPPED: &str = "LOSS_BREAKER_TRIPPED";
 /// What opened the current interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StartKind {
-    /// The latest `KILL_SWITCH_CHANGED {on: false}` (the user opened trading; a Live arming does too).
+    /// The latest `KILL_SWITCH_CHANGED {on: false}` that followed an ON (the user opened trading; a Live arming does too).
     TradingOpened,
     /// The `LOSS_BREAKER_BASELINE` of the first start: nothing before it counts.
     Baseline,
@@ -59,7 +59,7 @@ fn events_of(db: &Db, ty: &str) -> Result<Vec<Ev>, String> {
 }
 
 /// The start of the current interval: the later (by event id) of the newest
-/// `KILL_SWITCH_CHANGED {on: false}` and the `LOSS_BREAKER_BASELINE`. The baseline is written here
+/// `KILL_SWITCH_CHANGED {on: false}` that switched the kill switch from ON to OFF and the `LOSS_BREAKER_BASELINE`. The baseline is written here
 /// when this database never had one, so the history before the first start never counts, even when
 /// the kill switch was opened (and the pairs lost money) before this version existed.
 pub fn interval_start(db: &Db) -> Result<IntervalStart, String> {
@@ -71,14 +71,29 @@ pub fn interval_start(db: &Db) -> Result<IntervalStart, String> {
             IntervalStart { event_id: id, ts_ms: db.now_ms(), kind: StartKind::Baseline }
         }
     };
-    let opened = events_of(db, KILL_SWITCH_CHANGED)?.into_iter().rfind(|e| e.payload["on"] == Value::Bool(false));
+    // Only an OFF that follows a real ON opens trading (the switch starts OFF): an OFF written while it
+    // was already OFF switched nothing and must not make the breaker forget what happened since.
+    let mut is_on = false;
+    let mut opened: Option<Ev> = None;
+    for e in events_of(db, KILL_SWITCH_CHANGED)? {
+        match e.payload["on"].as_bool() {
+            Some(true) => is_on = true,
+            Some(false) => {
+                if is_on {
+                    opened = Some(e);
+                }
+                is_on = false;
+            }
+            None => {}
+        }
+    }
     Ok(match opened {
         Some(e) if e.id > baseline.event_id => IntervalStart { event_id: e.id, ts_ms: e.ts_ms, kind: StartKind::TradingOpened },
         _ => baseline,
     })
 }
 
-/// A pair whose `CLOSE_CONFIRMED` falls inside the interval.
+/// A pair that counts in the interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosedPair {
     pub pair: String,
@@ -86,17 +101,39 @@ pub struct ClosedPair {
     pub ts_ms: i64,
 }
 
-/// Pairs with a `CLOSE_CONFIRMED` after `start`, ordered by that event's time (then id), each pair once.
+/// The states a pair is left in for a person; confirming it closed from one of them ends in FINALIZED.
+const ALERT_STATES: [&str; 3] = ["PARTIAL_FAILURE", "IMBALANCED", "UNRESOLVED"];
+
+/// Every event that says "this pair is closed", oldest first: a `CLOSE_CONFIRMED`, or the transition
+/// of a pair from an alert state into FINALIZED (the user's "confirm closed": such a pair never gets
+/// a `CLOSE_CONFIRMED`, and the money it lost is real all the same). The payload carries `simulated`.
+fn closing_events(db: &Db) -> Result<Vec<Ev>, String> {
+    let mut out = events_of(db, crate::engine::actor::CLOSE_CONFIRMED)?;
+    for mut e in events_of(db, crate::engine::transition::PAIR_TRANSITION)? {
+        if e.payload["to"] == "FINALIZED" && e.payload["from"].as_str().is_some_and(|f| ALERT_STATES.contains(&f)) {
+            e.payload = json!({ "simulated": e.payload["detail"]["simulated"] });
+            out.push(e);
+        }
+    }
+    out.sort_by_key(|e| e.id);
+    Ok(out)
+}
+
+/// Pairs that count since `start`, ordered by the time of their first closing event (then id), each
+/// pair once: the pair's earliest `CLOSE_CONFIRMED` / hand-confirmed finalization decides when it is
+/// counted, and a pair whose first such event lies before `start` was counted in an earlier interval.
 /// Simulated pairs are left out: they hold no money and have no PnL by design.
 pub fn closed_pairs_since(db: &Db, start: &IntervalStart) -> Result<Vec<ClosedPair>, String> {
-    let mut out: Vec<ClosedPair> = Vec::new();
-    for e in events_of(db, crate::engine::actor::CLOSE_CONFIRMED)? {
+    let mut first: Vec<(ClosedPair, bool)> = Vec::new(); // (earliest event, any event says simulated)
+    for e in closing_events(db)? {
         let Some(pair) = e.pair else { continue };
-        if e.id <= start.event_id || e.payload["simulated"] == Value::Bool(true) || out.iter().any(|c| c.pair == pair) {
-            continue;
+        let simulated = e.payload["simulated"] == Value::Bool(true);
+        match first.iter_mut().find(|(c, _)| c.pair == pair) {
+            Some((_, sim)) => *sim |= simulated,
+            None => first.push((ClosedPair { pair, event_id: e.id, ts_ms: e.ts_ms }, simulated)),
         }
-        out.push(ClosedPair { pair, event_id: e.id, ts_ms: e.ts_ms });
     }
+    let mut out: Vec<ClosedPair> = first.into_iter().filter(|(c, sim)| c.event_id > start.event_id && !sim).map(|(c, _)| c).collect();
     out.sort_by_key(|c| (c.ts_ms, c.event_id));
     Ok(out)
 }
@@ -177,7 +214,7 @@ impl Assessment {
     pub fn reason(&self) -> Option<TripReason> {
         self.state.reason.or_else(|| {
             let code = self.recorded_trip.as_ref()?["reason"].as_str()?;
-            [TripReason::UnknownPnl, TripReason::MaxLoss, TripReason::ConsecutiveLosses].into_iter().find(|r| r.code() == code)
+            [TripReason::UnknownPnl, TripReason::MaxLoss, TripReason::ConsecutiveLosses, TripReason::Unreadable].into_iter().find(|r| r.code() == code)
         })
     }
 
@@ -223,12 +260,14 @@ impl Assessment {
     }
 }
 
-/// The highest event id among the events the breaker reacts to (closes, PnL results, kill switch
-/// changes, trips, baselines): the engine re-assesses only when this moved.
+/// The highest event id among the events the breaker reacts to (closes, hand-confirmed finalizations,
+/// PnL results, kill switch changes, trips, baselines, risk settings changes): the engine re-assesses
+/// only when this moved.
 pub fn watermark(db: &Db) -> Result<i64, String> {
     db.with_conn(|c| {
         Ok(c.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type IN ('CLOSE_CONFIRMED', 'PAIR_PNL_COMPUTED', 'PAIR_PNL_RECOMPUTED', 'KILL_SWITCH_CHANGED', 'LOSS_BREAKER_TRIPPED', 'LOSS_BREAKER_BASELINE')",
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type IN ('CLOSE_CONFIRMED', 'PAIR_PNL_COMPUTED', 'PAIR_PNL_RECOMPUTED', 'KILL_SWITCH_CHANGED', 'LOSS_BREAKER_TRIPPED', 'LOSS_BREAKER_BASELINE', 'RISK_CONFIG_UPDATED') \
+             OR (event_type = 'PAIR_TRANSITION' AND json_extract(payload, '$.to') = 'FINALIZED')",
             [],
             |r| r.get::<_, i64>(0),
         )?)
@@ -258,8 +297,25 @@ pub(crate) mod testkit {
         append(db, crate::engine::actor::CLOSE_CONFIRMED, Some(pair), json!({ "verified_flat": true, "simulated": simulated }))
     }
 
+    /// The manual "confirm closed" of a pair in an alert state: `PAIR_TRANSITION` `from` -> FINALIZED.
+    pub(crate) fn finalize_by_hand(db: &Db, pair: &str, from: &str, simulated: bool) -> i64 {
+        append(db, crate::engine::transition::PAIR_TRANSITION, Some(pair), json!({ "from": from, "to": "FINALIZED", "event": "Manual(ConfirmClosed)", "detail": { "simulated": simulated } }))
+    }
+
     /// A closed demo pair worth `delta` (long closes `delta` away from its open, no fees) at `ts`.
     pub(crate) fn closed(db: &Db, clock: &crate::ports::ManualClock, uuid: &str, ts: i64, delta: &str) {
+        pair_with_fills(db, clock, uuid, ts, delta);
+        close(db, uuid, false);
+    }
+
+    /// The same pair as [`closed`], but the user confirmed it by hand from PARTIAL_FAILURE: there is
+    /// no `CLOSE_CONFIRMED`, only the transition into FINALIZED.
+    pub(crate) fn closed_by_hand(db: &Db, clock: &crate::ports::ManualClock, uuid: &str, ts: i64, delta: &str) {
+        pair_with_fills(db, clock, uuid, ts, delta);
+        finalize_by_hand(db, uuid, "PARTIAL_FAILURE", false);
+    }
+
+    fn pair_with_fills(db: &Db, clock: &crate::ports::ManualClock, uuid: &str, ts: i64, delta: &str) {
         let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: ts, simulated: false, scan: json!({}) };
         let row = NewPair { internal_uuid: uuid.into(), pair_id: format!("pid-{uuid}"), symbol: "BTCUSDT".into(), status: PairState::Closing, entry: serde_json::to_value(env).unwrap() };
         db.add_pair_if_not_pending(&row).unwrap();
@@ -281,7 +337,6 @@ pub(crate) mod testkit {
                 }),
             );
         }
-        close(db, uuid, false);
     }
 }
 
@@ -365,10 +420,42 @@ mod tests {
     }
 
     #[test]
+    fn an_off_that_switched_nothing_does_not_reset_the_interval() {
+        // review round 1 (A6): only an OFF that follows a real ON opens trading; an OFF written while the
+        // switch was already OFF (a redundant save, a re-arm of an armed engine) must not forget the losses
+        let (_d, db, clock) = open_tmp();
+        interval_start(&db).unwrap();
+        clock.set(2_000_000);
+        db.set_kill_switch(true).unwrap();
+        clock.set(3_000_000);
+        db.set_kill_switch(false).unwrap();
+        let opened = interval_start(&db).unwrap();
+        assert_eq!((opened.kind, opened.ts_ms), (StartKind::TradingOpened, 3_000_000));
+        clock.set(3_500_000);
+        close(&db, "lost", false);
+        clock.set(4_000_000);
+        db.set_kill_switch(false).unwrap(); // already OFF: nothing was switched
+        let still = interval_start(&db).unwrap();
+        assert_eq!(still, opened, "the start stays where the real opening was");
+        assert_eq!(closed_pairs_since(&db, &still).unwrap().len(), 1, "and the loss since then still counts");
+    }
+
+    #[test]
+    fn an_off_before_any_on_is_not_an_opening() {
+        // the switch starts OFF: an OFF event with nothing ON before it opens nothing
+        let (_d, db, clock) = open_tmp();
+        let first = interval_start(&db).unwrap();
+        clock.set(2_000_000);
+        db.set_kill_switch(false).unwrap();
+        assert_eq!(interval_start(&db).unwrap(), first);
+    }
+
+    #[test]
     fn a_live_arming_is_an_opening_too() {
         // Live: arming writes KILL_SWITCH_CHANGED {on:false} together with LIVE_ARMED
         let (_d, db, clock) = open_tmp();
         interval_start(&db).unwrap();
+        db.set_kill_switch_with_event(true, "LIVE_STARTUP_LOCK", &json!({})).unwrap(); // every Live start is locked
         clock.set(2_000_000);
         db.set_kill_switch_with_event(false, "LIVE_ARMED", &json!({})).unwrap();
         let start = interval_start(&db).unwrap();
@@ -407,6 +494,74 @@ mod tests {
         close(&db, "early", false); // the same pair confirmed again: still one pair, at its first confirmation
         let got = closed_pairs_since(&db, &start).unwrap();
         assert_eq!(got.iter().map(|c| (c.pair.as_str(), c.ts_ms)).collect::<Vec<_>>(), [("early", 2_000_000), ("late", 3_000_000)]);
+    }
+
+    // ---- review round 1 (A2): a pair the user confirmed by hand counts too ----
+
+    #[test]
+    fn a_pair_finalized_by_hand_from_an_alert_state_counts_without_any_close_confirmation() {
+        let (_d, db, clock) = open_tmp();
+        let start = interval_start(&db).unwrap();
+        clock.set(2_000_000);
+        for (i, from) in ["PARTIAL_FAILURE", "IMBALANCED", "UNRESOLVED"].into_iter().enumerate() {
+            clock.set(2_000_000 + i as i64);
+            testkit::finalize_by_hand(&db, &format!("h{i}"), from, false);
+        }
+        let got = closed_pairs_since(&db, &start).unwrap();
+        assert_eq!(got.iter().map(|c| c.pair.as_str()).collect::<Vec<_>>(), ["h0", "h1", "h2"]);
+    }
+
+    #[test]
+    fn a_pair_counts_once_at_the_earlier_of_its_two_events() {
+        let (_d, db, clock) = open_tmp();
+        let start = interval_start(&db).unwrap();
+        clock.set(2_000_000);
+        testkit::finalize_by_hand(&db, "p", "PARTIAL_FAILURE", false);
+        clock.set(5_000_000);
+        close(&db, "p", false);
+        clock.set(3_000_000);
+        close(&db, "q", false);
+        let got = closed_pairs_since(&db, &start).unwrap();
+        assert_eq!(got.iter().map(|c| (c.pair.as_str(), c.ts_ms)).collect::<Vec<_>>(), [("p", 2_000_000), ("q", 3_000_000)], "p at its confirmation by hand, once");
+    }
+
+    #[test]
+    fn a_pair_closed_before_the_start_and_finalized_by_hand_after_it_belongs_to_the_earlier_interval() {
+        let (_d, db, clock) = open_tmp();
+        let first = interval_start(&db).unwrap();
+        clock.set(2_000_000);
+        close(&db, "old", false);
+        db.set_kill_switch(true).unwrap();
+        clock.set(3_000_000);
+        db.set_kill_switch(false).unwrap();
+        let start = interval_start(&db).unwrap();
+        assert!(start.event_id > first.event_id);
+        clock.set(4_000_000);
+        testkit::finalize_by_hand(&db, "old", "PARTIAL_FAILURE", false);
+        assert!(closed_pairs_since(&db, &start).unwrap().is_empty(), "it was already counted where it was closed");
+    }
+
+    #[test]
+    fn a_simulated_pair_finalized_by_hand_and_an_ordinary_finalization_are_not_counted() {
+        let (_d, db, clock) = open_tmp();
+        let start = interval_start(&db).unwrap();
+        clock.set(2_000_000);
+        testkit::finalize_by_hand(&db, "sim", "PARTIAL_FAILURE", true);
+        testkit::finalize_by_hand(&db, "normal", "CLOSING", false); // the pipeline's own finalization follows a CLOSE_CONFIRMED
+        assert!(closed_pairs_since(&db, &start).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_watermark_moves_on_a_hand_finalization_and_on_a_risk_settings_change_but_not_on_other_transitions() {
+        let (_d, db, _clock) = open_tmp();
+        let w0 = watermark(&db).unwrap();
+        append(&db, "PAIR_TRANSITION", Some("a"), json!({ "from": "PREPARED", "to": "ORDER_SUBMIT" }));
+        assert_eq!(watermark(&db).unwrap(), w0, "an ordinary transition is not watched");
+        testkit::finalize_by_hand(&db, "a", "UNRESOLVED", false);
+        let w1 = watermark(&db).unwrap();
+        assert!(w1 > w0);
+        append(&db, "RISK_CONFIG_UPDATED", None, json!({}));
+        assert!(watermark(&db).unwrap() > w1, "new limits are looked at at once");
     }
 
     #[test]

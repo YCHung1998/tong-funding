@@ -17,6 +17,9 @@ pub enum TripReason {
     MaxLoss,
     /// The trailing run of losing pairs reached the limit.
     ConsecutiveLosses,
+    /// The events (or the stored settings) could not be read, so the interval cannot be judged:
+    /// entries stop (fail closed). `evaluate` never returns this one; the engine writes it.
+    Unreadable,
 }
 
 impl TripReason {
@@ -26,6 +29,7 @@ impl TripReason {
             TripReason::UnknownPnl => "UNKNOWN_PNL",
             TripReason::MaxLoss => "MAX_LOSS",
             TripReason::ConsecutiveLosses => "CONSECUTIVE_LOSSES",
+            TripReason::Unreadable => "UNREADABLE",
         }
     }
 
@@ -35,6 +39,7 @@ impl TripReason {
             TripReason::UnknownPnl => "損益未知",
             TripReason::MaxLoss => "累計虧損達上限",
             TripReason::ConsecutiveLosses => "連虧達上限",
+            TripReason::Unreadable => "無法評估熔斷",
         }
     }
 }
