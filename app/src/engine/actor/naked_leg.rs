@@ -218,12 +218,62 @@ impl Actor {
                 w.waited_rounds = w.waited_rounds.saturating_add(1);
                 w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
             }
-            // task 2.2 records the conclusions; acting on them comes with 2.3 - 2.5
+            // the conclusions below are recorded; acting on them comes with 2.4 and 2.5
             wd::Conclusion::Flatten | wd::Conclusion::Hedged | wd::Conclusion::Flat | wd::Conclusion::Unknown => {
                 w.waited_rounds = 0;
                 w.done = true;
             }
         }
+        self.dirty = true;
+        // An order that is not over is cancelled; the next round (5 s later) looks again. Only now,
+        // after the record: the cancel is the action of this conclusion.
+        if let (wd::Conclusion::WaitForCancel, Some((probe, _))) = (conclusion, evidence) {
+            self.cancel_unfinished(view, probe);
+        }
+    }
+
+    /// Cancels the pair's own orders that are not over (never a position, never anybody else's
+    /// order), then looks each one up again.
+    fn cancel_unfinished(&self, view: &PairView, probe: &wd::WatchdogProbe) {
+        for l in &probe.legs {
+            for id in l.open_order_ids() {
+                let (executor, db, tx) = (self.executor.clone(), self.db.clone(), self.event_tx.clone());
+                let (pair, symbol, exchange) = (view.internal_uuid.clone(), view.symbol.clone(), l.read.exchange);
+                tokio::spawn(async move {
+                    let cancel = executor.cancel(exchange, &symbol, &id).await;
+                    let after = executor.query(exchange, &symbol, &id).await;
+                    // keep the intent in step with what the exchange reports (state changes only)
+                    if let QueryOutcome::Found(status) = &after
+                        && let Ok(Some(row)) = db.get_intent(&id)
+                        && IntentState::parse(&row.state) != Some(intent_state_of(status))
+                    {
+                        let _ = intent::record_query_outcome(&db, &id, &after, executor.is_simulated());
+                    }
+                    let _ = tx.send(Event::WatchdogCancelled { pair, exchange, client_order_id: id, cancel, after }).await;
+                });
+            }
+        }
+    }
+
+    /// What the watchdog's cancel and the lookup after it said (a record; the next round decides).
+    pub(super) fn on_watchdog_cancelled(&mut self, pair: &str, exchange: Exchange, client_order_id: &str, cancel: &QueryOutcome, after: &QueryOutcome) {
+        let verdict = match after {
+            QueryOutcome::Found(s) if s.state != OrderState::Open => "final",
+            QueryOutcome::Found(_) => "still open after cancel",
+            QueryOutcome::NotFound | QueryOutcome::Failed { .. } => "final state not confirmed",
+        };
+        let (symbol, simulated) = self.pairs.get(pair).map(|v| (v.symbol.clone(), v.simulated)).unwrap_or_default();
+        let payload = json!({
+            "client_order_id": client_order_id,
+            "exchange": exchange.name(),
+            "symbol": symbol,
+            "cancel": query_json(cancel),
+            "after": query_json(after),
+            "verdict": verdict,
+            "simulated": simulated,
+            "by": "watchdog",
+        });
+        self.note(ORDER_CANCEL_RESULT, Some(pair), payload);
         self.dirty = true;
     }
 }

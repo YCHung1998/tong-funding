@@ -537,6 +537,10 @@ fn event_errors(ev: &Event) -> Texts {
                 errs("order lookup", &l.read.recorded, &mut out);
             }
         }
+        Event::WatchdogCancelled { cancel, after, .. } => {
+            query_texts("order cancel", cancel, &mut out);
+            query_texts("order lookup", after, &mut out);
+        }
         Event::OpenPrepared { result, .. } => errs("pre-send barrier", result, &mut out),
         Event::ReconciliationDone { result } => errs("reconciliation", result, &mut out),
         Event::PreflightDone { .. } => {}

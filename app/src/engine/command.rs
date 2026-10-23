@@ -200,6 +200,9 @@ pub enum Event {
     /// naked-leg-watchdog: what one verification round read on both legs. `entry_no` numbers the
     /// alert entry that asked for it; the result of an older entry is dropped.
     WatchdogProbed { pair: PairUuid, entry_no: u64, probe: WatchdogProbe },
+    /// naked-leg-watchdog: an own order that was not over was cancelled (`cancel` = what the cancel
+    /// call said) and looked up again (`after`). A record only: the next round verifies.
+    WatchdogCancelled { pair: PairUuid, exchange: Exchange, client_order_id: String, cancel: QueryOutcome, after: QueryOutcome },
 }
 
 /// What made a leg reach the early-exit threshold (recorded with the `LEG_EARLY_EXIT` event).

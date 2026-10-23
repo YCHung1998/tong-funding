@@ -2426,6 +2426,7 @@ impl Actor {
             Event::PreflightDone { report } => self.on_preflight_done(report),
             Event::FlattenPositionFetched { pair, leg, position, recorded } => self.on_flatten_position(&pair, leg, position, recorded),
             Event::WatchdogProbed { pair, entry_no, probe } => self.on_watchdog_probed(&pair, entry_no, probe),
+            Event::WatchdogCancelled { pair, exchange, client_order_id, cancel, after } => self.on_watchdog_cancelled(&pair, exchange, &client_order_id, &cancel, &after),
         }
     }
 

@@ -22,19 +22,37 @@ struct Watched {
     inner: Arc<SimulatedExecutor>,
     queries: AtomicUsize,
     cancels: AtomicUsize,
+    /// The next this-many cancels do nothing (the order stays as it is), like a cancel that lost a race.
+    swallow_cancels: AtomicUsize,
+    cancelled: Mutex<Vec<String>>,
     hold: std::sync::atomic::AtomicBool,
     release: tokio::sync::Notify,
 }
 
 impl Watched {
     fn new(inner: Arc<SimulatedExecutor>) -> Arc<Watched> {
-        Arc::new(Watched { inner, queries: AtomicUsize::new(0), cancels: AtomicUsize::new(0), hold: std::sync::atomic::AtomicBool::new(false), release: tokio::sync::Notify::new() })
+        Arc::new(Watched {
+            inner,
+            queries: AtomicUsize::new(0),
+            cancels: AtomicUsize::new(0),
+            swallow_cancels: AtomicUsize::new(0),
+            cancelled: Mutex::default(),
+            hold: std::sync::atomic::AtomicBool::new(false),
+            release: tokio::sync::Notify::new(),
+        })
     }
     fn queries(&self) -> usize {
         self.queries.load(Ordering::SeqCst)
     }
     fn cancels(&self) -> usize {
         self.cancels.load(Ordering::SeqCst)
+    }
+    /// The ids every cancel call named, in order.
+    fn cancelled_ids(&self) -> Vec<String> {
+        self.cancelled.lock().unwrap().clone()
+    }
+    fn swallow_cancels(&self, n: usize) {
+        self.swallow_cancels.store(n, Ordering::SeqCst);
     }
     fn hold(&self, on: bool) {
         self.hold.store(on, Ordering::SeqCst);
@@ -53,6 +71,11 @@ impl Executor for Watched {
     }
     fn cancel(&self, exchange: Exchange, symbol: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
         self.cancels.fetch_add(1, Ordering::SeqCst);
+        self.cancelled.lock().unwrap().push(id.to_string());
+        let swallowed = self.swallow_cancels.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+        if swallowed {
+            return self.inner.query(exchange, symbol, id); // the cancel did nothing: the order as it is
+        }
         self.inner.cancel(exchange, symbol, id)
     }
     fn query(&self, exchange: Exchange, symbol: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
@@ -281,4 +304,69 @@ async fn a_round_whose_result_never_arrives_is_given_up_as_unknown() {
     assert_eq!(rounds.len(), 1, "{rounds:?}");
     assert_eq!(rounds[0]["conclusion"], json!("UNKNOWN"));
     assert!(rounds[0]["reason"].as_str().unwrap().contains("did not report"), "{}", rounds[0]);
+}
+
+// ---- 2.3 an order that is not over: cancel, look again, give up after three rounds -----------
+
+/// The pair at its fill timeout with the short order still open after the engine's own cancel
+/// (that cancel is swallowed, plus `swallow_more` after it): UNRESOLVED, the long leg filled 10, the
+/// short leg 7 of 10. Returns the time the pair entered the state.
+async fn open_short(swallow_more: usize) -> (Rig, EngineHandle, Arc<Watched>, i64) {
+    let (rig, h, watched) = started_watched(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Partial(dec("0.7")));
+    watched.swallow_cancels(1 + swallow_more);
+    run_until(&rig.clock, T + 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "UNRESOLVED", "{:?}", labels(&rig.db));
+    let since = ts_of(&rig.db, "UNRESOLVED")[0];
+    (rig, h, watched, since)
+}
+
+fn conclusions(rounds: &[Value]) -> Vec<String> {
+    rounds.iter().map(|r| r["conclusion"].as_str().unwrap_or("?").to_string()).collect()
+}
+
+fn watchdog_cancel_results(db: &Db) -> Vec<Value> {
+    payloads(db, ORDER_CANCEL_RESULT).into_iter().filter(|p| p["by"] == json!("watchdog")).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unfinished_order_is_cancelled_nothing_is_sent_and_the_next_round_looks_again() {
+    let (rig, _h, watched, since) = open_short(1).await;
+    let engine_cancels = watched.cancels();
+    assert_eq!(engine_cancels, 1, "the fill timeout's own cancel (it did nothing)");
+    run_until(&rig.clock, since + 5_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["WAIT_FOR_CANCEL"], "{r:?}");
+    assert_eq!(r[0]["waited_rounds"], json!(0), "{}", r[0]);
+    assert_eq!(watched.cancels(), engine_cancels + 1, "one cancel for the one order that is not over");
+    assert_eq!(watched.cancelled_ids().last(), Some(&sim_id(Leg::Short, OrderAction::Open)), "the pair's own unfinished order, never the filled long one");
+    assert_eq!(rig.sim.submitted().len(), 2, "while an order is unfinished nothing is sent");
+    let results = watchdog_cancel_results(&rig.db);
+    assert_eq!(results.len(), 1, "the cancel and the lookup after it are recorded: {results:?}");
+    assert_eq!(results[0]["client_order_id"], json!(sim_id(Leg::Short, OrderAction::Open)));
+    assert_eq!(results[0]["after"]["state"], json!("Open"), "the swallowed cancel left it open: {}", results[0]);
+
+    // 5 s later the second cancel works; the third round finds both legs over and holding a position
+    run_until(&rig.clock, since + 15_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["WAIT_FOR_CANCEL", "WAIT_FOR_CANCEL", "HEDGED"], "{r:?}");
+    assert_eq!(ts_of(&rig.db, wd::NAKED_LEG_WATCHDOG), vec![since + 5_000, since + 10_000, since + 15_000], "rounds are 5 s apart");
+    assert_eq!(r.iter().map(|x| x["waited_rounds"].clone()).collect::<Vec<_>>(), vec![json!(0), json!(1), json!(2)], "each record carries the earlier consecutive waits it was decided with");
+    assert_eq!(rig.sim.submitted().len(), 2, "still no order of the watchdog's");
+    assert_eq!(status(&rig.db, UUID), "UNRESOLVED", "the pair state is never changed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_consecutive_unfinished_rounds_conclude_unknown_and_the_last_one_cancels_nothing() {
+    let (rig, _h, watched, since) = open_short(usize::MAX / 2).await; // no cancel ever works
+    let engine_cancels = watched.cancels();
+    run_until(&rig.clock, since + 20_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["WAIT_FOR_CANCEL", "WAIT_FOR_CANCEL", "UNKNOWN"], "{r:?}");
+    let why = r[2]["reason"].as_str().unwrap();
+    assert!(why.contains("short") && why.contains("3 rounds"), "{why}");
+    assert_eq!(watched.cancels(), engine_cancels + 2, "a cancel in each of the two waiting rounds, none in the Unknown one");
+    assert_eq!(rig.sim.submitted().len(), 2, "nothing was ever sent");
+    run_until(&rig.clock, since + 40_000).await;
+    assert_eq!(rounds(&rig.db).len(), 3, "an Unknown conclusion ends the rounds: no fourth one");
 }
