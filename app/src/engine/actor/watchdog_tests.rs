@@ -412,7 +412,12 @@ async fn after_the_order_the_attempt_is_recorded_and_one_more_round_confirms_bot
     assert_eq!(a["client_order_id"], json!(sim_id(Leg::Long, OrderAction::Close)));
     let r = rounds(&rig.db);
     assert_eq!(conclusions(&r), vec!["FLATTEN", "FLAT"], "verified again after the order: nothing left on either leg");
-    assert_eq!(ts_of(&rig.db, wd::NAKED_LEG_WATCHDOG), vec![since + 5_000, since + 6_000, since + 11_000], "the order's result is seen at the next tick; the next round is 5 s after it");
+    let progress_at: Vec<i64> = events(&rig.db)
+        .into_iter()
+        .filter(|(_, l, p)| l == wd::NAKED_LEG_WATCHDOG && (p["kind"] == json!(wd::KIND_ROUND) || p["kind"] == json!(wd::KIND_ATTEMPT_RESULT)))
+        .map(|(t, _, _)| t)
+        .collect();
+    assert_eq!(progress_at, vec![since + 5_000, since + 6_000, since + 11_000], "the order's result is seen at the next tick; the next round is 5 s after it");
     assert_eq!(r[1]["attempts_sent"], json!(1));
     assert_eq!(rig.sim.submitted().len(), 3, "and no second order");
     run_until(&rig.clock, since + 40_000).await;
@@ -488,4 +493,113 @@ fn seed_demo_bare_long(rig: &Rig, entered_ms: i64) {
         .append(transition::PAIR_TRANSITION, Some(UUID), json!({ "from": "ORDER_SUBMIT", "to": "PARTIAL_FAILURE", "event": "System(OneLegSubmitFailed)", "detail": { "simulated": false } }))
         .unwrap();
     rig.clock.set(now);
+}
+
+// ---- 2.5 retries, the lock and the notification ----------------------------------------------
+
+fn reduce_only_orders(rig: &Rig) -> Vec<OrderRequest> {
+    rig.sim.submitted().into_iter().filter(|r| r.reduce_only).collect()
+}
+
+fn records_of_kind(db: &Db, kind: &str) -> Vec<Value> {
+    payloads(db, wd::NAKED_LEG_WATCHDOG).into_iter().filter(|p| p["kind"] == json!(kind)).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unknown_conclusion_sends_nothing_locks_the_engine_in_one_transaction_and_tells_the_user() {
+    let (rig, _h, _w, since) = bare_long(Opts::default()).await;
+    run_until(&rig.clock, since + 1_000).await;
+    rig.sim.fail_queries(Some("exchange unreachable (scripted)".into()));
+    run_until(&rig.clock, since + 5_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["UNKNOWN"], "{r:?}");
+    assert!(r[0]["reason"].as_str().unwrap().contains("unreachable"), "{}", r[0]);
+    assert_eq!(rig.sim.submitted().len(), 2, "a failed lookup sends nothing");
+    assert!(rig.db.kill_switch_halted(), "new entries are stopped");
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the pair state is not touched");
+    // KILL_SWITCH_CHANGED and NAKED_LEG_WATCHDOG_LOCK come from ONE transaction: adjacent, same time
+    let all = events(&rig.db);
+    let at = all.iter().position(|(_, l, _)| l == wd::NAKED_LEG_WATCHDOG_LOCK).expect("the lock event");
+    assert_eq!((all[at - 1].1.as_str(), all[at - 1].2["on"].clone()), ("KILL_SWITCH_CHANGED", json!(true)), "{:?}", all[at - 1]);
+    assert_eq!(all[at - 1].0, all[at].0);
+    let lock = &all[at].2;
+    assert_eq!((lock["pair"].clone(), lock["pair_id"].clone(), lock["symbol"].clone(), lock["alert_state"].clone()), (json!(UUID), json!(format!("pid-{UUID}")), json!(SYM), json!("PARTIAL_FAILURE")), "{lock}");
+    assert!(lock["reason"].as_str().unwrap().contains("unreachable"), "{lock}");
+    // the user is told, with the words of the shared copy
+    sleep(Duration::from_millis(100)).await;
+    let calls = rig.notifier.watchdog_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(matches!(&calls[0].outcome, crate::engine::alert::WatchdogOutcome::Locked { reason } if reason.contains("unreachable")), "{calls:?}");
+    assert_eq!((calls[0].pair.as_str(), calls[0].symbol.as_str(), calls[0].simulated), (UUID, SYM, true));
+    assert!(calls[0].body().contains("沒有送出任何單") && calls[0].body().contains("停止開新倉"), "{}", calls[0].body());
+    assert_eq!(rig.notifier.calls().len(), 1, "the pair-alert notification is a separate one, still just one");
+    let notified = records_of_kind(&rig.db, "NOTIFY_RESULT");
+    assert_eq!((notified.len(), notified[0]["ok"].clone(), notified[0]["outcome"].clone()), (1, json!(true), json!("LOCKED")), "{notified:?}");
+    // it stays final: the exchange is back and the user lifts the kill switch, still no further round
+    rig.sim.fail_queries(None);
+    rig.db.set_kill_switch(false).unwrap();
+    run_until(&rig.clock, since + 40_000).await;
+    assert_eq!(rounds(&rig.db).len(), 1, "no automatic action until the user acts");
+    assert_eq!(rig.sim.submitted().len(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn three_rejected_flatten_orders_lock_the_engine_and_no_fourth_is_sent() {
+    let (rig, _h, _w, since) = bare_long(Opts::default()).await;
+    rig.sim.script_prefix("simlc", SimBehavior::Reject("110090 risk limit (scripted)".into())); // every long close
+    run_until(&rig.clock, since + 30_000).await;
+    let closes = reduce_only_orders(&rig);
+    assert_eq!(closes.len(), 3, "three attempts, never a fourth: {closes:?}");
+    assert_eq!(closes.iter().map(|c| (c.exchange, c.side, c.quantity)).collect::<Vec<_>>(), vec![(Exchange::Binance, OrderSide::Sell, dec("10")); 3]);
+    let ids: BTreeSet<String> = closes.iter().map(|c| c.client_order_id.clone()).collect();
+    assert_eq!(ids.len(), 3, "each attempt is a new order with its own id");
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["FLATTEN", "FLATTEN", "FLATTEN", "UNKNOWN"], "{r:?}");
+    assert_eq!(r.iter().map(|x| x["attempt"].clone()).collect::<Vec<_>>()[..3], [json!(1), json!(2), json!(3)]);
+    assert_eq!(r[3]["reason"], json!("auto flatten failed 3 times"));
+    sleep(Duration::from_millis(100)).await;
+    let kinds: Vec<String> = payloads(&rig.db, wd::NAKED_LEG_WATCHDOG).iter().map(|p| p["kind"].as_str().unwrap_or("?").to_string()).collect();
+    assert_eq!(kinds.iter().filter(|k| *k == wd::KIND_ROUND).count(), 4, "{kinds:?}");
+    assert_eq!(kinds.iter().filter(|k| *k == wd::KIND_ATTEMPT_RESULT).count(), 3, "{kinds:?}");
+    assert_eq!(kinds.iter().filter(|k| *k == wd::KIND_NOTIFY_RESULT).count(), 1, "{kinds:?}");
+    let rounds_at: Vec<i64> = events(&rig.db).into_iter().filter(|(_, l, p)| l == wd::NAKED_LEG_WATCHDOG && p["kind"] == json!("ROUND")).map(|(t, _, _)| t - since).collect();
+    assert_eq!(rounds_at, vec![5_000, 11_000, 17_000, 23_000], "5 s after the first grace, then 5 s after each attempt's result (seen at the next tick)");
+    let attempts = records_of_kind(&rig.db, wd::KIND_ATTEMPT_RESULT);
+    assert_eq!(attempts.iter().map(|a| (a["ok"].clone(), a["attempt"].clone())).collect::<Vec<_>>(), vec![(json!(false), json!(1)), (json!(false), json!(2)), (json!(false), json!(3))]);
+    assert!(attempts.iter().all(|a| a["reason"].as_str().unwrap().contains("rejected")), "{attempts:?}");
+    assert!(rig.db.kill_switch_halted());
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG_LOCK), 1);
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(rig.notifier.watchdog_calls().len(), 1, "told once");
+    run_until(&rig.clock, since + 60_000).await;
+    assert_eq!(reduce_only_orders(&rig).len(), 3, "and it stays at three");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_successful_flatten_is_told_to_the_user_once_with_the_leg_and_the_quantity() {
+    let (rig, _h, _w, since) = bare_long(Opts::default()).await;
+    run_until(&rig.clock, since + 12_000).await;
+    sleep(Duration::from_millis(100)).await;
+    let calls = rig.notifier.watchdog_calls();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert!(matches!(&calls[0].outcome, crate::engine::alert::WatchdogOutcome::Flattened { leg: Leg::Long, exchange: Exchange::Binance, quantity } if *quantity == dec("10")), "{calls:?}");
+    assert!(calls[0].body().contains("系統已自動平掉多腿，請確認兩所皆無部位後按「人工確認已平倉」"), "{}", calls[0].body());
+    assert!(!rig.db.kill_switch_halted(), "a flatten that worked locks nothing");
+    let notified = records_of_kind(&rig.db, "NOTIFY_RESULT");
+    assert_eq!((notified.len(), notified[0]["outcome"].clone()), (1, json!("FLATTENED")), "{notified:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failing_notifier_changes_nothing_but_one_record() {
+    let (rig, _h, _w, since) = bare_long(Opts::default()).await;
+    *rig.notifier.fail_with.lock().unwrap() = Some("osascript not available".into());
+    rig.sim.script_prefix("simlc", SimBehavior::Reject("scripted".into()));
+    run_until(&rig.clock, since + 30_000).await;
+    sleep(Duration::from_millis(100)).await;
+    assert!(rig.db.kill_switch_halted(), "the lock does not depend on the notification");
+    let notified = records_of_kind(&rig.db, "NOTIFY_RESULT");
+    assert_eq!((notified.len(), notified[0]["ok"].clone()), (1, json!(false)), "{notified:?}");
+    assert!(notified[0]["error"].as_str().unwrap().contains("osascript"), "{}", notified[0]);
+    assert_eq!(rig.notifier.watchdog_calls().len(), 1, "and it is not retried in a loop");
 }

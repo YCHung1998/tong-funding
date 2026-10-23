@@ -214,6 +214,8 @@ pub const KIND_ROUND: &str = "ROUND";
 pub const KIND_ATTEMPT_RESULT: &str = "ATTEMPT_RESULT";
 /// `NAKED_LEG_WATCHDOG.kind` of a pair the watchdog cannot act on (written once, with the reason).
 pub const KIND_SKIPPED: &str = "SKIPPED";
+/// `NAKED_LEG_WATCHDOG.kind` of what became of a notification (sent, or why not).
+pub const KIND_NOTIFY_RESULT: &str = "NOTIFY_RESULT";
 
 /// One stored event of a pair as far as the watchdog's progress reads it.
 #[derive(Debug, Clone, PartialEq)]

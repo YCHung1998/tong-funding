@@ -19,7 +19,10 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use tong_funding_core::risk::ExecutionMode;
+use tong_funding_core::types::{Decimal, Exchange};
 
+use super::ports::Leg;
+use super::watchdog_text;
 use crate::identity::ProcessIdentity;
 use crate::ui::env_label::EnvLabel;
 
@@ -152,10 +155,56 @@ impl AlertNotice {
     }
 }
 
+/// What the naked-leg watchdog did on its own, for a notification.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WatchdogOutcome {
+    /// The bare leg was closed with a reduce-only market order.
+    Flattened { leg: Leg, exchange: Exchange, quantity: Decimal },
+    /// Nothing was sent; new entries are stopped (kill switch ON) because the situation could not be proven.
+    Locked { reason: String },
+}
+
+/// A notification about what the watchdog did. Its words come from `watchdog_text`, the same source
+/// as the risk page and the manual-handling card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WatchdogNotice {
+    pub pair: String,
+    pub pair_id: String,
+    pub symbol: String,
+    pub simulated: bool,
+    pub identity: ProcessIdentity,
+    pub outcome: WatchdogOutcome,
+}
+
+impl WatchdogNotice {
+    fn env_name(&self) -> &'static str {
+        EnvLabel::of(self.identity, if self.simulated { ExecutionMode::Simulation } else { ExecutionMode::ExchangeDemo }).env_name()
+    }
+
+    pub fn title(&self) -> String {
+        self.texts().0
+    }
+
+    pub fn body(&self) -> String {
+        self.texts().1
+    }
+
+    fn texts(&self) -> (String, String) {
+        let env = self.env_name();
+        let (title, body) = match &self.outcome {
+            WatchdogOutcome::Flattened { leg, exchange, quantity } => watchdog_text::flattened_notice(&self.symbol, &self.pair_id, env, *leg, *exchange, *quantity),
+            WatchdogOutcome::Locked { reason } => watchdog_text::locked_notice(&self.symbol, &self.pair_id, env, reason),
+        };
+        (redact_secrets(&title), redact_secrets(&body))
+    }
+}
+
 /// One-shot system notification channel. May block (it runs on a blocking thread); `Err` is
 /// recorded as `ALERT_NOTIFY_FAILED` and never retried automatically.
 pub trait Notifier: Send + Sync {
     fn notify(&self, notice: &AlertNotice) -> Result<(), String>;
+    /// naked-leg-watchdog: what the system did on its own (flattened a bare leg / stopped new entries).
+    fn notify_watchdog(&self, notice: &WatchdogNotice) -> Result<(), String>;
 }
 
 /// Placeholder until the macOS mechanism is chosen on the Mac (task 3.1): writes one line to
@@ -167,12 +216,19 @@ impl Notifier for LogNotifier {
         eprintln!("[alert] {} — {}", notice.title(), notice.body());
         Ok(())
     }
+
+    fn notify_watchdog(&self, notice: &WatchdogNotice) -> Result<(), String> {
+        eprintln!("[watchdog] {} — {}", notice.title(), notice.body());
+        Ok(())
+    }
 }
 
 /// Test notifier: records every call, optionally failing.
 #[derive(Default)]
 pub struct RecordingNotifier {
     pub calls: Mutex<Vec<AlertNotice>>,
+    /// naked-leg-watchdog notices (kept apart from `calls`, which count the pair alerts).
+    pub watchdog_calls: Mutex<Vec<WatchdogNotice>>,
     pub fail_with: Mutex<Option<String>>,
 }
 
@@ -180,11 +236,23 @@ impl RecordingNotifier {
     pub fn calls(&self) -> Vec<AlertNotice> {
         self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
+
+    pub fn watchdog_calls(&self) -> Vec<WatchdogNotice> {
+        self.watchdog_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
 }
 
 impl Notifier for RecordingNotifier {
     fn notify(&self, notice: &AlertNotice) -> Result<(), String> {
         self.calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(notice.clone());
+        match self.fail_with.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn notify_watchdog(&self, notice: &WatchdogNotice) -> Result<(), String> {
+        self.watchdog_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(notice.clone());
         match self.fail_with.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
             Some(e) => Err(e),
             None => Ok(()),

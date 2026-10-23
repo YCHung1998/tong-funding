@@ -34,3 +34,4 @@ pub mod sim;
 pub mod timings;
 pub mod transition;
 pub mod watchdog;
+pub mod watchdog_text;

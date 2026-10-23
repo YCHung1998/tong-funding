@@ -915,3 +915,26 @@ async fn real_orders_carry_the_prefix_of_the_process_identity() {
         assert!(sent.iter().all(|r| r.client_order_id.starts_with(expect) && !r.client_order_id.starts_with(other)), "{identity:?}: {sent:?}");
     }
 }
+
+/// naked-leg-watchdog: an Unknown conclusion locks a Live engine the same way a manual lock does: the
+/// kill switch is ON and the engine is disarmed (the next trade needs preflight and Arm again).
+#[tokio::test(start_paused = true)]
+async fn an_unknown_watchdog_conclusion_disarms_and_locks_a_live_engine() {
+    use crate::engine::watchdog::{NAKED_LEG_WATCHDOG_LOCK, WatchdogProbe};
+    use tong_funding_core::pair::SystemEvent as Ev;
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    seed_state(&rig.db, UUID, SYM, PairState::FillMonitor);
+    let (rig, mut actor, _h) = armed_actor((rig, deps));
+    actor.land(UUID, Ev::TimeoutPartialFill, json!({})).unwrap(); // PARTIAL_FAILURE locks a Live engine ...
+    rearm(&rig, &mut actor); // ... the user arms it again
+    assert!(actor.armed() && !locked(&rig), "armed before the round");
+    let (entry_no, now) = (actor.flows[UUID].watchdog.as_ref().unwrap().entry_no, rig.clock.now_ms());
+    actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap().phase = naked_leg::Phase::Verifying { started_ms: now };
+    let probe = WatchdogProbe::unreadable([(Leg::Long, Exchange::Binance), (Leg::Short, Exchange::Bybit)], "exchange unreachable (scripted)");
+    actor.on_event(Event::WatchdogProbed { pair: UUID.into(), entry_no, probe });
+    assert!(locked(&rig) && !actor.armed(), "kill switch ON and disarmed");
+    assert_eq!(count(&rig.db, NAKED_LEG_WATCHDOG_LOCK), 1);
+    let reason = actor.live_status().last_lock_reason.expect("the lock reason is shown with the arming panel");
+    assert!(reason.contains("watchdog") && reason.contains("unreachable"), "{reason}");
+    assert!(rig.sim.submitted().is_empty(), "nothing was sent");
+}

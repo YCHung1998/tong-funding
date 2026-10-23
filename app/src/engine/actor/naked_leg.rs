@@ -251,14 +251,74 @@ impl Actor {
                     self.cancel_unfinished(view, probe);
                 }
             }
-            // these end the rounds (2.5 adds the lock for Unknown)
-            wd::Decision::Hedged | wd::Decision::Flat | wd::Decision::Unknown { .. } => {
-                if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
-                    w.waited_rounds = 0;
-                    w.done = true;
-                }
+            // these end the rounds
+            wd::Decision::Hedged | wd::Decision::Flat => self.end_rounds(pair),
+            // Not provable (a lookup failed, a position does not match, the attempts are used up):
+            // nothing is sent, new entries stop, the user is told.
+            wd::Decision::Unknown { reason } => {
+                self.end_rounds(pair);
+                self.watchdog_lock(view, &reason);
             }
         }
+    }
+
+    /// No further automatic action for this entry until the user acts.
+    fn end_rounds(&mut self, pair: &str) {
+        if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+            w.waited_rounds = 0;
+            w.done = true;
+        }
+    }
+
+    /// The situation could not be proven and nothing was sent: new entries stop (kill switch ON,
+    /// written with `NAKED_LEG_WATCHDOG_LOCK` in ONE transaction), a Live engine is disarmed, and the
+    /// user is told. Closing and every manual action stay available.
+    fn watchdog_lock(&mut self, view: &PairView, reason: &str) {
+        let payload = json!({
+            "pair": view.internal_uuid,
+            "pair_id": view.pair_id,
+            "symbol": view.symbol,
+            "alert_state": view.state.as_str(),
+            "simulated": view.simulated,
+            "reason": reason,
+        });
+        if let Err(e) = self.db.set_kill_switch_with_event(true, wd::NAKED_LEG_WATCHDOG_LOCK, &payload)
+            && !self.db.is_halted()
+        {
+            self.db.halt(HaltReason::KillSwitchReadFailed(format!("watchdog lock could not be written: {e}")));
+        }
+        if self.live_on() {
+            self.live.last_lock_reason = Some(format!("naked-leg watchdog: {reason}"));
+            self.live_disarm();
+        }
+        self.dirty = true;
+        self.notify_watchdog(view, alert::WatchdogOutcome::Locked { reason: reason.to_string() });
+    }
+
+    /// One notification about what the watchdog did, off the actor (a notifier may block). Its failure
+    /// changes nothing but one record.
+    fn notify_watchdog(&self, view: &PairView, outcome: alert::WatchdogOutcome) {
+        let label = match &outcome {
+            alert::WatchdogOutcome::Flattened { .. } => "FLATTENED",
+            alert::WatchdogOutcome::Locked { .. } => "LOCKED",
+        };
+        let notice = alert::WatchdogNotice {
+            pair: view.internal_uuid.clone(),
+            pair_id: view.pair_id.clone(),
+            symbol: view.symbol.clone(),
+            simulated: view.simulated,
+            identity: self.identity,
+            outcome,
+        };
+        let (notifier, events) = (self.notifier.clone(), self.events.clone());
+        tokio::task::spawn_blocking(move || {
+            let result = notifier.notify_watchdog(&notice);
+            let mut payload = json!({ "kind": wd::KIND_NOTIFY_RESULT, "ok": result.is_ok(), "outcome": label });
+            if let Err(e) = result {
+                payload["error"] = json!(e);
+            }
+            let _ = events.append(wd::NAKED_LEG_WATCHDOG, Some(&notice.pair), payload);
+        });
     }
 
     /// Sends the one reduce-only close of the bare leg (through the same path as the manual flatten:
@@ -356,6 +416,13 @@ impl Actor {
             w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
         }
         self.dirty = true;
+        if result.is_ok() {
+            let exchange = match f.leg {
+                Leg::Long => view.long_exchange,
+                Leg::Short => view.short_exchange,
+            };
+            self.notify_watchdog(view, alert::WatchdogOutcome::Flattened { leg: f.leg, exchange, quantity: f.quantity });
+        }
     }
 
     /// Cancels the pair's own orders that are not over (never a position, never anybody else's
