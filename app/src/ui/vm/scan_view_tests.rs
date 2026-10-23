@@ -128,7 +128,7 @@ fn visible_index_maps_back_to_the_logical_column_after_hiding_a_middle_column() 
 fn total_width_shrinks_when_columns_are_hidden_and_decides_horizontal_scroll() {
     let mut v = ColumnVisibility::default();
     let full = v.total_width();
-    assert_eq!(full, 50.0 + 120.0 + 50.0 + 110.0 + 150.0 * 3.0 + 160.0 + 120.0 + 200.0 + 60.0 + 130.0);
+    assert_eq!(full, 50.0 + 120.0 + 50.0 + 120.0 + 176.0 * 3.0 + 160.0 + 112.0 + 200.0 + 80.0 + 130.0);
     assert!(v.needs_horizontal_scroll(1000.0), "12 columns do not fit 1000 px");
     for c in [ScanColumn::Direction, ScanColumn::NetEdge, ScanColumn::Okx, ScanColumn::Bybit, ScanColumn::Add, ScanColumn::Gross] {
         v.toggle(c);
@@ -209,6 +209,120 @@ fn symbol_stays_visible_whatever_the_disabled_set_says() {
     v.set_disabled_exchanges(&[Binance, Bybit, Okx]);
     assert!(v.is_visible(ScanColumn::Symbol));
     assert!(v.is_visible(ScanColumn::Rank));
+}
+
+// ---- scanner-layout 2.2: column widths follow the widest content, rows have room for two lines ----
+
+use tong_funding_core::edge_kind::EdgeKind;
+
+use crate::ui::scanner::{Countdown, GROSS_INTERVALS_DIFFER};
+
+/// Width a cell needs for `parts` laid out in one line, padding included.
+fn need(parts: &[String]) -> f32 {
+    parts.iter().map(|p| est_text_px(p)).sum::<f32>() + CELL_GAP_PX * parts.len().saturating_sub(1) as f32 + CELL_PAD_PX
+}
+
+fn rate(rate: &str, secs: i64, eq: Option<&str>, stale: bool) -> RateCell {
+    RateCell::Rate { rate: d(rate), interval_secs: secs, eq_8h: eq.map(d), stale }
+}
+
+#[test]
+fn the_width_model_counts_wide_characters_as_a_full_em() {
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+    assert!(close(est_text_px("0.0400"), 6.0 * 0.6 * CELL_FONT_PX));
+    assert!(close(est_text_px("週期不同"), 4.0 * CELL_FONT_PX));
+    assert!(close(est_text_px("−1"), CELL_FONT_PX + 0.6 * CELL_FONT_PX), "the minus sign is not ASCII: counted wide, on the safe side");
+}
+
+#[test]
+fn a_rate_cell_is_two_lines_rate_with_interval_then_the_8h_equivalent() {
+    let c = rate("0.0005", 14_400, Some("0.001"), false);
+    assert_eq!(c.first_line(), ["0.0500".to_string(), "4h".to_string()]);
+    assert_eq!(c.second_line().as_deref(), Some("8h 等效 0.1000（僅供顯示）"));
+    let eight = rate("0.0005", 28_800, None, false);
+    assert_eq!(eight.first_line(), ["0.0500".to_string(), "8h".to_string()]);
+    assert_eq!(eight.second_line(), None, "an 8h rate has no second line");
+    assert_eq!(rate("0.0005", 14_400, Some("0.001"), true).first_line().last().map(String::as_str), Some("過期"), "the stale marker stays on the first line");
+    assert_eq!(RateCell::Empty.first_line(), ["—".to_string()]);
+    assert_eq!(RateCell::DataError { interval_unknown: true }.first_line(), ["資料異常".to_string(), "週期未知".to_string()]);
+}
+
+#[test]
+fn the_exchange_columns_fit_their_widest_cell_on_both_lines() {
+    // -12.3456 % is far beyond any real funding rate; the 8h equivalent can be several times the rate.
+    let cells = [
+        rate("-0.123456", 3_600, Some("-0.987654"), true),
+        rate("0.0005", 14_400, Some("0.001"), true),
+        rate("0.0005", 1_800, Some("0.0001"), false),
+        RateCell::DataError { interval_unknown: true },
+        RateCell::Empty,
+    ];
+    for col in [ScanColumn::Binance, ScanColumn::Bybit, ScanColumn::Okx] {
+        for c in &cells {
+            assert!(need(&c.first_line()) <= col.width(), "{:?}: line 1 of {c:?} needs {} px", col, need(&c.first_line()));
+            if let Some(l2) = c.second_line() {
+                assert!(need(&[l2.clone()]) <= col.width(), "{:?}: line 2 {l2:?} needs {} px", col, need(&[l2.clone()]));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_gross_column_fits_the_value_and_both_labels_without_cutting_any() {
+    let mut r = row(1, "X");
+    r.gross_spread = Some(d("0.123456"));
+    r.intervals_differ = true;
+    assert_eq!(r.gross_text(), "12.3456");
+    for kind in [EdgeKind::IntervalMismatch, EdgeKind::RateGap] {
+        let tags = vec![GROSS_INTERVALS_DIFFER.to_string(), crate::ui::scanner::edge_kind_text(kind).to_string()];
+        assert!(need(&tags) <= ScanColumn::Gross.width(), "{tags:?} need {} px", need(&tags));
+    }
+    assert!(need(&[r.gross_text()]) <= ScanColumn::Gross.width());
+    assert_eq!(GROSS_INTERVALS_DIFFER, "週期不同");
+}
+
+#[test]
+fn the_gross_labels_come_from_the_row_in_order_interval_difference_then_kind() {
+    let mut r = row(1, "X");
+    assert!(r.gross_tags().is_empty());
+    r.intervals_differ = true;
+    assert_eq!(r.gross_tags(), ["週期不同"]);
+}
+
+#[test]
+fn the_other_columns_fit_their_longest_fixed_texts() {
+    for q in [Qualified::Yes, Qualified::No, Qualified::NotConfigured, Qualified::NotApplicable, Qualified::NotSynchronized] {
+        assert!(need(&[q.text().to_string()]) <= ScanColumn::Qualified.width(), "{:?} needs {} px", q, need(&[q.text().to_string()]));
+    }
+    for c in [
+        Countdown::Remaining { ms: 99 * 3_600_000 + 59 * 60_000 + 59_000, calibrated: false },
+        Countdown::Remaining { ms: 1_000, calibrated: true },
+        Countdown::Settling,
+        Countdown::Unknown,
+    ] {
+        assert!(need(&[c.text()]) <= ScanColumn::Countdown.width(), "{:?} needs {} px", c, need(&[c.text()]));
+    }
+    for (l, s) in [(Binance, Bybit), (Bybit, Binance), (Okx, Binance), (Binance, Okx)] {
+        let mut r = row(1, "X");
+        r.direction = Some((l, s));
+        assert!(need(&[r.direction_text()]) <= ScanColumn::Direction.width(), "{} needs {} px", r.direction_text(), need(&[r.direction_text()]));
+    }
+}
+
+#[test]
+fn rows_are_tall_enough_for_two_lines_of_cell_text() {
+    // two lines of 10 px text at the line height of 1.6, and the cell's top and bottom padding
+    assert!(ROW_HEIGHT_PX >= 2.0 * CELL_FONT_PX * 1.6 + 8.0, "{ROW_HEIGHT_PX}");
+}
+
+#[test]
+fn all_twelve_columns_fit_a_1850_px_window_so_the_main_actions_are_in_view() {
+    // The page is 1850 - 224 (side bar and padding) wide, the table bordered by 2 px.
+    const TABLE_PX: f32 = 1850.0 - 224.0 - 2.0;
+    let mut v = ColumnVisibility::default();
+    assert!(v.total_width() <= TABLE_PX, "all columns: {} px", v.total_width());
+    v.toggle(ScanColumn::Okx);
+    assert!(!v.needs_horizontal_scroll(TABLE_PX));
 }
 
 // ---- sort state transitions --------------------------------------------------------------------

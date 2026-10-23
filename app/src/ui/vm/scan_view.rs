@@ -9,6 +9,21 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::scanner::{Qualified, RateCell, RowsView, ScanRow, ScannerVm};
 
+/// Font size of the table's cell text (`pages::small`), in px at 100% zoom.
+pub const CELL_FONT_PX: f32 = 10.0;
+/// Left plus right padding of a table cell.
+pub const CELL_PAD_PX: f32 = 16.0;
+/// Gap between the parts of one line in a cell (`gap_1`).
+pub const CELL_GAP_PX: f32 = 4.0;
+/// Row height at 100% zoom: two lines of cell text (line height 1.6) plus the cell's top and bottom padding.
+pub const ROW_HEIGHT_PX: f32 = 44.0;
+
+/// Width of `text` in one line, on the safe side: ASCII is as wide as a monospaced digit (0.6 em),
+/// anything else (Chinese, full-width brackets, the minus sign) counts as a full em.
+pub fn est_text_px(text: &str) -> f32 {
+    text.chars().map(|c| if c.is_ascii() { 0.6 } else { 1.0 }).sum::<f32>() * CELL_FONT_PX
+}
+
 /// The columns of the Funding Rate Matrix, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ScanColumn {
@@ -85,17 +100,20 @@ impl ScanColumn {
         }
     }
 
+    /// Width in px at 100% zoom. Each is the widest content the column draws plus the cell padding
+    /// (`est_text_px`; the tests in `scan_view_tests` keep them in step with the texts), so nothing is
+    /// cut off or runs into the next column (scanner-layout).
     pub fn width(self) -> f32 {
         match self {
             ScanColumn::Rank => 50.0,
             ScanColumn::Symbol => 120.0,
             ScanColumn::Coverage => 50.0,
-            ScanColumn::Countdown => 110.0,
-            ScanColumn::Binance | ScanColumn::Bybit | ScanColumn::Okx => 150.0,
+            ScanColumn::Countdown => 120.0,
+            ScanColumn::Binance | ScanColumn::Bybit | ScanColumn::Okx => 176.0,
             ScanColumn::Direction => 160.0,
-            ScanColumn::Gross => 120.0,
+            ScanColumn::Gross => 112.0,
             ScanColumn::NetEdge => 200.0,
-            ScanColumn::Qualified => 60.0,
+            ScanColumn::Qualified => 80.0,
             ScanColumn::Add => 130.0,
         }
     }

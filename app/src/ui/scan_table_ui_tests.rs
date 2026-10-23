@@ -406,3 +406,105 @@ fn showing_the_okx_column_by_hand_is_kept_through_refreshes_and_page_changes(cx:
 fn every_column_shows_when_every_exchange_is_ticked(cx: &mut TestAppContext) {
     assert_eq!(open(cx).view(cx).0, ScanColumn::ALL);
 }
+
+// ---- scanner-layout 2.2: the default window shows the main actions and nothing is cut or overlapped ----
+
+/// The width of the screenshot that prompted scanner-layout (about 1,850 logical px, zoom 100%).
+const DEFAULT_WIDTH: f32 = 1850.0;
+
+/// Like `feed_with`, but every Binance rate is a 4 h rate against Bybit's 8 h: each row shows the
+/// interval difference, the 8 h equivalent on Binance, and (when core classifies it) the kind tag.
+fn mixed_interval_feed(settings: Settings) -> Vec<SourceUpdate> {
+    let mut v = feed_with(settings);
+    for u in &mut v {
+        if let SourceUpdate::Market { exchange: Exchange::Binance, observations, .. } = u {
+            for o in observations.iter_mut() {
+                o.funding_interval_secs = Some(14_400);
+            }
+        }
+    }
+    v
+}
+
+fn all_ticked() -> Settings {
+    complete_settings("0.01")
+}
+
+/// Bounds of a column header by logical column (None = not drawn: scrolled out of the table).
+fn header(rig: &Rig, c: ScanColumn, cx: &mut TestAppContext) -> Option<gpui_kit::Bounds<Pixels>> {
+    let at = rig.view(cx).0.iter().position(|x| *x == c)?;
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(("col-header", at)).map(|e| e.bounds())
+    })
+    .unwrap()
+}
+
+fn bounds_of(rig: &Rig, id: impl Into<gpui_kit::ElementId>, cx: &mut TestAppContext) -> gpui_kit::Bounds<Pixels> {
+    let id = id.into();
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.find(id).bounds()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn at_the_default_width_the_qualified_and_add_columns_are_in_view_without_scrolling(cx: &mut TestAppContext) {
+    for settings in [okx_unticked(), all_ticked()] {
+        let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(settings));
+        for c in [ScanColumn::Qualified, ScanColumn::Add] {
+            let b = header(&rig, c, cx).unwrap_or_else(|| panic!("{c:?} is not drawn: it is scrolled out of the table"));
+            assert!(b.right() <= px(DEFAULT_WIDTH), "{c:?} ends at {:?}, past the {DEFAULT_WIDTH} px window", b.right());
+            assert!(b.size.width >= px(c.width() - 1.0), "{c:?} is cut to {:?}", b.size.width);
+        }
+        let table = bounds_of(&rig, "scan-table", cx);
+        let add = header(&rig, ScanColumn::Add, cx).unwrap();
+        assert!(add.right() <= table.right(), "inside the table, so no horizontal scroll is needed: {:?} vs {:?}", add.right(), table.right());
+    }
+}
+
+#[gpui_kit::test]
+fn a_rate_cell_is_two_stacked_lines_inside_its_column_and_inside_its_row(cx: &mut TestAppContext) {
+    let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(okx_unticked()));
+    let col = header(&rig, ScanColumn::Binance, cx).expect("Binance column");
+    let cell = bounds_of(&rig, SharedString::from("rate-DDDUSDT-Binance"), cx);
+    let (line1, line2) = (bounds_of(&rig, SharedString::from("rate-line1-DDDUSDT-Binance"), cx), bounds_of(&rig, SharedString::from("rate-line2-DDDUSDT-Binance"), cx));
+    assert!(line2.top() >= line1.bottom(), "the 8h equivalent is under the rate, not beside it: {line1:?} / {line2:?}");
+    for b in [cell, line1, line2] {
+        assert!(b.left() >= col.left() && b.right() <= col.right(), "{b:?} leaves its column {col:?}");
+    }
+    // the row pitch is the row height: the whole cell (its 4 px padding top and bottom included) fits it
+    let next = bounds_of(&rig, SharedString::from("rate-BBBUSDT-Binance"), cx);
+    let pitch = next.top() - cell.top();
+    assert_eq!(pitch, px(super::scan_view::ROW_HEIGHT_PX), "rows are tall enough for two lines");
+    assert!(cell.size.height + px(8.0) <= pitch, "two lines ({:?}) do not fit the {pitch:?} row", cell.size.height);
+    // an 8 h rate has just the one line
+    let eight = cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(SharedString::from("rate-line2-DDDUSDT-Bybit")).is_some()
+    });
+    assert!(!eight.unwrap(), "Bybit is 8h: no second line");
+}
+
+#[gpui_kit::test]
+fn the_gross_labels_stay_inside_the_gross_column_clear_of_net_edge(cx: &mut TestAppContext) {
+    let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(okx_unticked()));
+    let gross = header(&rig, ScanColumn::Gross, cx).expect("Gross column");
+    let net = header(&rig, ScanColumn::NetEdge, cx).expect("Net Edge column");
+    assert!(gross.right() <= net.left(), "adjacent columns do not overlap");
+    let value = bounds_of(&rig, SharedString::from("gross-value-DDDUSDT"), cx);
+    let diff = bounds_of(&rig, SharedString::from("gross-diff-DDDUSDT"), cx);
+    let kind = cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(SharedString::from("edge-kind-DDDUSDT")).map(|e| e.bounds())
+    });
+    let kind = kind.unwrap().expect("the 4h/8h row is classified, so the kind tag is drawn");
+    for b in [value, diff, kind] {
+        assert!(b.left() >= gross.left() && b.right() <= gross.right(), "{b:?} leaves the Gross column {gross:?}");
+    }
+    assert!(diff.top() >= value.bottom(), "the labels are under the value: {value:?} / {diff:?}");
+    assert!(kind.left() >= diff.right(), "the two labels do not overlap each other: {diff:?} / {kind:?}");
+    let net_cell = bounds_of(&rig, SharedString::from("net-DDDUSDT"), cx);
+    assert!(net_cell.left() >= gross.right(), "Net Edge starts after Gross ends");
+}

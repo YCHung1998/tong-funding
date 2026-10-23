@@ -19,6 +19,19 @@ use crate::ui::theme::{Tone, funding_tone};
 /// positive value gives the same percentage (design D3).
 pub const SCAN_NOTIONAL_USDT: i64 = 1_000;
 
+/// Marker on a rate whose source is failing or stale.
+pub const STALE_NOTE: &str = "過期";
+/// Gross Spread label when the two legs settle on different intervals.
+pub const GROSS_INTERVALS_DIFFER: &str = "週期不同";
+
+/// The opportunity-kind tag (`週期錯位`, `費率差`).
+pub fn edge_kind_text(k: EdgeKind) -> &'static str {
+    match k {
+        EdgeKind::IntervalMismatch => "週期錯位",
+        EdgeKind::RateGap => "費率差",
+    }
+}
+
 /// One exchange's cell in a row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RateCell {
@@ -44,6 +57,22 @@ impl RateCell {
             RateCell::Rate { rate, .. } => format::rate_pct(*rate),
         }
     }
+    /// Line 1 of the cell: the rate (or `—` / `資料異常`), the interval tag, the stale marker.
+    pub fn first_line(&self) -> Vec<String> {
+        let mut parts = vec![self.text()];
+        parts.extend(self.tag());
+        if let RateCell::Rate { stale: true, .. } = self {
+            parts.push(STALE_NOTE.into());
+        }
+        parts
+    }
+    /// Line 2 of the cell: the 8h equivalent (display only), present when the interval is not 8h.
+    pub fn second_line(&self) -> Option<String> {
+        match self {
+            RateCell::Rate { eq_8h: Some(e), .. } => Some(format!("8h 等效 {}（僅供顯示）", format::rate_pct(*e))),
+            _ => None,
+        }
+    }
     /// Interval tag (`4h`, `8h`, `週期未知`), if any.
     pub fn tag(&self) -> Option<String> {
         match self {
@@ -55,13 +84,10 @@ impl RateCell {
     /// Secondary text: 8h equivalent (display only), stale marker.
     pub fn notes(&self) -> Vec<String> {
         match self {
-            RateCell::Rate { eq_8h, stale, .. } => {
-                let mut v = Vec::new();
-                if let Some(e) = eq_8h {
-                    v.push(format!("8h 等效 {}（僅供顯示）", format::rate_pct(*e)));
-                }
+            RateCell::Rate { stale, .. } => {
+                let mut v: Vec<String> = self.second_line().into_iter().collect();
                 if *stale {
-                    v.push("過期".into());
+                    v.push(STALE_NOTE.into());
                 }
                 v
             }
@@ -187,10 +213,12 @@ impl ScanRow {
     }
     /// Opportunity-kind tag (`週期錯位`, `費率差`); none when there is no classification or no income.
     pub fn edge_kind_label(&self) -> Option<&'static str> {
-        self.edge.as_ref()?.kind.map(|k| match k {
-            EdgeKind::IntervalMismatch => "週期錯位",
-            EdgeKind::RateGap => "費率差",
-        })
+        self.edge.as_ref()?.kind.map(edge_kind_text)
+    }
+    /// Labels under the Gross Spread value, in this order: `週期不同` (the legs settle on different
+    /// intervals). The opportunity-kind tag is drawn after it (it carries a tooltip).
+    pub fn gross_tags(&self) -> Vec<&'static str> {
+        if self.intervals_differ { vec![GROSS_INTERVALS_DIFFER] } else { Vec::new() }
     }
     /// Tooltip of the tag: what the kind means plus the hourly rate spread.
     pub fn edge_kind_hint(&self) -> Option<String> {

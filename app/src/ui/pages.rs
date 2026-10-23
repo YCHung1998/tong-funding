@@ -682,15 +682,24 @@ pub struct ScannerTable {
     pub events: std::rc::Rc<std::cell::RefCell<Vec<ScanEvent>>>,
 }
 
-fn rate_cell(c: &RateCell) -> Div {
-    let mut d = div().flex().gap_1().items_center().child(small(c.text(), tone(c.tone())));
-    if let Some(tag) = c.tag() {
-        d = d.child(small(tag, theme::INFO));
+/// A rate cell is two lines (scanner-layout): the rate, its interval tag and the stale marker; under
+/// it the 8h equivalent. The ids follow the symbol and exchange (not the row index) for the tests.
+fn rate_cell(c: &RateCell, symbol: &str, exchange: Exchange) -> Div {
+    let key = format!("{symbol}-{}", exchange.name());
+    let mut line1 = div().id(SharedString::from(format!("rate-line1-{key}"))).test_support().flex().gap_1().items_center();
+    for (i, part) in c.first_line().into_iter().enumerate() {
+        let color = match (i, part.as_str()) {
+            (0, _) => c.tone().color(),
+            (_, scanner::STALE_NOTE) => theme::TEXT_MUTED,
+            _ => theme::INFO,
+        };
+        line1 = line1.child(small(part, color));
     }
-    for n in c.notes() {
-        d = d.child(small(n, theme::TEXT_MUTED));
+    let mut cell = div().id(SharedString::from(format!("rate-{key}"))).test_support().flex().flex_col().child(line1);
+    if let Some(eq) = c.second_line() {
+        cell = cell.child(small(eq, theme::TEXT_MUTED).id(SharedString::from(format!("rate-line2-{key}"))).test_support());
     }
-    d
+    div().child(cell)
 }
 
 impl ScannerTable {
@@ -753,19 +762,21 @@ impl TableDelegate for ScannerTable {
                 let clock = r.countdown_target.map(|(_, e)| self.clocks.get(&e).copied().unwrap_or(ClockState::Unsynced)).unwrap_or(ClockState::Unsynced);
                 small(scanner::countdown(r.countdown_target, clock, self.now_ms).text(), theme::TEXT_SECONDARY)
             }
-            ScanColumn::Binance => rate_cell(&r.cells[0].1),
-            ScanColumn::Bybit => rate_cell(&r.cells[1].1),
-            ScanColumn::Okx => rate_cell(&r.cells[2].1),
+            ScanColumn::Binance => rate_cell(&r.cells[0].1, &r.symbol, r.cells[0].0),
+            ScanColumn::Bybit => rate_cell(&r.cells[1].1, &r.symbol, r.cells[1].0),
+            ScanColumn::Okx => rate_cell(&r.cells[2].1, &r.symbol, r.cells[2].0),
             ScanColumn::Direction => small(r.direction_text(), theme::TEXT_SECONDARY),
             ScanColumn::Gross => {
-                let mut d = div().flex().gap_1().child(small(r.gross_text(), theme::TEXT_SECONDARY));
-                if r.intervals_differ {
-                    d = d.child(small("週期不同", theme::WARNING));
+                // The value on the first line, the labels under it: the column is as wide as the widest of
+                // them (not value + two labels side by side), and nothing is cut or reaches Net Edge.
+                let mut tags = div().id(SharedString::from(format!("gross-tags-{}", r.symbol))).flex().gap_1();
+                for tag in r.gross_tags() {
+                    tags = tags.child(small(tag, theme::WARNING).id(SharedString::from(format!("gross-diff-{}", r.symbol))).test_support());
                 }
                 if let (Some(label), Some(hint)) = (r.edge_kind_label(), r.edge_kind_hint()) {
                     // The id follows the symbol, not the row index: gpui keeps tooltip state per element id, so an
                     // index would show the previous row's text on whatever symbol a re-sort puts there.
-                    d = d.child(
+                    tags = tags.child(
                         div()
                             .id(SharedString::from(format!("edge-kind-{}", r.symbol)))
                             .test_support()
@@ -773,9 +784,20 @@ impl TableDelegate for ScannerTable {
                             .child(small(label, theme::TEXT_SECONDARY)),
                     );
                 }
-                d
+                div().child(
+                    div()
+                        .id(SharedString::from(format!("gross-{}", r.symbol)))
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .child(small(r.gross_text(), theme::TEXT_SECONDARY).id(SharedString::from(format!("gross-value-{}", r.symbol))).test_support())
+                        .child(tags),
+                )
             }
-            ScanColumn::NetEdge => small(r.net_edge.text(), tone(r.net_edge.tone())),
+            ScanColumn::NetEdge => div().child(
+                // A long "未設定（缺 …）" wraps onto the second line instead of running into the next column.
+                small(r.net_edge.text(), tone(r.net_edge.tone())).id(SharedString::from(format!("net-{}", r.symbol))).test_support().whitespace_normal().line_clamp(2),
+            ),
             ScanColumn::Add => {
                 let cell = self.candidates.get(row).cloned().unwrap_or_default();
                 let (mark, color) = match (&cell.blocked, cell.checked) {

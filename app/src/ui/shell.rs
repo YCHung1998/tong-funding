@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::{Size, Sizable};
 use gpui_kit::*;
 use tong_funding_core::types::Exchange;
 
@@ -548,6 +549,8 @@ impl Shell {
     fn scanner_page(&self, cx: &mut Context<Self>) -> Div {
         let vm = &self.scanner;
         let refreshing = self.source.refresh_in_progress();
+        // Rows are two lines of text tall; the text follows the zoom, so the row height must too.
+        let zoom_factor = super::zoom_ui::current(cx).factor();
         let mut sources = div().flex().gap_4();
         for s in scanner::HEADER_SOURCES {
             let mut f = banner::freshness(&self.snap, s, self.now_ms);
@@ -675,7 +678,7 @@ impl Shell {
         if matches!(vm.visible(self.only_qualified), RowsView::NoneQualified) {
             body = body.child(text("目前沒有達標標的", theme::TEXT_MUTED));
         } else if !matches!(vm.state, ScanState::Loading) {
-            body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(rx(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
+            body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(rx(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true).with_size(Size::Size(px(super::scan_view::ROW_HEIGHT_PX * zoom_factor)))));
         }
         let chips = self.column_chips(cx);
         div().flex().flex_col().gap_3().child(header).child(breakdown).child(cards).child(controls).child(chips).child(body).child(candidate_list)
