@@ -412,7 +412,8 @@ impl Actor {
     /// watchdog: a reduce-only market close of `qty` (already sized by `plan_leg_close`) of ONE leg.
     /// The order intent is landed first; if that fails nothing is sent. The pair state is not changed.
     /// Returns the `client_order_id`, or why nothing was sent.
-    pub(super) fn send_flatten(&mut self, view: &PairView, leg: Leg, qty: Decimal, position: Decimal, eff: &EffectiveConfig, by: FlattenBy, attempt: Option<u32>) -> Result<String, String> {
+    pub(super) fn send_flatten(&mut self, view: &PairView, plan: FlattenPlan, eff: &EffectiveConfig, by: FlattenBy, attempt: Option<u32>) -> Result<String, String> {
+        let FlattenPlan { leg, qty, position } = plan;
         let pair = view.internal_uuid.as_str();
         let exchange = match leg {
             Leg::Long => view.long_exchange,
@@ -480,10 +481,19 @@ impl Actor {
         if qty.is_zero() {
             return self.flatten_aborted(pair, leg, "nothing to close on this leg (already flat)".into(), None, manual);
         }
-        if let Err(why) = self.send_flatten(&view, leg, qty, position, &eff, manual, None) {
+        if let Err(why) = self.send_flatten(&view, FlattenPlan { leg, qty, position }, &eff, manual, None) {
             self.flatten_aborted(pair, leg, why, None, manual);
         }
     }
+}
+
+/// What a flatten sends: the leg, how much (already sized by `plan_leg_close`) and the position it was
+/// sized against (for the record).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlattenPlan {
+    pub(super) leg: Leg,
+    pub(super) qty: Decimal,
+    pub(super) position: Decimal,
 }
 
 /// Who asked for a flatten order (written as `by` on `LEG_FLATTEN` / `LEG_FLATTEN_ABORTED`).

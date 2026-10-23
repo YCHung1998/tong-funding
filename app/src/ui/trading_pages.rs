@@ -893,6 +893,10 @@ impl Shell {
             for l in &a.legs {
                 hist = hist.child(small(format!("  {} · {} · {} · {} · {}", l.leg, l.exchange, side_text(l.side), l.status.text(), l.order_id_text), theme::TEXT_SECONDARY));
             }
+            // the one exception: what the watchdog really flattened is written down, with the confirmation still due
+            for line in &a.watchdog {
+                hist = hist.child(small(format!("  {line}"), theme::POSITIVE));
+            }
         }
         page.child(hist)
     }

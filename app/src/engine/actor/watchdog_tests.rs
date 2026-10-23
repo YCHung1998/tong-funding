@@ -94,7 +94,7 @@ impl Executor for Watched {
     fn cancel(&self, exchange: Exchange, symbol: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
         self.cancels.fetch_add(1, Ordering::SeqCst);
         self.cancelled.lock().unwrap().push(id.to_string());
-        let swallowed = self.swallow_cancels.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+        let swallowed = self.swallow_cancels.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
         if let Some(state) = self.idle_state(id) {
             let state = if swallowed { state } else { OrderState::Cancelled };
             self.idle.lock().unwrap().insert(id.to_string(), state);

@@ -5,7 +5,7 @@
 //! Rule of this file: it never changes the pair's state, and when anything is unknown it sends
 //! nothing, locks the engine (kill switch ON) and says so.
 
-use super::live::FlattenBy;
+use super::live::{FlattenBy, FlattenPlan};
 use super::*;
 use crate::engine::watchdog as wd;
 
@@ -345,7 +345,7 @@ impl Actor {
         let (risk, overrides) = self.load_risk().unwrap_or_else(|_| (RiskConfig::default(), RiskOverrides::new()));
         let eff = effective_for_pair(&risk, &overrides, view.long_exchange, view.short_exchange);
         let attempt = attempts_sent.saturating_add(1);
-        match self.send_flatten(view, leg, qty, position, &eff, FlattenBy::Watchdog, Some(attempt)) {
+        match self.send_flatten(view, FlattenPlan { leg, qty, position }, &eff, FlattenBy::Watchdog, Some(attempt)) {
             Ok(client_order_id) => {
                 if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
                     w.attempts_sent = attempt;

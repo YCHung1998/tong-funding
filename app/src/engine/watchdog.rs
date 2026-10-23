@@ -297,7 +297,7 @@ pub fn load_progress(db: &Db, pair: &str, state: PairState, now_ms: i64) -> Resu
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let (after_id, alert_since_ms) = entry.map_or((0, now_ms), |(id, ts)| (id, ts));
+        let (after_id, alert_since_ms) = entry.unwrap_or((0, now_ms));
         let mut st = c.prepare("SELECT ts_ms, event_type, payload FROM events WHERE pair_id = ?1 AND id > ?2 AND event_type IN (?3, ?4) ORDER BY id")?;
         let rows = st.query_map(rusqlite::params![pair, after_id, NAKED_LEG_WATCHDOG, LEG_FLATTEN], |r| {
             let payload: String = r.get(2)?;

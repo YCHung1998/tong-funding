@@ -19,4 +19,4 @@
 
 ## 4. 驗證
 
-- [ ] 4.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate naked-leg-watchdog --strict` 通過
+- [x] 4.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate naked-leg-watchdog --strict` 通過

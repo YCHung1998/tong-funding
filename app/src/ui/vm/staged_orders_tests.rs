@@ -900,3 +900,66 @@ fn the_card_colours_follow_what_the_watchdog_says() {
     assert_eq!(tone_for(PairState::PartialFailure, vec![round("FLAT")]), Tone::Warning);
     assert_eq!(tone_for(PairState::Unresolved, vec![round("UNKNOWN")]), Tone::Negative, "could not prove: stopped");
 }
+
+// ---- naked-leg-watchdog: the "last result" block, the one place that may say the system flattened ----
+
+fn failed_attempt_with(watchdog: Vec<StoredEvent>) -> UiSnapshot {
+    let mut s = snap();
+    eng(&mut s).pairs[0].state = PairState::PartialFailure;
+    let mut events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "rejected", "reason": "insufficient margin", "client_order_id": "demoso0001"}), "PARTIAL_FAILURE");
+    events.extend(watchdog);
+    events.sort_by_key(|e| std::cmp::Reverse((e.ts_ms, e.id))); // newest first
+    s.trade_events = events;
+    s
+}
+
+fn flatten_records() -> Vec<StoredEvent> {
+    vec![
+        wd_event(10, 6_000, json!({"kind": "ROUND", "conclusion": "FLATTEN", "leg": "long", "quantity": "10", "attempt": 1})),
+        wd_event(11, 5_000, json!({"kind": "ATTEMPT_RESULT", "ok": true, "attempt": 1, "leg": "long", "quantity": "10"})),
+    ]
+}
+
+#[test]
+fn the_last_result_says_what_the_watchdog_flattened_and_still_asks_for_the_confirmation() {
+    // spec staged-orders-page: the one exception, 如實寫出系統做了什麼（哪一腿、數量），並仍提示需人工確認已平倉
+    let s = failed_attempt_with(flatten_records());
+    let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
+    assert!(a.needs_manual && a.headline.contains("需人工處理") && a.headline.contains("PARTIAL_FAILURE"), "{}", a.headline);
+    assert!(!a.headline.contains("回滾"), "still never 'rolled back': {}", a.headline);
+    assert_eq!(
+        a.watchdog,
+        vec!["系統已自動平掉多腿，請確認兩所皆無部位後按「人工確認已平倉」。".to_string(), "明細：Binance 賣出 10（只減倉市價單）。".to_string()]
+    );
+}
+
+#[test]
+fn without_a_finished_watchdog_flatten_the_last_result_says_nothing_about_a_repair() {
+    // nothing recorded, waiting, flatten sent but not finished, retrying, hedged, flat, unknown: none of
+    // these is "the system flattened", so none may put a word about it into the result block
+    let round = |c: &str| wd_event(10, 6_000, json!({"kind": "ROUND", "conclusion": c, "leg": "long", "quantity": "10", "attempt": 1, "reason": "x"}));
+    let failed = wd_event(11, 5_000, json!({"kind": "ATTEMPT_RESULT", "ok": false, "attempt": 1, "leg": "long", "quantity": "10", "reason": "rejected"}));
+    let cases: Vec<(&str, Vec<StoredEvent>)> = vec![
+        ("nothing recorded", vec![]),
+        ("flatten sent", vec![round("FLATTEN")]),
+        ("flatten failed", vec![round("FLATTEN"), failed]),
+        ("waiting for a cancel", vec![round("WAIT_FOR_CANCEL")]),
+        ("hedged", vec![round("HEDGED")]),
+        ("flat", vec![round("FLAT")]),
+        ("unknown", vec![round("UNKNOWN")]),
+    ];
+    for (what, records) in cases {
+        let a = &build(&failed_attempt_with(records), &BTreeSet::new(), NOW).last_results[0];
+        assert!(a.watchdog.is_empty(), "{what}: {:?}", a.watchdog);
+        assert!(a.needs_manual, "{what}");
+    }
+}
+
+#[test]
+fn a_flatten_of_an_earlier_entry_does_not_colour_the_result_of_the_current_one() {
+    let mut records = flatten_records();
+    // the pair was closed by hand and failed again after that
+    records.push(ev(12, NOW - 2_000, "PAIR_TRANSITION", "u-BTCUSDT", json!({"from": "CLOSING", "to": "PARTIAL_FAILURE"})));
+    let a = &build(&failed_attempt_with(records), &BTreeSet::new(), NOW).last_results[0];
+    assert!(a.watchdog.is_empty(), "{:?}", a.watchdog);
+}

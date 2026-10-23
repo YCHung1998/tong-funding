@@ -26,7 +26,7 @@ use super::env_label::{ConfirmKind, EnvLabel};
 use super::risk_settings::missing_display;
 use super::theme::Tone;
 use crate::engine::command::{Blocker, Command, PairView};
-use crate::engine::ports::OrderSide;
+use crate::engine::ports::{Leg, OrderSide};
 use crate::engine::timings::EngineTimings;
 use crate::engine::watchdog::{self, PairEvent};
 use crate::engine::watchdog_text;
@@ -232,6 +232,11 @@ pub struct AttemptView {
     pub failed_checks: Vec<String>,
     pub needs_manual: bool,
     pub headline: String,
+    /// naked-leg-watchdog: the ONE exception to "never suggest the system repaired anything" (spec
+    /// staged-orders-page): when the watchdog really sent and finished the flatten of the bare leg, the
+    /// result says what the system did (leg, exchange, quantity) and still asks for the confirmation.
+    /// Empty in every other case.
+    pub watchdog: Vec<String>,
 }
 
 /// A leg to close by hand (reduce-only; quantity = the account's actual position).
@@ -675,15 +680,19 @@ fn leg_read(snap: &UiSnapshot, simulated: bool, ex: Exchange, symbol: &str) -> R
     Ok((qty, orders.items.iter().filter(|o| o.symbol == symbol).count()))
 }
 
+/// The events the page holds for one pair, in the form the watchdog's status is derived from.
+fn pair_events(snap: &UiSnapshot, uuid: &str) -> Vec<PairEvent> {
+    snap.trade_events
+        .iter()
+        .filter(|e| e.pair_id.as_deref() == Some(uuid))
+        .filter_map(|e| Some(PairEvent { id: e.id, ts_ms: e.ts_ms, event_type: e.event_type.clone(), payload: serde_json::from_str(&e.payload).ok()? }))
+        .collect()
+}
+
 /// naked-leg-watchdog: the card's lines for the pair's current alert entry, from the events the page
 /// holds (so a restart shows the same thing the engine remembers).
 fn watchdog_lines(snap: &UiSnapshot, p: &PairView, now_ms: i64) -> (Vec<String>, Tone) {
-    let events: Vec<PairEvent> = snap
-        .trade_events
-        .iter()
-        .filter(|e| e.pair_id.as_deref() == Some(p.internal_uuid.as_str()))
-        .filter_map(|e| Some(PairEvent { id: e.id, ts_ms: e.ts_ms, event_type: e.event_type.clone(), payload: serde_json::from_str(&e.payload).ok()? }))
-        .collect();
+    let events = pair_events(snap, &p.internal_uuid);
     let status = watchdog::status_of_pair(p.state, &events);
     let tone = match &status {
         watchdog::Status::Flattened { .. } => Tone::Positive,
@@ -846,7 +855,21 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
             } else {
                 format!("{mode_label} · {symbol} · 狀態 {state}")
             };
-            AttemptView { uuid: pair.to_string(), symbol, at: ts, simulated, mode_label, legs, state, failed_checks, needs_manual, headline }
+            // the exception of the spec: only a flatten the watchdog really finished is written down here
+            let watchdog = view
+                .filter(|v| is_alert(v.state))
+                .map(|v| match watchdog::status_of_pair(v.state, &pair_events(snap, pair)) {
+                    watchdog::Status::Flattened { leg, quantity } => {
+                        let exchange = match leg {
+                            Leg::Long => v.long_exchange,
+                            Leg::Short => v.short_exchange,
+                        };
+                        vec![watchdog_text::flattened_sentence(leg), watchdog_text::flattened_detail(leg, exchange, quantity)]
+                    }
+                    _ => Vec::new(),
+                })
+                .unwrap_or_default();
+            AttemptView { uuid: pair.to_string(), symbol, at: ts, simulated, mode_label, legs, state, failed_checks, needs_manual, headline, watchdog }
         })
         .collect()
 }
