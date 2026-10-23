@@ -833,9 +833,9 @@ fn hedged_flat_and_unknown_conclusions_reach_the_card() {
         p
     };
     for (state, c, extra, expect) in [
-        (PairState::Imbalanced, "HEDGED", json!({}), "兩腿都有部位（已對沖），系統不會送單，請人工處理。"),
+        (PairState::Imbalanced, "HEDGED", json!({}), "兩腿都有部位（可能不平衡），系統不會送單，請人工處理。"),
         (PairState::PartialFailure, "FLAT", json!({}), "兩腿都沒有部位，系統不會送單，請人工處理；確認兩所皆無部位後按「人工確認已平倉」。"),
-        (PairState::Unresolved, "UNKNOWN", json!({"reason": "long order status unknown: order x not found"}), "查證結果不明（long order status unknown: order x not found），系統沒有送出任何單，已停止開新倉並通知你，請人工處理。"),
+        (PairState::Unresolved, "UNKNOWN", json!({"reason": "long order status unknown: order x not found"}), "查證結果不明（long order status unknown: order x not found），系統沒有送出任何單，已停止開新倉，並在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知），請人工處理。"),
     ] {
         let mut s = snap();
         into_alert(&mut s, state, vec![entered(state.as_str(), 20_000), wd_event(2, 14_000, conclusion(c, extra))]);

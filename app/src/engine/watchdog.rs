@@ -26,6 +26,10 @@ pub const WATCHDOG_INTERVAL_MS: i64 = 5_000;
 pub const MAX_FLATTEN_ATTEMPTS: u32 = 3;
 /// This many consecutive rounds that still find an unfinished order end in `Unknown`.
 pub const MAX_CANCEL_WAIT_ROUNDS: u32 = 3;
+/// This many consecutive rounds that could not READ what they need (a lookup failed, an order was not
+/// found, a position was unreadable, the round timed out) end in `Unknown`. A real contradiction
+/// (wrong side, beyond the tolerance, a position the record does not explain) is `Unknown` at once.
+pub const MAX_READ_FAIL_ROUNDS: u32 = 3;
 /// A round that has not read both legs by now is given up (`Unknown`): an exchange that does not
 /// answer is not "nothing there".
 pub const WATCHDOG_PROBE_TIMEOUT_MS: i64 = 30_000;
@@ -61,6 +65,8 @@ pub struct DecideInput<'a> {
     pub waited_rounds: u32,
     /// Flatten orders already sent for this entry.
     pub attempts_sent: u32,
+    /// Earlier consecutive rounds of this entry that ended in `ReadFailed`.
+    pub read_failed_rounds: u32,
 }
 
 /// The conclusion of one round.
@@ -74,6 +80,9 @@ pub enum Decision {
     Flat,
     /// An order is not over yet: it is cancelled, nothing is sent, the next round looks again.
     WaitForCancel,
+    /// Something could not be READ (lookup failed, order not found, position unreadable, timeout):
+    /// nothing is sent, the next round (5 s later) looks again; the third in a row is `Unknown`.
+    ReadFailed { reason: String },
     /// Not provable: nothing is sent, the engine is locked and the user is told why.
     Unknown { reason: String },
 }
@@ -97,7 +106,7 @@ pub fn decide(input: &DecideInput<'_>) -> Decision {
         }
     }
     if !failures.is_empty() {
-        return Decision::Unknown { reason: failures.join("; ") };
+        return read_failure(failures.join("; "), input.read_failed_rounds);
     }
 
     // 2. An order that is not over can still fill: cancel it and look again, a bounded number of times.
@@ -121,11 +130,19 @@ pub fn decide(input: &DecideInput<'_>) -> Decision {
             continue;
         };
         match plan_leg_close(l.leg, l.exchange, input.symbol, input.simulated, input.tolerance_pct, *position, Ok(*recorded)) {
-            // A huge tolerance can plan "0" for a held position: that is not an empty leg.
-            Ok((qty, _)) if qty.is_zero() && !position.is_zero() => {
-                problems.push(format!("{}: position {} without a recorded fill is not provably the pair's", l.leg.as_str(), position.normalize()));
+            // "Empty" means a recorded fill of 0 AND a position of 0, nothing less: a huge tolerance can
+            // plan "0" for a leg that recorded a fill and holds nothing (or holds something and recorded
+            // nothing), and neither is provably the pair's empty leg.
+            Ok((qty, _)) if qty.is_zero() => {
+                if !(recorded.is_zero() && position.is_zero()) {
+                    problems.push(format!(
+                        "{}: position {} with a recorded fill of {} is not an empty leg (nothing to close, nothing proven)",
+                        l.leg.as_str(),
+                        position.normalize(),
+                        recorded.normalize()
+                    ));
+                }
             }
-            Ok((qty, _)) if qty.is_zero() => {}
             Ok((qty, _)) => held[i] = Some(qty),
             Err(LegClosePlanError::WrongSide(reason)) => problems.push(reason),
             Err(LegClosePlanError::Mismatch(alert)) => problems.push(mismatch_text(l.leg, &alert)),
@@ -142,6 +159,14 @@ pub fn decide(input: &DecideInput<'_>) -> Decision {
         (Some(qty), None) => flatten_or_give_up(Leg::Long, qty, input.attempts_sent),
         (None, Some(qty)) => flatten_or_give_up(Leg::Short, qty, input.attempts_sent),
     }
+}
+
+/// A round that could not read what it needs: `ReadFailed` until it is the third in a row, then `Unknown`.
+pub fn read_failure(reason: String, earlier_read_failed_rounds: u32) -> Decision {
+    if earlier_read_failed_rounds.saturating_add(1) >= MAX_READ_FAIL_ROUNDS {
+        return Decision::Unknown { reason: format!("{reason} (reading failed in {MAX_READ_FAIL_ROUNDS} rounds in a row)") };
+    }
+    Decision::ReadFailed { reason }
 }
 
 fn flatten_or_give_up(leg: Leg, qty: Decimal, attempts_sent: u32) -> Decision {
@@ -172,6 +197,8 @@ pub enum Conclusion {
     Hedged,
     Flat,
     WaitForCancel,
+    /// Not one of the five final conclusions: a round that could not read; nothing was decided yet.
+    ReadFailed,
     Unknown,
 }
 
@@ -182,12 +209,13 @@ impl Conclusion {
             Conclusion::Hedged => "HEDGED",
             Conclusion::Flat => "FLAT",
             Conclusion::WaitForCancel => "WAIT_FOR_CANCEL",
+            Conclusion::ReadFailed => "READ_FAILED",
             Conclusion::Unknown => "UNKNOWN",
         }
     }
 
     pub fn parse(s: &str) -> Option<Conclusion> {
-        [Conclusion::Flatten, Conclusion::Hedged, Conclusion::Flat, Conclusion::WaitForCancel, Conclusion::Unknown].into_iter().find(|c| c.as_str() == s)
+        [Conclusion::Flatten, Conclusion::Hedged, Conclusion::Flat, Conclusion::WaitForCancel, Conclusion::ReadFailed, Conclusion::Unknown].into_iter().find(|c| c.as_str() == s)
     }
 
     /// After one of these no further round runs for the alert entry (until the user acts).
@@ -203,6 +231,7 @@ impl Decision {
             Decision::Hedged => Conclusion::Hedged,
             Decision::Flat => Conclusion::Flat,
             Decision::WaitForCancel => Conclusion::WaitForCancel,
+            Decision::ReadFailed { .. } => Conclusion::ReadFailed,
             Decision::Unknown { .. } => Conclusion::Unknown,
         }
     }
@@ -225,6 +254,50 @@ pub struct Record {
     pub payload: Value,
 }
 
+/// A flatten order the watchdog really sent in this entry, and what is known of its fill.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentOrder {
+    pub leg: Leg,
+    /// The exchange's name as written on `LEG_FLATTEN`.
+    pub exchange: String,
+    pub quantity: Decimal,
+    pub client_order_id: String,
+    /// What the order's result said was filled; `None` = not confirmed (yet).
+    pub filled: Option<Decimal>,
+}
+
+/// The watchdog's own flatten orders of an entry (`LEG_FLATTEN` with `by: "watchdog"`), each with the
+/// fill its `ATTEMPT_RESULT` reported. Oldest first.
+pub fn sent_from_records(records: &[Record]) -> Vec<SentOrder> {
+    let mut out: Vec<SentOrder> = Vec::new();
+    let dec = |r: &Record, k: &str| r.payload.get(k).and_then(Value::as_str).and_then(|q| q.parse::<Decimal>().ok());
+    let text = |r: &Record, k: &str| r.payload.get(k).and_then(Value::as_str).map(str::to_string);
+    for r in records {
+        let leg = match r.payload.get("leg").and_then(Value::as_str) {
+            Some("long") => Leg::Long,
+            Some("short") => Leg::Short,
+            _ => continue,
+        };
+        match r.event_type.as_str() {
+            LEG_FLATTEN if text(r, "by").as_deref() == Some("watchdog") => out.push(SentOrder {
+                leg,
+                exchange: text(r, "exchange").unwrap_or_default(),
+                quantity: dec(r, "quantity").unwrap_or_default(),
+                client_order_id: text(r, "client_order_id").unwrap_or_default(),
+                filled: None,
+            }),
+            NAKED_LEG_WATCHDOG if text(r, "kind").as_deref() == Some(KIND_ATTEMPT_RESULT) => {
+                let id = text(r, "client_order_id");
+                if let Some(o) = out.iter_mut().rev().find(|o| Some(&o.client_order_id) == id.as_ref()) {
+                    o.filled = dec(r, "filled");
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Where the watchdog stands for one alert entry of a pair, rebuilt from the stored events (so a
 /// restart continues instead of starting over, and the page can show the same thing).
 #[derive(Debug, Clone, PartialEq)]
@@ -237,10 +310,14 @@ pub struct Progress {
     pub attempts_sent: u32,
     /// Consecutive newest rounds that concluded `WAIT_FOR_CANCEL`.
     pub waited_rounds: u32,
+    /// Consecutive newest rounds that concluded `READ_FAILED`.
+    pub read_failed_rounds: u32,
     /// Time of the newest watchdog record of this entry.
     pub last_record_ms: Option<i64>,
     /// A conclusion that ends the rounds was reached.
     pub terminal: bool,
+    /// The flatten orders the watchdog sent in this entry.
+    pub sent: Vec<SentOrder>,
 }
 
 impl Progress {
@@ -254,7 +331,7 @@ impl Progress {
 
 /// `records` = the watchdog-relevant events of the pair after its entry, oldest first.
 pub fn progress_from_records(alert_since_ms: i64, records: &[Record]) -> Progress {
-    let mut p = Progress { alert_since_ms, rounds: 0, attempts_sent: 0, waited_rounds: 0, last_record_ms: None, terminal: false };
+    let mut p = Progress { alert_since_ms, rounds: 0, attempts_sent: 0, waited_rounds: 0, read_failed_rounds: 0, last_record_ms: None, terminal: false, sent: sent_from_records(records) };
     for r in records {
         let text = |k: &str| r.payload.get(k).and_then(Value::as_str);
         match r.event_type.as_str() {
@@ -267,14 +344,11 @@ pub fn progress_from_records(alert_since_ms: i64, records: &[Record]) -> Progres
                 Some(KIND_ROUND) => {
                     p.rounds = p.rounds.saturating_add(1);
                     p.last_record_ms = Some(r.ts_ms);
-                    match text("conclusion").and_then(Conclusion::parse) {
-                        Some(Conclusion::WaitForCancel) => p.waited_rounds = p.waited_rounds.saturating_add(1),
-                        Some(c) => {
-                            p.waited_rounds = 0;
-                            p.terminal |= c.ends_the_rounds();
-                        }
-                        None => p.waited_rounds = 0,
-                    }
+                    let conclusion = text("conclusion").and_then(Conclusion::parse);
+                    // each run counts only consecutive rounds of its own kind
+                    p.waited_rounds = if conclusion == Some(Conclusion::WaitForCancel) { p.waited_rounds.saturating_add(1) } else { 0 };
+                    p.read_failed_rounds = if conclusion == Some(Conclusion::ReadFailed) { p.read_failed_rounds.saturating_add(1) } else { 0 };
+                    p.terminal |= conclusion.is_some_and(Conclusion::ends_the_rounds);
                 }
                 Some(KIND_ATTEMPT_RESULT) => p.last_record_ms = Some(r.ts_ms),
                 // notifications, skips and the like are not progress
@@ -437,18 +511,20 @@ pub enum Status {
     Waiting { due_ms: Option<i64> },
     /// An order of the pair is not over yet: it was cancelled, the next look is at `next_ms`.
     WaitingCancel { waited: u32, next_ms: i64 },
+    /// The round could not read what it needs (`failed` rounds in a row); the next look is at `next_ms`.
+    ReadRetry { failed: u32, reason: String, next_ms: i64 },
     /// A flatten order (attempt `attempt`) was sent and is awaited.
     Flattening { leg: Leg, quantity: Decimal, attempt: u32 },
     /// An attempt did not work; the next look is at `next_ms`.
     Retrying { attempt: u32, reason: String, next_ms: i64 },
     /// The bare leg was closed by the watchdog; the user still confirms.
     Flattened { leg: Leg, quantity: Decimal },
-    /// Both legs hold a position: nothing was sent.
-    Hedged,
+    /// Both legs hold a position (the quantities the round read, absolute): nothing was sent.
+    Hedged { long: Option<Decimal>, short: Option<Decimal> },
     /// Neither leg holds a position: nothing was sent.
     Flat,
-    /// Not provable: nothing was sent, new entries are stopped.
-    Unknown { reason: String },
+    /// Not provable: new entries are stopped; `sent` = the flatten orders that were sent before that (often none).
+    Unknown { reason: String, sent: Vec<SentOrder> },
     /// The watchdog cannot act on this pair.
     Skipped { reason: String },
 }
@@ -508,14 +584,21 @@ pub fn status_from_records(alert_since_ms: Option<i64>, records: &[Record]) -> S
                 let earlier = r.payload.get("waited_rounds").and_then(Value::as_u64).map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
                 Status::WaitingCancel { waited: earlier.saturating_add(1), next_ms }
             }
+            Some(Conclusion::ReadFailed) => {
+                let earlier = r.payload.get("read_failed_rounds").and_then(Value::as_u64).map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+                Status::ReadRetry { failed: earlier.saturating_add(1), reason: text(r, "reason").unwrap_or_default(), next_ms }
+            }
             Some(Conclusion::Flatten) => match (leg_of(r), quantity_of(r)) {
                 (Some(leg), Some(quantity)) => Status::Flattening { leg, quantity, attempt: attempt_of(r) },
                 _ => waiting,
             },
-            Some(Conclusion::Hedged) => Status::Hedged,
+            Some(Conclusion::Hedged) => {
+                let held = |leg: &str| r.payload["legs"][leg]["position"].as_str().and_then(|q| q.parse::<Decimal>().ok()).map(|q| q.abs());
+                Status::Hedged { long: held("long"), short: held("short") }
+            }
             // FLAT after our own flatten is that flatten, not an unexplained empty pair
             Some(Conclusion::Flat) => flattened.map_or(Status::Flat, |(leg, quantity)| Status::Flattened { leg, quantity }),
-            Some(Conclusion::Unknown) => Status::Unknown { reason: text(r, "reason").unwrap_or_default() },
+            Some(Conclusion::Unknown) => Status::Unknown { reason: text(r, "reason").unwrap_or_default(), sent: sent_from_records(records) },
             None => waiting,
         },
         Some(_) | None => waiting,
@@ -569,7 +652,7 @@ mod tests {
     }
 
     fn input(long: LegRead, short: LegRead) -> DecideInput<'static> {
-        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], waited_rounds: 0, attempts_sent: 0 }
+        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], waited_rounds: 0, read_failed_rounds: 0, attempts_sent: 0 }
     }
 
     fn unknown_reason(d: Decision) -> String {
@@ -673,6 +756,24 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_leg_means_a_recorded_fill_of_zero_and_a_position_of_zero_even_with_a_huge_tolerance() {
+        // review round 1 (A10): with a 100 % tolerance `plan_leg_close` plans 0 for a leg that
+        // recorded 50 and holds nothing; that is not "confirmed unfilled", so the other leg is not flattened
+        let mut i = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "50", true));
+        i.tolerance_pct = dec("100");
+        let why = unknown_reason(decide(&i));
+        assert!(why.contains("short") && why.contains("recorded fill"), "{why}");
+        // and the mirror: the flattened leg itself holding nothing with a recorded fill is no flatten either
+        let mut i = input(read(Leg::Long, "0", "50", true), read(Leg::Short, "0", "0", true));
+        i.tolerance_pct = dec("100");
+        assert!(matches!(decide(&i), Decision::Unknown { .. }), "{:?}", decide(&i));
+        // a truly empty leg (0 and 0) still counts as empty at that tolerance
+        let mut i = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", true));
+        i.tolerance_pct = dec("100");
+        assert_eq!(decide(&i), Decision::Flatten { leg: Leg::Long, qty: dec("100") });
+    }
+
+    #[test]
     fn a_position_of_the_other_leg_without_a_recorded_fill_is_unknown() {
         // exposure on the same symbol that is not the pair's (manual trading)
         let d = decide(&input(read(Leg::Long, "100", "100", true), read(Leg::Short, "-3", "0", true)));
@@ -680,22 +781,55 @@ mod tests {
         assert!(why.contains("short"), "{why}");
     }
 
-    // ---- spec: 查詢失敗 ----
+    // ---- spec: 查詢失敗（讀取類錯誤連續 3 輪才未知） ----
+
+    fn read_failed_reason(d: Decision) -> String {
+        match d {
+            Decision::ReadFailed { reason } => reason,
+            other => panic!("expected ReadFailed, got {other:?}"),
+        }
+    }
 
     #[test]
-    fn any_failed_read_is_unknown_and_names_every_failure() {
+    fn a_failed_read_is_not_decided_yet_and_names_every_failure() {
         let mut long = read(Leg::Long, "100", "100", true);
         long.position = Err("Binance positions list incomplete".into());
         let mut short = read(Leg::Short, "0", "0", true);
         short.recorded = Err("order x not found".into());
-        let why = unknown_reason(decide(&input(long, short)));
+        let why = read_failed_reason(decide(&input(long, short)));
         assert!(why.contains("long position") && why.contains("incomplete"), "{why}");
         assert!(why.contains("short recorded fill") && why.contains("not found"), "{why}");
 
         let mut long = read(Leg::Long, "100", "100", true);
         long.orders_terminal = Err("order lookup failed: timeout".into());
-        let why = unknown_reason(decide(&input(long, read(Leg::Short, "0", "0", true))));
+        let why = read_failed_reason(decide(&input(long, read(Leg::Short, "0", "0", true))));
         assert!(why.contains("long order status") && why.contains("timeout"), "{why}");
+    }
+
+    #[test]
+    fn the_third_read_failure_in_a_row_is_unknown() {
+        let failing = |earlier: u32| {
+            let mut long = read(Leg::Long, "100", "100", true);
+            long.position = Err("exchange unreachable".into());
+            let mut i = input(long, read(Leg::Short, "0", "0", true));
+            i.read_failed_rounds = earlier;
+            decide(&i)
+        };
+        assert!(matches!(failing(0), Decision::ReadFailed { .. }), "round 1");
+        assert!(matches!(failing(1), Decision::ReadFailed { .. }), "round 2");
+        let why = unknown_reason(failing(MAX_READ_FAIL_ROUNDS - 1));
+        assert!(why.contains("exchange unreachable") && why.contains("3 rounds in a row"), "round 3: {why}");
+    }
+
+    #[test]
+    fn a_real_contradiction_is_unknown_at_once_not_after_three_rounds() {
+        // position 150 vs recorded 100: not a read problem, the reads are fine and they disagree
+        let d = decide(&input(read(Leg::Long, "150", "100", true), read(Leg::Short, "0", "0", true)));
+        assert!(matches!(d, Decision::Unknown { .. }), "{d:?}");
+        let d = decide(&input(read(Leg::Long, "-5", "5", true), read(Leg::Short, "0", "0", true)));
+        assert!(matches!(d, Decision::Unknown { .. }), "wrong side: {d:?}");
+        let d = decide(&input(read(Leg::Long, "100", "100", true), read(Leg::Short, "-3", "0", true)));
+        assert!(matches!(d, Decision::Unknown { .. }), "a position the record does not explain: {d:?}");
     }
 
     // ---- spec: 委託仍未終結 ----
@@ -722,7 +856,7 @@ mod tests {
         let mut long = read(Leg::Long, "100", "100", true);
         long.position = Err("unreadable".into());
         let short = read(Leg::Short, "0", "0", false);
-        assert!(matches!(decide(&input(long, short)), Decision::Unknown { .. }));
+        assert!(matches!(decide(&input(long, short)), Decision::ReadFailed { .. }));
     }
 
     #[test]
@@ -800,6 +934,17 @@ mod tests {
         let p = progress_from_records(10_000, &records);
         assert_eq!(p.attempts_sent, 2, "a manual flatten (or an old one without `by`) is not the watchdog's attempt");
         assert_eq!(p.last_record_ms, Some(22_000));
+    }
+
+    #[test]
+    fn consecutive_read_failures_are_counted_apart_from_waits_and_any_other_conclusion_resets_them() {
+        let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "READ_FAILED")]);
+        assert_eq!((p.rounds, p.read_failed_rounds, p.waited_rounds, p.terminal), (2, 2, 0, false), "READ_FAILED alone does not end the rounds");
+        let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "WAIT_FOR_CANCEL"), round(25_000, "READ_FAILED")]);
+        assert_eq!((p.read_failed_rounds, p.waited_rounds), (1, 0), "a wait in between broke the run");
+        let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "READ_FAILED"), round(25_000, "UNKNOWN")]);
+        assert_eq!((p.read_failed_rounds, p.terminal), (0, true));
+        assert_eq!(Conclusion::parse("READ_FAILED"), Some(Conclusion::ReadFailed));
     }
 
     #[test]
@@ -969,6 +1114,12 @@ mod tests {
     }
 
     #[test]
+    fn a_round_that_could_not_read_says_how_many_in_a_row_and_when_it_looks_again() {
+        let r = [at(15_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "READ_FAILED", "reason": "long position unreadable: timeout", "read_failed_rounds": 1 }))];
+        assert_eq!(status_from_records(Some(10_000), &r), Status::ReadRetry { failed: 2, reason: "long position unreadable: timeout".into(), next_ms: 20_000 });
+    }
+
+    #[test]
     fn a_sent_flatten_is_flattening_until_its_result_is_recorded() {
         assert_eq!(status_from_records(Some(10_000), &[flatten_round(15_000, 1)]), Status::Flattening { leg: Leg::Long, quantity: dec("10"), attempt: 1 });
     }
@@ -1002,9 +1153,23 @@ mod tests {
     #[test]
     fn hedged_flat_and_unknown_conclusions_are_the_status() {
         let round = |c: &str| at(15_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": c, "reason": "long position unreadable: timeout" }));
-        assert_eq!(status_from_records(Some(10_000), &[round("HEDGED")]), Status::Hedged);
+        assert_eq!(status_from_records(Some(10_000), &[round("HEDGED")]), Status::Hedged { long: None, short: None });
         assert_eq!(status_from_records(Some(10_000), &[round("FLAT")]), Status::Flat);
-        assert_eq!(status_from_records(Some(10_000), &[round("UNKNOWN")]), Status::Unknown { reason: "long position unreadable: timeout".into() });
+        assert_eq!(status_from_records(Some(10_000), &[round("UNKNOWN")]), Status::Unknown { reason: "long position unreadable: timeout".into(), sent: vec![] });
+    }
+
+    #[test]
+    fn a_hedged_round_carries_the_quantities_it_read_and_an_unknown_one_the_orders_already_sent() {
+        let hedged = at(15_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "HEDGED", "legs": { "long": { "position": "10" }, "short": { "position": "-7" } } }));
+        assert_eq!(status_from_records(Some(10_000), &[hedged]), Status::Hedged { long: Some(dec("10")), short: Some(dec("7")) }, "both legs, sizes without sign");
+        // review round 1 (A8): the unknown conclusion lists what was sent before it, with the fill each reported
+        let sent = at(16_000, LEG_FLATTEN, json!({ "by": "watchdog", "leg": "long", "exchange": "Binance", "quantity": "10", "client_order_id": "c1", "attempt": 1 }));
+        let result = at(17_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ATTEMPT_RESULT, "ok": false, "attempt": 1, "leg": "long", "quantity": "10", "client_order_id": "c1", "filled": "4", "reason": "x" }));
+        let manual = at(17_500, LEG_FLATTEN, json!({ "by": "manual", "leg": "long", "exchange": "Binance", "quantity": "1", "client_order_id": "m1" }));
+        let unknown = at(22_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "UNKNOWN", "reason": "auto flatten failed 3 times" }));
+        let st = status_from_records(Some(10_000), &[sent, result, manual, unknown]);
+        let expected = SentOrder { leg: Leg::Long, exchange: "Binance".into(), quantity: dec("10"), client_order_id: "c1".into(), filled: Some(dec("4")) };
+        assert_eq!(st, Status::Unknown { reason: "auto flatten failed 3 times".into(), sent: vec![expected] }, "the user's own order is not the watchdog's");
     }
 
     #[test]
@@ -1012,7 +1177,7 @@ mod tests {
         let skip = at(11_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_SKIPPED, "reason": "pair belongs to EXCHANGE_DEMO" }));
         assert_eq!(status_from_records(Some(10_000), std::slice::from_ref(&skip)), Status::Skipped { reason: "pair belongs to EXCHANGE_DEMO".into() });
         let later = [skip, at(15_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "HEDGED" }))];
-        assert_eq!(status_from_records(Some(10_000), &later), Status::Hedged);
+        assert_eq!(status_from_records(Some(10_000), &later), Status::Hedged { long: None, short: None });
     }
 
     fn transition(id: i64, ts: i64, to: &str) -> PairEvent {

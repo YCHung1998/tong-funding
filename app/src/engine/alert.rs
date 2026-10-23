@@ -161,7 +161,7 @@ pub enum WatchdogOutcome {
     /// The bare leg was closed with a reduce-only market order.
     Flattened { leg: Leg, exchange: Exchange, quantity: Decimal },
     /// Nothing was sent; new entries are stopped (kill switch ON) because the situation could not be proven.
-    Locked { reason: String },
+    Locked { reason: String, sent: Vec<super::watchdog::SentOrder> },
 }
 
 /// A notification about what the watchdog did. Its words come from `watchdog_text`, the same source
@@ -193,7 +193,7 @@ impl WatchdogNotice {
         let env = self.env_name();
         let (title, body) = match &self.outcome {
             WatchdogOutcome::Flattened { leg, exchange, quantity } => watchdog_text::flattened_notice(&self.symbol, &self.pair_id, env, *leg, *exchange, *quantity),
-            WatchdogOutcome::Locked { reason } => watchdog_text::locked_notice(&self.symbol, &self.pair_id, env, reason),
+            WatchdogOutcome::Locked { reason, sent } => watchdog_text::locked_notice(&self.symbol, &self.pair_id, env, reason, sent),
         };
         (redact_secrets(&title), redact_secrets(&body))
     }
@@ -222,7 +222,7 @@ impl BreakerNotice {
         let basis = if self.provisional { "（暫計：價格損益扣手續費，不含資金費）" } else { "" };
         let used = format!("{:.2}", self.loss_used);
         redact_secrets(&format!(
-            "{env}：{}。已虧 {used}／{} USDT · 連虧 {}／{} 筆{basis}。系統只停止開新倉，進行中的配對照常出場；要繼續交易請自行重新開放交易（會重新計算）。",
+            "{env}：{}。已虧 {used}／{} USDT · 連虧 {}／{} 筆{basis}。系統只停止開新倉：進行中的配對提前出場會暫停、排程出場照常；要繼續交易請自行重新開放交易（會重新計算）。",
             self.reason.text(),
             self.max_loss.normalize(),
             self.consecutive,
@@ -451,7 +451,7 @@ mod tests {
             symbol: "BTCUSDT".into(),
             simulated: false,
             identity: ProcessIdentity::Live,
-            outcome: WatchdogOutcome::Locked { reason: "lookup failed: signature=RAWSIG".into() },
+            outcome: WatchdogOutcome::Locked { reason: "lookup failed: signature=RAWSIG".into(), sent: vec![] },
         };
         let (title, body) = (n.title(), n.body());
         assert!(title.contains("BTCUSDT") && body.contains("pid-u1") && body.contains("LIVE"), "{title} / {body}");
@@ -474,7 +474,7 @@ mod tests {
         let body = n.body();
         assert!(n.title().contains("熔斷已觸發") && n.title().contains("停止開新倉"), "{}", n.title());
         assert!(body.contains("LIVE") && body.contains("連虧達上限") && body.contains("已虧 6.20／5 USDT · 連虧 2／2"), "{body}");
-        assert!(body.contains("暫計") && body.contains("不含資金費") && body.contains("進行中的配對照常出場"), "{body}");
+        assert!(body.contains("暫計") && body.contains("不含資金費") && body.contains("排程出場照常"), "{body}");
         let final_net = BreakerNotice { provisional: false, ..n };
         assert!(!final_net.body().contains("暫計"), "{}", final_net.body());
     }

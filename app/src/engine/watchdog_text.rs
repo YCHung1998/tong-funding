@@ -6,7 +6,7 @@
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::ports::Leg;
-use super::watchdog::{MAX_CANCEL_WAIT_ROUNDS, MAX_FLATTEN_ATTEMPTS, Status, WATCHDOG_GRACE_MS};
+use super::watchdog::{MAX_CANCEL_WAIT_ROUNDS, MAX_FLATTEN_ATTEMPTS, MAX_READ_FAIL_ROUNDS, SentOrder, Status, WATCHDOG_GRACE_MS};
 
 /// "多腿" / "空腿".
 pub fn leg_word(leg: Leg) -> &'static str {
@@ -32,9 +32,30 @@ pub fn flattened_detail(leg: Leg, exchange: Exchange, quantity: Decimal) -> Stri
     format!("明細：{} {verb} {}（只減倉市價單）。", exchange.name(), quantity.normalize())
 }
 
-/// The sentence for a round that could not prove the situation: nothing was sent, new entries are stopped.
-pub fn unknown_sentence(reason: &str) -> String {
-    format!("查證結果不明（{reason}），系統沒有送出任何單，已停止開新倉並通知你，請人工處理。")
+/// What the system does to TELL the user, said as it is: an alert in the app and a line in the system
+/// log. There is no macOS system notification yet (`LogNotifier`), so no text may promise one.
+pub const NOTIFY_NOTE: &str = "在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）";
+
+/// The sentence for a round that could not prove the situation: new entries are stopped. When the
+/// watchdog had already sent flatten orders in this entry they are listed (one per order, with the
+/// fill its result reported); only when it sent none does the sentence say that nothing was sent.
+pub fn unknown_sentence(reason: &str, sent: &[SentOrder]) -> String {
+    if sent.is_empty() {
+        return format!("查證結果不明（{reason}），系統沒有送出任何單，已停止開新倉，並{NOTIFY_NOTE}，請人工處理。");
+    }
+    let list = sent.iter().enumerate().map(|(i, o)| sent_line(i + 1, o)).collect::<Vec<_>>().join("；");
+    format!("查證結果不明（{reason}）。看門狗已送出 {} 張平倉單：{list}。已停止開新倉，並{NOTIFY_NOTE}；請先到交易所確認兩腿實際持倉，再人工處理。", sent.len())
+}
+
+/// One flatten order of an entry: its number, leg, exchange, direction, quantity and the fill reported.
+fn sent_line(n: usize, o: &SentOrder) -> String {
+    // closing a long position sells, closing a short position buys
+    let verb = match o.leg {
+        Leg::Long => "賣出",
+        Leg::Short => "買進",
+    };
+    let filled = o.filled.map_or("成交量未確認".to_string(), |f| format!("成交 {}", f.normalize()));
+    format!("第 {n} 張：{} {} {verb} {}，{filled}", leg_word(o.leg), o.exchange, o.quantity.normalize())
 }
 
 /// Notification title / body for "the watchdog flattened the bare leg".
@@ -46,8 +67,8 @@ pub fn flattened_notice(symbol: &str, pair_id: &str, env: &str, leg: Leg, exchan
 }
 
 /// Notification title / body for "the watchdog could not prove it: nothing sent, new entries stopped".
-pub fn locked_notice(symbol: &str, pair_id: &str, env: &str, reason: &str) -> (String, String) {
-    (format!("tong-funding: {symbol} 看門狗查證不明，已停止開新倉"), format!("{pair_id}（{env}）{}", unknown_sentence(reason)))
+pub fn locked_notice(symbol: &str, pair_id: &str, env: &str, reason: &str, sent: &[SentOrder]) -> (String, String) {
+    (format!("tong-funding: {symbol} 看門狗查證不明，已停止開新倉"), format!("{pair_id}（{env}）{}", unknown_sentence(reason, sent)))
 }
 
 /// Title of the fixed block on the risk page.
@@ -74,13 +95,13 @@ pub fn rules_runs(order_timeout_seconds: u32) -> Vec<Run> {
     vec![
         plain_run("只有在".into()),
         bold_run("確認只有一腿成交"),
-        plain_run(format!("時，系統會在訂單逾時 {order_timeout_seconds} 秒後再等 {wait_seconds} 秒，先撤銷另一腿的委託並查證它確實沒有成交，然後以")),
+        plain_run(format!("時（另一腿已平倉、只剩一腿有部位時也適用），系統會在訂單逾時 {order_timeout_seconds} 秒後再等 {wait_seconds} 秒，先撤銷另一腿的委託並查證它確實沒有成交，然後以")),
         bold_run("只減倉的市價單"),
-        plain_run(format!("平掉已成交那一腿（最多重試 {MAX_FLATTEN_ATTEMPTS} 次）。系統")),
+        plain_run(format!("平掉已成交那一腿（最多送出 {MAX_FLATTEN_ATTEMPTS} 次）。系統")),
         bold_run("不會"),
-        plain_run("開新倉、加碼、補另一腿，或動到這個配對以外的持倉，也不會改變配對狀態（仍需你確認已平倉）。查證結果不明或重試用完時".into()),
+        plain_run("開新倉、加碼、補另一腿，或動到這個配對以外的持倉，也不會改變配對狀態（仍需你確認已平倉）。查證結果不明或送單用完時".into()),
         bold_run("不會動作"),
-        plain_run("，改為停止開新倉並通知你。".into()),
+        plain_run(format!("，改為停止開新倉，並{NOTIFY_NOTE}。停止開新倉時，提前出場也會暫停，排程出場照常。")),
     ]
 }
 
@@ -137,18 +158,29 @@ pub fn status_lines(status: &Status, exchanges: (Exchange, Exchange), now_ms: i6
             hms(*next_ms)
         )],
         Status::Flattening { leg, quantity, attempt } => vec![format!(
-            "看門狗已送出{}的只減倉平倉單（數量 {}，第 {attempt} 次，最多 {MAX_FLATTEN_ATTEMPTS} 次），等待成交與查證。",
+            "看門狗已送出{}的只減倉平倉單（數量 {}，第 {attempt} 次，最多送出 {MAX_FLATTEN_ATTEMPTS} 次），等待成交與查證。",
             leg_word(*leg),
             quantity.normalize()
         )],
         Status::Retrying { attempt, reason, next_ms } => vec![format!(
-            "看門狗自動平倉第 {attempt} 次未成功（{reason}），將在 {} UTC 重新查證；最多 {MAX_FLATTEN_ATTEMPTS} 次，用完會停止開新倉並通知你。",
+            "看門狗自動平倉第 {attempt} 次未成功（{reason}），將在 {} UTC 重新查證；最多送出 {MAX_FLATTEN_ATTEMPTS} 次，用完會停止開新倉，並{NOTIFY_NOTE}。",
             hms(*next_ms)
         )],
         Status::Flattened { leg, quantity } => vec![flattened_sentence(*leg), flattened_detail(*leg, exchange_of(*leg), *quantity)],
-        Status::Hedged => vec!["兩腿都有部位（已對沖），系統不會送單，請人工處理。".to_string()],
+        Status::Hedged { long, short } => {
+            let sizes = match (long, short) {
+                (Some(l), Some(s)) => format!("：多腿 {}、空腿 {}", l.normalize(), s.normalize()),
+                _ => String::new(),
+            };
+            // both legs hold something, but nothing says the two quantities are equal
+            vec![format!("兩腿都有部位（可能不平衡）{sizes}，系統不會送單，請人工處理。")]
+        }
         Status::Flat => vec!["兩腿都沒有部位，系統不會送單，請人工處理；確認兩所皆無部位後按「人工確認已平倉」。".to_string()],
-        Status::Unknown { reason } => vec![unknown_sentence(reason)],
+        Status::Unknown { reason, sent } => vec![unknown_sentence(reason, sent)],
+        Status::ReadRetry { failed, reason, next_ms } => vec![format!(
+            "看門狗查證時讀取失敗（{reason}），第 {failed} 輪；將在 {} UTC 再查證，連續 {MAX_READ_FAIL_ROUNDS} 輪讀取失敗就視為查證不明並停止開新倉。",
+            hms(*next_ms)
+        )],
         Status::Skipped { reason } => vec![format!("看門狗不處理這個配對：{reason}")],
     }
 }
@@ -174,11 +206,32 @@ mod tests {
         assert_eq!(flattened_detail(Leg::Short, Exchange::Bybit, dec("10")), "明細：Bybit 買進 10（只減倉市價單）。");
     }
 
+    const NOTE: &str = "在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）";
+
+    fn sent(leg: Leg, exchange: &str, quantity: &str, filled: Option<&str>) -> SentOrder {
+        SentOrder { leg, exchange: exchange.into(), quantity: dec(quantity), client_order_id: "c".into(), filled: filled.map(dec) }
+    }
+
     #[test]
-    fn the_unknown_sentence_says_nothing_was_sent_and_new_entries_are_stopped() {
-        let s = unknown_sentence("long position unreadable: timeout");
+    fn the_unknown_sentence_without_a_sent_order_says_nothing_was_sent_and_new_entries_are_stopped() {
+        let s = unknown_sentence("long position unreadable: timeout", &[]);
         assert!(s.contains("查證結果不明") && s.contains("long position unreadable: timeout"), "{s}");
         assert!(s.contains("沒有送出任何單") && s.contains("停止開新倉") && s.contains("人工處理"), "{s}");
+        assert!(s.contains(NOTE) && !s.contains("通知你"), "no promise of a notification that is not wired: {s}");
+    }
+
+    #[test]
+    fn the_unknown_sentence_after_sent_orders_lists_each_order_with_its_fill_and_never_says_nothing_was_sent() {
+        // review round 1 (A8): "auto flatten failed 3 times" is Unknown AFTER three orders went out
+        let orders = [sent(Leg::Long, "Binance", "10", Some("4")), sent(Leg::Long, "Binance", "6", Some("0")), sent(Leg::Long, "Binance", "6", None)];
+        let s = unknown_sentence("auto flatten failed 3 times", &orders);
+        assert!(!s.contains("沒有送出任何單"), "{s}");
+        assert!(s.contains("已送出 3 張平倉單"), "{s}");
+        assert!(s.contains("第 1 張：多腿 Binance 賣出 10，成交 4") && s.contains("第 2 張：多腿 Binance 賣出 6，成交 0") && s.contains("第 3 張：多腿 Binance 賣出 6，成交量未確認"), "{s}");
+        assert!(s.contains("停止開新倉") && s.contains(NOTE) && s.contains("確認") && s.contains("人工處理"), "{s}");
+        // a short leg is closed by buying
+        let s = unknown_sentence("x", &[sent(Leg::Short, "Bybit", "0.5", Some("0.5"))]);
+        assert!(s.contains("已送出 1 張平倉單") && s.contains("第 1 張：空腿 Bybit 買進 0.5，成交 0.5"), "{s}");
     }
 
     #[test]
@@ -188,14 +241,15 @@ mod tests {
         assert!(body.contains("pid-1") && body.contains("EXCHANGE_DEMO"), "{body}");
         assert!(body.contains(&flattened_sentence(Leg::Long)) && body.contains(&flattened_detail(Leg::Long, Exchange::Binance, dec("10"))), "{body}");
 
-        let (title, body) = locked_notice("BTCUSDT", "pid-1", "LIVE", "auto flatten failed 3 times");
+        let orders = [sent(Leg::Long, "Binance", "10", Some("0"))];
+        let (title, body) = locked_notice("BTCUSDT", "pid-1", "LIVE", "auto flatten failed 3 times", &orders);
         assert!(title.contains("BTCUSDT") && title.contains("停止開新倉"), "{title}");
-        assert!(body.contains("pid-1") && body.contains("LIVE") && body.contains(&unknown_sentence("auto flatten failed 3 times")), "{body}");
+        assert!(body.contains("pid-1") && body.contains("LIVE") && body.contains(&unknown_sentence("auto flatten failed 3 times", &orders)), "{body}");
     }
 
     // ---- 3.1 the rules text of the risk page ----
 
-    const APPROVED_20: &str = "只有在確認只有一腿成交時，系統會在訂單逾時 20 秒後再等 5 秒，先撤銷另一腿的委託並查證它確實沒有成交，然後以只減倉的市價單平掉已成交那一腿（最多重試 3 次）。系統不會開新倉、加碼、補另一腿，或動到這個配對以外的持倉，也不會改變配對狀態（仍需你確認已平倉）。查證結果不明或重試用完時不會動作，改為停止開新倉並通知你。";
+    const APPROVED_20: &str = "只有在確認只有一腿成交時（另一腿已平倉、只剩一腿有部位時也適用），系統會在訂單逾時 20 秒後再等 5 秒，先撤銷另一腿的委託並查證它確實沒有成交，然後以只減倉的市價單平掉已成交那一腿（最多送出 3 次）。系統不會開新倉、加碼、補另一腿，或動到這個配對以外的持倉，也不會改變配對狀態（仍需你確認已平倉）。查證結果不明或送單用完時不會動作，改為停止開新倉，並在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）。停止開新倉時，提前出場也會暫停，排程出場照常。";
 
     #[test]
     fn the_rules_text_is_the_approved_draft_with_the_real_numbers() {
@@ -226,12 +280,15 @@ mod tests {
         for needle in [
             "確認只有一腿成交", // when
             "再等 5 秒", // the wait
-            "撤銷另一腿的委託", "查證它確實沒有成交", "只減倉的市價單", "最多重試 3 次", // what it does
+            "撤銷另一腿的委託", "查證它確實沒有成交", "只減倉的市價單", "最多送出 3 次", // what it does
+            "另一腿已平倉、只剩一腿有部位時也適用", // the leftover-leg case
+            "提前出場也會暫停，排程出場照常", // what the stop does to exits
             "不會開新倉、加碼、補另一腿", "配對以外的持倉", "不會改變配對狀態", "仍需你確認已平倉", // what it never does
-            "查證結果不明或重試用完時不會動作", "停止開新倉並通知你", // when unsure
+            "查證結果不明或送單用完時不會動作", "停止開新倉", NOTE, // when unsure
         ] {
             assert!(t.contains(needle), "missing {needle:?} in {t}");
         }
+        assert!(!t.contains("通知你") && !t.contains("重試"), "no promise of a notification that is not wired, no \"retry\": {t}");
     }
 
     #[test]
@@ -267,14 +324,21 @@ mod tests {
 
     #[test]
     fn hedged_and_flat_ask_for_a_manual_decision_and_say_nothing_was_sent() {
-        assert_eq!(status_lines(&Status::Hedged, PAIR, NOW), vec!["兩腿都有部位（已對沖），系統不會送單，請人工處理。".to_string()]);
+        assert_eq!(
+            status_lines(&Status::Hedged { long: Some(dec("10")), short: Some(dec("7")) }, PAIR, NOW),
+            vec!["兩腿都有部位（可能不平衡）：多腿 10、空腿 7，系統不會送單，請人工處理。".to_string()],
+            "both quantities are listed"
+        );
+        let unknown_sizes = status_lines(&Status::Hedged { long: None, short: None }, PAIR, NOW);
+        assert_eq!(unknown_sizes, vec!["兩腿都有部位（可能不平衡），系統不會送單，請人工處理。".to_string()]);
+        assert!(!unknown_sizes[0].contains("已對沖"), "{unknown_sizes:?}");
         assert_eq!(status_lines(&Status::Flat, PAIR, NOW), vec!["兩腿都沒有部位，系統不會送單，請人工處理；確認兩所皆無部位後按「人工確認已平倉」。".to_string()]);
     }
 
     #[test]
     fn unknown_gives_the_reason_and_says_new_entries_are_stopped() {
-        let lines = status_lines(&Status::Unknown { reason: "long position unreadable: timeout".into() }, PAIR, NOW);
-        assert_eq!(lines, vec![unknown_sentence("long position unreadable: timeout")]);
+        let lines = status_lines(&Status::Unknown { reason: "long position unreadable: timeout".into(), sent: vec![] }, PAIR, NOW);
+        assert_eq!(lines, vec![unknown_sentence("long position unreadable: timeout", &[])]);
         assert!(lines[0].contains("long position unreadable: timeout") && lines[0].contains("停止開新倉") && lines[0].contains("人工處理"));
     }
 
@@ -284,9 +348,13 @@ mod tests {
         assert!(cancel[0].contains("尚未終結") && cancel[0].contains("撤單") && cancel[0].contains("08:00:05 UTC") && cancel[0].contains("第 2 輪"), "{cancel:?}");
         assert!(cancel[0].contains(&format!("連續 {MAX_CANCEL_WAIT_ROUNDS} 輪")), "{cancel:?}");
         let flattening = status_lines(&Status::Flattening { leg: Leg::Long, quantity: dec("10"), attempt: 2 }, PAIR, NOW);
-        assert!(flattening[0].contains("多腿") && flattening[0].contains("只減倉") && flattening[0].contains("數量 10") && flattening[0].contains("第 2 次"), "{flattening:?}");
+        assert!(flattening[0].contains("多腿") && flattening[0].contains("只減倉") && flattening[0].contains("數量 10") && flattening[0].contains("第 2 次") && flattening[0].contains("最多送出 3 次"), "{flattening:?}");
         let retry = status_lines(&Status::Retrying { attempt: 1, reason: "order rejected: risk limit".into(), next_ms: NOW + 5_000 }, PAIR, NOW);
-        assert!(retry[0].contains("第 1 次未成功") && retry[0].contains("order rejected: risk limit") && retry[0].contains("08:00:05 UTC") && retry[0].contains("最多 3 次"), "{retry:?}");
+        assert!(retry[0].contains("第 1 次未成功") && retry[0].contains("order rejected: risk limit") && retry[0].contains("08:00:05 UTC") && retry[0].contains("最多送出 3 次"), "{retry:?}");
+        assert!(retry[0].contains(NOTE) && !retry[0].contains("通知你"), "{retry:?}");
+        let read = status_lines(&Status::ReadRetry { failed: 2, reason: "long position unreadable: timeout".into(), next_ms: NOW + 5_000 }, PAIR, NOW);
+        assert!(read[0].contains("讀取失敗") && read[0].contains("long position unreadable: timeout") && read[0].contains("08:00:05 UTC") && read[0].contains("第 2 輪"), "{read:?}");
+        assert!(read[0].contains("連續 3 輪") && read[0].contains("停止開新倉"), "{read:?}");
         let skipped = status_lines(&Status::Skipped { reason: "pair belongs to EXCHANGE_DEMO".into() }, PAIR, NOW);
         assert!(skipped[0].contains("不處理") && skipped[0].contains("EXCHANGE_DEMO"), "{skipped:?}");
     }
@@ -300,9 +368,10 @@ mod tests {
             Status::Flattening { leg: Leg::Short, quantity: dec("1"), attempt: 1 },
             Status::Retrying { attempt: 1, reason: "x".into(), next_ms: NOW },
             Status::Flattened { leg: Leg::Short, quantity: dec("1") },
-            Status::Hedged,
+            Status::Hedged { long: Some(dec("1")), short: Some(dec("1")) },
             Status::Flat,
-            Status::Unknown { reason: "x".into() },
+            Status::ReadRetry { failed: 1, reason: "x".into(), next_ms: NOW },
+            Status::Unknown { reason: "x".into(), sent: vec![] },
             Status::Skipped { reason: "x".into() },
         ];
         for st in all {

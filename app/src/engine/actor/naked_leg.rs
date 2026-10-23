@@ -15,8 +15,8 @@ use crate::engine::watchdog as wd;
 pub(super) enum Phase {
     /// Nothing in flight: the next round starts at `next_round_ms`.
     Idle,
-    /// A round was started at `started_ms`; its result arrives as `Event::WatchdogProbed`.
-    Verifying { started_ms: i64 },
+    /// A round is out; its result arrives as `Event::WatchdogProbed` (the probe has its own time limit).
+    Verifying,
     /// The flatten order of the bare leg was sent and is awaited.
     Flattening(Flattening),
 }
@@ -46,17 +46,20 @@ pub(super) struct WatchdogFlow {
     pub(super) rounds: u32,
     pub(super) attempts_sent: u32,
     pub(super) waited_rounds: u32,
+    /// Consecutive rounds that could not read what they need (the third is `Unknown`).
+    pub(super) read_failed_rounds: u32,
     /// A conclusion that ends the rounds was reached: no further automatic action for this entry.
     pub(super) done: bool,
     pub(super) phase: Phase,
-    /// `client_order_id`s of the flatten orders this entry sent itself (the others in flight are the user's).
-    pub(super) own_orders: Vec<String>,
+    /// The flatten orders this entry sent itself (the others in flight are the user's), with the fill
+    /// each result reported: what an `Unknown` notice and the card list.
+    pub(super) sent: Vec<wd::SentOrder>,
 }
 
 impl WatchdogFlow {
     /// The pair entered `state` at `now`: nothing happened yet, the first round waits out the grace.
     fn fresh(entry_no: u64, state: PairState, now: i64) -> WatchdogFlow {
-        WatchdogFlow { entry_no, state, alert_since_ms: now, next_round_ms: now.saturating_add(wd::WATCHDOG_GRACE_MS), rounds: 0, attempts_sent: 0, waited_rounds: 0, done: false, phase: Phase::Idle, own_orders: Vec::new() }
+        WatchdogFlow { entry_no, state, alert_since_ms: now, next_round_ms: now.saturating_add(wd::WATCHDOG_GRACE_MS), rounds: 0, attempts_sent: 0, waited_rounds: 0, read_failed_rounds: 0, done: false, phase: Phase::Idle, sent: Vec::new() }
     }
 
     /// Rebuilt from the stored events of the current entry.
@@ -69,9 +72,10 @@ impl WatchdogFlow {
             rounds: p.rounds,
             attempts_sent: p.attempts_sent,
             waited_rounds: p.waited_rounds,
+            read_failed_rounds: p.read_failed_rounds,
             done: p.terminal,
             phase: Phase::Idle,
-            own_orders: Vec::new(),
+            sent: p.sent.clone(),
         }
     }
 }
@@ -144,12 +148,7 @@ impl Actor {
             Phase::Idle if now >= next_round_ms && self.user_flatten_active(pair) => {}
             Phase::Idle if now >= next_round_ms => self.start_round(view, now),
             Phase::Idle => {}
-            // The round's result is overdue (its event was lost): give it up, never wait for ever.
-            Phase::Verifying { started_ms } if now.saturating_sub(started_ms) >= wd::WATCHDOG_PROBE_TIMEOUT_MS + REPORT_SLACK_MS => {
-                let decision = wd::Decision::Unknown { reason: "the verification round did not report back".into() };
-                self.finish_round(view, decision, None, now);
-            }
-            Phase::Verifying { .. } => {}
+            Phase::Verifying => {}
             Phase::Flattening(f) => self.check_flatten(view, &f, now),
         }
     }
@@ -166,8 +165,8 @@ impl Actor {
         if flow.flatten_inflight.iter().any(|b| *b) {
             return true;
         }
-        let own: &[String] = flow.watchdog.as_ref().map_or(&[], |w| w.own_orders.as_slice());
-        flow.close.as_ref().is_some_and(|set| set.legs.iter().flatten().any(|o| !o.is_over() && !own.contains(&o.req.client_order_id)))
+        let own = |id: &str| flow.watchdog.as_ref().is_some_and(|w| w.sent.iter().any(|o| o.client_order_id == id));
+        flow.close.as_ref().is_some_and(|set| set.legs.iter().flatten().any(|o| !o.is_over() && !own(&o.req.client_order_id)))
     }
 
     /// The pair's own orders per leg (open and close), from its order intents.
@@ -186,7 +185,7 @@ impl Actor {
     /// Marks a round as started; returns the number of the entry it belongs to.
     fn begin_round(&mut self, pair: &str, now: i64) -> Option<u64> {
         let w = self.flows.get_mut(pair)?.watchdog.as_mut()?;
-        w.phase = Phase::Verifying { started_ms: now };
+        w.phase = Phase::Verifying;
         w.rounds = w.rounds.saturating_add(1);
         Some(w.entry_no)
     }
@@ -224,7 +223,7 @@ impl Actor {
         let Some(w) = self.flows.get(pair).and_then(|f| f.watchdog.clone()) else { return };
         // A late result of an earlier entry, of a pair that left the state, or of a round that is not
         // in flight is dropped.
-        if w.entry_no != entry_no || w.state != view.state || w.done || !matches!(w.phase, Phase::Verifying { .. }) {
+        if w.entry_no != entry_no || w.state != view.state || w.done || !matches!(w.phase, Phase::Verifying) {
             return;
         }
         let now = self.clock.now_ms();
@@ -237,6 +236,7 @@ impl Actor {
             tolerance_pct: tolerance,
             legs: [probe.legs[0].read.clone(), probe.legs[1].read.clone()],
             waited_rounds: w.waited_rounds,
+            read_failed_rounds: w.read_failed_rounds,
             attempts_sent: w.attempts_sent,
         };
         let decision = wd::decide(&input);
@@ -253,8 +253,23 @@ impl Actor {
             w.phase = Phase::Idle;
         }
         self.dirty = true;
+        // each run counts only consecutive rounds of its own kind
+        if !matches!(decision, wd::Decision::ReadFailed { .. })
+            && let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut())
+        {
+            w.read_failed_rounds = 0;
+        }
         // The action of the conclusion comes only after its record.
         match decision {
+            // Something could not be read: nothing is decided yet, the next round (5 s later) looks
+            // again; the third failure in a row is `Unknown` (see `wd::read_failure`).
+            wd::Decision::ReadFailed { .. } => {
+                if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+                    w.read_failed_rounds = w.read_failed_rounds.saturating_add(1);
+                    w.waited_rounds = 0;
+                    w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
+                }
+            }
             wd::Decision::Flatten { leg, qty } => {
                 let position = evidence.and_then(|(probe, _)| probe.legs[idx(leg)].read.position.clone().ok()).unwrap_or_default();
                 self.begin_flatten(view, leg, qty, position, recorded, now);
@@ -310,7 +325,8 @@ impl Actor {
             self.live_disarm();
         }
         self.dirty = true;
-        self.notify_watchdog(view, alert::WatchdogOutcome::Locked { reason: reason.to_string() });
+        let sent = self.flows.get(&view.internal_uuid).and_then(|f| f.watchdog.as_ref()).map(|w| w.sent.clone()).unwrap_or_default();
+        self.notify_watchdog(view, alert::WatchdogOutcome::Locked { reason: reason.to_string(), sent });
     }
 
     /// One notification about what the watchdog did, off the actor (a notifier may block). Its failure
@@ -370,7 +386,11 @@ impl Actor {
             Ok(client_order_id) => {
                 if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
                     w.attempts_sent = attempt;
-                    w.own_orders.push(client_order_id.clone());
+                    let exchange = match leg {
+                        Leg::Long => view.long_exchange,
+                        Leg::Short => view.short_exchange,
+                    };
+                    w.sent.push(wd::SentOrder { leg, exchange: exchange.name().to_string(), quantity: qty, client_order_id: client_order_id.clone(), filled: None });
                     w.phase = Phase::Flattening(Flattening { leg, quantity: qty, client_order_id, attempt, timeout_at_ms: fill::timeout_at_ms(&eff, now) });
                 }
             }
@@ -440,6 +460,9 @@ impl Actor {
         if let Some(w) = self.flows.get_mut(pair).and_then(|fl| fl.watchdog.as_mut()) {
             w.phase = Phase::Idle;
             w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
+            if let Some(o) = w.sent.iter_mut().find(|o| o.client_order_id == f.client_order_id) {
+                o.filled = filled;
+            }
         }
         self.dirty = true;
         if result.is_ok() {
@@ -497,9 +520,6 @@ impl Actor {
     }
 }
 
-/// How long after the probe's own limit a missing result is given up (a lost event).
-const REPORT_SLACK_MS: i64 = 10_000;
-
 /// The record of one round: the conclusion and the basis it was drawn from.
 fn round_payload(view: &PairView, w: &WatchdogFlow, decision: &wd::Decision, evidence: Option<(&wd::WatchdogProbe, Decimal)>) -> Value {
     let mut p = json!({
@@ -512,6 +532,7 @@ fn round_payload(view: &PairView, w: &WatchdogFlow, decision: &wd::Decision, evi
         "symbol": view.symbol,
         "simulated": view.simulated,
         "waited_rounds": w.waited_rounds,
+        "read_failed_rounds": w.read_failed_rounds,
         "attempts_sent": w.attempts_sent,
     });
     if let Some((probe, tolerance)) = evidence {
@@ -524,7 +545,7 @@ fn round_payload(view: &PairView, w: &WatchdogFlow, decision: &wd::Decision, evi
             p["quantity"] = json!(dstr(*qty));
             p["attempt"] = json!(w.attempts_sent.saturating_add(1));
         }
-        wd::Decision::Unknown { reason } => p["reason"] = json!(reason),
+        wd::Decision::Unknown { reason } | wd::Decision::ReadFailed { reason } => p["reason"] = json!(reason),
         wd::Decision::Hedged | wd::Decision::Flat | wd::Decision::WaitForCancel => {}
     }
     p

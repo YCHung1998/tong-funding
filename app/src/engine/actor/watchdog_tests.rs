@@ -302,38 +302,28 @@ async fn a_pair_of_the_other_execution_mode_is_skipped_with_one_event_and_no_rea
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_round_that_cannot_finish_within_the_probe_limit_concludes_unknown() {
+async fn rounds_that_cannot_finish_within_the_probe_limit_read_nothing_and_the_third_in_a_row_is_unknown() {
     let (rig, _h, watched, since) = bare_long(Opts::default()).await;
     run_until(&rig.clock, since + 1_000).await;
     watched.hold(true); // the exchange never answers the lookup
-    run_until(&rig.clock, since + 5_000 + wd::WATCHDOG_PROBE_TIMEOUT_MS + 3_000).await;
-    let rounds = rounds(&rig.db);
-    assert_eq!(rounds.len(), 1, "{rounds:?}");
-    assert_eq!(rounds[0]["conclusion"], json!("UNKNOWN"), "{}", rounds[0]);
-    let why = rounds[0]["reason"].as_str().unwrap();
+    let limit = wd::WATCHDOG_PROBE_TIMEOUT_MS;
+    // round 1 starts at +5 s and gives up at +35 s: a timeout is a failed READ, not a verdict
+    run_until(&rig.clock, since + 5_000 + limit + 2_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["READ_FAILED"], "{r:?}");
+    let why = r[0]["reason"].as_str().unwrap();
     assert!(why.contains("did not finish") && why.contains("30 s"), "{why}");
-    assert_eq!(rounds[0]["leg"], Value::Null, "an unknown round names no leg to close");
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_round_whose_result_never_arrives_is_given_up_as_unknown() {
-    let (rig, deps) = rig(Opts::default());
-    seed_pair(&rig.db, UUID, PairState::FillMonitor, true);
-    let (mut actor, _h) = Actor::new(deps);
-    actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
-    // a round was started long ago and its event was lost
-    rig.clock.advance(120_000);
-    let now = rig.clock.now_ms();
-    if let Some(w) = actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()) {
-        w.phase = naked_leg::Phase::Verifying { started_ms: now - 60_000 };
-        w.rounds = 1;
-    }
-    let view = actor.pairs.get(UUID).cloned().unwrap();
-    actor.watchdog_tick(&view, now);
-    let rounds = rounds(&rig.db);
-    assert_eq!(rounds.len(), 1, "{rounds:?}");
-    assert_eq!(rounds[0]["conclusion"], json!("UNKNOWN"));
-    assert!(rounds[0]["reason"].as_str().unwrap().contains("did not report"), "{}", rounds[0]);
+    assert_eq!(r[0]["leg"], Value::Null, "a round that read nothing names no leg to close");
+    assert!(!rig.db.kill_switch_halted(), "one failed read locks nothing");
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG_LOCK), 0);
+    // rounds 2 and 3, each 5 s after the previous result
+    run_until(&rig.clock, since + 5_000 + 3 * limit + 15_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["READ_FAILED", "READ_FAILED", "UNKNOWN"], "{r:?}");
+    assert_eq!(r.iter().map(|x| x["read_failed_rounds"].clone()).collect::<Vec<_>>(), vec![json!(0), json!(1), json!(2)]);
+    assert!(rig.db.kill_switch_halted(), "the third failed read in a row locks");
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG_LOCK), 1);
+    assert_eq!(rig.sim.submitted().len(), 2, "and nothing was ever sent");
 }
 
 // ---- 2.3 an order that is not over: cancel, look again, give up after three rounds -----------
@@ -541,9 +531,17 @@ async fn an_unknown_conclusion_sends_nothing_locks_the_engine_in_one_transaction
     run_until(&rig.clock, since + 1_000).await;
     rig.sim.fail_queries(Some("exchange unreachable (scripted)".into()));
     run_until(&rig.clock, since + 5_000).await;
+    // a failed READ is not a verdict yet: the first two rounds only look again 5 s later
     let r = rounds(&rig.db);
-    assert_eq!(conclusions(&r), vec!["UNKNOWN"], "{r:?}");
-    assert!(r[0]["reason"].as_str().unwrap().contains("unreachable"), "{}", r[0]);
+    assert_eq!(conclusions(&r), vec!["READ_FAILED"], "{r:?}");
+    assert!(!rig.db.kill_switch_halted(), "one failed read locks nothing");
+    run_until(&rig.clock, since + 10_000).await;
+    assert_eq!(conclusions(&rounds(&rig.db)), vec!["READ_FAILED", "READ_FAILED"]);
+    assert!(!rig.db.kill_switch_halted(), "two in a row neither");
+    run_until(&rig.clock, since + 15_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["READ_FAILED", "READ_FAILED", "UNKNOWN"], "{r:?}");
+    assert!(r[2]["reason"].as_str().unwrap().contains("unreachable"), "{}", r[2]);
     assert_eq!(rig.sim.submitted().len(), 2, "a failed lookup sends nothing");
     assert!(rig.db.kill_switch_halted(), "new entries are stopped");
     assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the pair state is not touched");
@@ -559,7 +557,7 @@ async fn an_unknown_conclusion_sends_nothing_locks_the_engine_in_one_transaction
     sleep(Duration::from_millis(100)).await;
     let calls = rig.notifier.watchdog_calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
-    assert!(matches!(&calls[0].outcome, crate::engine::alert::WatchdogOutcome::Locked { reason } if reason.contains("unreachable")), "{calls:?}");
+    assert!(matches!(&calls[0].outcome, crate::engine::alert::WatchdogOutcome::Locked { reason, .. } if reason.contains("unreachable")), "{calls:?}");
     assert_eq!((calls[0].pair.as_str(), calls[0].symbol.as_str(), calls[0].simulated), (UUID, SYM, true));
     assert!(calls[0].body().contains("沒有送出任何單") && calls[0].body().contains("停止開新倉"), "{}", calls[0].body());
     assert_eq!(rig.notifier.calls().len(), 1, "the pair-alert notification is a separate one, still just one");
@@ -569,7 +567,7 @@ async fn an_unknown_conclusion_sends_nothing_locks_the_engine_in_one_transaction
     rig.sim.fail_queries(None);
     rig.db.set_kill_switch(false).unwrap();
     run_until(&rig.clock, since + 40_000).await;
-    assert_eq!(rounds(&rig.db).len(), 1, "no automatic action until the user acts");
+    assert_eq!(rounds(&rig.db).len(), 3, "no automatic action until the user acts");
     assert_eq!(rig.sim.submitted().len(), 2);
 }
 
@@ -602,6 +600,15 @@ async fn three_rejected_flatten_orders_lock_the_engine_and_no_fourth_is_sent() {
     assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
     sleep(Duration::from_millis(100)).await;
     assert_eq!(rig.notifier.watchdog_calls().len(), 1, "told once");
+    // review round 1 (A8): three orders did go out, so the notice lists them and never says "nothing was sent"
+    let body = rig.notifier.watchdog_calls()[0].body();
+    assert!(!body.contains("沒有送出任何單"), "{body}");
+    assert!(body.contains("已送出 3 張平倉單") && body.contains("第 1 張：多腿 Binance 賣出 10") && body.contains("第 3 張"), "{body}");
+    let card = wd::status_of_pair(
+        PairState::PartialFailure,
+        &events(&rig.db).into_iter().enumerate().map(|(i, (ts, l, p))| wd::PairEvent { id: i as i64, ts_ms: ts, event_type: if l == "PARTIAL_FAILURE" { "PAIR_TRANSITION".into() } else { l }, payload: p }).collect::<Vec<_>>(),
+    );
+    assert!(matches!(&card, wd::Status::Unknown { sent, .. } if sent.len() == 3), "the manual-handling card lists them too: {card:?}");
     run_until(&rig.clock, since + 60_000).await;
     assert_eq!(reduce_only_orders(&rig).len(), 3, "and it stays at three");
 }
@@ -708,8 +715,12 @@ async fn after_a_restart_the_wait_is_counted_from_the_entry_and_a_lost_simulated
     assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG), 0, "the new process has not waited 5 s since its own start: it counts from the entry event");
     run_until(&rig.clock, since + 5_000).await;
     let r = rounds(&rig.db);
-    assert_eq!(conclusions(&r), vec!["UNKNOWN"], "{r:?}");
-    assert!(r[0]["reason"].as_str().unwrap().contains("not found"), "the simulated order is gone with the ledger: {}", r[0]);
+    assert_eq!(conclusions(&r), vec!["READ_FAILED"], "an order that cannot be found is a failed read: look again before judging: {r:?}");
+    assert!(!rig.db.kill_switch_halted());
+    run_until(&rig.clock, since + 15_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["READ_FAILED", "READ_FAILED", "UNKNOWN"], "{r:?}");
+    assert!(r[2]["reason"].as_str().unwrap().contains("not found"), "the simulated order is gone with the ledger: {}", r[2]);
     assert!(rig.db.kill_switch_halted(), "unknown means locked, in SIMULATION too");
     sleep(Duration::from_millis(100)).await;
     assert_eq!(second.watchdog_calls().len(), 1);
@@ -785,7 +796,7 @@ async fn the_manual_flatten_that_finds_the_watchdog_busy_when_its_reads_return_s
     actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
     assert_eq!(actor.dispatch(Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }), CommandReply::Accepted);
     // the watchdog got a round going meanwhile
-    actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap().phase = naked_leg::Phase::Verifying { started_ms: rig.clock.now_ms() };
+    actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap().phase = naked_leg::Phase::Verifying;
     actor.on_flatten_position(UUID, Leg::Long, Ok(dec("10")), Ok(dec("10")));
     assert!(rig.sim.submitted().is_empty(), "nothing sent");
     let aborted = events_of(&rig.db, "LEG_FLATTEN_ABORTED");
@@ -847,6 +858,7 @@ async fn an_aborted_flatten_counts_as_an_attempt_survives_a_restart_and_three_of
             wd::LegRead { leg: Leg::Short, exchange: Exchange::Bybit, position: Ok(dec("0")), recorded: Ok(dec("0")), orders_terminal: Ok(true) },
         ],
         waited_rounds: 0,
+        read_failed_rounds: 0,
         attempts_sent: 3,
     });
     assert!(matches!(d, wd::Decision::Unknown { .. }), "{d:?}");

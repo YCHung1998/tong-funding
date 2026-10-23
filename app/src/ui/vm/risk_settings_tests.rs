@@ -693,6 +693,12 @@ mod breaker_fields {
             assert!(h.meaning.contains("kill switch") || h.meaning.contains("開新倉"), "{}", h.meaning);
         }
         assert!(Field::LossBreakerMaxLossUsdt.help().meaning.contains("15") || Field::LossBreakerMaxLossUsdt.help().meaning.contains("USDT"));
+        // review round 1 (A9): what the stop really does to exits, and no promise of a system notification
+        for f in BOTH {
+            let m = f.help().meaning;
+            assert!(m.contains("提前出場會暫停") && m.contains("排程出場照常"), "{m}");
+            assert!(m.contains(crate::engine::watchdog_text::NOTIFY_NOTE) && !m.contains("通知你"), "{m}");
+        }
         let mut s = complete_settings("0.01");
         s.risk.loss_breaker_max_loss_usdt = d("0.5");
         let vm = evaluate(&RiskForm::from_settings(&s), &s);

@@ -258,12 +258,12 @@ impl Field {
                 affects: &[Pretrade, Execution],
             },
             Field::LossBreakerMaxLossUsdt => FieldHelp {
-                meaning: "熔斷：自最近一次開放交易（kill switch 關閉，Live 為武裝）起，已平倉配對的累計虧損達此 USDT 數，就自動打開 kill switch，只停止開新倉、平倉與進行中的配對照常；Live 同時解除武裝。每筆金額用 PnL 淨額，淨額未知時用價格損益扣兩邊手續費（暫計，不含資金費）；金額算不出來也會觸發。預設 15（新的 Live 資料庫預設 5），越低越嚴。",
+                meaning: "熔斷：自最近一次開放交易（kill switch 關閉，Live 為武裝）起，已平倉配對的累計虧損達此 USDT 數，就自動打開 kill switch，只停止開新倉；平倉與人工處理照常，進行中的配對提前出場會暫停、排程出場照常；Live 同時解除武裝，並在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）。每筆金額用 PnL 淨額，淨額未知時用價格損益扣兩邊手續費（暫計，不含資金費）；金額算不出來也會觸發。預設 15（新的 Live 資料庫預設 5），越低越嚴。",
                 formula: Some("區間內各筆金額加總 ≤ −上限 → 觸發；重新開放交易後重新計算"),
                 affects: &[Execution],
             },
             Field::LossBreakerMaxConsecutiveLosses => FieldHelp {
-                meaning: "熔斷：自最近一次開放交易起，結尾連續虧損（金額小於 0）的已平倉配對達此筆數，就自動打開 kill switch，只停止開新倉；獲利或持平的一筆會讓連虧歸零。預設 3（新的 Live 資料庫預設 2），越低越嚴。",
+                meaning: "熔斷：自最近一次開放交易起，結尾連續虧損（金額小於 0）的已平倉配對達此筆數，就自動打開 kill switch，只停止開新倉（提前出場會暫停、排程出場照常），並在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）；獲利或持平的一筆會讓連虧歸零。預設 3（新的 Live 資料庫預設 2），越低越嚴。",
                 formula: Some("結尾連續虧損筆數 ≥ 上限 → 觸發"),
                 affects: &[Execution],
             },

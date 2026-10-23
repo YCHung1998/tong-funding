@@ -697,8 +697,9 @@ fn watchdog_lines(snap: &UiSnapshot, p: &PairView, now_ms: i64) -> (Vec<String>,
     let tone = match &status {
         watchdog::Status::Flattened { .. } => Tone::Positive,
         watchdog::Status::Unknown { .. } => Tone::Negative,
-        watchdog::Status::Hedged
+        watchdog::Status::Hedged { .. }
         | watchdog::Status::Flat
+        | watchdog::Status::ReadRetry { .. }
         | watchdog::Status::WaitingCancel { .. }
         | watchdog::Status::Retrying { .. }
         | watchdog::Status::Skipped { .. } => Tone::Warning,
@@ -859,13 +860,8 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
             let watchdog = view
                 .filter(|v| is_alert(v.state))
                 .map(|v| match watchdog::status_of_pair(v.state, &pair_events(snap, pair)) {
-                    watchdog::Status::Flattened { leg, quantity } => {
-                        let exchange = match leg {
-                            Leg::Long => v.long_exchange,
-                            Leg::Short => v.short_exchange,
-                        };
-                        vec![watchdog_text::flattened_sentence(leg), watchdog_text::flattened_detail(leg, exchange, quantity)]
-                    }
+                    // the words come from the one source the card and the notices use
+                    status @ watchdog::Status::Flattened { .. } => watchdog_text::status_lines(&status, (v.long_exchange, v.short_exchange), 0), // a flatten that happened has no clock in it
                     _ => Vec::new(),
                 })
                 .unwrap_or_default();

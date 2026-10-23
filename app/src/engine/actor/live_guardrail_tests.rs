@@ -577,12 +577,12 @@ async fn the_manual_flatten_waits_while_the_watchdog_works_on_the_pair() {
     use tong_funding_core::pair::SystemEvent as Ev;
     let (rig, deps) = live_deps("MANUAL", &live_risk());
     seed_state(&rig.db, UUID, SYM, PairState::FillMonitor);
-    let (rig, mut actor, _h) = armed_actor((rig, deps));
+    let (_rig, mut actor, _h) = armed_actor((rig, deps));
     assert_eq!(actor.land(UUID, Ev::TimeoutPartialFill, json!({})), Ok(PairState::PartialFailure));
     let set_phase = |actor: &mut Actor, phase: naked_leg::Phase| {
         actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).expect("tracked").phase = phase;
     };
-    set_phase(&mut actor, naked_leg::Phase::Verifying { started_ms: rig.clock.now_ms() });
+    set_phase(&mut actor, naked_leg::Phase::Verifying);
     let r = actor.dispatch(Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long });
     assert!(why(&r).contains("watchdog"), "{r:?}");
     assert!(!actor.flows[UUID].flatten_inflight[0], "the refused button started nothing");
@@ -929,7 +929,12 @@ async fn an_unknown_watchdog_conclusion_disarms_and_locks_a_live_engine() {
     rearm(&rig, &mut actor); // ... the user arms it again
     assert!(actor.armed() && !locked(&rig), "armed before the round");
     let (entry_no, now) = (actor.flows[UUID].watchdog.as_ref().unwrap().entry_no, rig.clock.now_ms());
-    actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap().phase = naked_leg::Phase::Verifying { started_ms: now };
+    {
+        // the third failed read in a row is the verdict (A7): the two before it are already counted
+        let w = actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap();
+        w.phase = naked_leg::Phase::Verifying;
+        w.read_failed_rounds = 2;
+    }
     let probe = WatchdogProbe::unreadable([(Leg::Long, Exchange::Binance), (Leg::Short, Exchange::Bybit)], "exchange unreachable (scripted)");
     actor.on_event(Event::WatchdogProbed { pair: UUID.into(), entry_no, probe });
     assert!(locked(&rig) && !actor.armed(), "kill switch ON and disarmed");
