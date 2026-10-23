@@ -537,16 +537,57 @@ async fn flatten_leg_closes_only_the_bare_leg_with_the_actual_position_while_loc
     assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the pair state is not changed");
     let ev = of(&rig.db, LEG_FLATTEN);
     assert!(ev.len() == 1 && ev[0]["leg"] == json!("long") && ev[0]["quantity"] == json!("0.09"), "{ev:?}");
+    assert_eq!(ev[0]["by"], json!("manual"), "naked-leg-watchdog: the button's order says who sent it: {ev:?}");
     // the other leg never had a fill: nothing to close, nothing sent
     assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Short }).await, CommandReply::Accepted);
     run_until(&rig.clock, T - 4_000).await;
     assert_eq!(rig.sim.submitted().iter().filter(|r| r.reduce_only).count(), 1);
     let aborted = of(&rig.db, LEG_FLATTEN_ABORTED);
     assert!(aborted.len() == 1 && aborted[0]["reason"].as_str().unwrap().contains("already flat"), "{aborted:?}");
+    assert_eq!(aborted[0]["by"], json!("manual"), "{aborted:?}");
     // flattening the same leg again finds it flat
     assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }).await, CommandReply::Accepted);
     run_until(&rig.clock, T - 2_000).await;
     assert_eq!(rig.sim.submitted().iter().filter(|r| r.reduce_only).count(), 1, "no second close");
+}
+
+/// naked-leg-watchdog: the same bare leg, nobody presses the button. The watchdog flattens it in Live
+/// too, while the engine is locked and not armed (closing never needs the arming).
+#[tokio::test(start_paused = true)]
+async fn the_watchdog_flattens_the_bare_leg_of_a_locked_live_engine_without_the_button_or_the_arming() {
+    let (rig, h) = bare_long_leg().await;
+    assert!(locked(&rig) && !h.live.borrow().armed, "PARTIAL_FAILURE locked and disarmed the engine");
+    let since = ts_of(&rig.db, "PARTIAL_FAILURE")[0];
+    assert!(rig.sim.submitted().iter().all(|r| !r.reduce_only), "nothing closed yet");
+    run_until(&rig.clock, since + 5_000).await;
+    let closes: Vec<_> = rig.sim.submitted().into_iter().filter(|r| r.reduce_only).collect();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!((closes[0].exchange, closes[0].side, closes[0].quantity), (Exchange::Binance, OrderSide::Sell, dec("0.09")));
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO);
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the pair state is not changed");
+    let ev = of(&rig.db, LEG_FLATTEN);
+    assert!(ev.len() == 1 && ev[0]["by"] == json!("watchdog") && ev[0]["quantity"] == json!("0.09"), "{ev:?}");
+    assert!(locked(&rig) && !h.live.borrow().armed, "the watchdog neither unlocks nor arms");
+    assert_eq!(opens(&rig).len(), 2, "and it opens nothing: only the pair's own two opening orders (one of them refused) ever reached the executor");
+}
+
+/// One check or flatten at a time per pair: while the watchdog works on a pair the user's button waits.
+#[tokio::test(start_paused = true)]
+async fn the_manual_flatten_waits_while_the_watchdog_works_on_the_pair() {
+    use tong_funding_core::pair::SystemEvent as Ev;
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    seed_state(&rig.db, UUID, SYM, PairState::FillMonitor);
+    let (rig, mut actor, _h) = armed_actor((rig, deps));
+    assert_eq!(actor.land(UUID, Ev::TimeoutPartialFill, json!({})), Ok(PairState::PartialFailure));
+    let set_phase = |actor: &mut Actor, phase: naked_leg::Phase| {
+        actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).expect("tracked").phase = phase;
+    };
+    set_phase(&mut actor, naked_leg::Phase::Verifying { started_ms: rig.clock.now_ms() });
+    let r = actor.dispatch(Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long });
+    assert!(why(&r).contains("watchdog"), "{r:?}");
+    assert!(!actor.flows[UUID].flatten_inflight[0], "the refused button started nothing");
+    set_phase(&mut actor, naked_leg::Phase::Idle);
+    assert_eq!(actor.dispatch(Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }), CommandReply::Accepted, "idle again: the button works as before");
 }
 
 #[tokio::test(start_paused = true)]

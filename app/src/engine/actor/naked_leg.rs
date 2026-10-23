@@ -5,6 +5,7 @@
 //! Rule of this file: it never changes the pair's state, and when anything is unknown it sends
 //! nothing, locks the engine (kill switch ON) and says so.
 
+use super::live::FlattenBy;
 use super::*;
 use crate::engine::watchdog as wd;
 
@@ -15,6 +16,20 @@ pub(super) enum Phase {
     Idle,
     /// A round was started at `started_ms`; its result arrives as `Event::WatchdogProbed`.
     Verifying { started_ms: i64 },
+    /// The flatten order of the bare leg was sent and is awaited.
+    Flattening(Flattening),
+}
+
+/// The flatten order the watchdog has in flight.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Flattening {
+    pub(super) leg: Leg,
+    pub(super) quantity: Decimal,
+    pub(super) client_order_id: String,
+    /// Which attempt of this entry it is (1-based).
+    pub(super) attempt: u32,
+    /// After this the order counts as not confirmed (the pair's effective order timeout).
+    pub(super) timeout_at_ms: i64,
 }
 
 /// Progress of the watchdog for one alert entry of a pair (memory only; rebuilt from events).
@@ -128,7 +143,13 @@ impl Actor {
                 self.finish_round(view, decision, None, now);
             }
             Phase::Verifying { .. } => {}
+            Phase::Flattening(f) => self.check_flatten(view, &f, now),
         }
+    }
+
+    /// The watchdog is checking or flattening this pair right now (the manual flatten waits).
+    pub(super) fn watchdog_busy(&self, pair: &str) -> bool {
+        self.flows.get(pair).and_then(|f| f.watchdog.as_ref()).is_some_and(|w| !w.done && w.phase != Phase::Idle)
     }
 
     /// The pair's own orders per leg (open and close), from its order intents.
@@ -208,28 +229,133 @@ impl Actor {
     fn finish_round(&mut self, view: &PairView, decision: wd::Decision, evidence: Option<(&wd::WatchdogProbe, Decimal)>, now: i64) {
         let pair = view.internal_uuid.as_str();
         let Some(w) = self.flows.get(pair).and_then(|f| f.watchdog.clone()) else { return };
-        let conclusion = decision.conclusion();
         let payload = round_payload(view, &w, &decision, evidence);
-        let _ = self.events.append(wd::NAKED_LEG_WATCHDOG, Some(pair), payload);
-        let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) else { return };
-        w.phase = Phase::Idle;
-        match conclusion {
-            wd::Conclusion::WaitForCancel => {
-                w.waited_rounds = w.waited_rounds.saturating_add(1);
-                w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
-            }
-            // the conclusions below are recorded; acting on them comes with 2.4 and 2.5
-            wd::Conclusion::Flatten | wd::Conclusion::Hedged | wd::Conclusion::Flat | wd::Conclusion::Unknown => {
-                w.waited_rounds = 0;
-                w.done = true;
-            }
+        let recorded = self.events.append(wd::NAKED_LEG_WATCHDOG, Some(pair), payload).is_ok();
+        if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+            w.phase = Phase::Idle;
         }
         self.dirty = true;
-        // An order that is not over is cancelled; the next round (5 s later) looks again. Only now,
-        // after the record: the cancel is the action of this conclusion.
-        if let (wd::Conclusion::WaitForCancel, Some((probe, _))) = (conclusion, evidence) {
-            self.cancel_unfinished(view, probe);
+        // The action of the conclusion comes only after its record.
+        match decision {
+            wd::Decision::Flatten { leg, qty } => {
+                let position = evidence.and_then(|(probe, _)| probe.legs[idx(leg)].read.position.clone().ok()).unwrap_or_default();
+                self.begin_flatten(view, leg, qty, position, recorded, now);
+            }
+            // An order that is not over is cancelled; the next round (5 s later) looks again.
+            wd::Decision::WaitForCancel => {
+                if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+                    w.waited_rounds = w.waited_rounds.saturating_add(1);
+                    w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
+                }
+                if let Some((probe, _)) = evidence {
+                    self.cancel_unfinished(view, probe);
+                }
+            }
+            // these end the rounds (2.5 adds the lock for Unknown)
+            wd::Decision::Hedged | wd::Decision::Flat | wd::Decision::Unknown { .. } => {
+                if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+                    w.waited_rounds = 0;
+                    w.done = true;
+                }
+            }
         }
+    }
+
+    /// Sends the one reduce-only close of the bare leg (through the same path as the manual flatten:
+    /// intent first, nothing sent when it cannot be landed) and waits for its result.
+    fn begin_flatten(&mut self, view: &PairView, leg: Leg, qty: Decimal, position: Decimal, decision_recorded: bool, now: i64) {
+        let pair = view.internal_uuid.as_str();
+        let Some(attempts_sent) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()).map(|w| {
+            w.waited_rounds = 0;
+            w.attempts_sent
+        }) else {
+            return;
+        };
+        let retry_later = |this: &mut Actor| {
+            if let Some(w) = this.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+                w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
+            }
+        };
+        // no record, no order
+        if !decision_recorded {
+            self.flatten_aborted(pair, leg, "the conclusion could not be recorded; nothing sent".into(), None, FlattenBy::Watchdog);
+            return retry_later(self);
+        }
+        // like every close: never held back by unreadable settings (defaults then)
+        let (risk, overrides) = self.load_risk().unwrap_or_else(|_| (RiskConfig::default(), RiskOverrides::new()));
+        let eff = effective_for_pair(&risk, &overrides, view.long_exchange, view.short_exchange);
+        let attempt = attempts_sent.saturating_add(1);
+        match self.send_flatten(view, leg, qty, position, &eff, FlattenBy::Watchdog, Some(attempt)) {
+            Ok(client_order_id) => {
+                if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+                    w.attempts_sent = attempt;
+                    w.phase = Phase::Flattening(Flattening { leg, quantity: qty, client_order_id, attempt, timeout_at_ms: fill::timeout_at_ms(&eff, now) });
+                }
+            }
+            Err(why) => {
+                self.flatten_aborted(pair, leg, why, None, FlattenBy::Watchdog);
+                retry_later(self);
+            }
+        }
+    }
+
+    /// Looks at the flatten order in flight: filled, refused, ended without being filled, or not
+    /// confirmed within the order timeout. Anything but "still waiting" ends the attempt.
+    fn check_flatten(&mut self, view: &PairView, f: &Flattening, now: i64) {
+        let pair = view.internal_uuid.as_str();
+        let order = self.flows.get(pair).and_then(|fl| fl.close.as_ref()).and_then(|s| s.legs[idx(f.leg)].as_ref()).filter(|o| o.req.client_order_id == f.client_order_id);
+        let (result, filled): (Option<Result<(), String>>, Option<Decimal>) = match order {
+            None => (Some(Err("the order is no longer tracked".into())), None),
+            Some(o) => {
+                let filled = o.status.as_ref().map(|s| s.filled_quantity);
+                let result = if let Some(reason) = o.submit_rejected() {
+                    Some(Err(format!("order rejected: {reason}")))
+                } else if o.is_over() && !o.query_inflight {
+                    match &o.status {
+                        Some(s) if s.state == OrderState::Filled && s.filled_quantity >= o.req.quantity => Some(Ok(())),
+                        Some(s) => Some(Err(format!("order ended {:?} with {} of {} filled", s.state, dstr(s.filled_quantity), dstr(o.req.quantity)))),
+                        None => Some(Err("order ended without a status".into())),
+                    }
+                } else if now >= f.timeout_at_ms {
+                    Some(Err("order not confirmed within the order timeout".into()))
+                } else {
+                    None // still in flight
+                };
+                (result, filled)
+            }
+        };
+        if let Some(result) = result {
+            self.finish_attempt(view, f, result, filled, now);
+        }
+    }
+
+    /// Records what became of the flatten order and schedules the next verification, 5 s later.
+    fn finish_attempt(&mut self, view: &PairView, f: &Flattening, result: Result<(), String>, filled: Option<Decimal>, now: i64) {
+        let pair = view.internal_uuid.as_str();
+        let mut payload = json!({
+            "kind": wd::KIND_ATTEMPT_RESULT,
+            "ok": result.is_ok(),
+            "attempt": f.attempt,
+            "leg": f.leg.as_str(),
+            "quantity": dstr(f.quantity),
+            "client_order_id": f.client_order_id,
+            "alert_state": view.state.as_str(),
+            "pair_id": view.pair_id,
+            "symbol": view.symbol,
+            "simulated": view.simulated,
+        });
+        if let Some(filled) = filled {
+            payload["filled"] = json!(dstr(filled));
+        }
+        if let Err(why) = &result {
+            payload["reason"] = json!(why);
+        }
+        self.note(wd::NAKED_LEG_WATCHDOG, Some(pair), payload);
+        if let Some(w) = self.flows.get_mut(pair).and_then(|fl| fl.watchdog.as_mut()) {
+            w.phase = Phase::Idle;
+            w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
+        }
+        self.dirty = true;
     }
 
     /// Cancels the pair's own orders that are not over (never a position, never anybody else's

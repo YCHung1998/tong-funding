@@ -364,6 +364,10 @@ impl Actor {
         if let Some(why) = self.executor_mismatch(&view) {
             return CommandReply::Rejected(why);
         }
+        // one check or flatten at a time per pair: while the naked-leg watchdog works on it, the user waits
+        if self.watchdog_busy(pair) {
+            return CommandReply::Rejected("the naked-leg watchdog is checking or flattening this pair right now; try again in a few seconds".into());
+        }
         let flow = self.flows.entry(pair.to_string()).or_default();
         if flow.flatten_inflight[idx(leg)] {
             return CommandReply::Rejected(format!("a flatten of the {} leg is already in progress", leg.as_str()));
@@ -396,12 +400,50 @@ impl Actor {
         CommandReply::Accepted
     }
 
-    fn flatten_aborted(&mut self, pair: &str, leg: Leg, reason: String, detail: Option<Value>) {
-        let mut payload = json!({ "leg": leg.as_str(), "reason": reason });
+    pub(super) fn flatten_aborted(&mut self, pair: &str, leg: Leg, reason: String, detail: Option<Value>, by: FlattenBy) {
+        let mut payload = json!({ "leg": leg.as_str(), "reason": reason, "by": by.as_str() });
         if let Some(d) = detail {
             payload["detail"] = d;
         }
         self.note(LEG_FLATTEN_ABORTED, Some(pair), payload);
+    }
+
+    /// The one place a flatten order is sent, for the Live manual `FlattenLeg` and for the naked-leg
+    /// watchdog: a reduce-only market close of `qty` (already sized by `plan_leg_close`) of ONE leg.
+    /// The order intent is landed first; if that fails nothing is sent. The pair state is not changed.
+    /// Returns the `client_order_id`, or why nothing was sent.
+    pub(super) fn send_flatten(&mut self, view: &PairView, leg: Leg, qty: Decimal, position: Decimal, eff: &EffectiveConfig, by: FlattenBy, attempt: Option<u32>) -> Result<String, String> {
+        let pair = view.internal_uuid.as_str();
+        let exchange = match leg {
+            Leg::Long => view.long_exchange,
+            Leg::Short => view.short_exchange,
+        };
+        let prefix = self.id_prefix();
+        let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, qty);
+        // intent first: if it cannot be landed nothing is sent
+        intent::land_intents(&self.db, pair, &[(leg, &req)]).map_err(|why| format!("order intent not landed ({why}); nothing sent"))?;
+        let mut payload = json!({
+            "leg": leg.as_str(),
+            "exchange": exchange.name(),
+            "symbol": view.symbol,
+            "client_order_id": req.client_order_id,
+            "quantity": dstr(qty),
+            "position": dstr(position),
+            "simulated": view.simulated,
+            "by": by.as_str(),
+        });
+        if let Some(n) = attempt {
+            payload["attempt"] = json!(n);
+        }
+        self.note(LEG_FLATTEN, Some(pair), payload);
+        let now = self.clock.now_ms();
+        let client_order_id = req.client_order_id.clone();
+        let flow = self.flows.entry(pair.to_string()).or_default();
+        flow.close_triggered_ms = Some(now);
+        let set = flow.close.get_or_insert_with(|| OrderSet { sent_at_ms: now, eff: eff.clone(), legs: [None, None], cancel_started: false });
+        set.legs[idx(leg)] = Some(LegOrder::new(req.clone(), Decimal::ONE));
+        self.spawn_submit_inner(pair.to_string(), leg, OrderAction::Close, req, Some(now), true);
+        Ok(client_order_id)
     }
 
     /// Size the leg's reduce-only close with `plan_leg_close` (min of recorded fill and position,
@@ -410,13 +452,14 @@ impl Actor {
         if let Some(flow) = self.flows.get_mut(pair) {
             flow.flatten_inflight[idx(leg)] = false;
         }
+        let manual = FlattenBy::Manual;
         let Some(view) = self.pairs.get(pair).cloned() else { return };
         if !alert::is_alert_state(view.state) {
-            return self.flatten_aborted(pair, leg, format!("pair is {} now; nothing sent", view.state), None);
+            return self.flatten_aborted(pair, leg, format!("pair is {} now; nothing sent", view.state), None, manual);
         }
         let position = match position {
             Ok(p) => p,
-            Err(e) => return self.flatten_aborted(pair, leg, format!("position unreadable: {e}; nothing sent"), None),
+            Err(e) => return self.flatten_aborted(pair, leg, format!("position unreadable: {e}; nothing sent"), None, manual),
         };
         // like every close: never held back by unreadable settings (defaults then)
         let (risk, overrides) = self.load_risk().unwrap_or_else(|_| (RiskConfig::default(), RiskOverrides::new()));
@@ -427,41 +470,37 @@ impl Actor {
         };
         let qty = match plan_leg_close(leg, exchange, &view.symbol, view.simulated, eff.max_leg_imbalance_pct, position, recorded) {
             Ok((qty, _residual)) => qty,
-            Err(LegClosePlanError::WrongSide(reason)) => return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), None),
+            Err(LegClosePlanError::WrongSide(reason)) => return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), None, manual),
             Err(LegClosePlanError::Mismatch(alert)) => {
                 self.note(CLOSE_QUANTITY_MISMATCH, Some(pair), alert.clone());
                 let reason = alert["reason"].as_str().unwrap_or("position and recorded fill disagree").to_string();
-                return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), Some(alert));
+                return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), Some(alert), manual);
             }
         };
         if qty.is_zero() {
-            return self.flatten_aborted(pair, leg, "nothing to close on this leg (already flat)".into(), None);
+            return self.flatten_aborted(pair, leg, "nothing to close on this leg (already flat)".into(), None, manual);
         }
-        let prefix = self.id_prefix();
-        let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, qty);
-        // intent first: if it cannot be landed nothing is sent
-        if let Err(why) = intent::land_intents(&self.db, pair, &[(leg, &req)]) {
-            return self.flatten_aborted(pair, leg, format!("order intent not landed ({why}); nothing sent"), None);
+        if let Err(why) = self.send_flatten(&view, leg, qty, position, &eff, manual, None) {
+            self.flatten_aborted(pair, leg, why, None, manual);
         }
-        self.note(
-            LEG_FLATTEN,
-            Some(pair),
-            json!({
-                "leg": leg.as_str(),
-                "exchange": exchange.name(),
-                "symbol": view.symbol,
-                "client_order_id": req.client_order_id,
-                "quantity": dstr(qty),
-                "position": dstr(position),
-                "simulated": view.simulated,
-            }),
-        );
-        let now = self.clock.now_ms();
-        let flow = self.flows.entry(pair.to_string()).or_default();
-        flow.close_triggered_ms = Some(now);
-        let set = flow.close.get_or_insert_with(|| OrderSet { sent_at_ms: now, eff: eff.clone(), legs: [None, None], cancel_started: false });
-        set.legs[idx(leg)] = Some(LegOrder::new(req.clone(), Decimal::ONE));
-        self.spawn_submit_inner(pair.to_string(), leg, OrderAction::Close, req, Some(now), true);
+    }
+}
+
+/// Who asked for a flatten order (written as `by` on `LEG_FLATTEN` / `LEG_FLATTEN_ABORTED`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlattenBy {
+    /// The user pressed the flatten button (Live only).
+    Manual,
+    /// The naked-leg watchdog (authorization B).
+    Watchdog,
+}
+
+impl FlattenBy {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            FlattenBy::Manual => "manual",
+            FlattenBy::Watchdog => "watchdog",
+        }
     }
 }
 

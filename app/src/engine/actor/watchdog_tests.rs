@@ -370,3 +370,122 @@ async fn three_consecutive_unfinished_rounds_conclude_unknown_and_the_last_one_c
     run_until(&rig.clock, since + 40_000).await;
     assert_eq!(rounds(&rig.db).len(), 3, "an Unknown conclusion ends the rounds: no fourth one");
 }
+
+// ---- 2.4 the flatten: one reduce-only order of the bare leg, intent first, by: "watchdog" ----
+
+fn events_of(db: &Db, label: &str) -> Vec<(i64, Value)> {
+    events(db).into_iter().filter(|(_, l, _)| l == label).map(|(t, _, p)| (t, p)).collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_bare_leg_is_flattened_with_one_reduce_only_order_and_the_pair_state_does_not_change() {
+    let (rig, _h, _w, since) = bare_long(Opts::default()).await;
+    run_until(&rig.clock, since + 5_000).await;
+    let sent = rig.sim.submitted();
+    assert_eq!(sent.len(), 3, "the two opening orders and exactly one more: {sent:?}");
+    let close = &sent[2];
+    assert_eq!(
+        (close.client_order_id.clone(), close.exchange, close.side, close.quantity, close.reduce_only, close.leverage, close.intended_base_qty),
+        (sim_id(Leg::Long, OrderAction::Close), Exchange::Binance, OrderSide::Sell, dec("10"), true, None, None),
+        "a reduce-only market sell of the long leg's recorded position, nothing else"
+    );
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO, "the bare leg is flat");
+    assert_eq!(rig.sim.position(Exchange::Bybit, SYM), Decimal::ZERO, "the other exchange was never touched");
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the pair still needs the user's confirmation");
+    let flatten = events_of(&rig.db, "LEG_FLATTEN");
+    assert_eq!(flatten.len(), 1, "{flatten:?}");
+    let f = &flatten[0].1;
+    assert_eq!((f["by"].clone(), f["leg"].clone(), f["exchange"].clone(), f["quantity"].clone(), f["position"].clone()), (json!("watchdog"), json!("long"), json!("Binance"), json!("10"), json!("10")), "{f}");
+    assert_eq!((f["client_order_id"].clone(), f["simulated"].clone(), f["attempt"].clone()), (json!(sim_id(Leg::Long, OrderAction::Close)), json!(true), json!(1)), "{f}");
+    let intent = rig.db.get_intent(&sim_id(Leg::Long, OrderAction::Close)).unwrap().expect("the order intent was landed");
+    assert_eq!(intent.state, "FILLED");
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_the_order_the_attempt_is_recorded_and_one_more_round_confirms_both_legs_flat() {
+    let (rig, _h, _w, since) = bare_long(Opts::default()).await;
+    run_until(&rig.clock, since + 12_000).await;
+    let attempts: Vec<Value> = payloads(&rig.db, wd::NAKED_LEG_WATCHDOG).into_iter().filter(|p| p["kind"] == json!(wd::KIND_ATTEMPT_RESULT)).collect();
+    assert_eq!(attempts.len(), 1, "{attempts:?}");
+    let a = &attempts[0];
+    assert_eq!((a["ok"].clone(), a["attempt"].clone(), a["leg"].clone(), a["quantity"].clone()), (json!(true), json!(1), json!("long"), json!("10")), "{a}");
+    assert_eq!(a["client_order_id"], json!(sim_id(Leg::Long, OrderAction::Close)));
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["FLATTEN", "FLAT"], "verified again after the order: nothing left on either leg");
+    assert_eq!(ts_of(&rig.db, wd::NAKED_LEG_WATCHDOG), vec![since + 5_000, since + 6_000, since + 11_000], "the order's result is seen at the next tick; the next round is 5 s after it");
+    assert_eq!(r[1]["attempts_sent"], json!(1));
+    assert_eq!(rig.sim.submitted().len(), 3, "and no second order");
+    run_until(&rig.clock, since + 40_000).await;
+    assert_eq!(rig.sim.submitted().len(), 3);
+    assert_eq!(rounds(&rig.db).len(), 2, "FLAT ends the rounds");
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_order_intent_that_cannot_be_landed_sends_nothing_and_halts_the_store() {
+    let (rig, _h, _w, since) = bare_long(Opts::default()).await;
+    run_until(&rig.clock, since + 1_000).await;
+    rig.db
+        .with_raw_conn_for_tests(|c| Ok(c.execute_batch("CREATE TRIGGER no_more_intents BEFORE INSERT ON order_intents BEGIN SELECT RAISE(ABORT, 'injected failure'); END")?))
+        .unwrap();
+    run_until(&rig.clock, since + 5_000).await;
+    assert_eq!(rig.sim.submitted().len(), 2, "no intent, no order: only the two opening orders ever reached the executor");
+    assert!(rig.db.is_halted(), "a write that fails halts the store (fail closed)");
+    let plain = rusqlite::Connection::open(rig.db.path()).unwrap(); // a halted store refuses reads; the file does not
+    let rows: i64 = plain.query_row("SELECT COUNT(*) FROM order_intents WHERE client_order_id = ?1", [sim_id(Leg::Long, OrderAction::Close)], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 0, "no close intent exists");
+    run_until(&rig.clock, since + 20_000).await;
+    assert_eq!(rig.sim.submitted().len(), 2, "and a halted store runs no further round");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_watchdog_flattens_in_exchange_demo_too_after_a_restart_with_the_wait_counted_from_the_entry() {
+    let (rig, deps) = rig(Opts { demo: true, ..Opts::default() });
+    let entered = rig.clock.now_ms() - 1_000; // the pair entered the state 1 s before this process started
+    seed_demo_bare_long(&rig, entered);
+    let _h = start(deps);
+    let start_ms = rig.clock.now_ms();
+    run_until(&rig.clock, start_ms + 2_000).await;
+    assert!(rig.demo.requests.lock().unwrap().is_empty(), "entered + 5 s has not come yet: the wait is counted from the entry event, not from the restart");
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG), 0);
+    run_until(&rig.clock, entered + 5_000).await;
+    let requests = rig.demo.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    let r = &requests[0];
+    assert_eq!((r.exchange, r.side, r.quantity, r.reduce_only), (Exchange::Binance, OrderSide::Sell, dec("10"), true));
+    assert!(r.client_order_id.starts_with("demo"), "{}", r.client_order_id);
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    let f = events_of(&rig.db, "LEG_FLATTEN");
+    assert_eq!((f.len(), f[0].1["by"].clone(), f[0].1["simulated"].clone()), (1, json!("watchdog"), json!(false)));
+    assert!(rig.sim.submitted().is_empty(), "the simulator was never involved");
+}
+
+/// A demo pair that entered PARTIAL_FAILURE at `entered_ms`: its long leg filled (10) and its short
+/// order refused, as a restart finds it in the database. The fake exchange holds the long position.
+fn seed_demo_bare_long(rig: &Rig, entered_ms: i64) {
+    seed_pair(&rig.db, UUID, PairState::PartialFailure, false);
+    let req = |leg: Leg| OrderRequest {
+        prepared: None,
+        notional_usdt: None,
+        client_order_id: client_order_id(IdPrefix::Demo, UUID, leg, OrderAction::Open, 0),
+        exchange: if leg == Leg::Long { Exchange::Binance } else { Exchange::Bybit },
+        symbol: SYM.into(),
+        side: if leg == Leg::Long { OrderSide::Buy } else { OrderSide::Sell },
+        quantity: dec("10"),
+        reduce_only: false,
+        intended_base_qty: Some(dec("10")),
+        leverage: Some(dec("5")),
+    };
+    let (long, short) = (req(Leg::Long), req(Leg::Short));
+    intent::land_intents(&rig.db, UUID, &[(Leg::Long, &long), (Leg::Short, &short)]).unwrap();
+    rig.db.update_intent_state(&long.client_order_id, IntentState::Filled, Some("demo-1")).unwrap();
+    rig.db.update_intent_state(&short.client_order_id, IntentState::Failed, None).unwrap();
+    rig.demo.positions.lock().unwrap().insert((Exchange::Binance, SYM.into()), dec("10"));
+    let filled = OrderStatus { client_order_id: long.client_order_id.clone(), exchange_order_id: Some("demo-1".into()), filled_quantity: dec("10"), avg_price: Some(dec("100")), fee: None, fee_asset: None, state: OrderState::Filled };
+    rig.demo.orders.lock().unwrap().insert(long.client_order_id.clone(), filled);
+    let now = rig.clock.now_ms();
+    rig.clock.set(entered_ms);
+    crate::store::events::EventStore::new(rig.db.clone())
+        .append(transition::PAIR_TRANSITION, Some(UUID), json!({ "from": "ORDER_SUBMIT", "to": "PARTIAL_FAILURE", "event": "System(OneLegSubmitFailed)", "detail": { "simulated": false } }))
+        .unwrap();
+    rig.clock.set(now);
+}
