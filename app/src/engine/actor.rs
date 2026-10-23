@@ -408,6 +408,32 @@ impl Drop for ManualDoneGuard {
     }
 }
 
+/// Review round 2 (B4): holds the event a task must report when it ends without its own result (a panic
+/// in an adapter). `disarm` once the real result is sent; dropped armed, the fallback is sent instead
+/// (`try_send`: a drop must not wait), so the pair is never left "in flight" by a lost task.
+struct LostTaskGuard {
+    tx: mpsc::Sender<Event>,
+    fallback: Option<Event>,
+}
+
+impl LostTaskGuard {
+    fn new(tx: mpsc::Sender<Event>, fallback: Event) -> LostTaskGuard {
+        LostTaskGuard { tx, fallback: Some(fallback) }
+    }
+
+    fn disarm(&mut self) {
+        self.fallback = None;
+    }
+}
+
+impl Drop for LostTaskGuard {
+    fn drop(&mut self) {
+        if let Some(event) = self.fallback.take() {
+            let _ = self.tx.try_send(event);
+        }
+    }
+}
+
 /// How long the executor's pre-send barrier may take before the pair is aborted ("nothing sent"). It is
 /// independent of the fill timeout: per leg it may need a mode read and a set-leverage (each bounded by the
 /// 5 s order-request timeout), for two legs, plus margin.

@@ -210,11 +210,15 @@ impl Actor {
         let legs = [(Leg::Long, view.long_exchange), (Leg::Short, view.short_exchange)];
         let symbol = view.symbol.clone();
         tokio::spawn(async move {
+            // a task that ends without a result (a panic) still reports one: an unreadable round
+            let lost = wd::WatchdogProbe::unreadable(legs, "the verification task ended without a result");
+            let mut guard = LostTaskGuard::new(tx.clone(), Event::WatchdogProbed { pair: pair.clone(), entry_no, probe: lost });
             let limit = Duration::from_millis(wd::WATCHDOG_PROBE_TIMEOUT_MS as u64);
             let probe = match tokio::time::timeout(limit, probe_pair(account.as_ref(), executor.as_ref(), &symbol, legs, orders)).await {
                 Ok(p) => p,
                 Err(_) => wd::WatchdogProbe::unreadable(legs, &format!("the verification round did not finish within {} s", wd::WATCHDOG_PROBE_TIMEOUT_MS / 1000)),
             };
+            guard.disarm();
             let _ = tx.send(Event::WatchdogProbed { pair, entry_no, probe }).await;
         });
     }

@@ -421,7 +421,11 @@ impl Actor {
         let (account, executor, tx) = (self.account_for(view.simulated), self.executor.clone(), self.event_tx.clone());
         let (sym, pair) = (view.symbol.clone(), pair.to_string());
         tokio::spawn(async move {
+            // a read task that ends without a result (a panic) still clears `flatten_inflight` and writes the abort
+            let lost = "the position read task ended without a result".to_string();
+            let mut guard = LostTaskGuard::new(tx.clone(), Event::FlattenPositionFetched { pair: pair.clone(), leg, position: Err(lost.clone()), recorded: Err(lost) });
             let (position, recorded) = tokio::join!(signed_position(account.as_ref(), exchange, &sym), recorded_fill(executor.as_ref(), exchange, &sym, &orders));
+            guard.disarm();
             let _ = tx.send(Event::FlattenPositionFetched { pair, leg, position, recorded }).await;
         });
         CommandReply::Accepted

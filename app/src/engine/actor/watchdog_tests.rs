@@ -27,6 +27,8 @@ struct Watched {
     cancelled: Mutex<Vec<String>>,
     hold: std::sync::atomic::AtomicBool,
     release: tokio::sync::Notify,
+    /// Every lookup panics (a bug in an adapter): the task that made it ends without a result.
+    panic_queries: std::sync::atomic::AtomicBool,
     /// Orders whose id starts with this prefix are accepted and never fill (Open until cancelled);
     /// they never reach the simulator, so they leave no position.
     idle_prefix: Mutex<Option<String>>,
@@ -43,6 +45,7 @@ impl Watched {
             cancelled: Mutex::default(),
             hold: std::sync::atomic::AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
+            panic_queries: std::sync::atomic::AtomicBool::new(false),
             idle_prefix: Mutex::default(),
             idle: Mutex::default(),
         })
@@ -69,6 +72,9 @@ impl Watched {
     }
     fn swallow_cancels(&self, n: usize) {
         self.swallow_cancels.store(n, Ordering::SeqCst);
+    }
+    fn panic_queries(&self, on: bool) {
+        self.panic_queries.store(on, Ordering::SeqCst);
     }
     fn hold(&self, on: bool) {
         self.hold.store(on, Ordering::SeqCst);
@@ -109,6 +115,7 @@ impl Executor for Watched {
         self.queries.fetch_add(1, Ordering::SeqCst);
         let (symbol, id) = (symbol.to_string(), id.to_string());
         Box::pin(async move {
+            assert!(!self.panic_queries.load(Ordering::SeqCst), "scripted lookup panic");
             if self.hold.load(Ordering::SeqCst) {
                 self.release.notified().await;
             }
@@ -947,4 +954,37 @@ async fn a_manual_flatten_is_sent_after_a_leftover_orders_timeout_and_refused_be
     let later = actor.send_flatten(&view, plan(), &eff, live::FlattenBy::Manual, None);
     assert!(later.is_ok(), "past the order timeout the leftover is unknown, not running: {later:?}");
     assert_eq!(events_of(&rig.db, "LEG_FLATTEN").len(), 1);
+}
+
+// ---- review round 2, B4: a task that ends without a result does not leave the pair stuck -------
+
+/// A verification task that panics (an adapter bug) used to leave the round "in flight" forever: no
+/// record, no lock, no further round. Now it reports an unreadable round (a failed read), so the third
+/// one is Unknown and locks.
+#[tokio::test(start_paused = true)]
+async fn a_verification_task_that_panics_counts_as_a_failed_read_and_the_third_locks() {
+    let (rig, _h, watched, since) = bare_long(Opts::default()).await;
+    watched.panic_queries(true);
+    run_until(&rig.clock, since + 30_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["READ_FAILED", "READ_FAILED", "UNKNOWN"], "{r:?}");
+    assert!(r[0]["reason"].as_str().unwrap().contains("without a result"), "{}", r[0]);
+    assert!(rig.db.kill_switch_halted(), "locked, not stuck");
+    assert!(reduce_only_orders(&rig).is_empty(), "nothing sent");
+}
+
+/// The manual FlattenLeg's read task that panics used to leave `flatten_inflight` set: every later
+/// FlattenLeg said "already in progress" and the watchdog waited for it.
+#[tokio::test(start_paused = true)]
+async fn a_manual_flatten_read_that_panics_clears_its_guard_and_is_recorded_as_aborted() {
+    let (rig, h, watched, since) = live_bare_long().await;
+    watched.panic_queries(true);
+    run_until(&rig.clock, since + 1_000).await;
+    assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }).await, CommandReply::Accepted);
+    run_until(&rig.clock, since + 2_000).await;
+    let aborted = events_of(&rig.db, "LEG_FLATTEN_ABORTED");
+    assert_eq!(aborted.len(), 1, "{aborted:?}");
+    assert!(aborted[0].1["reason"].as_str().unwrap().contains("without a result"), "{}", aborted[0].1);
+    watched.panic_queries(false);
+    assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }).await, CommandReply::Accepted, "not stuck on `already in progress`");
 }
