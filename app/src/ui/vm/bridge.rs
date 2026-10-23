@@ -375,6 +375,9 @@ pub struct UiSnapshot {
     pub market_updates: u64,
     /// The engine's latest snapshot; `None` = not running (every trading action is disabled).
     pub engine: Option<EngineState>,
+    /// loss-circuit-breaker: the engine's status-bar data (trading allowed or why not, queue, breaker,
+    /// pairs needing a person); `None` = the engine has not published one.
+    pub engine_status: Option<crate::engine::status::EngineStatus>,
     /// Why the engine is not running, if it failed to start.
     pub engine_error: Option<String>,
     /// `pairs.entry_json.scan` by internal uuid (scan prices, notional, leverage, Net Edge).
@@ -444,6 +447,8 @@ pub enum SourceUpdate {
     System(SystemFlags),
     ScanRuns { records: Vec<ScanRecord>, capacity: usize },
     Engine(EngineState),
+    /// loss-circuit-breaker: the status-bar data that came with the same engine snapshot.
+    EngineStatus(crate::engine::status::EngineStatus),
     EngineUnavailable(String),
     PairEntries(BTreeMap<String, Value>),
     TradeEvents(Vec<StoredEvent>),
@@ -533,8 +538,10 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
             snap.engine = Some(e);
             snap.engine_error = None;
         }
+        SourceUpdate::EngineStatus(status) => snap.engine_status = Some(status),
         SourceUpdate::EngineUnavailable(why) => {
             snap.engine = None;
+            snap.engine_status = None;
             snap.engine_error = Some(why);
         }
         SourceUpdate::PairEntries(m) => snap.pair_entries = m,

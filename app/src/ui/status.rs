@@ -1,5 +1,6 @@
-//! Status bar model. In this change connections are always "disconnected" and the
-//! kill switch slot is always "not enabled"; later changes feed real values in.
+//! Status bar model: identity, mode and the exchange connection dots. What the bar says about
+//! trading (allowed or stopped and why, trigger, queue, breaker, pairs to handle) comes from
+//! `vm::status_bar`.
 
 use super::env_label::EnvLabel;
 use super::nav::{Page, DEBUG_WARNING};
@@ -41,31 +42,15 @@ impl Connection {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KillSwitch {
-    Disabled,
-    Halted,
-}
-
-impl KillSwitch {
-    pub fn label(self) -> &'static str {
-        match self {
-            KillSwitch::Disabled => "未啟用",
-            KillSwitch::Halted => "已停機",
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusModel {
     pub identity: ProcessIdentity,
     pub mode: ExecutionMode,
     pub exchanges: Vec<(&'static str, Connection)>,
-    pub kill_switch: KillSwitch,
 }
 
 impl Default for StatusModel {
-    /// Fail-safe first-launch state: SIMULATION, nothing connected, kill switch slot idle.
+    /// Fail-safe first-launch state: SIMULATION, nothing connected.
     fn default() -> Self {
         StatusModel {
             identity: ProcessIdentity::Demo,
@@ -75,7 +60,6 @@ impl Default for StatusModel {
                 ("Bybit", Connection::Disconnected),
                 ("OKX", Connection::Disconnected),
             ],
-            kill_switch: KillSwitch::Disabled,
         }
     }
 }
@@ -92,9 +76,6 @@ pub fn all_ui_strings(identity: ProcessIdentity) -> Vec<String> {
     }
     for c in [Connection::Disconnected, Connection::Connected] {
         out.push(c.label().to_string());
-    }
-    for k in [KillSwitch::Disabled, KillSwitch::Halted] {
-        out.push(k.label().to_string());
     }
     for (name, _) in StatusModel::default().exchanges {
         out.push(name.to_string());

@@ -13,7 +13,7 @@ use tong_funding_core::types::Exchange;
 
 use super::alerts::{self, Alert, FreshStatus};
 use super::banner::{self, Acks, LoadView, Region};
-use super::bridge::{Bridge, CommandSink, KillSwitchState, ReadOnlyDataSource, SourceId, SourceUpdate, UiSnapshot};
+use super::bridge::{Bridge, CommandSink, ReadOnlyDataSource, SourceId, SourceUpdate, UiSnapshot};
 use super::trading_pages::TradingState;
 use super::clock::{now_unix_secs, read_clock};
 use super::dashboard::{self, DashboardVm};
@@ -26,6 +26,7 @@ use super::scan_view::{ScanColumn, ScanEvent, ScanViewState, table_rows};
 use super::scanner::{self, RowsView, ScannerVm, TableState as ScanState};
 use super::env_label::{BannerTone, EnvBanner, EnvLabel};
 use super::status::{Connection, StatusModel};
+use super::status_bar::{self, Cell, StatusBarVm};
 use super::system_log::{self, LogFilter, LogRow, SystemLogVm};
 use super::theme;
 use super::units::{fs, rx};
@@ -40,6 +41,8 @@ pub struct Shell {
     now_secs: i64,
     pub(crate) now_ms: i64,
     status: StatusModel,
+    /// What the status bar says (loss-circuit-breaker 3.1); rebuilt on every recompute and every second.
+    bar: StatusBarVm,
     pub(crate) source: Arc<dyn ReadOnlyDataSource>,
     /// Commands to the engine (the only way a page changes trading state).
     pub(crate) sink: Arc<dyn CommandSink>,
@@ -140,6 +143,7 @@ impl Shell {
             now_secs: now_unix_secs(),
             now_ms,
             status: StatusModel::default(),
+            bar: status_bar::build(&snap, now_ms),
             source,
             sink,
             trading,
@@ -200,6 +204,8 @@ impl Shell {
         if secs != self.now_secs {
             self.now_secs = secs;
             self.alerts = alerts::alerts(&self.snap, self.now_ms);
+            // the queue countdown moves every second
+            self.bar = status_bar::build(&self.snap, self.now_ms);
             self.prune_acks();
             self.auto_add_now();
             let now = self.now_ms;
@@ -227,6 +233,7 @@ impl Shell {
         self.alerts = alerts::alerts(&self.snap, self.now_ms);
         self.prune_acks();
         self.status = self.status_model();
+        self.bar = status_bar::build(&self.snap, self.now_ms);
         self.sync_table(cx);
     }
 
@@ -268,10 +275,6 @@ impl Shell {
             let online = self.snap.health_of(SourceId::MarketPoll(ex)).is_some_and(|h| alerts::source_status(h, self.now_ms) == FreshStatus::Online);
             *conn = if online { Connection::Connected } else { Connection::Disconnected };
         }
-        s.kill_switch = match self.snap.system.kill_switch {
-            KillSwitchState::Off if self.snap.system.store_halt.is_none() => super::status::KillSwitch::Disabled,
-            _ => super::status::KillSwitch::Halted,
-        };
         s
     }
 
@@ -819,16 +822,18 @@ impl Shell {
     fn status_bar(&self, zoom_label: Option<String>) -> Div {
         let bar = div()
             .flex()
+            .flex_wrap()
             .items_center()
             .justify_between()
-            .h(rx(28.0))
+            .gap_x_4()
+            .min_h(rx(28.0))
             .px_4()
             .bg(rgb(theme::BG_BASE))
             .border_t_1()
             .border_color(rgb(theme::BORDER))
             .text_size(fs(10.0));
-        let mut left = div().flex().items_center().gap_4().child(div().px_2().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::ACCENT)).child(self.status.mode.label(self.status.identity)));
-        for (name, conn) in &self.status.exchanges {
+        let mut left = div().flex().items_center().gap_4().child(div().px_2().rounded_sm().bg(rgb(theme::BG_CARD)).text_color(rgb(theme::ACCENT)).child(self.bar.env));
+        for (name, conn) in &self.bar.exchanges {
             let dot = if *conn == Connection::Connected { theme::POSITIVE } else { theme::TEXT_MUTED };
             left = left.child(
                 div()
@@ -844,13 +849,18 @@ impl Shell {
         if let Some(label) = zoom_label {
             left = left.child(div().text_color(rgb(theme::TEXT_MUTED)).child(label));
         }
-        bar.child(left).child(
-            div()
-                .flex()
-                .gap_1()
-                .child(div().text_color(rgb(theme::TEXT_MUTED)).child("Kill switch"))
-                .child(div().text_color(rgb(theme::TEXT_SECONDARY)).child(self.status.kill_switch.label())),
-        )
+        let cell = |c: &Cell| div().text_color(rgb(c.tone.map_or(theme::TEXT_SECONDARY, theme::Tone::color))).child(c.text.clone());
+        let right = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_4()
+            .child(cell(&self.bar.trading))
+            .child(cell(&self.bar.trigger))
+            .child(cell(&self.bar.queue))
+            .child(cell(&self.bar.breaker))
+            .child(cell(&self.bar.handling));
+        bar.child(left).child(right)
     }
 }
 

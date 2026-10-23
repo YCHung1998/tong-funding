@@ -115,6 +115,16 @@ impl EnvLabel {
         }
     }
 
+    /// The status bar's environment in plain Chinese: 模擬 / Demo 帳戶 / 真錢 (never the internal code).
+    pub fn status_name(self) -> &'static str {
+        match (self.identity, self.mode) {
+            (ProcessIdentity::Live, ExecutionMode::ExchangeDemo) => "真錢",
+            (ProcessIdentity::Live, ExecutionMode::Simulation) => "模擬",
+            (ProcessIdentity::Demo, ExecutionMode::ExchangeDemo) => "Demo 帳戶",
+            (ProcessIdentity::Demo, ExecutionMode::Simulation) => "模擬",
+        }
+    }
+
     /// Name of this world for notices and pair cards.
     pub fn env_name(self) -> &'static str {
         match (self.identity, self.mode) {

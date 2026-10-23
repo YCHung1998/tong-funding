@@ -94,10 +94,11 @@ fn all_three_exchanges_start_disconnected() {
 }
 
 #[test]
-fn kill_switch_slot_shows_not_enabled() {
-    let s = StatusModel::default();
-    assert_eq!(s.kill_switch, KillSwitch::Disabled);
-    assert_eq!(s.kill_switch.label(), "未啟用");
+fn the_old_kill_switch_slot_is_gone_the_bar_speaks_of_trading() {
+    // loss-circuit-breaker 3.1: 「Kill switch 未啟用」 is replaced by 「交易：允許 / 已停止（原因）」
+    for id in [ProcessIdentity::Demo, ProcessIdentity::Live] {
+        assert!(all_ui_strings(id).iter().all(|s| !s.contains("Kill switch") && s != "未啟用" && s != "已停機"));
+    }
 }
 
 #[test]

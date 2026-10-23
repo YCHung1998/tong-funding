@@ -917,8 +917,12 @@ where
         let (shared, mut rx) = (ctx.shared.clone(), handle.snapshots.clone());
         tokio::spawn(async move {
             loop {
-                let state = super::engine_view::engine_state(&rx.borrow_and_update());
+                let (state, status) = {
+                    let snapshot = rx.borrow_and_update();
+                    (super::engine_view::engine_state(&snapshot), snapshot.status.clone())
+                };
                 shared.push(SourceUpdate::Engine(state));
+                shared.push(SourceUpdate::EngineStatus(status));
                 if rx.changed().await.is_err() {
                     shared.push(SourceUpdate::EngineUnavailable("引擎已停止".into()));
                     break;

@@ -46,6 +46,8 @@ pub mod symbol_options;
 pub mod risk_settings;
 #[path = "vm/staged_orders.rs"]
 pub mod staged_orders;
+#[path = "vm/status_bar.rs"]
+pub mod status_bar;
 #[path = "vm/dashboard.rs"]
 pub mod dashboard;
 #[path = "vm/env_label.rs"]
