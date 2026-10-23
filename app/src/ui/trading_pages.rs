@@ -55,6 +55,8 @@ pub struct TradingState {
     pub staged_sel: BTreeSet<String>,
     pub staged_confirm: Option<PendingConfirm>,
     pub staged_note: Option<String>,
+    /// Disabled-exchange lines the user opened (`<page>-<exchange>`, all pages); never persisted.
+    pub expanded: BTreeSet<String>,
     pub close_confirm: Option<CloseConfirm>,
     pub close_now_confirm: Option<RunningRow>,
     c_notional: In,
@@ -130,6 +132,7 @@ impl TradingState {
             staged_sel: BTreeSet::new(),
             staged_confirm: None,
             staged_note: None,
+            expanded: BTreeSet::new(),
             close_confirm: None,
             close_now_confirm: None,
             c_notional: new_input(window, cx, "1000"),
@@ -481,6 +484,35 @@ impl Shell {
         ))
     }
 
+    /// Opens or closes one disabled-exchange line (`key` = `<page>-<exchange>`).
+    pub(crate) fn toggle_note(&mut self, key: &str) {
+        if !self.trading.expanded.remove(key) {
+            self.trading.expanded.insert(key.to_string());
+        }
+    }
+
+    /// The click handler of the disabled-exchange line `key`.
+    pub(crate) fn note_toggle(&self, cx: &Context<Self>, key: String) -> ClickFn {
+        Box::new(cx.listener(move |this: &mut Shell, _: &ClickEvent, _, cx| {
+            this.toggle_note(&key);
+            cx.notify();
+        }))
+    }
+
+    /// The overview page; its disabled-exchange lines open and close here.
+    pub(crate) fn dashboard_page(&self, cx: &Context<Self>) -> Div {
+        let open = |k: &str| self.trading.expanded.contains(k);
+        let toggle = |k: String| self.note_toggle(cx, k);
+        super::pages::dashboard_page(&self.dashboard, &super::pages::Notes { open: &open, toggle: &toggle })
+    }
+
+    /// One disabled-exchange line of the page `page`.
+    fn note_line(&self, n: &super::labels::DisabledNote, page: &str, cx: &Context<Self>) -> Div {
+        let open = |k: &str| self.trading.expanded.contains(k);
+        let toggle = |k: String| self.note_toggle(cx, k);
+        super::pages::Notes { open: &open, toggle: &toggle }.line(n, page)
+    }
+
     fn click(&self, cx: &mut Context<Self>, f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> ClickFn {
         Box::new(cx.listener(move |this: &mut Shell, _: &ClickEvent, _, cx| {
             f(this, cx);
@@ -650,6 +682,9 @@ impl Shell {
         let mut margins = div().flex().gap_4();
         for (ex, t) in &vm.margins {
             margins = margins.child(small(format!("{} 可用保證金：{t}", ex.name()), theme::TEXT_SECONDARY));
+        }
+        for n in &vm.disabled_exchanges {
+            margins = margins.child(self.note_line(n, "staged", cx));
         }
         let enabled = vm.disabled.is_empty();
         let mut submit = div().flex().gap_3().items_center().child(btn("submit-selected", "一鍵送出已選取", enabled, self.click(cx, |this, _| {
@@ -919,9 +954,10 @@ impl Shell {
         match vm.notional {
             Some(n) => {
                 for q in contract_settings::quote(&symbol, n, &self.snap, self.now_ms) {
-                    let price = q.price.map_or_else(|| DASH.into(), |p| p.normalize().to_string());
-                    let age = q.observed_at.map_or_else(|| DASH.into(), |t| format!("{} 秒前", format::secs(self.now_ms - t)));
-                    quote = quote.child(small(format!("{} · 現價 {price} · {age} · 預期數量 {}", q.exchange.name(), q.cell.text()), theme::TEXT_SECONDARY));
+                    quote = match &q.disabled {
+                        Some(note) => quote.child(self.note_line(note, "contract", cx)),
+                        None => quote.child(small(q.line(self.now_ms), theme::TEXT_SECONDARY)),
+                    };
                 }
                 // Pairs trade one shared quantity (matched-leg-quantity); the rows above are single-leg references.
                 quote = quote.child(small(contract_settings::pair_quote(&symbol, n, &self.snap, self.now_ms), theme::TEXT_PRIMARY));

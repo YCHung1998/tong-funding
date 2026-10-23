@@ -21,6 +21,7 @@ use super::contract_settings::{pair_quantity, QuoteCell};
 use super::leverage_cap::{self, CapCheck};
 use super::positions::{spread_view, SpreadView};
 use super::engine_view::{blocker_text, refusing_blockers};
+use super::labels::{plain_error, DisabledNote};
 use super::env_label::{ConfirmKind, EnvLabel};
 use super::risk_settings::missing_display;
 use crate::engine::command::{Blocker, Command, PairView};
@@ -322,8 +323,10 @@ pub struct StagedVm {
     pub mode: Option<ExecutionMode>,
     pub identity: crate::identity::ProcessIdentity,
     pub trigger_mode: Option<TriggerMode>,
-    /// Binance / Bybit available margin text (never 0 for unknown).
+    /// Available margin text of each ENABLED exchange (never 0 for unknown).
     pub margins: Vec<(Exchange, String)>,
+    /// Exchanges the risk settings left unticked: one muted line each, their margin text behind it.
+    pub disabled_exchanges: Vec<DisabledNote>,
     pub last_results: Vec<AttemptView>,
     pub manual: Vec<ManualHandling>,
     pub running: Vec<RunningRow>,
@@ -497,7 +500,7 @@ fn margin_text(acc: Option<&LegAccount>) -> String {
         None => "未知（尚未查詢）".into(),
         Some(a) => match &a.available_margin {
             Ok(m) => format!("{} USDT", super::format::money(*m, 2)),
-            Err(e) => format!("未知（{e}）"),
+            Err(e) => format!("未知（{}）", plain_error(e)),
         },
     }
 }
@@ -546,7 +549,16 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         }
     }
 
-    let margins = tradable_exchanges(snap.identity).iter().map(|ex| (*ex, margin_text(snap.leg_accounts.get(&(false, *ex))))).collect();
+    // ui-plain-language: an exchange the risk settings left unticked has no margin line, only its muted line.
+    let (mut margins, mut disabled_exchanges) = (Vec::new(), Vec::new());
+    for ex in tradable_exchanges(snap.identity).iter().copied() {
+        let text = margin_text(snap.leg_accounts.get(&(false, ex)));
+        if snap.exchange_enabled(ex) {
+            margins.push((ex, text));
+        } else {
+            disabled_exchanges.push(DisabledNote::new(ex, Some(format!("可用保證金：{text}"))));
+        }
+    }
     let manual = pairs.iter().filter(|p| is_alert(p.state)).map(|p| handling(snap, p)).collect();
     let exit_delay = EngineTimings::default().exit_delay_ms;
     let trigger_mode = engine.map(|e| e.trigger_mode);
@@ -573,6 +585,7 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         identity: snap.identity,
         trigger_mode,
         margins,
+        disabled_exchanges,
         last_results: last_results(snap, 5),
         manual,
         running,

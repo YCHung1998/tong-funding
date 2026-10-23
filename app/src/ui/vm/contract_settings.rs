@@ -9,6 +9,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 use super::bridge::{CommandSink, ContractTemplate, Settings, UiSnapshot};
 use super::env_label::EnvLabel;
 use super::format;
+use super::labels::{plain_error, DisabledNote};
 use crate::engine::command::Command;
 use crate::engine::ports::OrderRules;
 
@@ -163,7 +164,7 @@ impl QuoteCell {
             QuoteCell::Stale { .. } => "價格已過期".into(),
             QuoteCell::NoPrice => "無價格".into(),
             QuoteCell::NotListed => "未上架".into(),
-            QuoteCell::NoRules(why) => format!("無法取得合約規格（{why}）"),
+            QuoteCell::NoRules(why) => format!("無法取得合約規格（{}）", plain_error(why)),
             QuoteCell::RulesPending => "合約規格載入中".into(),
         }
     }
@@ -299,6 +300,17 @@ pub struct ExchangeQuote {
     pub price: Option<Decimal>,
     pub observed_at: Option<i64>,
     pub cell: QuoteCell,
+    /// The exchange is not in `allowed_exchanges`: the page draws this one muted line instead of the row.
+    pub disabled: Option<DisabledNote>,
+}
+
+impl ExchangeQuote {
+    /// The row as the page draws it: `Binance · 現價 60200 · 3 秒前 · 預期數量 0.019 BTC`.
+    pub fn line(&self, now_ms: i64) -> String {
+        let price = self.price.map_or_else(|| format::DASH.to_string(), |p| p.normalize().to_string());
+        let age = self.observed_at.map_or_else(|| format::DASH.to_string(), |t| format!("{} 秒前", format::secs(now_ms - t)));
+        format!("{} · 現價 {price} · {age} · 預期數量 {}", self.exchange.name(), self.cell.text())
+    }
 }
 
 /// The quantity quote of `symbol` for a per-leg `notional`, on every exchange. A price older than
@@ -306,11 +318,11 @@ pub struct ExchangeQuote {
 pub fn quote(symbol: &str, notional: Decimal, snap: &UiSnapshot, now_ms: i64) -> Vec<ExchangeQuote> {
     let symbol = symbol.trim().to_ascii_uppercase();
     let stale_ms = i64::try_from(snap.settings.risk.stale_data_threshold_ms).unwrap_or(i64::MAX);
-    Exchange::ALL
+    let rows: Vec<ExchangeQuote> = Exchange::ALL
         .into_iter()
         .map(|ex| {
             let o = snap.market.get(&ex).and_then(|f| f.observations.iter().find(|o| o.symbol == symbol));
-            let Some(o) = o else { return ExchangeQuote { exchange: ex, price: None, observed_at: None, cell: QuoteCell::NoPrice } };
+            let Some(o) = o else { return ExchangeQuote { exchange: ex, price: None, observed_at: None, cell: QuoteCell::NoPrice, disabled: None } };
             let age = now_ms - o.observed_at;
             let cell = if !tong_funding_core::funding::is_consistent_listed(o) && o.data_status != tong_funding_core::funding::DataStatus::Listed {
                 QuoteCell::NotListed
@@ -319,7 +331,16 @@ pub fn quote(symbol: &str, notional: Decimal, snap: &UiSnapshot, now_ms: i64) ->
             } else {
                 leg_quantity(ex, &symbol, notional, o.mark_price, snap.rules.get(&(ex, symbol.clone())))
             };
-            ExchangeQuote { exchange: ex, price: Some(o.mark_price), observed_at: Some(o.observed_at), cell }
+            ExchangeQuote { exchange: ex, price: Some(o.mark_price), observed_at: Some(o.observed_at), cell, disabled: None }
+        })
+        .collect();
+    // ui-plain-language: an exchange the risk settings left unticked is one muted line, its row behind it.
+    rows.into_iter()
+        .map(|mut q| {
+            if !snap.exchange_enabled(q.exchange) {
+                q.disabled = Some(DisabledNote::new(q.exchange, Some(q.line(now_ms))));
+            }
+            q
         })
         .collect()
 }

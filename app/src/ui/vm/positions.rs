@@ -15,6 +15,7 @@ use super::bridge::{tradable_exchanges, AccountState, PairInfo, UiSnapshot};
 use super::env_label::EnvLabel;
 use super::format::{self, DASH};
 use super::funding::{self as fv, PairFunding, PnlPanel, TimelineRow};
+use super::labels::{plain_error, DisabledNote, DISABLED_WITH_POSITIONS};
 use crate::exchange::signed::models::Position;
 use crate::ui::theme::Tone;
 
@@ -179,6 +180,8 @@ pub struct PosRow {
     /// OKX only: the position in contracts (`quantity / ctVal`), when `ctVal` is known. Shown beside
     /// the coin amount; never used as the coin amount.
     pub contracts: Option<Decimal>,
+    /// `此交易所已停用，仍有持倉` when the exchange is not in `allowed_exchanges`: the row is shown as usual, with this note.
+    pub note: Option<&'static str>,
 }
 
 impl PosRow {
@@ -318,8 +321,10 @@ pub struct PositionsVm {
     /// `Binance +4.00 · Bybit −4.00`.
     pub pnl_breakdown: String,
     pub pair_cards: Vec<PairCard>,
-    /// Incomplete lists (with the reason), unconnected exchanges.
+    /// Incomplete lists (with the reason), unconnected exchanges (enabled exchanges only).
     pub notices: Vec<String>,
+    /// Exchanges the risk settings left unticked: one muted line each, what would have been a notice behind it.
+    pub disabled: Vec<DisabledNote>,
 }
 
 /// An OKX position in contracts, from its coin amount and the instrument's `ctVal`; `None` for the
@@ -365,6 +370,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
             funding,
             funding_tone,
             contracts: contracts_of(snap, p),
+            note: (!snap.exchange_enabled(p.exchange)).then_some(DISABLED_WITH_POSITIONS),
         })
         .collect();
 
@@ -407,19 +413,35 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
         by_ex.iter().map(|(e, v)| format!("{} {}", e.name(), format::signed(*v, 2))).collect::<Vec<_>>().join(" · ")
     };
 
-    let mut notices = Vec::new();
+    // What an exchange's account state says about its positions. An exchange the risk settings left
+    // unticked gets one muted line with these behind it instead of yellow notices (ui-plain-language).
+    let (mut notices, mut disabled) = (Vec::new(), Vec::new());
     for e in tradable_exchanges(snap.identity).iter().copied() {
+        let mut lines = Vec::new();
+        let mut raw_error = None;
         match snap.account(e) {
             AccountState::Loaded { data, .. } if data.positions_incomplete.is_some() => {
-                notices.push(format!("{} 持倉列表可能不完整", e.name()));
+                lines.push(format!("{} 持倉列表可能不完整", e.name()));
                 if let Some(why) = &data.positions_incomplete {
-                    notices.push(format!("{}：{why}", e.name()));
+                    lines.push(format!("{}：{why}", e.name()));
                 }
             }
-            AccountState::NotConnected { reason } => notices.push(format!("{} 未連線：{reason}", e.name())),
-            AccountState::Failed { error, .. } => notices.push(format!("{} 持倉讀取失敗：{error}", e.name())),
-            AccountState::Loading => notices.push(format!("{} 持倉載入中", e.name())),
+            AccountState::NotConnected { reason } => lines.push(format!("{} 未連線：{reason}", e.name())),
+            AccountState::Failed { error, .. } => {
+                lines.push(format!("{} 持倉讀取失敗：{}", e.name(), plain_error(&error)));
+                raw_error = Some(error);
+            }
+            AccountState::Loading => lines.push(format!("{} 持倉載入中", e.name())),
             _ => {}
+        }
+        if snap.exchange_enabled(e) {
+            notices.extend(lines);
+        } else {
+            let mut detail = (!lines.is_empty()).then(|| lines.join("；"));
+            if let (Some(d), Some(raw)) = (detail.as_mut(), raw_error.filter(|raw| plain_error(raw) != *raw)) {
+                d.push_str(&format!(" · 原始訊息：{raw}"));
+            }
+            disabled.push(DisabledNote::new(e, detail));
         }
     }
 
@@ -436,6 +458,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
         pnl_breakdown,
         pair_cards: pair_cards(snap, &g, now_ms),
         notices,
+        disabled,
     }
 }
 

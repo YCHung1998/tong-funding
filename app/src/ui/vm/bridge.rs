@@ -415,6 +415,12 @@ impl UiSnapshot {
     pub fn okx_ct_val(&self, symbol: &str) -> Option<Decimal> {
         self.rules.get(&(Exchange::Okx, symbol.to_string()))?.as_ref().ok()?.okx_ct_val.filter(|c| *c > Decimal::ZERO)
     }
+    /// Whether the risk setting `allowed_exchanges` lets the system trade on `e` (the pages show an
+    /// exchange that is not enabled as one muted line, ui-plain-language). Settings that could not be
+    /// read enable every exchange: nothing is hidden on a guess.
+    pub fn exchange_enabled(&self, e: Exchange) -> bool {
+        self.settings.error.is_some() || self.settings.risk.allowed_exchanges.contains(&e)
+    }
     pub fn health_of(&self, s: SourceId) -> Option<&SourceHealth> {
         self.health.iter().find(|h| h.source == s)
     }

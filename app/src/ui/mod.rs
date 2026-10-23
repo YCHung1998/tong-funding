@@ -75,6 +75,8 @@ pub mod zoom;
 mod testkit;
 
 #[cfg(test)]
+mod plain_language_ui_tests;
+#[cfg(test)]
 mod risk_help_ui_tests;
 #[cfg(test)]
 mod auto_add_ui_tests;

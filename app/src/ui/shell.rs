@@ -48,7 +48,7 @@ pub struct Shell {
     pub(crate) scanner: ScannerVm,
     /// Trading pages' inputs, selections and pending confirmations (ui-trading-pages).
     pub(crate) trading: TradingState,
-    dashboard: DashboardVm,
+    pub(crate) dashboard: DashboardVm,
     positions: PositionsVm,
     pos_filter: positions::Filter,
     alerts: Vec<Alert>,
@@ -765,7 +765,11 @@ impl Shell {
                 cx.notify();
             }))
         };
-        let page = pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin, &on_recheck, &on_open, &on_flatten);
+        let open = |k: &str| self.trading.expanded.contains(k);
+        let toggle = |k: String| self.note_toggle(cx, k);
+        let notes = pages::Notes { open: &open, toggle: &toggle };
+        let actions = pages::PairActions { on_recheck: &on_recheck, on_open: &on_open, on_flatten: &on_flatten };
+        let page = pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin, &actions, &notes);
         match self.flatten_panel(cx) {
             Some(p) => div().flex().flex_col().gap_3().child(p).child(page),
             None => page,
@@ -801,7 +805,7 @@ impl Shell {
     fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         self.trading.load_forms(&self.snap, window, cx);
         let inner = match self.page {
-            Page::Overview => pages::dashboard_page(&self.dashboard),
+            Page::Overview => self.dashboard_page(cx),
             Page::Scanner => self.scanner_page(cx),
             Page::Positions => self.positions_page(cx),
             Page::SystemLogs => self.system_log_page(cx),

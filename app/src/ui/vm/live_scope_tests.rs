@@ -32,6 +32,7 @@ fn live_panels_and_account_cards_never_list_okx_and_demo_keeps_all_three() {
             .map(|c| match c {
                 ExchangeCard::Connected(c) => c.exchange,
                 ExchangeCard::NotConnected { exchange, .. } | ExchangeCard::Loading { exchange } | ExchangeCard::Failed { exchange, .. } => *exchange,
+                ExchangeCard::Disabled(n) => n.exchange,
             })
             .collect();
         assert_eq!(cards, expect, "dashboard cards {identity:?}");

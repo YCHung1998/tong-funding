@@ -202,3 +202,17 @@ fn the_default_command_sink_methods_send_exactly_the_live_commands() {
     assert_eq!(sent[1], ("arm".to_string(), Command::Arm { preflight_id: "pf-1".into(), caps_hash: "hash".into(), confirmation: "confirm".into(), checklist_ack: true }));
     assert_eq!(sent[2], ("flatten".to_string(), Command::FlattenLeg { pair: "pair-1".into(), leg: Leg::Short }));
 }
+
+// ---- ui-plain-language: which exchanges the risk settings leave enabled ---------------------------
+
+#[test]
+fn an_exchange_is_enabled_when_allowed_exchanges_lists_it_and_unreadable_settings_enable_all() {
+    let mut s = UiSnapshot::default();
+    assert!(Exchange::ALL.iter().all(|e| s.exchange_enabled(*e)), "the default allows every exchange");
+    s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+    assert!(s.exchange_enabled(Exchange::Binance) && s.exchange_enabled(Exchange::Bybit));
+    assert!(!s.exchange_enabled(Exchange::Okx), "OKX unticked");
+    // settings that could not be read are not read as "everything unticked": nothing is hidden on a guess
+    s.settings.error = Some("config.risk is not valid JSON".into());
+    assert!(Exchange::ALL.iter().all(|e| s.exchange_enabled(*e)));
+}
