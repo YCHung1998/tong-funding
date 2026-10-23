@@ -6,10 +6,12 @@
 
 use rusqlite::params;
 use serde_json::{Value, json};
-use tong_funding_core::loss_breaker::{BreakerState, TripReason, evaluate};
+use tong_funding_core::loss_breaker::{BreakerState, PairAmount, TripReason, amount_of, evaluate};
+use tong_funding_core::pnl::{PnlBreakdown, compute_pnl};
 use tong_funding_core::risk::RiskConfig;
 use tong_funding_core::types::Decimal;
 
+use crate::funding::pnl_record::{assemble, latest_pnl};
 use crate::store::db::Db;
 use crate::store::events::{EventRow, EventStore};
 
@@ -92,10 +94,28 @@ pub fn closed_pairs_since(db: &Db, start: &IntervalStart) -> Result<Vec<ClosedPa
     Ok(out)
 }
 
+/// What one closed pair is worth: the newest stored PnL when its net is known, otherwise a fresh
+/// recomputation from the fills now in the store (price PnL minus both fees; the net itself when
+/// that became known meanwhile), otherwise unknown.
+pub fn pair_amount(db: &Db, pair: &str, now_ms: i64) -> PairAmount {
+    if let Ok(Some(stored)) = latest_pnl(db, pair)
+        && let Ok(b) = serde_json::from_value::<PnlBreakdown>(stored.payload["breakdown"].clone())
+        && let net @ PairAmount::Net(_) = amount_of(&b)
+    {
+        return net;
+    }
+    match assemble(db, pair, now_ms) {
+        Ok(a) => amount_of(&compute_pnl(&a.input)),
+        // Not readable: nothing can be said about this pair, which the breaker treats as a stop.
+        Err(_) => PairAmount::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::db::test_support::open_tmp;
+    use tong_funding_core::types::Exchange;
 
     fn append(db: &Db, ty: &str, pair: Option<&str>, payload: Value) -> i64 {
         EventStore::new(db.clone()).append(ty, pair, payload).unwrap().unwrap()
@@ -224,5 +244,81 @@ mod tests {
         append(&db, "PAIR_PNL_COMPUTED", Some("x"), json!({}));
         append(&db, "ORDER_SUBMITTED", Some("y"), json!({}));
         assert!(closed_pairs_since(&db, &start).unwrap().is_empty());
+    }
+
+    // ---- 2.2 what a pair is worth ---------------------------------------------------------------
+
+    mod amount {
+        use super::*;
+        use crate::funding::pnl_record::tests::{Fx, both_fetched, d, ledger, scenario};
+        use crate::funding::pnl_record::{recompute_if_changed, settle_pnl};
+
+        const T: i64 = crate::funding::pnl_record::tests::T;
+
+        /// Close references for both close orders (what the engine writes before a reduce-only close);
+        /// they make the PnL net computable once funding is in.
+        fn close_references(fx: &Fx) {
+            for (leg, ex, avg) in [("long", "Binance", "59997.5"), ("short", "Bybit", "60000")] {
+                append(
+                    &fx.db,
+                    "ORDER_FILL",
+                    Some("p1"),
+                    json!({
+                        "client_order_id": format!("demo-p1-{leg}-close"), "leg": leg, "action": "close", "exchange": ex,
+                        "filled_quantity": "0.02", "avg_price": avg, "fee": "0.24", "fee_asset": "USDT", "reference_price": avg,
+                    }),
+                );
+            }
+        }
+
+        #[test]
+        fn funding_not_booked_yet_is_price_pnl_minus_both_fees() {
+            // long 0.02 x (59997.5 - 60002.5) = -0.10, short 0; four fees of 0.24 = 0.96
+            let fx = scenario(true);
+            assert_eq!(pair_amount(&fx.db, "p1", T + 80_000), PairAmount::Provisional(d("-1.06")));
+        }
+
+        #[test]
+        fn a_stored_pnl_with_a_known_net_wins() {
+            let fx = scenario(true);
+            close_references(&fx);
+            fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T), ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+            both_fetched(&fx);
+            settle_pnl(&fx.db, "p1", T + 80_000, false).unwrap();
+            assert_eq!(pair_amount(&fx.db, "p1", T + 90_000), PairAmount::Net(d("0.24") + d("-0.10") - d("0.96")), "the spec's -0.82");
+        }
+
+        #[test]
+        fn an_incomplete_stored_pnl_falls_back_to_the_recomputation_and_switches_to_net_when_it_arrives() {
+            let fx = scenario(true);
+            close_references(&fx);
+            fx.db.write_funding_ledger(&[ledger(Exchange::Bybit, "BTCUSDT", "2", "0.36", T)]).unwrap();
+            both_fetched(&fx);
+            fx.clock.set(T + 700_000);
+            settle_pnl(&fx.db, "p1", T + 700_000, true).unwrap(); // final attempt: INCOMPLETE (Binance funding missing)
+            assert_eq!(pair_amount(&fx.db, "p1", T + 700_000), PairAmount::Provisional(d("-1.06")), "net unknown: price PnL - fees, funding left out");
+            // the late entry arrives and the PnL is recomputed: now the net counts
+            fx.db.write_funding_ledger(&[ledger(Exchange::Binance, "BTCUSDT", "1", "-0.12", T)]).unwrap();
+            assert!(recompute_if_changed(&fx.db, "p1", T + 800_000).unwrap().is_some());
+            assert_eq!(pair_amount(&fx.db, "p1", T + 800_000), PairAmount::Net(d("-0.82")));
+        }
+
+        #[test]
+        fn a_pair_without_any_fill_record_or_that_does_not_exist_is_unknown() {
+            let fx = scenario(true);
+            let env = crate::engine::actor::PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: T, simulated: false, scan: json!({}) };
+            let row = crate::store::state::NewPair { internal_uuid: "empty".into(), pair_id: "pid-empty".into(), symbol: "BTCUSDT".into(), status: tong_funding_core::pair::PairState::Closing, entry: serde_json::to_value(env).unwrap() };
+            fx.db.add_pair_if_not_pending(&row).unwrap();
+            assert_eq!(pair_amount(&fx.db, "empty", T), PairAmount::Unknown);
+            assert_eq!(pair_amount(&fx.db, "no-such-pair", T), PairAmount::Unknown);
+        }
+
+        #[test]
+        fn a_fill_record_that_lost_its_price_is_unknown() {
+            let fx = scenario(true);
+            append(&fx.db, "ORDER_FILL", Some("p1"), json!({ "client_order_id": "demo-p1-long-close", "leg": "long", "action": "close", "exchange": "Binance", "filled_quantity": "0.02", "fee": "0.24", "fee_asset": "USDT" }));
+            // the newest event of an order is its record: without a price the price PnL cannot be told
+            assert_eq!(pair_amount(&fx.db, "p1", T), PairAmount::Unknown);
+        }
     }
 }

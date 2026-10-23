@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::pnl::{Component, PnlBreakdown};
 use crate::types::Decimal;
 
 /// Why the breaker tripped. When several hold at once the order is `UnknownPnl` (fail closed),
@@ -91,4 +92,37 @@ pub fn evaluate(amounts: &[Option<Decimal>], max_loss: Decimal, max_consecutive:
         None
     };
     BreakerState { net_sum, consecutive, unknown_count, tripped: reason.is_some(), reason }
+}
+
+/// What one closed pair is worth to the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairAmount {
+    /// The PnL net is known (funding included).
+    Net(Decimal),
+    /// The net is not known yet (typically funding not booked): price PnL minus the opening and the
+    /// closing fee. Funding is left out, which is the conservative side (it is usually income).
+    Provisional(Decimal),
+    /// Not even price PnL and fees can be told: the breaker treats the pair as a loss it cannot size.
+    Unknown,
+}
+
+impl PairAmount {
+    pub fn value(self) -> Option<Decimal> {
+        match self {
+            PairAmount::Net(v) | PairAmount::Provisional(v) => Some(v),
+            PairAmount::Unknown => None,
+        }
+    }
+}
+
+/// The amount of a pair from its PnL breakdown (the stored one or a fresh recomputation).
+pub fn amount_of(b: &PnlBreakdown) -> PairAmount {
+    if !b.missing.contains(&Component::Net) {
+        return PairAmount::Net(b.total.net);
+    }
+    let needed = [Component::PriceActual, Component::OpeningFee, Component::ClosingFee];
+    if needed.iter().any(|c| b.missing.contains(c)) {
+        return PairAmount::Unknown;
+    }
+    PairAmount::Provisional(b.total.price_actual - b.total.opening_fee - b.total.closing_fee)
 }

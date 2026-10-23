@@ -120,3 +120,107 @@ fn reason_codes_and_texts_are_stable() {
     assert_eq!(TripReason::UnknownPnl.text(), "損益未知");
     assert_eq!(TripReason::ConsecutiveLosses.text(), "連虧達上限");
 }
+
+// ---- 2.2: what one closed pair is worth (net when known, else price PnL minus fees) ----------
+
+mod pair_amount {
+    use super::*;
+    use tong_funding_core::pnl::{
+        compute_pnl, FillAction, FillRecord, FundingFetchState, FundingLedgerEntry, LegInput, PairInput,
+    };
+    use tong_funding_core::types::{Exchange, Side};
+
+    fn fill(id: &str, action: FillAction, qty: &str, avg: Option<&str>, fee: Option<&str>, reference: Option<&str>) -> FillRecord {
+        FillRecord {
+            id: id.into(),
+            action,
+            quantity: d(qty),
+            expected_price: reference.map(d),
+            actual_price: avg.map(d),
+            fee: fee.map(d),
+            fee_asset: Some("USDT".into()),
+            filled_at_ms: 0,
+            contract_value_missing: false,
+        }
+    }
+
+    fn leg(exchange: Exchange, side: Side, fills: Vec<FillRecord>, funding: Vec<FundingLedgerEntry>, fetch: FundingFetchState) -> LegInput {
+        LegInput { exchange, symbol: "BTCUSDT".into(), side, fills, funding, expected_settlements: Some(1), funding_fetch: fetch }
+    }
+
+    /// Long closes 2.0 below its open (price PnL -2.0 on qty 1), short flat; fees 1.9 in total.
+    fn losing_pair(funding_fetch: FundingFetchState, funding: Vec<FundingLedgerEntry>) -> PairInput {
+        let long = leg(
+            Exchange::Binance,
+            Side::Long,
+            vec![
+                fill("lo", FillAction::Open, "1", Some("100"), Some("0.5"), Some("100")),
+                fill("lc", FillAction::Close, "1", Some("98"), Some("0.4"), Some("98")),
+            ],
+            vec![],
+            funding_fetch.clone(),
+        );
+        let short = leg(
+            Exchange::Bybit,
+            Side::Short,
+            vec![
+                fill("so", FillAction::Open, "1", Some("100"), Some("0.5"), Some("100")),
+                fill("sc", FillAction::Close, "1", Some("100"), Some("0.5"), Some("100")),
+            ],
+            funding,
+            funding_fetch,
+        );
+        PairInput { legs: vec![long, short], ambiguous_attribution: false, reconciliation_mismatch: false }
+    }
+
+    #[test]
+    fn funding_not_in_yet_uses_price_pnl_minus_both_fees() {
+        // spec: price PnL -2.0, fees 1.9 (open 1.0 + close 0.9), funding not fetched -> -3.9
+        let b = compute_pnl(&losing_pair(FundingFetchState::NotFetched, vec![]));
+        assert_eq!(amount_of(&b), PairAmount::Provisional(d("-3.9")));
+        assert_eq!(amount_of(&b).value(), Some(d("-3.9")));
+    }
+
+    #[test]
+    fn a_known_net_is_used_as_it_is() {
+        // spec: later the net is +0.5 -> that value; -2.0 - 1.9 + funding 4.4 = +0.5
+        let entry = FundingLedgerEntry::new(Exchange::Bybit, "BTCUSDT", d("4.4"), "USDT", 1, "k1", "SETTLEMENT", serde_json::json!({}));
+        let long_funding = FundingLedgerEntry::new(Exchange::Binance, "BTCUSDT", d("0"), "USDT", 1, "k0", "FUNDING_FEE", serde_json::json!({}));
+        let mut input = losing_pair(FundingFetchState::Fetched, vec![entry]);
+        input.legs[0].funding = vec![long_funding];
+        let b = compute_pnl(&input);
+        assert_eq!(amount_of(&b), PairAmount::Net(d("0.5")));
+    }
+
+    #[test]
+    fn a_missing_fill_price_or_fee_is_unknown_never_zero() {
+        let mut no_price = losing_pair(FundingFetchState::NotFetched, vec![]);
+        no_price.legs[0].fills[1].actual_price = None;
+        assert_eq!(amount_of(&compute_pnl(&no_price)), PairAmount::Unknown);
+        let mut no_fee = losing_pair(FundingFetchState::NotFetched, vec![]);
+        no_fee.legs[1].fills[0].fee = None;
+        assert_eq!(amount_of(&compute_pnl(&no_fee)), PairAmount::Unknown);
+        assert_eq!(PairAmount::Unknown.value(), None);
+    }
+
+    #[test]
+    fn no_fills_at_all_is_unknown() {
+        let empty = PairInput { legs: vec![leg(Exchange::Binance, Side::Long, vec![], vec![], FundingFetchState::NotFetched)], ambiguous_attribution: false, reconciliation_mismatch: false };
+        assert_eq!(amount_of(&compute_pnl(&empty)), PairAmount::Unknown);
+    }
+
+    #[test]
+    fn open_and_close_quantities_that_differ_are_unknown() {
+        let mut input = losing_pair(FundingFetchState::NotFetched, vec![]);
+        input.legs[0].fills[1].quantity = d("0.5");
+        assert_eq!(amount_of(&compute_pnl(&input)), PairAmount::Unknown);
+    }
+
+    #[test]
+    fn a_missing_reference_price_does_not_make_the_amount_unknown() {
+        // the reference price only feeds slippage; price PnL and fees are what the breaker uses
+        let mut input = losing_pair(FundingFetchState::NotFetched, vec![]);
+        input.legs[0].fills[1].expected_price = None;
+        assert_eq!(amount_of(&compute_pnl(&input)), PairAmount::Provisional(d("-3.9")));
+    }
+}
