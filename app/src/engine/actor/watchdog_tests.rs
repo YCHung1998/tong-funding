@@ -27,6 +27,10 @@ struct Watched {
     cancelled: Mutex<Vec<String>>,
     hold: std::sync::atomic::AtomicBool,
     release: tokio::sync::Notify,
+    /// Orders whose id starts with this prefix are accepted and never fill (Open until cancelled);
+    /// they never reach the simulator, so they leave no position.
+    idle_prefix: Mutex<Option<String>>,
+    idle: Mutex<HashMap<String, OrderState>>,
 }
 
 impl Watched {
@@ -39,7 +43,19 @@ impl Watched {
             cancelled: Mutex::default(),
             hold: std::sync::atomic::AtomicBool::new(false),
             release: tokio::sync::Notify::new(),
+            idle_prefix: Mutex::default(),
+            idle: Mutex::default(),
         })
+    }
+    /// Orders with this id prefix are accepted, never fill and stay Open until a cancel works.
+    fn idle_orders(&self, prefix: &str) {
+        *self.idle_prefix.lock().unwrap() = Some(prefix.to_string());
+    }
+    fn idle_status(id: &str, state: OrderState) -> OrderStatus {
+        OrderStatus { client_order_id: id.into(), exchange_order_id: Some("idle-1".into()), filled_quantity: Decimal::ZERO, avg_price: None, fee: None, fee_asset: None, state }
+    }
+    fn idle_state(&self, id: &str) -> Option<OrderState> {
+        self.idle.lock().unwrap().get(id).copied()
     }
     fn queries(&self) -> usize {
         self.queries.load(Ordering::SeqCst)
@@ -67,12 +83,23 @@ impl Executor for Watched {
         true
     }
     fn submit(&self, req: OrderRequest) -> BoxFut<'_, SubmitOutcome> {
+        let idle = self.idle_prefix.lock().unwrap().as_deref().is_some_and(|p| req.client_order_id.starts_with(p));
+        if idle {
+            self.idle.lock().unwrap().insert(req.client_order_id.clone(), OrderState::Open);
+            let status = Watched::idle_status(&req.client_order_id, OrderState::Open);
+            return Box::pin(std::future::ready(SubmitOutcome::Accepted(status)));
+        }
         self.inner.submit(req)
     }
     fn cancel(&self, exchange: Exchange, symbol: &str, id: &str) -> BoxFut<'_, QueryOutcome> {
         self.cancels.fetch_add(1, Ordering::SeqCst);
         self.cancelled.lock().unwrap().push(id.to_string());
         let swallowed = self.swallow_cancels.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+        if let Some(state) = self.idle_state(id) {
+            let state = if swallowed { state } else { OrderState::Cancelled };
+            self.idle.lock().unwrap().insert(id.to_string(), state);
+            return Box::pin(std::future::ready(QueryOutcome::Found(Watched::idle_status(id, state))));
+        }
         if swallowed {
             return self.inner.query(exchange, symbol, id); // the cancel did nothing: the order as it is
         }
@@ -84,6 +111,9 @@ impl Executor for Watched {
         Box::pin(async move {
             if self.hold.load(Ordering::SeqCst) {
                 self.release.notified().await;
+            }
+            if let Some(state) = self.idle_state(&id) {
+                return QueryOutcome::Found(Watched::idle_status(&id, state));
             }
             self.inner.query(exchange, &symbol, &id).await
         })
@@ -602,4 +632,86 @@ async fn a_failing_notifier_changes_nothing_but_one_record() {
     assert_eq!((notified.len(), notified[0]["ok"].clone()), (1, json!(false)), "{notified:?}");
     assert!(notified[0]["error"].as_str().unwrap().contains("osascript"), "{}", notified[0]);
     assert_eq!(rig.notifier.watchdog_calls().len(), 1, "and it is not retried in a loop");
+}
+
+// ---- 2.6 the flows end to end on the simulator ----------------------------------------------
+// (one leg filled / other not -> flattened, state unchanged: `a_bare_leg_is_flattened_...` above;
+//  query failure -> locked: `an_unknown_conclusion_...`; 3 rejected flattens -> locked:
+//  `three_rejected_flatten_orders_...`; restart: `the_watchdog_flattens_in_exchange_demo_too_after_a_restart_...`)
+
+#[tokio::test(start_paused = true)]
+async fn both_legs_filled_sends_nothing_locks_nothing_and_ends_the_rounds() {
+    let (rig, _h, watched) = started_watched(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Partial(dec("0.7")));
+    run_until(&rig.clock, T + 5_000).await; // the fill timeout cancels the rest of the short order
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "{:?}", labels(&rig.db));
+    let since = ts_of(&rig.db, "PARTIAL_FAILURE")[0];
+    assert_eq!((rig.sim.position(Exchange::Binance, SYM), rig.sim.position(Exchange::Bybit, SYM)), (dec("10"), dec("-7")), "both legs hold a position");
+    run_until(&rig.clock, since + 5_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["HEDGED"], "{r:?}");
+    assert_eq!((r[0]["legs"]["long"]["position"].clone(), r[0]["legs"]["short"]["position"].clone()), (json!("10"), json!("-7")), "the basis shows both legs");
+    assert_eq!(rig.sim.submitted().len(), 2, "no order: the pair is hedged, the user decides");
+    assert!(!rig.db.kill_switch_halted(), "and nothing is locked");
+    assert_eq!(events_of(&rig.db, "LEG_FLATTEN").len(), 0);
+    run_until(&rig.clock, since + 60_000).await;
+    assert_eq!(rounds(&rig.db).len(), 1, "a conclusion that needs the user ends the rounds");
+    assert_eq!(rig.sim.submitted().len(), 2);
+    assert_eq!(watched.cancels(), 1, "only the fill timeout's own cancel of the short order's rest");
+    assert!(rig.notifier.watchdog_calls().is_empty(), "nothing was done, nothing to report beyond the pair alert");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_other_legs_unfilled_order_is_cancelled_and_verified_before_the_filled_leg_is_flattened() {
+    let (rig, _h, watched) = started_watched(Opts::default()).await;
+    // the short order is accepted and never fills; the fill timeout's own cancel does not work, so
+    // the pair ends UNRESOLVED with that order still open
+    watched.idle_orders(&sim_id(Leg::Short, OrderAction::Open));
+    watched.swallow_cancels(1);
+    run_until(&rig.clock, T + 5_000).await;
+    assert_eq!(status(&rig.db, UUID), "UNRESOLVED", "{:?}", labels(&rig.db));
+    let since = ts_of(&rig.db, "UNRESOLVED")[0];
+
+    run_until(&rig.clock, since + 5_000).await;
+    assert_eq!(conclusions(&rounds(&rig.db)), vec!["WAIT_FOR_CANCEL"], "the open order of the other leg is not proof of anything yet");
+    assert!(reduce_only_orders(&rig).is_empty(), "nothing is flattened while the other leg's order could still fill");
+    assert_eq!(watched.cancelled_ids().last(), Some(&sim_id(Leg::Short, OrderAction::Open)));
+
+    run_until(&rig.clock, since + 10_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["WAIT_FOR_CANCEL", "FLATTEN"], "{r:?}");
+    let short = &r[1]["legs"]["short"];
+    assert_eq!((short["position"].clone(), short["recorded"].clone(), short["orders_terminal"].clone()), (json!("0"), json!("0"), json!(true)), "{short}");
+    assert_eq!((short["orders"][0]["state"].clone(), short["orders"][0]["filled"].clone()), (json!("Cancelled"), json!("0")), "verified: over and unfilled");
+    let closes = reduce_only_orders(&rig);
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!((closes[0].exchange, closes[0].side, closes[0].quantity), (Exchange::Binance, OrderSide::Sell, dec("10")));
+    assert_eq!(status(&rig.db, UUID), "UNRESOLVED", "the state is the user's to move");
+
+    run_until(&rig.clock, since + 17_000).await;
+    assert_eq!(conclusions(&rounds(&rig.db)), vec!["WAIT_FOR_CANCEL", "FLATTEN", "FLAT"]);
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO);
+    assert!(!rig.db.kill_switch_halted());
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(rig.notifier.watchdog_calls().len(), 1, "told once that the long leg was flattened");
+}
+
+#[tokio::test(start_paused = true)]
+async fn after_a_restart_the_wait_is_counted_from_the_entry_and_a_lost_simulated_ledger_is_unknown() {
+    let (rig, h, _w, since) = bare_long(Opts::default()).await;
+    run_until(&rig.clock, since + 2_000).await;
+    drop(h); // process 1 ends; the simulated ledger (in memory only) dies with it
+    sleep(Duration::from_millis(50)).await;
+    let second = Arc::new(RecordingNotifier::default());
+    let _h2 = start(restarted(&rig, second.clone()));
+    run_until(&rig.clock, since + 4_000).await;
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG), 0, "the new process has not waited 5 s since its own start: it counts from the entry event");
+    run_until(&rig.clock, since + 5_000).await;
+    let r = rounds(&rig.db);
+    assert_eq!(conclusions(&r), vec!["UNKNOWN"], "{r:?}");
+    assert!(r[0]["reason"].as_str().unwrap().contains("not found"), "the simulated order is gone with the ledger: {}", r[0]);
+    assert!(rig.db.kill_switch_halted(), "unknown means locked, in SIMULATION too");
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(second.watchdog_calls().len(), 1);
+    assert!(second.calls().is_empty(), "the pair alert itself is not notified again after a restart");
 }
