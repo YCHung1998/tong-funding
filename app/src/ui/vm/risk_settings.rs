@@ -14,6 +14,7 @@ use super::bridge::{CommandSink, Settings};
 use super::env_label::EnvLabel;
 use crate::identity::ProcessIdentity;
 use crate::engine::command::Command;
+use crate::engine::watchdog_text;
 
 /// One editable number on the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -686,6 +687,37 @@ pub fn request_mode(identity: ProcessIdentity, current: ExecutionMode, target: E
 /// After the confirmation: the engine switches (and records `EXECUTION_MODE_CHANGED`).
 pub fn send_mode(identity: ProcessIdentity, target: ExecutionMode, sink: &dyn CommandSink) {
     sink.send(format!("切換模式 → {}", mode_label(identity, target)), Command::SetExecutionMode(target));
+}
+
+/// The fixed "自動處理規則（授權 B）" block of the page (naked-leg-watchdog): the rules the system acts
+/// by on its own, always shown, with no way to collapse or switch it. Every word comes from
+/// `engine::watchdog_text`, the one source shared with the manual-handling card and the notifications.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoRulesBlock {
+    pub title: &'static str,
+    /// The rule paragraph; bold runs are emphasised on the page.
+    pub runs: Vec<watchdog_text::Run>,
+    /// Lines under the paragraph: an exchange overrides the order timeout, or the stored settings
+    /// could not be read (then the number above is the default, not a fact).
+    pub notes: Vec<String>,
+}
+
+impl AutoRulesBlock {
+    /// The paragraph without emphasis.
+    pub fn plain(&self) -> String {
+        watchdog_text::plain(&self.runs)
+    }
+}
+
+/// The block for the STORED settings (what the engine acts by), not for unsaved edits in the form.
+pub fn auto_rules_block(settings: &Settings) -> AutoRulesBlock {
+    let mut notes = Vec::new();
+    if let Some(e) = &settings.error {
+        notes.push(format!("風控設定讀取失敗（{e}）：上面的訂單逾時秒數是預設值，實際值未知。"));
+    }
+    let overridden: Vec<(Exchange, u32)> = settings.overrides.iter().filter_map(|(ex, o)| o.order_timeout_seconds.map(|s| (*ex, s))).collect();
+    notes.extend(watchdog_text::rules_override_note(&overridden));
+    AutoRulesBlock { title: watchdog_text::RULES_TITLE, runs: watchdog_text::rules_runs(settings.risk.order_timeout_seconds), notes }
 }
 
 #[cfg(test)]

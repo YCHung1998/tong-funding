@@ -75,6 +75,8 @@ mod testkit;
 #[cfg(test)]
 mod risk_help_ui_tests;
 #[cfg(test)]
+mod watchdog_ui_tests;
+#[cfg(test)]
 mod auto_add_ui_tests;
 #[cfg(test)]
 mod notifications_ui_tests;

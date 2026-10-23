@@ -31,7 +31,7 @@ use super::staged_orders::{self, CloseConfirm, CostView, PendingConfirm, Running
 use super::symbol_options;
 use super::symbol_select::{CoinPicker, SymbolPicker};
 use super::theme;
-use super::units::rx;
+use super::units::{fs, rx};
 use crate::engine::command::{Command, CommandReply};
 use crate::engine::ports::OrderSide;
 
@@ -393,6 +393,29 @@ fn warn_box(lines: Vec<String>) -> Div {
         d = d.child(small(l, theme::WARNING));
     }
     d
+}
+
+/// A paragraph whose emphasised runs are bold (the words come from `engine::watchdog_text`).
+fn rich_paragraph(runs: &[crate::engine::watchdog_text::Run], color: u32) -> Div {
+    let mut at = 0;
+    let mut bold = Vec::new();
+    for r in runs {
+        let end = at + r.text.len();
+        if r.bold {
+            bold.push((at..end, HighlightStyle { font_weight: Some(FontWeight::BOLD), ..Default::default() }));
+        }
+        at = end;
+    }
+    div().text_color(rgb(color)).text_size(fs(10.0)).child(StyledText::new(crate::engine::watchdog_text::plain(runs)).with_highlights(bold))
+}
+
+/// The fixed "自動處理規則（授權 B）" block: always drawn, nothing to expand, collapse or switch.
+fn auto_rules_card(b: &risk_settings::AutoRulesBlock) -> impl IntoElement {
+    let mut c = card().id("naked-leg-rules").test_support().child(text(b.title, theme::TEXT_PRIMARY)).child(rich_paragraph(&b.runs, theme::TEXT_SECONDARY));
+    for n in &b.notes {
+        c = c.child(small(n.clone(), theme::WARNING));
+    }
+    c
 }
 
 fn mode_text(identity: crate::identity::ProcessIdentity, m: Option<ExecutionMode>) -> &'static str {
@@ -958,6 +981,8 @@ impl Shell {
         if let Some(e) = &base.error {
             page = page.child(warn_box(vec![format!("已儲存的風控設定讀取失敗：{e}")]));
         }
+        // naked-leg-watchdog: what the system does on its own (authorization B), for the stored settings
+        page = page.child(auto_rules_card(&risk_settings::auto_rules_block(&base)));
         let mut global = card().child(text("Global Limits · Layer 1 · Net Edge", theme::TEXT_PRIMARY));
         let shown = risk_settings::global_fields(self.snap.identity);
         for f in shown.iter().copied() {

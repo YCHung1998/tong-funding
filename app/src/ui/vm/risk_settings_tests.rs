@@ -551,3 +551,49 @@ mod live_caps {
         assert_eq!((Field::LiveMaxLegNotionalUsdt.unit(), Field::LiveMaxPairsPerArming.unit()), ("USDT", "筆"));
     }
 }
+
+// ---- naked-leg-watchdog: the fixed rules block ------------------------------------------------
+
+fn settings_with_timeout(seconds: u32) -> Settings {
+    let mut s = complete_settings("0.05");
+    s.risk.order_timeout_seconds = seconds;
+    s
+}
+
+#[test]
+fn the_rules_block_has_the_fixed_title_and_the_approved_words_with_the_stored_timeout() {
+    // spec: order_timeout_seconds 為 20 -> 區塊寫「訂單逾時 20 秒後再等 5 秒」
+    let b = auto_rules_block(&settings_with_timeout(20));
+    assert_eq!(b.title, "自動處理規則（授權 B）");
+    assert!(b.plain().contains("訂單逾時 20 秒後再等 5 秒"), "{}", b.plain());
+    assert_eq!(b.plain(), crate::engine::watchdog_text::rules_plain(20), "the page and every other place read the same function");
+    assert!(b.notes.is_empty(), "{:?}", b.notes);
+    let bold: Vec<&str> = b.runs.iter().filter(|r| r.bold).map(|r| r.text.as_str()).collect();
+    assert_eq!(bold, vec!["確認只有一腿成交", "只減倉的市價單", "不會", "不會動作"]);
+}
+
+#[test]
+fn the_number_follows_the_stored_setting_whenever_it_changes() {
+    for n in [3_u32, 15, 45] {
+        assert!(auto_rules_block(&settings_with_timeout(n)).plain().contains(&format!("訂單逾時 {n} 秒後再等 5 秒")), "{n}");
+    }
+}
+
+#[test]
+fn the_block_is_there_even_when_the_settings_are_incomplete_or_unreadable() {
+    let incomplete = auto_rules_block(&Settings::default());
+    assert_eq!(incomplete.title, "自動處理規則（授權 B）");
+    assert!(incomplete.plain().contains("訂單逾時 15 秒後再等 5 秒"), "the default timeout, which is what an incomplete config uses");
+    assert!(incomplete.notes.is_empty());
+    let unreadable = auto_rules_block(&Settings { error: Some("config.risk: bad json".into()), ..Settings::default() });
+    assert!(unreadable.notes.iter().any(|n| n.contains("讀取失敗") && n.contains("預設值")), "the number is the default, not a fact: {:?}", unreadable.notes);
+}
+
+#[test]
+fn an_exchange_that_overrides_the_timeout_adds_a_note_with_its_number() {
+    let mut s = settings_with_timeout(15);
+    s.overrides = parse_overrides(&serde_json::json!({ "Bybit": { "order_timeout_seconds": 7 } })).unwrap();
+    let b = auto_rules_block(&s);
+    assert!(b.notes.iter().any(|n| n.contains("Bybit 7 秒") && n.contains("較小")), "{:?}", b.notes);
+    assert!(b.plain().contains("訂單逾時 15 秒後再等 5 秒"), "the global number stays as it is");
+}
