@@ -37,13 +37,21 @@ pub struct IntervalStart {
     pub kind: StartKind,
 }
 
-/// `(id, ts_ms, payload)` of every event of `ty`, oldest first.
-fn events_of(db: &Db, ty: &str) -> Result<Vec<(i64, i64, Option<String>, Value)>, String> {
+/// One stored event, as much as the breaker reads of it.
+struct Ev {
+    id: i64,
+    ts_ms: i64,
+    pair: Option<String>,
+    payload: Value,
+}
+
+/// Every event of `ty`, oldest first.
+fn events_of(db: &Db, ty: &str) -> Result<Vec<Ev>, String> {
     db.with_conn(|c| {
         let mut st = c.prepare("SELECT id, ts_ms, pair_id, payload FROM events WHERE event_type = ?1 ORDER BY id")?;
         let rows = st.query_map(params![ty], |r| {
             let payload: String = r.get(3)?;
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<String>>(2)?, serde_json::from_str(&payload).unwrap_or(Value::Null)))
+            Ok(Ev { id: r.get(0)?, ts_ms: r.get(1)?, pair: r.get(2)?, payload: serde_json::from_str(&payload).unwrap_or(Value::Null) })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     })
@@ -55,17 +63,17 @@ fn events_of(db: &Db, ty: &str) -> Result<Vec<(i64, i64, Option<String>, Value)>
 /// when this database never had one, so the history before the first start never counts, even when
 /// the kill switch was opened (and the pairs lost money) before this version existed.
 pub fn interval_start(db: &Db) -> Result<IntervalStart, String> {
-    let mut baseline = events_of(db, LOSS_BREAKER_BASELINE)?.into_iter().next_back();
-    if baseline.is_none() {
-        let payload = json!({ "reason": "first start with the loss circuit breaker: earlier history is not counted" });
-        let id = EventStore::new(db.clone()).append(LOSS_BREAKER_BASELINE, None, payload.clone()).map_err(|e| e.to_string())?.ok_or("baseline event not stored")?;
-        baseline = Some((id, db.now_ms(), None, payload));
-    }
-    let opened = events_of(db, KILL_SWITCH_CHANGED)?.into_iter().rfind(|(_, _, _, p)| p["on"] == Value::Bool(false));
-    let (id, ts, _, _) = baseline.ok_or("no baseline")?;
-    let baseline = IntervalStart { event_id: id, ts_ms: ts, kind: StartKind::Baseline };
+    let baseline = match events_of(db, LOSS_BREAKER_BASELINE)?.pop() {
+        Some(e) => IntervalStart { event_id: e.id, ts_ms: e.ts_ms, kind: StartKind::Baseline },
+        None => {
+            let payload = json!({ "reason": "first start with the loss circuit breaker: earlier history is not counted" });
+            let id = EventStore::new(db.clone()).append(LOSS_BREAKER_BASELINE, None, payload).map_err(|e| e.to_string())?.ok_or("baseline event not stored")?;
+            IntervalStart { event_id: id, ts_ms: db.now_ms(), kind: StartKind::Baseline }
+        }
+    };
+    let opened = events_of(db, KILL_SWITCH_CHANGED)?.into_iter().rfind(|e| e.payload["on"] == Value::Bool(false));
     Ok(match opened {
-        Some((oid, ots, _, _)) if oid > baseline.event_id => IntervalStart { event_id: oid, ts_ms: ots, kind: StartKind::TradingOpened },
+        Some(e) if e.id > baseline.event_id => IntervalStart { event_id: e.id, ts_ms: e.ts_ms, kind: StartKind::TradingOpened },
         _ => baseline,
     })
 }
@@ -82,12 +90,12 @@ pub struct ClosedPair {
 /// Simulated pairs are left out: they hold no money and have no PnL by design.
 pub fn closed_pairs_since(db: &Db, start: &IntervalStart) -> Result<Vec<ClosedPair>, String> {
     let mut out: Vec<ClosedPair> = Vec::new();
-    for (id, ts, pair, payload) in events_of(db, crate::engine::actor::CLOSE_CONFIRMED)? {
-        let Some(pair) = pair else { continue };
-        if id <= start.event_id || payload["simulated"] == Value::Bool(true) || out.iter().any(|c| c.pair == pair) {
+    for e in events_of(db, crate::engine::actor::CLOSE_CONFIRMED)? {
+        let Some(pair) = e.pair else { continue };
+        if e.id <= start.event_id || e.payload["simulated"] == Value::Bool(true) || out.iter().any(|c| c.pair == pair) {
             continue;
         }
-        out.push(ClosedPair { pair, event_id: id, ts_ms: ts });
+        out.push(ClosedPair { pair, event_id: e.id, ts_ms: e.ts_ms });
     }
     out.sort_by_key(|c| (c.ts_ms, c.event_id));
     Ok(out)
@@ -156,7 +164,7 @@ pub fn assess(db: &Db, max_loss: Decimal, max_consecutive: u32, now_ms: i64) -> 
         .collect();
     let amounts: Vec<Option<Decimal>> = pairs.iter().map(|p| p.amount.value()).collect();
     let state = evaluate(&amounts, max_loss, max_consecutive);
-    let recorded_trip = events_of(db, LOSS_BREAKER_TRIPPED)?.into_iter().rfind(|(id, ..)| *id > start.event_id).map(|(.., payload)| payload);
+    let recorded_trip = events_of(db, LOSS_BREAKER_TRIPPED)?.into_iter().rfind(|e| e.id > start.event_id).map(|e| e.payload);
     Ok(Assessment { start, pairs, state, max_loss, max_consecutive, recorded_trip })
 }
 

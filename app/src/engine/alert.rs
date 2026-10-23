@@ -220,10 +220,10 @@ impl BreakerNotice {
     pub fn body(&self) -> String {
         let env = EnvLabel::of(self.identity, ExecutionMode::ExchangeDemo).env_name();
         let basis = if self.provisional { "（暫計：價格損益扣手續費，不含資金費）" } else { "" };
+        let used = format!("{:.2}", self.loss_used);
         redact_secrets(&format!(
-            "{env}：{}。已虧 {}／{} USDT · 連虧 {}／{} 筆{basis}。系統只停止開新倉，進行中的配對照常出場；要繼續交易請自行重新開放交易（會重新計算）。",
+            "{env}：{}。已虧 {used}／{} USDT · 連虧 {}／{} 筆{basis}。系統只停止開新倉，進行中的配對照常出場；要繼續交易請自行重新開放交易（會重新計算）。",
             self.reason.text(),
-            format!("{:.2}", self.loss_used),
             self.max_loss.normalize(),
             self.consecutive,
             self.max_consecutive,
