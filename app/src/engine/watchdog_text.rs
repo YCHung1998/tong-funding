@@ -154,7 +154,7 @@ pub fn status_lines(status: &Status, exchanges: (Exchange, Exchange), now_ms: i6
         Status::Waiting { due_ms: Some(_) } => vec!["看門狗查證中…".to_string()],
         Status::Waiting { due_ms: None } => vec![format!("看門狗等待中：訂單逾時後再等 {wait_seconds} 秒才會查證；只有確認只有一腿成交時才會自動平掉該腿。")],
         Status::WaitingCancel { waited, next_ms } => vec![format!(
-            "看門狗：另一腿的委託尚未終結，已送出撤單，將在 {} UTC 再查證（第 {waited} 輪等待，連續 {MAX_CANCEL_WAIT_ROUNDS} 輪未終結就視為查證不明）。",
+            "看門狗：另一腿的委託尚未終結，已送出撤單，將在 {} UTC 再查證（第 {waited} 輪等待，累計 {MAX_CANCEL_WAIT_ROUNDS} 輪未終結就視為查證不明）。",
             hms(*next_ms)
         )],
         Status::Flattening { leg, quantity, attempt } => vec![format!(
@@ -178,7 +178,7 @@ pub fn status_lines(status: &Status, exchanges: (Exchange, Exchange), now_ms: i6
         Status::Flat => vec!["兩腿都沒有部位，系統不會送單，請人工處理；確認兩所皆無部位後按「人工確認已平倉」。".to_string()],
         Status::Unknown { reason, sent } => vec![unknown_sentence(reason, sent)],
         Status::ReadRetry { failed, reason, next_ms } => vec![format!(
-            "看門狗查證時讀取失敗（{reason}），第 {failed} 輪；將在 {} UTC 再查證，連續 {MAX_READ_FAIL_ROUNDS} 輪讀取失敗就視為查證不明並停止開新倉。",
+            "看門狗查證時讀取失敗（{reason}），第 {failed} 輪；將在 {} UTC 再查證，累計 {MAX_READ_FAIL_ROUNDS} 輪讀取失敗就視為查證不明並停止開新倉。",
             hms(*next_ms)
         )],
         Status::Skipped { reason } => vec![format!("看門狗不處理這個配對：{reason}")],
@@ -346,7 +346,7 @@ mod tests {
     fn the_in_between_states_say_what_is_going_on_and_when_the_next_look_is() {
         let cancel = status_lines(&Status::WaitingCancel { waited: 2, next_ms: NOW + 5_000 }, PAIR, NOW);
         assert!(cancel[0].contains("尚未終結") && cancel[0].contains("撤單") && cancel[0].contains("08:00:05 UTC") && cancel[0].contains("第 2 輪"), "{cancel:?}");
-        assert!(cancel[0].contains(&format!("連續 {MAX_CANCEL_WAIT_ROUNDS} 輪")), "{cancel:?}");
+        assert!(cancel[0].contains(&format!("累計 {MAX_CANCEL_WAIT_ROUNDS} 輪")), "{cancel:?}");
         let flattening = status_lines(&Status::Flattening { leg: Leg::Long, quantity: dec("10"), attempt: 2 }, PAIR, NOW);
         assert!(flattening[0].contains("多腿") && flattening[0].contains("只減倉") && flattening[0].contains("數量 10") && flattening[0].contains("第 2 次") && flattening[0].contains("最多送出 3 次"), "{flattening:?}");
         let retry = status_lines(&Status::Retrying { attempt: 1, reason: "order rejected: risk limit".into(), next_ms: NOW + 5_000 }, PAIR, NOW);
@@ -354,7 +354,7 @@ mod tests {
         assert!(retry[0].contains(NOTE) && !retry[0].contains("通知你"), "{retry:?}");
         let read = status_lines(&Status::ReadRetry { failed: 2, reason: "long position unreadable: timeout".into(), next_ms: NOW + 5_000 }, PAIR, NOW);
         assert!(read[0].contains("讀取失敗") && read[0].contains("long position unreadable: timeout") && read[0].contains("08:00:05 UTC") && read[0].contains("第 2 輪"), "{read:?}");
-        assert!(read[0].contains("連續 3 輪") && read[0].contains("停止開新倉"), "{read:?}");
+        assert!(read[0].contains("累計 3 輪") && read[0].contains("停止開新倉"), "{read:?}");
         let skipped = status_lines(&Status::Skipped { reason: "pair belongs to EXCHANGE_DEMO".into() }, PAIR, NOW);
         assert!(skipped[0].contains("不處理") && skipped[0].contains("EXCHANGE_DEMO"), "{skipped:?}");
     }
