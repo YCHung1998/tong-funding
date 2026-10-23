@@ -21,8 +21,19 @@ pub const ROW_HEIGHT_PX: f32 = 44.0;
 /// Width of `text` in one line, on the safe side: ASCII is as wide as a monospaced digit (0.6 em),
 /// anything else (Chinese, full-width brackets, the minus sign) counts as a full em.
 pub fn est_text_px(text: &str) -> f32 {
-    text.chars().map(|c| if c.is_ascii() { 0.6 } else { 1.0 }).sum::<f32>() * CELL_FONT_PX
+    est_text_px_at(text, CELL_FONT_PX)
 }
+
+/// [`est_text_px`] at another font size.
+pub fn est_text_px_at(text: &str, font_px: f32) -> f32 {
+    text.chars().map(|c| if c.is_ascii() { 0.6 } else { 1.0 }).sum::<f32>() * font_px
+}
+
+/// Font size of the second line of a rate cell (the 8h equivalent), one step below the cell text, so
+/// the long `8h 等效 …（僅供顯示）` fits a narrow column.
+pub const RATE_NOTE_FONT_PX: f32 = 9.0;
+/// Font size of the table's header titles (what `Size::Medium` gave before the rows grew taller).
+pub const HEADER_FONT_PX: f32 = 14.0;
 
 /// The columns of the Funding Rate Matrix, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -106,15 +117,15 @@ impl ScanColumn {
     pub fn width(self) -> f32 {
         match self {
             ScanColumn::Rank => 50.0,
-            ScanColumn::Symbol => 120.0,
+            ScanColumn::Symbol => 104.0,
             ScanColumn::Coverage => 50.0,
-            ScanColumn::Countdown => 120.0,
-            ScanColumn::Binance | ScanColumn::Bybit | ScanColumn::Okx => 176.0,
-            ScanColumn::Direction => 160.0,
-            ScanColumn::Gross => 112.0,
-            ScanColumn::NetEdge => 200.0,
-            ScanColumn::Qualified => 80.0,
-            ScanColumn::Add => 130.0,
+            ScanColumn::Countdown => 100.0,
+            ScanColumn::Binance | ScanColumn::Bybit | ScanColumn::Okx => 160.0,
+            ScanColumn::Direction => 100.0,
+            ScanColumn::Gross => 120.0,
+            ScanColumn::NetEdge => 164.0,
+            ScanColumn::Qualified => 70.0,
+            ScanColumn::Add => 120.0,
         }
     }
 

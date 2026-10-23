@@ -700,6 +700,15 @@ pub struct ScannerTable {
     pub events: std::rc::Rc<std::cell::RefCell<Vec<ScanEvent>>>,
 }
 
+/// A cell of up to two lines of the same colour.
+fn two_lines(first: String, second: Option<String>, color: u32) -> Div {
+    let mut d = div().flex().flex_col().child(small(first, color));
+    if let Some(s) = second {
+        d = d.child(small(s, color));
+    }
+    d
+}
+
 /// A rate cell is two lines (scanner-layout): the rate, its interval tag and the stale marker; under
 /// it the 8h equivalent. The ids follow the symbol and exchange (not the row index) for the tests.
 fn rate_cell(c: &RateCell, symbol: &str, exchange: Exchange) -> Div {
@@ -715,7 +724,7 @@ fn rate_cell(c: &RateCell, symbol: &str, exchange: Exchange) -> Div {
     }
     let mut cell = div().id(SharedString::from(format!("rate-{key}"))).test_support().flex().flex_col().child(line1);
     if let Some(eq) = c.second_line() {
-        cell = cell.child(small(eq, theme::TEXT_MUTED).id(SharedString::from(format!("rate-line2-{key}"))).test_support());
+        cell = cell.child(small(eq, theme::TEXT_MUTED).text_size(fs(super::scan_view::RATE_NOTE_FONT_PX)).id(SharedString::from(format!("rate-line2-{key}"))).test_support());
     }
     div().child(cell)
 }
@@ -753,7 +762,8 @@ impl TableDelegate for ScannerTable {
     /// The header title is clickable too (the library only reacts to its small sort icon).
     fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
         let c = self.visible.get(col_ix).copied().unwrap_or(ScanColumn::Symbol);
-        let mut title = div().id(("scan-th", col_ix)).test_support().size_full().child(c.title());
+        // The rows are sized by pixels (two lines tall), which drops the table's own header font: set it.
+        let mut title = div().id(("scan-th", col_ix)).test_support().size_full().text_size(fs(super::scan_view::HEADER_FONT_PX)).child(c.title());
         if c.sortable() {
             let events = self.events.clone();
             title = title.cursor_pointer().on_click(move |_, _, _| events.borrow_mut().push(ScanEvent::CycleSort(c)));
@@ -778,12 +788,16 @@ impl TableDelegate for ScannerTable {
             ScanColumn::Coverage => small(r.coverage_text(), theme::TEXT_SECONDARY),
             ScanColumn::Countdown => {
                 let clock = r.countdown_target.map(|(_, e)| self.clocks.get(&e).copied().unwrap_or(ClockState::Unsynced)).unwrap_or(ClockState::Unsynced);
-                small(scanner::countdown(r.countdown_target, clock, self.now_ms).text(), theme::TEXT_SECONDARY)
+                let cd = scanner::countdown(r.countdown_target, clock, self.now_ms);
+                two_lines(cd.first_line(), cd.second_line(), theme::TEXT_SECONDARY)
             }
             ScanColumn::Binance => rate_cell(&r.cells[0].1, &r.symbol, r.cells[0].0),
             ScanColumn::Bybit => rate_cell(&r.cells[1].1, &r.symbol, r.cells[1].0),
             ScanColumn::Okx => rate_cell(&r.cells[2].1, &r.symbol, r.cells[2].0),
-            ScanColumn::Direction => small(r.direction_text(), theme::TEXT_SECONDARY),
+            ScanColumn::Direction => match r.direction_lines() {
+                Some((long, short)) => two_lines(long, Some(short), theme::TEXT_SECONDARY),
+                None => small(r.direction_text(), theme::TEXT_SECONDARY),
+            },
             ScanColumn::Gross => {
                 // The value on the first line, the labels under it: the column is as wide as the widest of
                 // them (not value + two labels side by side), and nothing is cut or reaches Net Edge.
@@ -812,10 +826,13 @@ impl TableDelegate for ScannerTable {
                         .child(tags),
                 )
             }
-            ScanColumn::NetEdge => div().child(
-                // A long "未設定（缺 …）" wraps onto the second line instead of running into the next column.
-                small(r.net_edge.text(), tone(r.net_edge.tone())).id(SharedString::from(format!("net-{}", r.symbol))).test_support().whitespace_normal().line_clamp(2),
-            ),
+            ScanColumn::NetEdge => {
+                // A long "未設定（缺 …）" wraps onto the second line instead of running into the next column;
+                // the whole list stays in the tooltip (and in the formula block at the top of the page).
+                let full = r.net_edge.text();
+                let cell = small(full.clone(), tone(r.net_edge.tone())).id(SharedString::from(format!("net-{}", r.symbol))).test_support().whitespace_normal().line_clamp(2);
+                div().child(if matches!(r.net_edge, scanner::NetEdgeCell::NotConfigured(_)) { cell.tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)).into_any_element() } else { cell.into_any_element() })
+            }
             ScanColumn::Add => {
                 let cell = self.candidates.get(row).cloned().unwrap_or_default();
                 let (mark, color) = match (&cell.blocked, cell.checked) {

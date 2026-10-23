@@ -170,6 +170,22 @@ pub enum Countdown {
 }
 
 impl Countdown {
+    /// Line 1 when the cell is drawn on two lines: the time, or `結算中`.
+    pub fn first_line(self) -> String {
+        match self {
+            Countdown::Remaining { ms, .. } => format::hms(ms),
+            Countdown::Settling => "結算中".into(),
+            Countdown::Unknown => DASH.into(),
+        }
+    }
+    /// Line 2: `（未校時）` for an uncalibrated clock, `待更新` while settling.
+    pub fn second_line(self) -> Option<String> {
+        match self {
+            Countdown::Remaining { calibrated: false, .. } => Some("（未校時）".into()),
+            Countdown::Settling => Some("待更新".into()),
+            _ => None,
+        }
+    }
     pub fn text(self) -> String {
         match self {
             Countdown::Remaining { ms, calibrated: true } => format::hms(ms),
@@ -210,6 +226,10 @@ impl ScanRow {
             Some((l, s)) => format!("L {} / S {}", l.name(), s.name()),
             None => DASH.into(),
         }
+    }
+    /// The direction on two lines (`L Bybit`, `S Binance`) for the narrow column.
+    pub fn direction_lines(&self) -> Option<(String, String)> {
+        self.direction.map(|(l, s)| (format!("L {}", l.name()), format!("S {}", s.name())))
     }
     pub fn gross_text(&self) -> String {
         self.gross_spread.map_or_else(|| DASH.into(), format::rate_pct)

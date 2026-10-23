@@ -128,7 +128,7 @@ fn visible_index_maps_back_to_the_logical_column_after_hiding_a_middle_column() 
 fn total_width_shrinks_when_columns_are_hidden_and_decides_horizontal_scroll() {
     let mut v = ColumnVisibility::default();
     let full = v.total_width();
-    assert_eq!(full, 50.0 + 120.0 + 50.0 + 120.0 + 176.0 * 3.0 + 160.0 + 112.0 + 200.0 + 80.0 + 130.0);
+    assert_eq!(full, 50.0 + 104.0 + 50.0 + 100.0 + 160.0 * 3.0 + 100.0 + 120.0 + 164.0 + 70.0 + 120.0);
     assert!(v.needs_horizontal_scroll(1000.0), "12 columns do not fit 1000 px");
     for c in [ScanColumn::Direction, ScanColumn::NetEdge, ScanColumn::Okx, ScanColumn::Bybit, ScanColumn::Add, ScanColumn::Gross] {
         v.toggle(c);
@@ -219,7 +219,11 @@ use crate::ui::scanner::{Countdown, GROSS_INTERVALS_DIFFER};
 
 /// Width a cell needs for `parts` laid out in one line, padding included.
 fn need(parts: &[String]) -> f32 {
-    parts.iter().map(|p| est_text_px(p)).sum::<f32>() + CELL_GAP_PX * parts.len().saturating_sub(1) as f32 + CELL_PAD_PX
+    need_at(parts, CELL_FONT_PX)
+}
+
+fn need_at(parts: &[String], font_px: f32) -> f32 {
+    parts.iter().map(|p| est_text_px_at(p, font_px)).sum::<f32>() + CELL_GAP_PX * parts.len().saturating_sub(1) as f32 + CELL_PAD_PX
 }
 
 fn rate(rate: &str, secs: i64, eq: Option<&str>, stale: bool) -> RateCell {
@@ -231,6 +235,7 @@ fn the_width_model_counts_wide_characters_as_a_full_em() {
     let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
     assert!(close(est_text_px("0.0400"), 6.0 * 0.6 * CELL_FONT_PX));
     assert!(close(est_text_px("週期不同"), 4.0 * CELL_FONT_PX));
+    assert!(close(est_text_px_at("0.0400", 9.0), 6.0 * 0.6 * 9.0));
     assert!(close(est_text_px("−1"), CELL_FONT_PX + 0.6 * CELL_FONT_PX), "the minus sign is not ASCII: counted wide, on the safe side");
 }
 
@@ -261,7 +266,8 @@ fn the_exchange_columns_fit_their_widest_cell_on_both_lines() {
         for c in &cells {
             assert!(need(&c.first_line()) <= col.width(), "{:?}: line 1 of {c:?} needs {} px", col, need(&c.first_line()));
             if let Some(l2) = c.second_line() {
-                assert!(need(std::slice::from_ref(&l2)) <= col.width(), "{:?}: line 2 {l2:?} needs {} px", col, need(std::slice::from_ref(&l2)));
+                let n = need_at(std::slice::from_ref(&l2), RATE_NOTE_FONT_PX);
+                assert!(n <= col.width(), "{:?}: line 2 {l2:?} needs {n} px", col);
             }
         }
     }
@@ -300,13 +306,42 @@ fn the_other_columns_fit_their_longest_fixed_texts() {
         Countdown::Settling,
         Countdown::Unknown,
     ] {
-        assert!(need(&[c.text()]) <= ScanColumn::Countdown.width(), "{:?} needs {} px", c, need(&[c.text()]));
+        // two lines: the time (or 結算中), then the note (未校時 / 待更新)
+        for line in std::iter::once(c.first_line()).chain(c.second_line()) {
+            assert!(need(std::slice::from_ref(&line)) <= ScanColumn::Countdown.width(), "{c:?}: {line:?} needs {} px", need(std::slice::from_ref(&line)));
+        }
     }
     for (l, s) in [(Binance, Bybit), (Bybit, Binance), (Okx, Binance), (Binance, Okx)] {
         let mut r = row(1, "X");
         r.direction = Some((l, s));
-        assert!(need(&[r.direction_text()]) <= ScanColumn::Direction.width(), "{} needs {} px", r.direction_text(), need(&[r.direction_text()]));
+        let (long, short) = r.direction_lines().expect("a direction");
+        for line in [long, short] {
+            assert!(need(std::slice::from_ref(&line)) <= ScanColumn::Direction.width(), "{line:?} needs {} px", need(std::slice::from_ref(&line)));
+        }
     }
+}
+
+#[test]
+fn countdown_and_direction_split_into_two_lines_without_changing_their_one_line_text() {
+    let cal = Countdown::Remaining { ms: 3_723_000, calibrated: true };
+    assert_eq!((cal.first_line(), cal.second_line()), ("01:02:03".to_string(), None));
+    let un = Countdown::Remaining { ms: 3_723_000, calibrated: false };
+    assert_eq!((un.first_line(), un.second_line().as_deref()), ("01:02:03".to_string(), Some("（未校時）")));
+    assert_eq!((Countdown::Settling.first_line(), Countdown::Settling.second_line().as_deref()), ("結算中".to_string(), Some("待更新")));
+    assert_eq!((Countdown::Unknown.first_line(), Countdown::Unknown.second_line()), ("—".to_string(), None));
+    for c in [cal, un, Countdown::Settling, Countdown::Unknown] {
+        let joined = match c.second_line() {
+            Some(n) if c == Countdown::Settling => format!("{} · {n}", c.first_line()),
+            Some(n) => format!("{}{n}", c.first_line()),
+            None => c.first_line(),
+        };
+        assert_eq!(joined, c.text(), "the lines say what the one-line text says");
+    }
+    let mut r = row(1, "X");
+    assert_eq!(r.direction_lines(), None);
+    r.direction = Some((Bybit, Binance));
+    assert_eq!(r.direction_lines(), Some(("L Bybit".to_string(), "S Binance".to_string())));
+    assert_eq!(r.direction_text(), "L Bybit / S Binance");
 }
 
 #[test]
@@ -318,12 +353,13 @@ fn rows_are_tall_enough_for_two_lines_of_cell_text() {
 }
 
 #[test]
-fn all_twelve_columns_fit_a_1850_px_window_so_the_main_actions_are_in_view() {
-    // The page is 1850 - 224 (side bar and padding) wide, the table bordered by 2 px.
-    const TABLE_PX: f32 = 1850.0 - 224.0 - 2.0;
+fn the_columns_fit_the_default_1470_px_window_when_okx_is_not_ticked() {
+    // The page is 1470 - 248 (side bar and margins) wide, the table bordered by 2 px.
+    const TABLE_PX: f32 = 1470.0 - 248.0 - 2.0;
     let mut v = ColumnVisibility::default();
-    assert!(v.total_width() <= TABLE_PX, "all columns: {} px", v.total_width());
-    v.toggle(ScanColumn::Okx);
+    v.set_disabled_exchanges(&[Okx]);
+    assert_eq!(v.visible().len(), 11);
+    assert!(v.total_width() <= TABLE_PX, "{} px > {TABLE_PX} px", v.total_width());
     assert!(!v.needs_horizontal_scroll(TABLE_PX));
 }
 

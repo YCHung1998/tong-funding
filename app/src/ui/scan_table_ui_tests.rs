@@ -354,7 +354,9 @@ fn scrolling_brings_the_last_column_into_view(cx: &mut TestAppContext) {
             let drawn: Vec<usize> = (0..12usize).filter(|i| window.try_find(("scan-th", *i)).is_some()).collect();
             // Rank and Symbol (0, 1) are fixed on the left: they stay drawn while the others scroll away.
             assert!(drawn.contains(&0) && drawn.contains(&1), "fixed columns must stay drawn: {drawn:?}");
-            let target = *drawn.iter().find(|i| **i >= 2).expect("some scrolling header is drawn");
+            // a header fully inside the window (a drawn one can be clipped away and cannot take the wheel)
+            let inside = |i: &usize| window.try_find(("scan-th", *i)).is_some_and(|e| e.visible());
+            let target = *drawn.iter().find(|i| **i >= 2 && inside(i)).expect("a scrolling header is drawn inside the window");
             window.scroll(("scan-th", target), ScrollDelta::Pixels(point(px(-400.), px(0.))), cx);
         })
         .unwrap();
@@ -409,8 +411,10 @@ fn every_column_shows_when_every_exchange_is_ticked(cx: &mut TestAppContext) {
 
 // ---- scanner-layout 2.2: the default window shows the main actions and nothing is cut or overlapped ----
 
-/// The width of the screenshot that prompted scanner-layout (about 1,850 logical px, zoom 100%).
-const DEFAULT_WIDTH: f32 = 1850.0;
+/// The window of the screenshot that prompted scanner-layout: 3164 x 2070 physical px on a 2x
+/// Retina display = about 1,470 logical px including the border, zoom 100%. The table gets about
+/// 1,220 of it (side bar and margins take 248).
+const DEFAULT_WIDTH: f32 = 1470.0;
 
 /// Like `feed_with`, but every Binance rate is a 4 h rate against Bybit's 8 h: each row shows the
 /// interval difference, the 8 h equivalent on Binance, and (when core classifies it) the kind tag.
@@ -451,8 +455,9 @@ fn bounds_of(rig: &Rig, id: impl Into<gpui_kit::ElementId>, cx: &mut TestAppCont
 
 #[gpui_kit::test]
 fn at_the_default_width_the_qualified_and_add_columns_are_in_view_without_scrolling(cx: &mut TestAppContext) {
-    for settings in [okx_unticked(), all_ticked()] {
-        let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(settings));
+    // Spec scanner-layout: with OKX unticked. (All three exchanges need about 1,360 px and scroll.)
+    {
+        let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(okx_unticked()));
         for c in [ScanColumn::Qualified, ScanColumn::Add] {
             let b = header(&rig, c, cx).unwrap_or_else(|| panic!("{c:?} is not drawn: it is scrolled out of the table"));
             assert!(b.right() <= px(DEFAULT_WIDTH), "{c:?} ends at {:?}, past the {DEFAULT_WIDTH} px window", b.right());
@@ -525,7 +530,7 @@ fn exists(rig: &Rig, id: impl Into<gpui_kit::ElementId>, cx: &mut TestAppContext
 
 #[gpui_kit::test]
 fn the_toggle_and_the_sources_are_a_clear_gap_apart_or_on_separate_lines(cx: &mut TestAppContext) {
-    for width in [DEFAULT_WIDTH, 1000.0, 700.0] {
+    for width in [1850.0, DEFAULT_WIDTH, 1000.0, 700.0] {
         let rig = open_with(cx, width, feed_with(okx_unticked()));
         let toggle = bounds_of(&rig, "only-qualified", cx);
         let sources = bounds_of(&rig, "scan-sources", cx);
