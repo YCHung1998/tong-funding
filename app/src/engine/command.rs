@@ -291,6 +291,8 @@ pub struct Snapshot {
     pub notices: Vec<Notice>,
     /// One per pair in an alert state (derived from the pairs; survives restarts).
     pub alerts: Vec<Alert>,
+    /// loss-circuit-breaker: what the status bar shows (trading allowed or why not, queue, breaker, pairs needing a person).
+    pub status: super::status::EngineStatus,
 }
 
 /// Reply to a command (sent on the command's oneshot, if any).

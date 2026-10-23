@@ -39,6 +39,7 @@ fn snapshot() -> Snapshot {
             simulated: true,
             reason: Some("LEG_REJECTED".into()),
         }],
+        status: Default::default(),
     }
 }
 

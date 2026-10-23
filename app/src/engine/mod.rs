@@ -32,6 +32,7 @@ pub mod preflight;
 pub mod recovery;
 pub mod schedule;
 pub mod sim;
+pub mod status;
 pub mod timings;
 pub mod transition;
 pub mod watchdog;

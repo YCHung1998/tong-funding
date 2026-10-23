@@ -2901,12 +2901,15 @@ impl Actor {
     }
 
     fn snapshot(&self) -> Snapshot {
+        let pairs: Vec<PairView> = self.pairs.values().map(|v| PairView { flat_confirmed: v.state == PairState::Closing && self.awaiting_pnl(&v.internal_uuid), ..v.clone() }).collect();
+        let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
+        let status = self.engine_status(&pairs, &blockers);
         Snapshot {
             now_ms: self.clock.now_ms(),
             trigger_mode: self.trigger_mode,
             execution_mode: self.execution_mode,
-            pairs: self.pairs.values().map(|v| PairView { flat_confirmed: v.state == PairState::Closing && self.awaiting_pnl(&v.internal_uuid), ..v.clone() }).collect(),
-            blockers: gate::current_blockers(&self.db, self.reconciliation_pending.as_deref()),
+            pairs,
+            blockers,
             prices: self.market_rx.borrow().iter().map(|((e, s), p)| (*e, s.clone(), *p)).collect(),
             notices: self.notices.clone(),
             alerts: self
@@ -2922,6 +2925,24 @@ impl Actor {
                     reason: self.alert_reasons.get(&v.internal_uuid).cloned(),
                 })
                 .collect(),
+            status,
+        }
+    }
+
+    /// loss-circuit-breaker 2.4: the status bar's data (trading allowed or why not, queue, breaker, pairs needing a person).
+    fn engine_status(&self, pairs: &[PairView], blockers: &[Blocker]) -> super::status::EngineStatus {
+        use super::status;
+        let cause = if blockers.contains(&Blocker::KillSwitch) { status::latest_kill_cause(&self.db) } else { status::StopReason::Manual };
+        let live_armed = self.live_on().then(|| self.armed());
+        let stop_reason = status::stop_reason(blockers, self.execution_mode, cause, live_armed);
+        let (queued_pairs, next_entry_ms) = status::queue_summary(pairs, &self.timings);
+        status::EngineStatus {
+            trading_allowed: stop_reason.is_none(),
+            stop_reason,
+            queued_pairs,
+            next_entry_ms,
+            breaker: self.breaker.clone(),
+            needs_handling: status::needs_handling(pairs),
         }
     }
 
@@ -3392,6 +3413,7 @@ fn dummy_snapshot() -> Snapshot {
         prices: Vec::new(),
         notices: Vec::new(),
         alerts: Vec::new(),
+        status: super::status::EngineStatus::default(),
     }
 }
 
