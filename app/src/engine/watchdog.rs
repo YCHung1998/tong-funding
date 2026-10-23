@@ -429,6 +429,118 @@ pub fn evidence(probe: &WatchdogProbe) -> Value {
     json!({ "long": leg(&probe.legs[0]), "short": leg(&probe.legs[1]) })
 }
 
+/// Where the watchdog stands for the pair's current alert entry, as the manual-handling card shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Status {
+    /// No round yet: the first one is due at `due_ms` (`None` = the entry time is not known).
+    Waiting { due_ms: Option<i64> },
+    /// An order of the pair is not over yet: it was cancelled, the next look is at `next_ms`.
+    WaitingCancel { waited: u32, next_ms: i64 },
+    /// A flatten order (attempt `attempt`) was sent and is awaited.
+    Flattening { leg: Leg, quantity: Decimal, attempt: u32 },
+    /// An attempt did not work; the next look is at `next_ms`.
+    Retrying { attempt: u32, reason: String, next_ms: i64 },
+    /// The bare leg was closed by the watchdog; the user still confirms.
+    Flattened { leg: Leg, quantity: Decimal },
+    /// Both legs hold a position: nothing was sent.
+    Hedged,
+    /// Neither leg holds a position: nothing was sent.
+    Flat,
+    /// Not provable: nothing was sent, new entries are stopped.
+    Unknown { reason: String },
+    /// The watchdog cannot act on this pair.
+    Skipped { reason: String },
+}
+
+/// The status from the watchdog records of one entry (oldest first). `alert_since_ms` = when the pair
+/// entered the state, if known. The newest record of a round, an attempt result or a skip decides;
+/// a flatten that worked stays visible after the round that confirmed both legs flat.
+pub fn status_from_records(alert_since_ms: Option<i64>, records: &[Record]) -> Status {
+    let text = |r: &Record, k: &str| r.payload.get(k).and_then(Value::as_str).map(str::to_string);
+    let leg_of = |r: &Record| match r.payload.get("leg").and_then(Value::as_str) {
+        Some("long") => Some(Leg::Long),
+        Some("short") => Some(Leg::Short),
+        _ => None,
+    };
+    let quantity_of = |r: &Record| text(r, "quantity").and_then(|q| q.parse::<Decimal>().ok());
+    let attempt_of = |r: &Record| r.payload.get("attempt").and_then(Value::as_u64).map_or(0, |a| u32::try_from(a).unwrap_or(u32::MAX));
+
+    let mut flattened: Option<(Leg, Decimal)> = None;
+    let mut newest: Option<&Record> = None;
+    for r in records.iter().filter(|r| r.event_type == NAKED_LEG_WATCHDOG) {
+        match text(r, "kind").as_deref() {
+            Some(KIND_ATTEMPT_RESULT) => {
+                if r.payload.get("ok").and_then(Value::as_bool) == Some(true)
+                    && let (Some(leg), Some(quantity)) = (leg_of(r), quantity_of(r))
+                {
+                    flattened = Some((leg, quantity));
+                }
+                newest = Some(r);
+            }
+            Some(KIND_ROUND | KIND_SKIPPED) => newest = Some(r),
+            // notifications and the like are not progress
+            Some(_) | None => {}
+        }
+    }
+    let waiting = Status::Waiting { due_ms: alert_since_ms.map(|t| t.saturating_add(WATCHDOG_GRACE_MS)) };
+    let Some(r) = newest else { return waiting };
+    let next_ms = r.ts_ms.saturating_add(WATCHDOG_INTERVAL_MS);
+    match text(r, "kind").as_deref() {
+        Some(KIND_SKIPPED) => Status::Skipped { reason: text(r, "reason").unwrap_or_default() },
+        Some(KIND_ATTEMPT_RESULT) => {
+            if r.payload.get("ok").and_then(Value::as_bool) == Some(true) {
+                flattened.map_or(waiting, |(leg, quantity)| Status::Flattened { leg, quantity })
+            } else {
+                Status::Retrying { attempt: attempt_of(r), reason: text(r, "reason").unwrap_or_default(), next_ms }
+            }
+        }
+        Some(KIND_ROUND) => match text(r, "conclusion").as_deref().and_then(Conclusion::parse) {
+            Some(Conclusion::WaitForCancel) => {
+                let earlier = r.payload.get("waited_rounds").and_then(Value::as_u64).map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX));
+                Status::WaitingCancel { waited: earlier.saturating_add(1), next_ms }
+            }
+            Some(Conclusion::Flatten) => match (leg_of(r), quantity_of(r)) {
+                (Some(leg), Some(quantity)) => Status::Flattening { leg, quantity, attempt: attempt_of(r) },
+                _ => waiting,
+            },
+            Some(Conclusion::Hedged) => Status::Hedged,
+            // FLAT after our own flatten is that flatten, not an unexplained empty pair
+            Some(Conclusion::Flat) => flattened.map_or(Status::Flat, |(leg, quantity)| Status::Flattened { leg, quantity }),
+            Some(Conclusion::Unknown) => Status::Unknown { reason: text(r, "reason").unwrap_or_default() },
+            None => waiting,
+        },
+        Some(_) | None => waiting,
+    }
+}
+
+/// A stored event of one pair (the page reads them from its event window).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairEvent {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub event_type: String,
+    pub payload: Value,
+}
+
+/// The status of the pair's CURRENT alert entry (the newest `PAIR_TRANSITION` into `state`) from its
+/// events, in any order. Records of an earlier entry do not count; without an entry event every
+/// record counts and the time of the first round is unknown.
+pub fn status_of_pair(state: PairState, events: &[PairEvent]) -> Status {
+    let mut sorted: Vec<&PairEvent> = events.iter().collect();
+    sorted.sort_by_key(|e| (e.ts_ms, e.id));
+    let entry = sorted.iter().rposition(|e| e.event_type == PAIR_TRANSITION && e.payload.get("to").and_then(Value::as_str) == Some(state.as_str()));
+    let (alert_since_ms, after) = match entry {
+        Some(i) => (Some(sorted[i].ts_ms), &sorted[i + 1..]),
+        None => (None, &sorted[..]),
+    };
+    let records: Vec<Record> = after
+        .iter()
+        .filter(|e| e.event_type == NAKED_LEG_WATCHDOG || e.event_type == LEG_FLATTEN)
+        .map(|e| Record { ts_ms: e.ts_ms, event_type: e.event_type.clone(), payload: e.payload.clone() })
+        .collect();
+    status_from_records(alert_since_ms, &records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -805,5 +917,105 @@ mod tests {
         assert_eq!(e["long"]["orders"][0], json!({ "client_order_id": "o1", "action": "open", "state": "Filled", "filled": "10" }));
         assert_eq!(e["short"]["position"], json!({ "error": "Bybit positions list incomplete" }), "an unreadable number is an error, never 0");
         assert_eq!(e["short"]["exchange"], json!("Bybit"));
+    }
+
+    // ---- 3.3: the status the manual-handling card shows, from the events ----
+
+    fn at(ts_ms: i64, event_type: &str, payload: Value) -> Record {
+        Record { ts_ms, event_type: event_type.into(), payload }
+    }
+
+    fn flatten_round(ts: i64, attempt: u32) -> Record {
+        at(ts, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "FLATTEN", "leg": "long", "quantity": "10", "attempt": attempt }))
+    }
+
+    fn attempt_result(ts: i64, ok: bool, attempt: u32) -> Record {
+        let mut p = json!({ "kind": KIND_ATTEMPT_RESULT, "ok": ok, "attempt": attempt, "leg": "long", "quantity": "10" });
+        if !ok {
+            p["reason"] = json!("order rejected: risk limit");
+        }
+        at(ts, NAKED_LEG_WATCHDOG, p)
+    }
+
+    #[test]
+    fn without_a_record_the_status_is_waiting_for_the_first_round() {
+        assert_eq!(status_from_records(Some(10_000), &[]), Status::Waiting { due_ms: Some(15_000) });
+        assert_eq!(status_from_records(None, &[]), Status::Waiting { due_ms: None });
+    }
+
+    #[test]
+    fn a_round_that_waits_for_the_cancel_says_when_it_looks_again() {
+        let r = [at(15_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "WAIT_FOR_CANCEL", "waited_rounds": 1 }))];
+        assert_eq!(status_from_records(Some(10_000), &r), Status::WaitingCancel { waited: 2, next_ms: 20_000 });
+    }
+
+    #[test]
+    fn a_sent_flatten_is_flattening_until_its_result_is_recorded() {
+        assert_eq!(status_from_records(Some(10_000), &[flatten_round(15_000, 1)]), Status::Flattening { leg: Leg::Long, quantity: dec("10"), attempt: 1 });
+    }
+
+    #[test]
+    fn a_failed_attempt_is_retrying_with_its_reason_and_the_next_look() {
+        let r = [flatten_round(15_000, 1), attempt_result(16_000, false, 1)];
+        assert_eq!(status_from_records(Some(10_000), &r), Status::Retrying { attempt: 1, reason: "order rejected: risk limit".into(), next_ms: 21_000 });
+    }
+
+    #[test]
+    fn a_successful_attempt_is_flattened_and_stays_flattened_after_the_confirming_round() {
+        let done = Status::Flattened { leg: Leg::Long, quantity: dec("10") };
+        let r = [flatten_round(15_000, 1), attempt_result(16_000, true, 1)];
+        assert_eq!(status_from_records(Some(10_000), &r), done);
+        let confirmed = [flatten_round(15_000, 1), attempt_result(16_000, true, 1), at(21_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "FLAT" }))];
+        assert_eq!(status_from_records(Some(10_000), &confirmed), done, "FLAT after our own flatten is the flatten, not an unexplained empty pair");
+        let notified = [flatten_round(15_000, 1), attempt_result(16_000, true, 1), at(16_001, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_NOTIFY_RESULT, "ok": true }))];
+        assert_eq!(status_from_records(Some(10_000), &notified), done, "a notification record changes nothing");
+    }
+
+    #[test]
+    fn hedged_flat_and_unknown_conclusions_are_the_status() {
+        let round = |c: &str| at(15_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": c, "reason": "long position unreadable: timeout" }));
+        assert_eq!(status_from_records(Some(10_000), &[round("HEDGED")]), Status::Hedged);
+        assert_eq!(status_from_records(Some(10_000), &[round("FLAT")]), Status::Flat);
+        assert_eq!(status_from_records(Some(10_000), &[round("UNKNOWN")]), Status::Unknown { reason: "long position unreadable: timeout".into() });
+    }
+
+    #[test]
+    fn a_skip_is_the_status_only_while_nothing_else_happened() {
+        let skip = at(11_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_SKIPPED, "reason": "pair belongs to EXCHANGE_DEMO" }));
+        assert_eq!(status_from_records(Some(10_000), std::slice::from_ref(&skip)), Status::Skipped { reason: "pair belongs to EXCHANGE_DEMO".into() });
+        let later = [skip, at(15_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "HEDGED" }))];
+        assert_eq!(status_from_records(Some(10_000), &later), Status::Hedged);
+    }
+
+    fn transition(id: i64, ts: i64, to: &str) -> PairEvent {
+        PairEvent { id, ts_ms: ts, event_type: PAIR_TRANSITION.into(), payload: json!({ "from": "X", "to": to }) }
+    }
+
+    fn pair_event(id: i64, r: Record) -> PairEvent {
+        PairEvent { id, ts_ms: r.ts_ms, event_type: r.event_type, payload: r.payload }
+    }
+
+    #[test]
+    fn the_status_of_a_pair_counts_only_the_records_after_its_current_entry() {
+        let old_unknown = pair_event(2, at(7_000, NAKED_LEG_WATCHDOG, json!({ "kind": KIND_ROUND, "conclusion": "UNKNOWN", "reason": "old" })));
+        let events = [transition(1, 1_000, "PARTIAL_FAILURE"), old_unknown.clone(), transition(3, 50_000, "CLOSING"), transition(4, 60_000, "PARTIAL_FAILURE")];
+        assert_eq!(status_of_pair(PairState::PartialFailure, &events), Status::Waiting { due_ms: Some(65_000) }, "the old entry's UNKNOWN is history");
+        let mut with_new = events.to_vec();
+        with_new.push(pair_event(5, flatten_round(66_000, 1)));
+        assert_eq!(status_of_pair(PairState::PartialFailure, &with_new), Status::Flattening { leg: Leg::Long, quantity: dec("10"), attempt: 1 });
+    }
+
+    #[test]
+    fn the_status_of_a_pair_does_not_depend_on_the_order_of_the_events() {
+        let mut events = vec![transition(1, 1_000, "UNRESOLVED"), pair_event(2, flatten_round(6_000, 1)), pair_event(3, attempt_result(7_000, true, 1))];
+        let forward = status_of_pair(PairState::Unresolved, &events);
+        events.reverse(); // the page's window is newest first
+        assert_eq!(status_of_pair(PairState::Unresolved, &events), forward);
+        assert_eq!(forward, Status::Flattened { leg: Leg::Long, quantity: dec("10") });
+    }
+
+    #[test]
+    fn a_pair_without_an_entry_event_has_a_status_without_a_time() {
+        assert_eq!(status_of_pair(PairState::Imbalanced, &[]), Status::Waiting { due_ms: None });
     }
 }

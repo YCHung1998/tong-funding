@@ -1,6 +1,7 @@
 //! Staged orders view-model (ui-trading-pages tasks 1.1–1.3; spec staged-orders-page). Pure: the
 //! page renders this and sends engine commands through [`CommandSink`]; it never decides
-//! pre-trade checks (the engine does) and never offers an automatic remedy.
+//! pre-trade checks (the engine does) and never offers or triggers an automatic remedy itself. What the
+//! engine's naked-leg watchdog did on its own (authorization B) is only REPORTED here, truthfully.
 //!
 //! - one-click submit = one `EnterSelected` with every selected PREPARED pair, only after the
 //!   per-leg confirmation built here (design D4: what is listed is what is sent); allowed in AUTO
@@ -23,9 +24,12 @@ use super::positions::{spread_view, SpreadView};
 use super::engine_view::{blocker_text, refusing_blockers};
 use super::env_label::{ConfirmKind, EnvLabel};
 use super::risk_settings::missing_display;
+use super::theme::Tone;
 use crate::engine::command::{Blocker, Command, PairView};
 use crate::engine::ports::OrderSide;
 use crate::engine::timings::EngineTimings;
+use crate::engine::watchdog::{self, PairEvent};
+use crate::engine::watchdog_text;
 use crate::store::event_query::StoredEvent;
 
 /// One PREPARED pair.
@@ -254,10 +258,16 @@ pub struct ManualHandling {
     pub close: Result<Vec<CloseLeg>, String>,
     /// "人工確認已平倉": enabled only when the latest read shows both legs flat with no open order.
     pub confirm_closed: Result<(), String>,
+    /// naked-leg-watchdog: what the watchdog did for this pair and what comes next, in the words of
+    /// `engine::watchdog_text` (rebuilt from the stored events, so a restart shows the same).
+    pub watchdog: Vec<String>,
+    /// How the lines are coloured (red: could not prove, amber: needs a look, green: it flattened).
+    pub watchdog_tone: Tone,
 }
 
 impl ManualHandling {
-    /// The only two actions (no automatic remedy exists).
+    /// The only two actions: the page offers no repair and no automatic flatten (what the engine's
+    /// watchdog did is shown in `watchdog`, not triggered from here).
     pub fn actions(&self) -> [&'static str; 2] {
         ["人工要求平倉", "人工確認已平倉"]
     }
@@ -547,7 +557,7 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
     }
 
     let margins = tradable_exchanges(snap.identity).iter().map(|ex| (*ex, margin_text(snap.leg_accounts.get(&(false, *ex))))).collect();
-    let manual = pairs.iter().filter(|p| is_alert(p.state)).map(|p| handling(snap, p)).collect();
+    let manual = pairs.iter().filter(|p| is_alert(p.state)).map(|p| handling(snap, p, now_ms)).collect();
     let exit_delay = EngineTimings::default().exit_delay_ms;
     let trigger_mode = engine.map(|e| e.trigger_mode);
     let running = pairs
@@ -665,7 +675,30 @@ fn leg_read(snap: &UiSnapshot, simulated: bool, ex: Exchange, symbol: &str) -> R
     Ok((qty, orders.items.iter().filter(|o| o.symbol == symbol).count()))
 }
 
-fn handling(snap: &UiSnapshot, p: &PairView) -> ManualHandling {
+/// naked-leg-watchdog: the card's lines for the pair's current alert entry, from the events the page
+/// holds (so a restart shows the same thing the engine remembers).
+fn watchdog_lines(snap: &UiSnapshot, p: &PairView, now_ms: i64) -> (Vec<String>, Tone) {
+    let events: Vec<PairEvent> = snap
+        .trade_events
+        .iter()
+        .filter(|e| e.pair_id.as_deref() == Some(p.internal_uuid.as_str()))
+        .filter_map(|e| Some(PairEvent { id: e.id, ts_ms: e.ts_ms, event_type: e.event_type.clone(), payload: serde_json::from_str(&e.payload).ok()? }))
+        .collect();
+    let status = watchdog::status_of_pair(p.state, &events);
+    let tone = match &status {
+        watchdog::Status::Flattened { .. } => Tone::Positive,
+        watchdog::Status::Unknown { .. } => Tone::Negative,
+        watchdog::Status::Hedged
+        | watchdog::Status::Flat
+        | watchdog::Status::WaitingCancel { .. }
+        | watchdog::Status::Retrying { .. }
+        | watchdog::Status::Skipped { .. } => Tone::Warning,
+        watchdog::Status::Waiting { .. } | watchdog::Status::Flattening { .. } => Tone::Muted,
+    };
+    (watchdog_text::status_lines(&status, (p.long_exchange, p.short_exchange), now_ms), tone)
+}
+
+fn handling(snap: &UiSnapshot, p: &PairView, now_ms: i64) -> ManualHandling {
     let reads: Vec<(Exchange, Result<(Decimal, usize), String>)> =
         [p.long_exchange, p.short_exchange].into_iter().map(|ex| (ex, leg_read(snap, p.simulated, ex, &p.symbol))).collect();
     let errors: Vec<String> = reads.iter().filter_map(|(_, r)| r.as_ref().err().cloned()).collect();
@@ -693,6 +726,7 @@ fn handling(snap: &UiSnapshot, p: &PairView) -> ManualHandling {
         }
         if why.is_empty() { Ok(()) } else { Err(why.join("；")) }
     };
+    let (watchdog, watchdog_tone) = watchdog_lines(snap, p, now_ms);
     ManualHandling {
         uuid: p.internal_uuid.clone(),
         symbol: p.symbol.clone(),
@@ -703,6 +737,8 @@ fn handling(snap: &UiSnapshot, p: &PairView) -> ManualHandling {
         legs: reads.into_iter().map(|(ex, r)| (ex, r.map(|(q, _)| q))).collect(),
         close,
         confirm_closed,
+        watchdog,
+        watchdog_tone,
     }
 }
 

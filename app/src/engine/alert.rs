@@ -151,7 +151,7 @@ impl AlertNotice {
     }
     pub fn body(&self) -> String {
         let mode = EnvLabel::of(self.identity, if self.simulated { ExecutionMode::Simulation } else { ExecutionMode::ExchangeDemo }).env_name();
-        redact_secrets(&format!("{} ({mode}) needs a manual decision: {}. Nothing is done automatically.", self.pair_id, self.reason.as_str()))
+        redact_secrets(&format!("{} ({mode}) needs a manual decision: {}. {}", self.pair_id, self.reason.as_str(), watchdog_text::pair_alert_note()))
     }
 }
 
@@ -379,6 +379,32 @@ mod tests {
         let body = notice(false, ProcessIdentity::Live).body();
         assert!(body.contains("(LIVE)"), "{body}");
         assert!(!body.contains("EXCHANGE_DEMO") && !body.contains("DEMO"), "{body}");
+    }
+
+    // naked-leg-watchdog: "Nothing is done automatically" is no longer true; the notice says the real rule.
+    #[test]
+    fn the_pair_alert_notice_states_the_authorization_b_rule_instead_of_claiming_nothing_happens() {
+        let body = notice(false, ProcessIdentity::Demo).body();
+        assert!(!body.contains("Nothing is done automatically"), "{body}");
+        assert!(body.contains(&watchdog_text::pair_alert_note()), "the same sentence the other places use: {body}");
+        assert!(body.contains("SUBMIT_REJECTED") && body.contains("EXCHANGE_DEMO"), "the old facts stay: {body}");
+    }
+
+    #[test]
+    fn a_watchdog_notice_names_the_pair_the_environment_and_redacts_secrets() {
+        let n = WatchdogNotice {
+            pair: "u1".into(),
+            pair_id: "pid-u1".into(),
+            symbol: "BTCUSDT".into(),
+            simulated: false,
+            identity: ProcessIdentity::Live,
+            outcome: WatchdogOutcome::Locked { reason: "lookup failed: signature=RAWSIG".into() },
+        };
+        let (title, body) = (n.title(), n.body());
+        assert!(title.contains("BTCUSDT") && body.contains("pid-u1") && body.contains("LIVE"), "{title} / {body}");
+        assert!(!body.contains("RAWSIG"), "{body}");
+        let flattened = WatchdogNotice { outcome: WatchdogOutcome::Flattened { leg: Leg::Short, exchange: Exchange::Bybit, quantity: Decimal::new(5, 1) }, ..n };
+        assert!(flattened.body().contains("系統已自動平掉空腿") && flattened.body().contains("Bybit 買進 0.5"), "{}", flattened.body());
     }
 
     #[test]

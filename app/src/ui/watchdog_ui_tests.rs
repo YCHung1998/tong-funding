@@ -42,13 +42,13 @@ fn settle(cx: &mut TestAppContext) {
     }
 }
 
-/// The shell on the risk page with `settings` delivered by the data source.
-fn risk_page(cx: &mut TestAppContext, settings: Settings) -> gpui_kit::WindowHandle<Root> {
+/// The shell on `page` with `updates` delivered by the data source.
+fn open_page(cx: &mut TestAppContext, page: Page, updates: Vec<SourceUpdate>) -> gpui_kit::WindowHandle<Root> {
     cx.update(|cx| {
         gpui_kit::init(cx);
         super::component_theme::apply(cx);
     });
-    let source: Arc<dyn ReadOnlyDataSource> = Arc::new(FakeSource(Mutex::new(vec![SourceUpdate::Settings(settings)])));
+    let source: Arc<dyn ReadOnlyDataSource> = Arc::new(FakeSource(Mutex::new(updates)));
     let sink: Arc<dyn CommandSink> = Arc::new(NullSink);
     let (window, shell) = cx.update(|cx| {
         let (w, shell) = gpui_kit::open_window(
@@ -62,7 +62,7 @@ fn risk_page(cx: &mut TestAppContext, settings: Settings) -> gpui_kit::WindowHan
     settle(cx);
     cx.update_window(window.into(), |_, w, cx| {
         shell.update(cx, |s, cx| {
-            s.go(Page::RiskSettings);
+            s.go(page);
             cx.notify();
         });
         w.render_frame(cx);
@@ -71,6 +71,11 @@ fn risk_page(cx: &mut TestAppContext, settings: Settings) -> gpui_kit::WindowHan
     settle(cx);
     cx.update_window(window.into(), |_, w, cx| w.render_frame(cx)).unwrap();
     window
+}
+
+/// The shell on the risk page with `settings` delivered by the data source.
+fn risk_page(cx: &mut TestAppContext, settings: Settings) -> gpui_kit::WindowHandle<Root> {
+    open_page(cx, Page::RiskSettings, vec![SourceUpdate::Settings(settings)])
 }
 
 #[gpui_kit::test]
@@ -100,4 +105,36 @@ fn clicking_the_rules_block_does_not_collapse_or_hide_it(cx: &mut TestAppContext
     }
     let after = cx.update_window(window.into(), |_, w, _| w.try_find("naked-leg-rules").map(|s| (s.visible(), s.bounds()))).unwrap();
     assert_eq!(after, Some((true, before)), "same place, same size, still there");
+}
+
+#[gpui_kit::test]
+fn the_manual_handling_card_draws_the_watchdog_status_of_a_pair_in_an_alert_state(cx: &mut TestAppContext) {
+    use crate::engine::command::PairView;
+    use crate::store::event_query::StoredEvent;
+    use crate::ui::bridge::EngineState;
+    use tong_funding_core::pair::PairState;
+    use tong_funding_core::risk::{ExecutionMode, TriggerMode};
+    use tong_funding_core::types::Exchange;
+    let pair = PairView {
+        internal_uuid: "u1".into(),
+        pair_id: "pid-u1".into(),
+        symbol: "BTCUSDT".into(),
+        long_exchange: Exchange::Binance,
+        short_exchange: Exchange::Bybit,
+        state: PairState::PartialFailure,
+        settlement_ms: 1_800_000_000_000,
+        simulated: true,
+        flat_confirmed: false,
+    };
+    let engine = EngineState { now_ms: 1_800_000_020_000, trigger_mode: TriggerMode::Manual, execution_mode: ExecutionMode::Simulation, pairs: vec![pair], blockers: vec![], notices: vec![], alerts: vec![] };
+    let ev = |id: i64, ts: i64, ty: &str, payload: serde_json::Value| StoredEvent { id, ts_ms: ts, event_type: ty.into(), pair_id: Some("u1".into()), payload: payload.to_string(), imported: false };
+    let events = vec![
+        ev(3, 1_800_000_014_000, "NAKED_LEG_WATCHDOG", serde_json::json!({"kind": "ATTEMPT_RESULT", "ok": true, "attempt": 1, "leg": "long", "quantity": "10"})),
+        ev(2, 1_800_000_015_000, "NAKED_LEG_WATCHDOG", serde_json::json!({"kind": "ROUND", "conclusion": "FLATTEN", "leg": "long", "quantity": "10", "attempt": 1})),
+        ev(1, 1_800_000_005_000, "PAIR_TRANSITION", serde_json::json!({"from": "FILL_MONITOR", "to": "PARTIAL_FAILURE"})),
+    ];
+    let window = open_page(cx, Page::StagedOrders, vec![SourceUpdate::Settings(complete_settings("0.01")), SourceUpdate::Engine(engine), SourceUpdate::TradeEvents(events)]);
+    let lines = cx.update_window(window.into(), |_, w, _| w.try_find("mwatchdog-u1").map(|s| (s.visible(), s.bounds()))).unwrap();
+    let (visible, bounds) = lines.expect("the watchdog's lines are drawn on the card of the pair in an alert state");
+    assert!(visible && bounds.size.height > px(8.), "{bounds:?}");
 }

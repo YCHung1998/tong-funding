@@ -6,7 +6,7 @@
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::ports::Leg;
-use super::watchdog::{MAX_FLATTEN_ATTEMPTS, WATCHDOG_GRACE_MS};
+use super::watchdog::{MAX_CANCEL_WAIT_ROUNDS, MAX_FLATTEN_ATTEMPTS, Status, WATCHDOG_GRACE_MS};
 
 /// "多腿" / "空腿".
 pub fn leg_word(leg: Leg) -> &'static str {
@@ -99,6 +99,60 @@ pub fn rules_override_note(overrides: &[(Exchange, u32)]) -> Option<String> {
     Some(format!("提醒：{list} 另有訂單逾時覆寫，配對實際取兩腿中較小的值（見下方「配對生效值預覽」）。"))
 }
 
+/// The line under the heading of the manual-handling card: what the system does NOT do (repair,
+/// move the pair), and where the rules and each pair's watchdog status are.
+pub const CARD_INTRO: &str = "系統不會補買、補賣另一腿，也不會改變配對狀態；只有確認只有一腿成交時，看門狗才會自動平掉那一腿（規則見風控設定頁「自動處理規則（授權 B）」）。各配對的看門狗狀態在下方。";
+
+/// The sentence the pair-alert notification ends with (instead of "Nothing is done automatically"):
+/// what the system will and will not do on its own, in one line.
+pub fn pair_alert_note() -> String {
+    format!(
+        "系統不會補單；只有確認只有一腿成交時，看門狗才會在訂單逾時後再等 {} 秒，撤銷並查證另一腿，再以只減倉市價單平掉已成交那一腿，其餘情況不會動作（規則見風控設定頁）。",
+        WATCHDOG_GRACE_MS / 1_000
+    )
+}
+
+/// `HH:MM:SS` of a time in ms since the epoch, in UTC.
+fn hms(ms: i64) -> String {
+    let secs = (ms / 1_000).rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", secs / 3_600, secs % 3_600 / 60, secs % 60)
+}
+
+/// The lines the manual-handling card shows for the watchdog's status: what it did, what it will do
+/// next, and what the user has to do. `exchanges` = (long, short) of the pair.
+pub fn status_lines(status: &Status, exchanges: (Exchange, Exchange), now_ms: i64) -> Vec<String> {
+    let wait_seconds = WATCHDOG_GRACE_MS / 1_000;
+    let exchange_of = |leg: Leg| match leg {
+        Leg::Long => exchanges.0,
+        Leg::Short => exchanges.1,
+    };
+    match status {
+        Status::Waiting { due_ms: Some(due) } if *due > now_ms => {
+            vec![format!("看門狗等待中：將在 {} UTC 查證（訂單逾時後再等 {wait_seconds} 秒）；只有確認只有一腿成交時才會自動平掉該腿。", hms(*due))]
+        }
+        Status::Waiting { due_ms: Some(_) } => vec!["看門狗查證中…".to_string()],
+        Status::Waiting { due_ms: None } => vec![format!("看門狗等待中：訂單逾時後再等 {wait_seconds} 秒才會查證；只有確認只有一腿成交時才會自動平掉該腿。")],
+        Status::WaitingCancel { waited, next_ms } => vec![format!(
+            "看門狗：另一腿的委託尚未終結，已送出撤單，將在 {} UTC 再查證（第 {waited} 輪等待，連續 {MAX_CANCEL_WAIT_ROUNDS} 輪未終結就視為查證不明）。",
+            hms(*next_ms)
+        )],
+        Status::Flattening { leg, quantity, attempt } => vec![format!(
+            "看門狗已送出{}的只減倉平倉單（數量 {}，第 {attempt} 次，最多 {MAX_FLATTEN_ATTEMPTS} 次），等待成交與查證。",
+            leg_word(*leg),
+            quantity.normalize()
+        )],
+        Status::Retrying { attempt, reason, next_ms } => vec![format!(
+            "看門狗自動平倉第 {attempt} 次未成功（{reason}），將在 {} UTC 重新查證；最多 {MAX_FLATTEN_ATTEMPTS} 次，用完會停止開新倉並通知你。",
+            hms(*next_ms)
+        )],
+        Status::Flattened { leg, quantity } => vec![flattened_sentence(*leg), flattened_detail(*leg, exchange_of(*leg), *quantity)],
+        Status::Hedged => vec!["兩腿都有部位（已對沖），系統不會送單，請人工處理。".to_string()],
+        Status::Flat => vec!["兩腿都沒有部位，系統不會送單，請人工處理；確認兩所皆無部位後按「人工確認已平倉」。".to_string()],
+        Status::Unknown { reason } => vec![unknown_sentence(reason)],
+        Status::Skipped { reason } => vec![format!("看門狗不處理這個配對：{reason}")],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +239,90 @@ mod tests {
         assert_eq!(rules_override_note(&[]), None);
         let note = rules_override_note(&[(Exchange::Bybit, 7), (Exchange::Binance, 20)]).unwrap();
         assert!(note.contains("Binance 20 秒") && note.contains("Bybit 7 秒") && note.contains("較小"), "{note}");
+    }
+
+    // ---- 3.3 the manual-handling card ----
+
+    /// 2027-01-15 08:00:00 UTC.
+    const NOW: i64 = 1_800_000_000_000;
+    const PAIR: (Exchange, Exchange) = (Exchange::Binance, Exchange::Bybit);
+
+    #[test]
+    fn waiting_says_when_the_check_comes() {
+        let lines = status_lines(&Status::Waiting { due_ms: Some(NOW + 5_000) }, PAIR, NOW);
+        assert_eq!(lines, vec!["看門狗等待中：將在 08:00:05 UTC 查證（訂單逾時後再等 5 秒）；只有確認只有一腿成交時才會自動平掉該腿。".to_string()]);
+        assert_eq!(status_lines(&Status::Waiting { due_ms: Some(NOW - 1) }, PAIR, NOW), vec!["看門狗查證中…".to_string()], "the time has come");
+        let unknown_time = status_lines(&Status::Waiting { due_ms: None }, PAIR, NOW);
+        assert!(unknown_time[0].contains("再等 5 秒") && !unknown_time[0].contains("UTC"), "{unknown_time:?}");
+    }
+
+    #[test]
+    fn a_flatten_that_happened_names_the_leg_the_quantity_and_what_the_user_does_next() {
+        let lines = status_lines(&Status::Flattened { leg: Leg::Long, quantity: dec("10") }, PAIR, NOW);
+        assert_eq!(lines[0], "系統已自動平掉多腿，請確認兩所皆無部位後按「人工確認已平倉」。", "the spec's sentence");
+        assert_eq!(lines[1], "明細：Binance 賣出 10（只減倉市價單）。");
+        let short = status_lines(&Status::Flattened { leg: Leg::Short, quantity: dec("0.5") }, PAIR, NOW);
+        assert_eq!((short[0].as_str(), short[1].as_str()), ("系統已自動平掉空腿，請確認兩所皆無部位後按「人工確認已平倉」。", "明細：Bybit 買進 0.5（只減倉市價單）。"));
+    }
+
+    #[test]
+    fn hedged_and_flat_ask_for_a_manual_decision_and_say_nothing_was_sent() {
+        assert_eq!(status_lines(&Status::Hedged, PAIR, NOW), vec!["兩腿都有部位（已對沖），系統不會送單，請人工處理。".to_string()]);
+        assert_eq!(status_lines(&Status::Flat, PAIR, NOW), vec!["兩腿都沒有部位，系統不會送單，請人工處理；確認兩所皆無部位後按「人工確認已平倉」。".to_string()]);
+    }
+
+    #[test]
+    fn unknown_gives_the_reason_and_says_new_entries_are_stopped() {
+        let lines = status_lines(&Status::Unknown { reason: "long position unreadable: timeout".into() }, PAIR, NOW);
+        assert_eq!(lines, vec![unknown_sentence("long position unreadable: timeout")]);
+        assert!(lines[0].contains("long position unreadable: timeout") && lines[0].contains("停止開新倉") && lines[0].contains("人工處理"));
+    }
+
+    #[test]
+    fn the_in_between_states_say_what_is_going_on_and_when_the_next_look_is() {
+        let cancel = status_lines(&Status::WaitingCancel { waited: 2, next_ms: NOW + 5_000 }, PAIR, NOW);
+        assert!(cancel[0].contains("尚未終結") && cancel[0].contains("撤單") && cancel[0].contains("08:00:05 UTC") && cancel[0].contains("第 2 輪"), "{cancel:?}");
+        assert!(cancel[0].contains(&format!("連續 {MAX_CANCEL_WAIT_ROUNDS} 輪")), "{cancel:?}");
+        let flattening = status_lines(&Status::Flattening { leg: Leg::Long, quantity: dec("10"), attempt: 2 }, PAIR, NOW);
+        assert!(flattening[0].contains("多腿") && flattening[0].contains("只減倉") && flattening[0].contains("數量 10") && flattening[0].contains("第 2 次"), "{flattening:?}");
+        let retry = status_lines(&Status::Retrying { attempt: 1, reason: "order rejected: risk limit".into(), next_ms: NOW + 5_000 }, PAIR, NOW);
+        assert!(retry[0].contains("第 1 次未成功") && retry[0].contains("order rejected: risk limit") && retry[0].contains("08:00:05 UTC") && retry[0].contains("最多 3 次"), "{retry:?}");
+        let skipped = status_lines(&Status::Skipped { reason: "pair belongs to EXCHANGE_DEMO".into() }, PAIR, NOW);
+        assert!(skipped[0].contains("不處理") && skipped[0].contains("EXCHANGE_DEMO"), "{skipped:?}");
+    }
+
+    #[test]
+    fn no_line_promises_or_hides_anything_the_rules_do_not_say() {
+        // every status mentions neither a repair of the missing leg nor an automatic state change
+        let all = [
+            Status::Waiting { due_ms: Some(NOW) },
+            Status::WaitingCancel { waited: 1, next_ms: NOW },
+            Status::Flattening { leg: Leg::Short, quantity: dec("1"), attempt: 1 },
+            Status::Retrying { attempt: 1, reason: "x".into(), next_ms: NOW },
+            Status::Flattened { leg: Leg::Short, quantity: dec("1") },
+            Status::Hedged,
+            Status::Flat,
+            Status::Unknown { reason: "x".into() },
+            Status::Skipped { reason: "x".into() },
+        ];
+        for st in all {
+            let text = status_lines(&st, PAIR, NOW).join("\n");
+            assert!(!text.is_empty(), "{st:?}");
+            assert!(!text.contains("補另一腿已") && !text.contains("已回滾") && !text.contains("已補"), "{st:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn the_card_intro_names_the_rules_block_and_promises_no_repair() {
+        assert!(CARD_INTRO.contains(RULES_TITLE), "{CARD_INTRO}");
+        assert!(CARD_INTRO.contains("不會補買、補賣") && CARD_INTRO.contains("不會改變配對狀態"), "{CARD_INTRO}");
+        assert!(!CARD_INTRO.contains("不會自動補救"), "the old sentence is false now that the watchdog can flatten a leg");
+    }
+
+    #[test]
+    fn the_pair_alert_note_states_the_rule_in_one_line() {
+        let note = pair_alert_note();
+        assert!(note.contains("不會補單") && note.contains("只有確認只有一腿成交") && note.contains("再等 5 秒") && note.contains("風控設定頁"), "{note}");
+        assert!(!note.contains('\n'), "one line");
     }
 }

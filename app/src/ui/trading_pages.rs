@@ -803,7 +803,9 @@ impl Shell {
         }
 
         if !vm.manual.is_empty() {
-            let mut m = card().border_color(rgb(theme::NEGATIVE)).child(text("需人工處理（系統不會自動補救）", theme::NEGATIVE));
+            // naked-leg-watchdog: the watchdog may have flattened a leg, so this heading no longer says
+            // "nothing is done automatically"; it says what is NOT done and where the rules are.
+            let mut m = card().border_color(rgb(theme::NEGATIVE)).child(text("需人工處理", theme::NEGATIVE)).child(small(crate::engine::watchdog_text::CARD_INTRO, theme::TEXT_SECONDARY));
             for h in &vm.manual {
                 let mut legs = div().flex().gap_3();
                 for (ex, q) in &h.legs {
@@ -828,7 +830,13 @@ impl Shell {
                 if let Err(why) = &h.confirm_closed {
                     actions = actions.child(small(why.clone(), theme::WARNING));
                 }
-                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs).child(actions);
+                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs);
+                // what the watchdog did for this pair and what comes next (the words of watchdog_text)
+                let mut status = div().id(SharedString::from(format!("mwatchdog-{}", h.uuid))).test_support().flex().flex_col();
+                for line in &h.watchdog {
+                    status = status.child(small(line.clone(), h.watchdog_tone.color()));
+                }
+                m = m.child(status).child(actions);
                 // live-guardrails (Live only): the exchange pages and the flatten of one bare leg.
                 if let [(long, _), (short, _)] = h.legs[..] {
                     let mut links = div().flex().flex_wrap().gap_2();

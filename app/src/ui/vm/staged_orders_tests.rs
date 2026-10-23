@@ -769,3 +769,134 @@ fn close_now_and_manual_close_confirmations_say_real_money_in_a_live_process() {
     assert_eq!(demo.running.iter().find(|r| r.symbol == "BTCUSDT").unwrap().button(), "確認平倉");
     assert_eq!(demo.manual[0].env.env_name(), "EXCHANGE_DEMO");
 }
+
+// ---- naked-leg-watchdog: what the manual-handling card says about it -----------------------------
+
+fn into_alert(s: &mut UiSnapshot, state: PairState, events: Vec<StoredEvent>) {
+    failed_pair(s);
+    eng(s).pairs[0].state = state;
+    let mut events = events;
+    events.sort_by_key(|e| std::cmp::Reverse((e.ts_ms, e.id))); // newest first, as the stored query returns them
+    s.trade_events = events;
+}
+
+fn entered(state: &str, ago_ms: i64) -> StoredEvent {
+    ev(1, NOW - ago_ms, "PAIR_TRANSITION", "u-BTCUSDT", json!({"from": "FILL_MONITOR", "to": state, "detail": {"simulated": false}}))
+}
+
+fn wd_event(id: i64, ago_ms: i64, payload: serde_json::Value) -> StoredEvent {
+    ev(id, NOW - ago_ms, "NAKED_LEG_WATCHDOG", "u-BTCUSDT", payload)
+}
+
+fn card(s: &UiSnapshot) -> ManualHandling {
+    build(s, &BTreeSet::new(), NOW).manual.into_iter().find(|h| h.uuid == "u-BTCUSDT").expect("a card for the pair in an alert state")
+}
+
+#[test]
+fn a_new_alert_shows_when_the_watchdog_will_check() {
+    let mut s = snap();
+    into_alert(&mut s, PairState::PartialFailure, vec![entered("PARTIAL_FAILURE", 2_000)]);
+    // NOW is 08:00:00 UTC; the pair entered 2 s ago, so the check comes at 08:00:03
+    assert_eq!(card(&s).watchdog, vec!["看門狗等待中：將在 08:00:03 UTC 查證（訂單逾時後再等 5 秒）；只有確認只有一腿成交時才會自動平掉該腿。".to_string()]);
+}
+
+#[test]
+fn after_a_watchdog_flatten_the_card_says_what_was_sent_and_the_user_still_confirms() {
+    // spec: 該配對的人工處理卡寫明「系統已自動平掉多腿，請確認兩所皆無部位後按『人工確認已平倉』」
+    let mut s = snap();
+    into_alert(
+        &mut s,
+        PairState::PartialFailure,
+        vec![
+            entered("PARTIAL_FAILURE", 20_000),
+            wd_event(2, 15_000, json!({"kind": "ROUND", "conclusion": "FLATTEN", "leg": "long", "quantity": "10", "attempt": 1})),
+            ev(3, NOW - 15_000, "LEG_FLATTEN", "u-BTCUSDT", json!({"by": "watchdog", "leg": "long", "quantity": "10"})),
+            wd_event(4, 14_000, json!({"kind": "ATTEMPT_RESULT", "ok": true, "attempt": 1, "leg": "long", "quantity": "10"})),
+        ],
+    );
+    let h = card(&s);
+    assert_eq!(h.watchdog[0], "系統已自動平掉多腿，請確認兩所皆無部位後按「人工確認已平倉」。");
+    assert_eq!(h.watchdog[1], "明細：Binance 賣出 10（只減倉市價單）。");
+    assert_eq!(h.watchdog.len(), 2);
+    // the page still only offers the two manual actions; it never triggers the flatten or any repair
+    assert_eq!(h.actions(), ["人工要求平倉", "人工確認已平倉"]);
+    assert_eq!(h.state, PairState::PartialFailure, "and the pair is still the user's to confirm");
+}
+
+#[test]
+fn hedged_flat_and_unknown_conclusions_reach_the_card() {
+    let conclusion = |c: &str, extra: serde_json::Value| {
+        let mut p = json!({"kind": "ROUND", "conclusion": c});
+        if let (Some(m), Some(x)) = (p.as_object_mut(), extra.as_object()) {
+            m.extend(x.clone());
+        }
+        p
+    };
+    for (state, c, extra, expect) in [
+        (PairState::Imbalanced, "HEDGED", json!({}), "兩腿都有部位（已對沖），系統不會送單，請人工處理。"),
+        (PairState::PartialFailure, "FLAT", json!({}), "兩腿都沒有部位，系統不會送單，請人工處理；確認兩所皆無部位後按「人工確認已平倉」。"),
+        (PairState::Unresolved, "UNKNOWN", json!({"reason": "long order status unknown: order x not found"}), "查證結果不明（long order status unknown: order x not found），系統沒有送出任何單，已停止開新倉並通知你，請人工處理。"),
+    ] {
+        let mut s = snap();
+        into_alert(&mut s, state, vec![entered(state.as_str(), 20_000), wd_event(2, 14_000, conclusion(c, extra))]);
+        assert_eq!(card(&s).watchdog, vec![expect.to_string()], "{c}");
+    }
+}
+
+#[test]
+fn records_of_an_earlier_entry_of_the_same_state_are_not_shown() {
+    let mut s = snap();
+    into_alert(
+        &mut s,
+        PairState::PartialFailure,
+        vec![
+            ev(1, NOW - 90_000, "PAIR_TRANSITION", "u-BTCUSDT", json!({"to": "PARTIAL_FAILURE"})),
+            wd_event(2, 80_000, json!({"kind": "ROUND", "conclusion": "UNKNOWN", "reason": "old trouble"})),
+            ev(3, NOW - 60_000, "PAIR_TRANSITION", "u-BTCUSDT", json!({"to": "CLOSING"})),
+            ev(4, NOW - 4_000, "PAIR_TRANSITION", "u-BTCUSDT", json!({"to": "PARTIAL_FAILURE"})),
+        ],
+    );
+    let lines = card(&s).watchdog;
+    assert!(lines[0].contains("看門狗等待中") && !lines.join("").contains("old trouble"), "{lines:?}");
+}
+
+#[test]
+fn another_pairs_watchdog_records_never_land_on_this_card() {
+    let mut s = snap();
+    into_alert(&mut s, PairState::PartialFailure, vec![entered("PARTIAL_FAILURE", 20_000)]);
+    s.trade_events.insert(0, ev(9, NOW - 1_000, "NAKED_LEG_WATCHDOG", "u-ETHUSDT", json!({"kind": "ROUND", "conclusion": "HEDGED"})));
+    assert!(card(&s).watchdog[0].contains("看門狗查證中") || card(&s).watchdog[0].contains("看門狗等待中"), "{:?}", card(&s).watchdog);
+}
+
+#[test]
+fn a_card_without_any_events_still_says_what_the_watchdog_will_do() {
+    let mut s = snap();
+    failed_pair(&mut s);
+    s.trade_events.clear();
+    let lines = card(&s).watchdog;
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("看門狗等待中") && lines[0].contains("再等 5 秒"), "{lines:?}");
+}
+
+#[test]
+fn the_card_colours_follow_what_the_watchdog_says() {
+    use crate::ui::theme::Tone;
+    let tone_for = |state: PairState, payloads: Vec<serde_json::Value>| {
+        let mut s = snap();
+        let mut events = vec![entered(state.as_str(), 20_000)];
+        events.extend(payloads.into_iter().enumerate().map(|(i, p)| wd_event(10 + i as i64, 15_000 - 100 * i as i64, p)));
+        into_alert(&mut s, state, events);
+        card(&s).watchdog_tone
+    };
+    let round = |c: &str| json!({"kind": "ROUND", "conclusion": c, "leg": "long", "quantity": "10", "attempt": 1, "reason": "x"});
+    let ok = json!({"kind": "ATTEMPT_RESULT", "ok": true, "attempt": 1, "leg": "long", "quantity": "10"});
+    let failed = json!({"kind": "ATTEMPT_RESULT", "ok": false, "attempt": 1, "leg": "long", "quantity": "10", "reason": "rejected"});
+    assert_eq!(tone_for(PairState::PartialFailure, vec![]), Tone::Muted, "waiting");
+    assert_eq!(tone_for(PairState::PartialFailure, vec![round("FLATTEN")]), Tone::Muted, "order sent");
+    assert_eq!(tone_for(PairState::PartialFailure, vec![round("FLATTEN"), ok]), Tone::Positive, "flattened");
+    assert_eq!(tone_for(PairState::PartialFailure, vec![round("FLATTEN"), failed]), Tone::Warning, "retrying");
+    assert_eq!(tone_for(PairState::PartialFailure, vec![round("WAIT_FOR_CANCEL")]), Tone::Warning);
+    assert_eq!(tone_for(PairState::Imbalanced, vec![round("HEDGED")]), Tone::Warning);
+    assert_eq!(tone_for(PairState::PartialFailure, vec![round("FLAT")]), Tone::Warning);
+    assert_eq!(tone_for(PairState::Unresolved, vec![round("UNKNOWN")]), Tone::Negative, "could not prove: stopped");
+}

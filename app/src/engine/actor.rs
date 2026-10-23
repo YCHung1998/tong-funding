@@ -29,6 +29,12 @@
 //! - alerts: entering PARTIAL_FAILURE / IMBALANCED / UNRESOLVED writes one `PAIR_ALERT` and
 //!   notifies once (`alert`); the banner (`Snapshot::alerts`) is derived from the pair states.
 //!   "Confirm closed" is accepted only after a re-query shows both legs flat.
+//! - naked-leg-watchdog (`naked_leg`, authorization B): 5 s after a pair entered an alert state, then
+//!   every 5 s while something is pending, one round reads both legs (positions, every own order by
+//!   `client_order_id`) and concludes: flatten ONE leg with a reduce-only market order (only when
+//!   exactly that leg holds the pair's position and the other is proven empty and over; intent
+//!   first, at most 3 tries), nothing (hedged / flat), cancel and look again (an order not over), or
+//!   unknown (nothing sent, kill switch ON, notification). It never changes the pair's state.
 //!
 //! A panic inside the actor ends the task: every later `send` gets `Rejected("engine stopped")`
 //! and the snapshot stops updating. There is no automatic restart (design Risks; unverified).
