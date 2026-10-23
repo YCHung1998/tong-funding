@@ -468,6 +468,19 @@ struct Flow {
     flatten_inflight: [bool; 2],
     /// naked-leg-watchdog: progress for the pair's current alert entry (`None` outside an alert state).
     watchdog: Option<naked_leg::WatchdogFlow>,
+    /// Every flatten order (manual `FlattenLeg` or watchdog) sent for this pair, with the time after
+    /// which its result no longer counts as "in flight" (review round 2, B1): only these can hold the
+    /// watchdog back or refuse another flatten; an ordinary close order of unknown result cannot.
+    flattens: Vec<SentFlatten>,
+}
+
+/// One flatten order of a pair (see `Flow::flattens`).
+#[derive(Debug, Clone)]
+struct SentFlatten {
+    client_order_id: String,
+    by: live::FlattenBy,
+    /// `fill::timeout_at_ms` of the pair's effective settings at sending.
+    deadline_ms: i64,
 }
 
 /// Progress of one leg's early exit.

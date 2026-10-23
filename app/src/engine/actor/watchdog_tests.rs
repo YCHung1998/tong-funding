@@ -770,21 +770,25 @@ async fn a_manual_flatten_whose_reads_are_slow_and_the_watchdogs_first_round_sen
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_manual_close_still_in_flight_holds_the_watchdogs_next_round_back() {
+async fn a_manual_flatten_still_in_flight_holds_the_watchdogs_next_round_back_until_its_order_timeout() {
     let (rig, deps) = rig(Opts::default());
     seed_pair(&rig.db, UUID, PairState::FillMonitor, true);
     let (mut actor, _h) = Actor::new(deps);
     actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
     rig.clock.advance(6_000);
-    // a close order of the user's is out and not over: the order's own lookups run on the tick
+    // a flatten order of the user's is out and not over (the order's own lookups run on the tick)
     let view = actor.pairs.get(UUID).cloned().unwrap();
-    let req = actor.close_request(actor.id_prefix(), UUID, Leg::Long, Exchange::Binance, SYM, dec("10"));
-    let flow = actor.flows.entry(UUID.to_string()).or_default();
-    flow.close = Some(OrderSet { sent_at_ms: rig.clock.now_ms(), eff: effective_for_pair(&risk(), &RiskOverrides::new(), Exchange::Binance, Exchange::Bybit), legs: [Some(LegOrder::new(req, Decimal::ONE)), None], cancel_started: false });
+    let eff = effective_for_pair(&risk(), &RiskOverrides::new(), Exchange::Binance, Exchange::Bybit);
+    let sent = actor.send_flatten(&view, live::FlattenPlan { leg: Leg::Long, qty: dec("10"), position: dec("10") }, &eff, live::FlattenBy::Manual, None).unwrap();
+    // its result has not come (the actor is not running here, nobody processes the submit's answer)
     assert!(actor.flatten_pending(UUID));
+    assert!(actor.user_flatten_active(UUID, rig.clock.now_ms()), "{sent}");
     actor.watchdog_tick(&view, rig.clock.now_ms());
     assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG), 0);
     assert!(!actor.watchdog_busy(UUID), "no round was started: the user's order is looked at first");
+    // past the order timeout the user's order is no longer "in flight": the watchdog's round may start
+    rig.clock.advance(fill::timeout_at_ms(&eff, 0) + 1_000);
+    assert!(!actor.user_flatten_active(UUID, rig.clock.now_ms()));
 }
 
 #[tokio::test(start_paused = true)]
@@ -886,4 +890,60 @@ async fn a_pair_flattened_by_the_watchdog_and_confirmed_by_hand_is_counted_by_th
     let tripped = payloads(&rig.db, "LOSS_BREAKER_TRIPPED");
     assert_eq!(tripped.len(), 1, "{tripped:?}");
     assert_eq!(tripped[0]["pairs"][0]["pair"], json!(UUID), "the pair is on the list that tripped it");
+}
+
+// ---- review round 2, B1: a leftover regular-close order must not silence the watchdog -----------
+
+/// The ordinary close of the short leg is sent and its result stays unknown (the submit says "unknown",
+/// the order never reached the exchange so every lookup finds nothing): the pair ends PARTIAL_FAILURE with
+/// a close order in `flow.close` that is never "over". It is not the user's flatten.
+#[tokio::test(start_paused = true)]
+async fn an_unknown_regular_close_order_does_not_silence_the_watchdog_and_ends_locked() {
+    let (rig, _h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Close), SimBehavior::Unknown { executed: false });
+    run_until(&rig.clock, T + 40_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "{:?}", labels(&rig.db));
+    run_until(&rig.clock, T + 340_000).await; // 300 s on
+    let r = rounds(&rig.db);
+    assert!(!r.is_empty(), "the watchdog ran: {:?}", labels(&rig.db));
+    assert_eq!(r.last().unwrap()["conclusion"], json!("UNKNOWN"), "{r:?}");
+    assert!(rig.db.kill_switch_halted(), "it ended locked, not silent");
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG_LOCK), 1);
+}
+
+/// An ordinary close order (not a manual flatten) whose result is unknown never holds the watchdog.
+#[tokio::test(start_paused = true)]
+async fn an_ordinary_close_order_of_unknown_result_is_not_a_user_flatten() {
+    let (rig, deps) = rig(Opts::default());
+    seed_pair(&rig.db, UUID, PairState::FillMonitor, true);
+    let (mut actor, _h) = Actor::new(deps);
+    actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
+    rig.clock.advance(6_000);
+    let req = actor.close_request(actor.id_prefix(), UUID, Leg::Long, Exchange::Binance, SYM, dec("10"));
+    let eff = effective_for_pair(&risk(), &RiskOverrides::new(), Exchange::Binance, Exchange::Bybit);
+    actor.flows.entry(UUID.to_string()).or_default().close = Some(OrderSet { sent_at_ms: rig.clock.now_ms(), eff, legs: [Some(LegOrder::new(req, Decimal::ONE)), None], cancel_started: false });
+    assert!(actor.flatten_pending(UUID));
+    assert!(!actor.user_flatten_active(UUID, rig.clock.now_ms()), "not the user's");
+}
+
+/// B1: a manual FlattenLeg is refused while another close of the leg can still be in flight, and sent
+/// once that order is past its order timeout (its result never came: unknown, not running).
+#[tokio::test(start_paused = true)]
+async fn a_manual_flatten_is_sent_after_a_leftover_orders_timeout_and_refused_before_it() {
+    let (rig, deps) = rig(Opts::default());
+    seed_pair(&rig.db, UUID, PairState::FillMonitor, true);
+    let (mut actor, _h) = Actor::new(deps);
+    actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
+    let view = actor.pairs.get(UUID).cloned().unwrap();
+    let eff = effective_for_pair(&risk(), &RiskOverrides::new(), Exchange::Binance, Exchange::Bybit);
+    let leftover = actor.close_request(actor.id_prefix(), UUID, Leg::Long, Exchange::Binance, SYM, dec("10"));
+    let sent_at = rig.clock.now_ms();
+    actor.flows.entry(UUID.to_string()).or_default().close = Some(OrderSet { sent_at_ms: sent_at, eff: eff.clone(), legs: [Some(LegOrder::new(leftover, Decimal::ONE)), None], cancel_started: false });
+    let plan = || live::FlattenPlan { leg: Leg::Long, qty: dec("10"), position: dec("10") };
+    let early = actor.send_flatten(&view, plan(), &eff, live::FlattenBy::Manual, None);
+    assert!(early.is_err_and(|why| why.contains("already in flight")), "inside the order timeout it is refused");
+    rig.clock.advance(fill::timeout_at_ms(&eff, 0) + 1_000);
+    let later = actor.send_flatten(&view, plan(), &eff, live::FlattenBy::Manual, None);
+    assert!(later.is_ok(), "past the order timeout the leftover is unknown, not running: {later:?}");
+    assert_eq!(events_of(&rig.db, "LEG_FLATTEN").len(), 1);
 }

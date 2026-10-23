@@ -364,6 +364,16 @@ impl Actor {
 
     // ---- FlattenLeg ----
 
+    /// The `client_order_id` of the pair's close order on `leg` when it is not over AND can still be in
+    /// flight: before its deadline (the flatten's own, else the order set's own order timeout).
+    pub(super) fn close_in_flight(&self, pair: &str, leg: Leg, now: i64) -> Option<String> {
+        let flow = self.flows.get(pair)?;
+        let set = flow.close.as_ref()?;
+        let o = set.legs[idx(leg)].as_ref().filter(|o| !o.is_over())?;
+        let deadline = flow.flattens.iter().find(|f| f.client_order_id == o.req.client_order_id).map_or_else(|| fill::timeout_at_ms(&set.eff, set.sent_at_ms), |f| f.deadline_ms);
+        (now < deadline).then(|| o.req.client_order_id.clone())
+    }
+
     pub(super) fn flatten_pending(&self, pair: &str) -> bool {
         self.flows.get(pair).is_some_and(|f| f.close.as_ref().is_some_and(|s| s.legs.iter().flatten().any(|o| !o.is_over())))
     }
@@ -436,9 +446,12 @@ impl Actor {
             Leg::Long => view.long_exchange,
             Leg::Short => view.short_exchange,
         };
-        // A close of this leg that is not over yet is never overwritten (nor doubled): refuse.
-        if let Some(open) = self.flows.get(pair).and_then(|f| f.close.as_ref()).and_then(|s| s.legs[idx(leg)].as_ref()).filter(|o| !o.is_over()) {
-            return Err(format!("a close order of the {} leg ({}) is already in flight; nothing sent", leg.as_str(), open.req.client_order_id));
+        let now = self.clock.now_ms();
+        // A close of this leg that is not over yet is never overwritten (nor doubled): refuse. Only while
+        // it can still be in flight (review round 2, B1): after its order timeout a result that never
+        // came is unknown, not "running", and the position this plan was sized from is fresh.
+        if let Some(open) = self.close_in_flight(pair, leg, now) {
+            return Err(format!("a close order of the {} leg ({}) is already in flight; nothing sent", leg.as_str(), open));
         }
         let prefix = self.id_prefix();
         let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, qty);
@@ -458,10 +471,10 @@ impl Actor {
             payload["attempt"] = json!(n);
         }
         self.note(LEG_FLATTEN, Some(pair), payload);
-        let now = self.clock.now_ms();
         let client_order_id = req.client_order_id.clone();
         let flow = self.flows.entry(pair.to_string()).or_default();
         flow.close_triggered_ms = Some(now);
+        flow.flattens.push(SentFlatten { client_order_id: client_order_id.clone(), by, deadline_ms: fill::timeout_at_ms(eff, now) });
         let set = flow.close.get_or_insert_with(|| OrderSet { sent_at_ms: now, eff: eff.clone(), legs: [None, None], cancel_started: false });
         set.legs[idx(leg)] = Some(LegOrder::new(req.clone(), Decimal::ONE));
         self.spawn_submit_inner(pair.to_string(), leg, OrderAction::Close, req, Some(now), true);

@@ -145,7 +145,7 @@ impl Actor {
         match phase {
             // A flatten of the user's (reading, or its order not over) goes first: two closes of one
             // position are never sent. The round comes when that is over.
-            Phase::Idle if now >= next_round_ms && self.user_flatten_active(pair) => {}
+            Phase::Idle if now >= next_round_ms && self.user_flatten_active(pair, now) => {}
             Phase::Idle if now >= next_round_ms => self.start_round(view, now),
             Phase::Idle => {}
             Phase::Verifying => {}
@@ -158,15 +158,17 @@ impl Actor {
         self.flows.get(pair).and_then(|f| f.watchdog.as_ref()).is_some_and(|w| !w.done && w.phase != Phase::Idle)
     }
 
-    /// The user's manual flatten is reading the exchange, or a close order that is not the watchdog's
-    /// own is not over yet.
-    pub(super) fn user_flatten_active(&self, pair: &str) -> bool {
+    /// The user's manual flatten is reading the exchange, or a flatten order the user sent (a manual
+    /// `FlattenLeg`) is not over yet and still inside its order timeout. Nothing else counts (review
+    /// round 2, B1): an ordinary close order whose result never came, or a manual order past its
+    /// timeout, is left to the watchdog's own round (lookup -> read failed -> ... -> Unknown, locked).
+    pub(super) fn user_flatten_active(&self, pair: &str, now: i64) -> bool {
         let Some(flow) = self.flows.get(pair) else { return false };
         if flow.flatten_inflight.iter().any(|b| *b) {
             return true;
         }
-        let own = |id: &str| flow.watchdog.as_ref().is_some_and(|w| w.sent.iter().any(|o| o.client_order_id == id));
-        flow.close.as_ref().is_some_and(|set| set.legs.iter().flatten().any(|o| !o.is_over() && !own(&o.req.client_order_id)))
+        let Some(set) = flow.close.as_ref() else { return false };
+        flow.flattens.iter().filter(|f| f.by == FlattenBy::Manual && now < f.deadline_ms).any(|f| set.legs.iter().flatten().any(|o| o.req.client_order_id == f.client_order_id && !o.is_over()))
     }
 
     /// The pair's own orders per leg (open and close), from its order intents.
