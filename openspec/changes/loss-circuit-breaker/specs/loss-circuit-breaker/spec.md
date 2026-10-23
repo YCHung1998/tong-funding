@@ -44,6 +44,8 @@
 kill switch 已經是開啟（手動或看門狗停止）時達到門檻，若本區間尚無觸發紀錄，系統 SHALL 仍以同一交易寫入 `KILL_SWITCH_CHANGED`（`cause` 為 `LOSS_BREAKER_TRIPPED`）與 `LOSS_BREAKER_TRIPPED` 並發出通知，狀態列的停止原因 SHALL 顯示「熔斷」。
 熔斷 SHALL 只擋開新倉；進行中的配對 SHALL 照常按排程出場（提前出場會暫停，因為 kill switch 開啟時提前出場不動作），平倉與人工處理 SHALL 照常可用。同一區間 SHALL 只觸發一次。
 熔斷評估 SHALL 失敗即封閉：讀取事件（含監看的 watermark）失敗而無法評估時，系統 SHALL 打開 kill switch、寫入 `LOSS_BREAKER_TRIPPED`（原因 `UNREADABLE`「無法評估熔斷」），Live 同時解除武裝並記錄鎖定原因，並發出通知。
+Live 武裝期間，熔斷使用的兩個門檻 SHALL 取「資料庫目前值」與「武裝時凍結值」中較嚴者；Live 讀不到某個門檻時 SHALL 使用 Live 預設（5 USDT／2 筆），不使用缺欄位時載入的較鬆預設。
+人工確認而 FINALIZED 的配對 SHALL 在人工確認結果事件（`MANUAL_CONFIRM_RESULT`，於該轉移落地之後寫入）出現時被重新評估；監看只依事件類型，不對全部 `PAIR_TRANSITION` 做 JSON 取值，計入規則仍以轉入 `FINALIZED` 的轉移為準。
 風控設定被修改（`RISK_CONFIG_UPDATED`）後 SHALL 立即重新評估，狀態列數字隨新門檻更新。在 App 內顯示警示並記錄於系統日誌是目前的通知方式（尚未接上 macOS 系統通知）。
 
 #### Scenario: 連虧達上限

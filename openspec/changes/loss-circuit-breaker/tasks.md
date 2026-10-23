@@ -31,3 +31,11 @@
 - [x] 5.7 A12 熔斷讀取失敗（含 watermark）失敗即封閉；`UNREADABLE` 通知、寫鎖定原因；三處鎖定共用 `lock_new_entries`
 - [x] 5.8 A13 `KILL_SWITCH_CHANGED` 帶 `cause`，狀態列改讀 cause
 - [x] 5.9 簡化：刪除觸發後多餘的第二次 assess、`force` 參數與重複的 `breaker_check`（評估放在 `dispatch(Tick)` 之前）；刪除 `EngineStatus.trading_allowed`
+
+## 6. 審查第二輪修正
+
+- [x] 6.1 B3 Live 武裝中熔斷取 min(儲存值, 凍結值)；Live 讀不到欄位時用 5／2；`config set` 寫入前取得實例鎖，App 執行中拒絕（`config show` 不取鎖）；測試：武裝中資料庫被改高仍以凍結值觸發、鎖被佔用時 CLI 拒絕
+- [x] 6.2 B5 A3 回填：Live 資料庫完全沒有 risk 列時也寫入 5／2；回填失敗寫 `LIVE_BREAKER_BACKFILL_FAILED`、維持鎖定並通知，不再 `let _ =` 吞掉
+- [x] 6.3 B6 `caps_hash`（改 `caps-v2`）與 `LIVE_ARMED` payload 納入兩個熔斷值（UI 與引擎同一函式）
+- [x] 6.4 B7 watermark 改監看 `MANUAL_CONFIRM_RESULT`，不再對全部 `PAIR_TRANSITION` 做 `json_extract`；計入規則不變
+- [x] 6.5 簡化：`lock_live` 改呼叫 `lock_new_entries`

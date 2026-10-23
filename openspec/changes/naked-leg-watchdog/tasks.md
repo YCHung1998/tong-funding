@@ -30,3 +30,10 @@
 - [x] 5.5 A10 「另一腿為空」明確要求記錄成交 0 且持倉 0（容差 100 的測試）
 - [x] 5.6 A11 送單前失敗的嘗試也計入次數，重啟後依事件還原，連續 3 次 → 未知
 - [x] 5.7 簡化：刪除 `REPORT_SLACK_MS` 兜底與其測試；`staged_orders.rs` 一律用 `watchdog_text::status_lines`
+
+## 6. 審查第二輪修正
+
+- [x] 6.1 B1 手動 `FlattenLeg` 的 `client_order_id` 與逾時記在 flow（`flattens`）；`user_flatten_active` 只看未逾時的手動單，`send_flatten` 的拒絕只適用未逾時的單；一般平倉的未知殘單不再讓看門狗永遠不跑（回歸測試：走到 PARTIAL_FAILURE 後 300 秒必有看門狗事件並鎖定，先紅後綠；另測殘單逾時後手動可送）
+- [x] 6.2 B2 `waited_rounds`／`read_failed_rounds` 各自獨立累計，只在 `finish_round` 一處更新（`RoundCounts::after`，重啟同規則重建），加 `MAX_ROUNDS_PER_ALERT = 12`；測試 W,R,W,R… 最終 Unknown
+- [x] 6.3 B4 探測任務與手動 `FlattenLeg` 讀取任務加 Drop guard（`LostTaskGuard`）：沒送出結果（含 panic）就改送讀取失敗／清 `flatten_inflight` 並寫 abort；測試以會 panic 的替身驗證
+- [x] 6.4 簡化：`watchdog.rs` 模組 doc 與 `WatchdogProbe::unreadable` doc 的過時說明更正；`read_failure` 改私有
