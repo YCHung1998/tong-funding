@@ -8,7 +8,7 @@ use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, Entity, Pixels, ScrollDelta, SharedString, TestAppContext, WindowHandle, base::Root, point, px, size};
 use tong_funding_core::types::Exchange;
 
-use super::bridge::{CommandSink, ReadOnlyDataSource, RefreshRequest, SourceUpdate};
+use super::bridge::{CommandSink, ReadOnlyDataSource, RefreshRequest, Settings, SourceUpdate};
 use super::nav::Page;
 use super::scan_view::{ScanColumn, SortDir, SortState};
 use super::shell::Shell;
@@ -43,10 +43,14 @@ fn wall_ms() -> i64 {
 
 /// Four symbols; default order (gross spread, settings incomplete) is DDD, BBB, CCC, AAA.
 fn feed() -> Vec<SourceUpdate> {
+    feed_with(complete_settings("0.01"))
+}
+
+fn feed_with(settings: Settings) -> Vec<SourceUpdate> {
     let now = wall_ms();
     let next = now + 4 * 3_600_000;
     let rates = [("AAAUSDT", "0.0001", "0.0000"), ("BBBUSDT", "0.0008", "-0.0002"), ("CCCUSDT", "0.0003", "-0.0001"), ("DDDUSDT", "0.0020", "-0.0010")];
-    let mut v = vec![SourceUpdate::Settings(complete_settings("0.01"))];
+    let mut v = vec![SourceUpdate::Settings(settings)];
     for (e, idx) in [(Exchange::Binance, 1), (Exchange::Bybit, 2)] {
         let observations = rates.iter().map(|r| obs(e, r.0, if idx == 1 { r.1 } else { r.2 }, 28_800, next, now)).collect();
         v.push(SourceUpdate::Market { exchange: e, observations, at: now });
@@ -68,11 +72,15 @@ fn open(cx: &mut TestAppContext) -> Rig {
 }
 
 fn open_sized(cx: &mut TestAppContext, width: f32) -> Rig {
+    open_with(cx, width, feed())
+}
+
+fn open_with(cx: &mut TestAppContext, width: f32, updates: Vec<SourceUpdate>) -> Rig {
     cx.update(|cx| {
         gpui_kit::init(cx);
         super::component_theme::apply(cx);
     });
-    let source: Arc<dyn ReadOnlyDataSource> = Arc::new(FakeSource(Mutex::new(feed())));
+    let source: Arc<dyn ReadOnlyDataSource> = Arc::new(FakeSource(Mutex::new(updates)));
     let sink: Arc<dyn CommandSink> = Arc::new(NullSink);
     let (window, shell) = cx.update(|cx| {
         let (w, shell) = gpui_kit::open_window(
@@ -354,4 +362,47 @@ fn scrolling_brings_the_last_column_into_view(cx: &mut TestAppContext) {
     }
     let after = last(&rig, cx).expect("after scrolling the last column is drawn");
     assert!(after <= px(NARROW) + px(0.5), "and it is fully inside the window: {after:?}");
+}
+
+// ---- scanner-layout 2.1: an exchange that is not enabled starts hidden --------------------------
+
+/// Complete settings with only Binance and Bybit ticked.
+fn okx_unticked() -> Settings {
+    let mut s = complete_settings("0.01");
+    s.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+    s
+}
+
+fn without_okx() -> Vec<ScanColumn> {
+    ScanColumn::ALL.into_iter().filter(|c| *c != ScanColumn::Okx).collect()
+}
+
+#[gpui_kit::test]
+fn the_okx_column_starts_hidden_when_okx_is_not_ticked_and_the_order_is_unchanged(cx: &mut TestAppContext) {
+    let rig = open_with(cx, WIDE, feed_with(okx_unticked()));
+    assert_eq!(rig.view(cx).0, without_okx());
+    // its button is still there so the user can show it
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.find(("col-chip", idx(ScanColumn::Okx)));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn showing_the_okx_column_by_hand_is_kept_through_refreshes_and_page_changes(cx: &mut TestAppContext) {
+    let rig = open_with(cx, WIDE, feed_with(okx_unticked()));
+    rig.click(("col-chip", idx(ScanColumn::Okx)), cx);
+    assert_eq!(rig.view(cx).0, ScanColumn::ALL, "shown at its place");
+    rig.settle(cx);
+    rig.goto(Page::Overview, cx);
+    rig.goto(Page::Scanner, cx);
+    assert_eq!(rig.view(cx).0, ScanColumn::ALL, "the manual choice is not overwritten by the default");
+    rig.click(("col-chip", idx(ScanColumn::Okx)), cx);
+    assert_eq!(rig.view(cx).0, without_okx(), "and it can be hidden again");
+}
+
+#[gpui_kit::test]
+fn every_column_shows_when_every_exchange_is_ticked(cx: &mut TestAppContext) {
+    assert_eq!(open(cx).view(cx).0, ScanColumn::ALL);
 }

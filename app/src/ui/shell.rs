@@ -239,6 +239,9 @@ impl Shell {
     pub(crate) fn sync_table(&mut self, cx: &mut Context<Self>) {
         // Filtered and ordered here, so the candidate cells below line up with the rows as drawn.
         let rows = table_rows(&self.scanner, self.only_qualified, self.view.sort).unwrap_or_default();
+        // An exchange the risk settings left unticked has its column hidden unless the user showed it.
+        let disabled: Vec<Exchange> = Exchange::ALL.into_iter().filter(|e| !self.snap.exchange_enabled(*e)).collect();
+        self.view.visibility.set_disabled_exchanges(&disabled);
         let (visible, sort) = (self.view.visibility.visible(), self.view.sort);
         let (now, clocks) = (self.now_ms, self.snap.clocks.clone());
         let candidates = self.candidate_cells(&rows);

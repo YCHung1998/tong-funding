@@ -137,6 +137,80 @@ fn total_width_shrinks_when_columns_are_hidden_and_decides_horizontal_scroll() {
     assert!(!v.needs_horizontal_scroll(1000.0), "after hiding six columns it fits: no sideways scroll");
 }
 
+// ---- scanner-layout 2.1: exchanges that are not enabled start hidden --------------------------
+
+#[test]
+fn a_column_maps_to_its_exchange_and_back() {
+    assert_eq!(ScanColumn::for_exchange(Binance), ScanColumn::Binance);
+    assert_eq!(ScanColumn::for_exchange(Bybit), ScanColumn::Bybit);
+    assert_eq!(ScanColumn::for_exchange(Okx), ScanColumn::Okx);
+}
+
+#[test]
+fn the_column_of_an_exchange_that_is_not_enabled_starts_hidden_and_the_order_is_unchanged() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Okx]);
+    assert!(!v.is_visible(ScanColumn::Okx));
+    let rest: Vec<_> = ScanColumn::ALL.into_iter().filter(|c| *c != ScanColumn::Okx).collect();
+    assert_eq!(v.visible(), rest);
+    assert!(!v.is_all_visible(), "the reset button has something to do");
+}
+
+#[test]
+fn nothing_is_hidden_when_every_exchange_is_enabled() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[]);
+    assert_eq!(v.visible(), ScanColumn::ALL);
+    assert!(v.is_all_visible());
+}
+
+#[test]
+fn showing_a_default_hidden_column_is_a_choice_that_survives_the_next_recompute() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Okx]);
+    assert!(v.toggle(ScanColumn::Okx), "one click shows it");
+    assert!(v.is_visible(ScanColumn::Okx));
+    assert_eq!(v.visible(), ScanColumn::ALL, "at its original place");
+    for _ in 0..3 {
+        v.set_disabled_exchanges(&[Okx]); // the shell syncs on every recompute
+    }
+    assert!(v.is_visible(ScanColumn::Okx), "the user's choice is not overwritten");
+    assert!(v.toggle(ScanColumn::Okx));
+    assert!(!v.is_visible(ScanColumn::Okx), "and a second click hides it again");
+}
+
+#[test]
+fn an_explicit_hide_stays_hidden_after_the_exchange_is_enabled_and_a_default_follows_the_setting() {
+    let mut v = ColumnVisibility::default();
+    v.toggle(ScanColumn::Bybit); // the user hid an enabled exchange
+    v.set_disabled_exchanges(&[]);
+    assert!(!v.is_visible(ScanColumn::Bybit));
+    // no choice about Okx: it follows the setting both ways
+    v.set_disabled_exchanges(&[Okx]);
+    assert!(!v.is_visible(ScanColumn::Okx));
+    v.set_disabled_exchanges(&[]);
+    assert!(v.is_visible(ScanColumn::Okx));
+}
+
+#[test]
+fn reset_shows_all_twelve_columns_even_when_an_exchange_is_not_enabled() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Okx]);
+    v.toggle(ScanColumn::Gross);
+    v.reset();
+    v.set_disabled_exchanges(&[Okx]);
+    assert_eq!(v.visible(), ScanColumn::ALL, "spec scanner-table-controls: reset = all columns shown");
+    assert!(v.is_all_visible());
+}
+
+#[test]
+fn symbol_stays_visible_whatever_the_disabled_set_says() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Binance, Bybit, Okx]);
+    assert!(v.is_visible(ScanColumn::Symbol));
+    assert!(v.is_visible(ScanColumn::Rank));
+}
+
 // ---- sort state transitions --------------------------------------------------------------------
 
 fn state() -> ScanViewState {
