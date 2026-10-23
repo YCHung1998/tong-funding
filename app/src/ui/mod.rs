@@ -56,6 +56,8 @@ pub mod engine_view;
 pub mod format;
 #[path = "vm/funding.rs"]
 pub mod funding;
+#[path = "vm/labels.rs"]
+pub mod labels;
 #[path = "vm/positions.rs"]
 pub mod positions;
 #[path = "vm/scan_view.rs"]
