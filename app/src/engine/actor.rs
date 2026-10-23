@@ -82,6 +82,7 @@ use crate::store::state::{AddPairOutcome, ConfigChange, FLAG_EXECUTION_MODE, Int
 #[cfg(test)]
 pub(crate) mod flow_tests;
 mod live;
+mod loss_breaker;
 mod naked_leg;
 mod pnl_gate;
 
@@ -549,6 +550,9 @@ struct Actor {
     pending_confirms: BTreeMap<PairUuid, Vec<oneshot::Sender<CommandReply>>>,
     /// naked-leg-watchdog: numbers each alert entry so a late result of an older entry is dropped.
     watchdog_entries: u64,
+    /// loss-circuit-breaker: the highest watched event id at the last look, and what that look found.
+    breaker_mark: Option<i64>,
+    breaker: Option<crate::engine::loss_breaker::BreakerView>,
     cmd_rx: mpsc::Receiver<CommandMsg>,
     event_tx: mpsc::Sender<Event>,
     event_rx: mpsc::Receiver<Event>,
@@ -648,6 +652,8 @@ impl Actor {
             notify_started: BTreeSet::new(),
             pending_confirms: BTreeMap::new(),
             watchdog_entries: 0,
+            breaker_mark: None,
+            breaker: None,
             cmd_rx,
             event_tx,
             event_rx,
@@ -662,6 +668,8 @@ impl Actor {
         // Pairs already in an alert state at startup: banner from their state; PAIR_ALERT /
         // notification only for an entry that has none yet (never again after a restart).
         actor.sync_alerts();
+        // loss-circuit-breaker: the interval start (the baseline on a first start) and a first look.
+        actor.breaker_check(true);
         let (snapshot_tx, snapshots) = watch::channel(actor.snapshot());
         actor.snapshot_tx = snapshot_tx;
         actor.publish_live();
@@ -682,6 +690,7 @@ impl Actor {
                 Some(ev) = self.event_rx.recv() => self.on_event(ev),
                 _ = tick.tick() => {
                     let _ = self.dispatch(Command::Tick);
+                    self.breaker_check(false);
                 }
                 changed = self.market_rx.changed(), if self.market_open => match changed {
                     Ok(()) => self.dirty = true,
@@ -2104,8 +2113,12 @@ impl Actor {
                 }
                 // The confirmation is recorded before FINALIZED; without it nothing is finalized.
                 if self.events.append(CLOSE_CONFIRMED, Some(pair), payload).is_ok() {
+                    // loss-circuit-breaker: the closed pair counts from this event on (price PnL minus fees)
+                    self.breaker_check(true);
                     // funding-pnl: FINALIZED also needs "PnL computed" (pnl_gate).
                     self.begin_pnl_wait(pair);
+                    // ... and again with the PnL it may have written just now
+                    self.breaker_check(false);
                 }
             }
             // Position updates may lag: re-checked on the next tick until the close timeout.

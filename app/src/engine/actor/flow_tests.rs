@@ -2300,6 +2300,10 @@ mod live_guardrail_tests;
 #[path = "watchdog_tests.rs"]
 mod watchdog_tests;
 
+// loss-circuit-breaker: evaluation timing, the trip and what it does (and does not) stop.
+#[path = "loss_breaker_tests.rs"]
+mod loss_breaker_tests;
+
 // ---- candidate-readd-after-close: engine side ---------------------------------------------
 
 /// Recorded case NMRUSDT: flat confirmed, CLOSING while the funding PnL waits. The snapshot says so
@@ -2314,6 +2318,10 @@ async fn a_closing_pair_waiting_for_pnl_is_flat_confirmed_and_frees_its_concurre
     run_until(&rig.clock, T + 16_000).await;
     assert_eq!(status(&rig.db, UUID), "CLOSING", "waiting for the PnL");
     assert_eq!(flat(&h), Some(true), "CLOSE_CONFIRMED recorded, PnL pending");
+    // loss-circuit-breaker: FakeDemo fills carry no fee, so the closed pair's amount is unknown and the
+    // breaker stopped new entries; the user opens trading again (a new interval) before the second pair.
+    assert!(rig.db.kill_switch_halted(), "stopped by the breaker");
+    rig.db.set_kill_switch(false).unwrap();
 
     // The same symbol again, settling a minute later; the first pair is still CLOSING at its check.
     assert_eq!(ask(&h, Command::AddPrepared(pair_at("pair-0002", SYM, T + 60_000))).await, CommandReply::Accepted);

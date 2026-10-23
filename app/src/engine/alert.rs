@@ -199,12 +199,46 @@ impl WatchdogNotice {
     }
 }
 
+/// loss-circuit-breaker: the breaker tripped and new entries stopped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakerNotice {
+    pub identity: ProcessIdentity,
+    pub reason: tong_funding_core::loss_breaker::TripReason,
+    pub loss_used: Decimal,
+    pub max_loss: Decimal,
+    pub consecutive: u32,
+    pub max_consecutive: u32,
+    /// Some amount is not the PnL net (funding left out): said in the text.
+    pub provisional: bool,
+}
+
+impl BreakerNotice {
+    pub fn title(&self) -> String {
+        "tong-funding: 熔斷已觸發，已停止開新倉".to_string()
+    }
+
+    pub fn body(&self) -> String {
+        let env = EnvLabel::of(self.identity, ExecutionMode::ExchangeDemo).env_name();
+        let basis = if self.provisional { "（暫計：價格損益扣手續費，不含資金費）" } else { "" };
+        redact_secrets(&format!(
+            "{env}：{}。已虧 {}／{} USDT · 連虧 {}／{} 筆{basis}。系統只停止開新倉，進行中的配對照常出場；要繼續交易請自行重新開放交易（會重新計算）。",
+            self.reason.text(),
+            format!("{:.2}", self.loss_used),
+            self.max_loss.normalize(),
+            self.consecutive,
+            self.max_consecutive,
+        ))
+    }
+}
+
 /// One-shot system notification channel. May block (it runs on a blocking thread); `Err` is
 /// recorded as `ALERT_NOTIFY_FAILED` and never retried automatically.
 pub trait Notifier: Send + Sync {
     fn notify(&self, notice: &AlertNotice) -> Result<(), String>;
     /// naked-leg-watchdog: what the system did on its own (flattened a bare leg / stopped new entries).
     fn notify_watchdog(&self, notice: &WatchdogNotice) -> Result<(), String>;
+    /// loss-circuit-breaker: the breaker tripped (new entries stopped).
+    fn notify_breaker(&self, notice: &BreakerNotice) -> Result<(), String>;
 }
 
 /// Placeholder until the macOS mechanism is chosen on the Mac (task 3.1): writes one line to
@@ -221,6 +255,11 @@ impl Notifier for LogNotifier {
         eprintln!("[watchdog] {} — {}", notice.title(), notice.body());
         Ok(())
     }
+
+    fn notify_breaker(&self, notice: &BreakerNotice) -> Result<(), String> {
+        eprintln!("[breaker] {} — {}", notice.title(), notice.body());
+        Ok(())
+    }
 }
 
 /// Test notifier: records every call, optionally failing.
@@ -229,6 +268,8 @@ pub struct RecordingNotifier {
     pub calls: Mutex<Vec<AlertNotice>>,
     /// naked-leg-watchdog notices (kept apart from `calls`, which count the pair alerts).
     pub watchdog_calls: Mutex<Vec<WatchdogNotice>>,
+    /// loss-circuit-breaker notices.
+    pub breaker_calls: Mutex<Vec<BreakerNotice>>,
     pub fail_with: Mutex<Option<String>>,
 }
 
@@ -239,6 +280,10 @@ impl RecordingNotifier {
 
     pub fn watchdog_calls(&self) -> Vec<WatchdogNotice> {
         self.watchdog_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    pub fn breaker_calls(&self) -> Vec<BreakerNotice> {
+        self.breaker_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 }
 
@@ -253,6 +298,14 @@ impl Notifier for RecordingNotifier {
 
     fn notify_watchdog(&self, notice: &WatchdogNotice) -> Result<(), String> {
         self.watchdog_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(notice.clone());
+        match self.fail_with.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn notify_breaker(&self, notice: &BreakerNotice) -> Result<(), String> {
+        self.breaker_calls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(notice.clone());
         match self.fail_with.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
             Some(e) => Err(e),
             None => Ok(()),
@@ -405,6 +458,25 @@ mod tests {
         assert!(!body.contains("RAWSIG"), "{body}");
         let flattened = WatchdogNotice { outcome: WatchdogOutcome::Flattened { leg: Leg::Short, exchange: Exchange::Bybit, quantity: Decimal::new(5, 1) }, ..n };
         assert!(flattened.body().contains("系統已自動平掉空腿") && flattened.body().contains("Bybit 買進 0.5"), "{}", flattened.body());
+    }
+
+    #[test]
+    fn a_breaker_notice_states_the_numbers_that_it_only_stops_new_entries_and_that_it_is_provisional() {
+        let n = BreakerNotice {
+            identity: ProcessIdentity::Live,
+            reason: tong_funding_core::loss_breaker::TripReason::ConsecutiveLosses,
+            loss_used: Decimal::new(62, 1),
+            max_loss: Decimal::from(5),
+            consecutive: 2,
+            max_consecutive: 2,
+            provisional: true,
+        };
+        let body = n.body();
+        assert!(n.title().contains("熔斷已觸發") && n.title().contains("停止開新倉"), "{}", n.title());
+        assert!(body.contains("LIVE") && body.contains("連虧達上限") && body.contains("已虧 6.20／5 USDT · 連虧 2／2"), "{body}");
+        assert!(body.contains("暫計") && body.contains("不含資金費") && body.contains("進行中的配對照常出場"), "{body}");
+        let final_net = BreakerNotice { provisional: false, ..n };
+        assert!(!final_net.body().contains("暫計"), "{}", final_net.body());
     }
 
     #[test]

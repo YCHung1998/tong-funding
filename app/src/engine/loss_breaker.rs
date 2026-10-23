@@ -8,12 +8,11 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use tong_funding_core::loss_breaker::{BreakerState, PairAmount, TripReason, amount_of, evaluate};
 use tong_funding_core::pnl::{PnlBreakdown, compute_pnl};
-use tong_funding_core::risk::RiskConfig;
 use tong_funding_core::types::Decimal;
 
 use crate::funding::pnl_record::{assemble, latest_pnl};
 use crate::store::db::Db;
-use crate::store::events::{EventRow, EventStore};
+use crate::store::events::EventStore;
 
 pub const KILL_SWITCH_CHANGED: &str = "KILL_SWITCH_CHANGED";
 /// Written once, the first time this feature runs on a database: the history before it is never counted.
@@ -108,6 +107,173 @@ pub fn pair_amount(db: &Db, pair: &str, now_ms: i64) -> PairAmount {
         Ok(a) => amount_of(&compute_pnl(&a.input)),
         // Not readable: nothing can be said about this pair, which the breaker treats as a stop.
         Err(_) => PairAmount::Unknown,
+    }
+}
+
+/// One pair that counts in the interval.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CountedPair {
+    pub pair: String,
+    pub closed_at_ms: i64,
+    pub amount: PairAmount,
+}
+
+/// The breaker as the UI shows it (published with every snapshot).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakerView {
+    pub start_ms: i64,
+    /// Signed cumulative amount of the interval.
+    pub net_sum: Decimal,
+    /// The loss used so far (never negative).
+    pub loss_used: Decimal,
+    pub consecutive: u32,
+    pub max_loss: Decimal,
+    pub max_consecutive: u32,
+    /// Tripped now, or a trip is on record for this interval (a trip is never undone by a better number).
+    pub tripped: bool,
+    pub reason: Option<TripReason>,
+    pub counted: usize,
+}
+
+/// The whole picture of the current interval.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assessment {
+    pub start: IntervalStart,
+    pub pairs: Vec<CountedPair>,
+    pub state: BreakerState,
+    pub max_loss: Decimal,
+    pub max_consecutive: u32,
+    /// The `LOSS_BREAKER_TRIPPED` already written for this interval, if any (its payload).
+    pub recorded_trip: Option<Value>,
+}
+
+/// Counts the pairs closed since the interval start, values each one and evaluates the limits.
+pub fn assess(db: &Db, max_loss: Decimal, max_consecutive: u32, now_ms: i64) -> Result<Assessment, String> {
+    let start = interval_start(db)?;
+    let pairs: Vec<CountedPair> = closed_pairs_since(db, &start)?
+        .into_iter()
+        .map(|c| CountedPair { amount: pair_amount(db, &c.pair, now_ms), pair: c.pair, closed_at_ms: c.ts_ms })
+        .collect();
+    let amounts: Vec<Option<Decimal>> = pairs.iter().map(|p| p.amount.value()).collect();
+    let state = evaluate(&amounts, max_loss, max_consecutive);
+    let recorded_trip = events_of(db, LOSS_BREAKER_TRIPPED)?.into_iter().rfind(|(id, ..)| *id > start.event_id).map(|(.., payload)| payload);
+    Ok(Assessment { start, pairs, state, max_loss, max_consecutive, recorded_trip })
+}
+
+impl Assessment {
+    /// The limits are exceeded now, or this interval already tripped.
+    pub fn tripped(&self) -> bool {
+        self.state.tripped || self.recorded_trip.is_some()
+    }
+
+    pub fn reason(&self) -> Option<TripReason> {
+        self.state.reason.or_else(|| {
+            let code = self.recorded_trip.as_ref()?["reason"].as_str()?;
+            [TripReason::UnknownPnl, TripReason::MaxLoss, TripReason::ConsecutiveLosses].into_iter().find(|r| r.code() == code)
+        })
+    }
+
+    pub fn view(&self) -> BreakerView {
+        BreakerView {
+            start_ms: self.start.ts_ms,
+            net_sum: self.state.net_sum,
+            loss_used: self.state.loss_used(),
+            consecutive: self.state.consecutive,
+            max_loss: self.max_loss,
+            max_consecutive: self.max_consecutive,
+            tripped: self.tripped(),
+            reason: self.reason(),
+            counted: self.pairs.len(),
+        }
+    }
+
+    /// The `LOSS_BREAKER_TRIPPED` payload: totals, thresholds, the pairs counted and why.
+    pub fn trip_payload(&self) -> Value {
+        let reason = self.state.reason;
+        json!({
+            "reason": reason.map(TripReason::code),
+            "reason_text": reason.map(TripReason::text),
+            "net_sum": self.state.net_sum.normalize().to_string(),
+            "loss_sum": self.state.loss_used().normalize().to_string(),
+            "consecutive_losses": self.state.consecutive,
+            "unknown_pairs": self.state.unknown_count,
+            "thresholds": {
+                "loss_breaker_max_loss_usdt": self.max_loss.normalize().to_string(),
+                "loss_breaker_max_consecutive_losses": self.max_consecutive,
+            },
+            "interval_start_ms": self.start.ts_ms,
+            "interval_start": match self.start.kind { StartKind::TradingOpened => "TRADING_OPENED", StartKind::Baseline => "BASELINE" },
+            // an amount that is not the PnL net leaves funding out: the notification says "暫計"
+            "provisional": self.pairs.iter().any(|p| !matches!(p.amount, PairAmount::Net(_))),
+            "pairs": self.pairs.iter().map(|p| json!({
+                "pair": p.pair,
+                "closed_at_ms": p.closed_at_ms,
+                "amount": p.amount.value().map(|v| v.normalize().to_string()),
+                "basis": match p.amount { PairAmount::Net(_) => "net", PairAmount::Provisional(_) => "price_pnl_minus_fees", PairAmount::Unknown => "unknown" },
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The highest event id among the events the breaker reacts to (closes, PnL results, kill switch
+/// changes, trips, baselines): the engine re-assesses only when this moved.
+pub fn watermark(db: &Db) -> Result<i64, String> {
+    db.with_conn(|c| {
+        Ok(c.query_row(
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type IN ('CLOSE_CONFIRMED', 'PAIR_PNL_COMPUTED', 'PAIR_PNL_RECOMPUTED', 'KILL_SWITCH_CHANGED', 'LOSS_BREAKER_TRIPPED', 'LOSS_BREAKER_BASELINE')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?)
+    })
+    .map_err(|e| e.to_string())
+}
+
+
+/// Fixtures shared with the actor tests.
+#[cfg(test)]
+pub(crate) mod testkit {
+    use super::*;
+    use crate::engine::actor::PairEnvelope;
+    use crate::store::state::NewPair;
+    use tong_funding_core::pair::PairState;
+    use tong_funding_core::types::Exchange;
+
+    fn dec(s: &str) -> Decimal {
+        s.parse().unwrap()
+    }
+
+    pub(crate) fn append(db: &Db, ty: &str, pair: Option<&str>, payload: Value) -> i64 {
+        EventStore::new(db.clone()).append(ty, pair, payload).unwrap().unwrap()
+    }
+
+    pub(crate) fn close(db: &Db, pair: &str, simulated: bool) -> i64 {
+        append(db, crate::engine::actor::CLOSE_CONFIRMED, Some(pair), json!({ "verified_flat": true, "simulated": simulated }))
+    }
+
+    /// A closed demo pair worth `delta` (long closes `delta` away from its open, no fees) at `ts`.
+    pub(crate) fn closed(db: &Db, clock: &crate::ports::ManualClock, uuid: &str, ts: i64, delta: &str) {
+        let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: ts, simulated: false, scan: json!({}) };
+        let row = NewPair { internal_uuid: uuid.into(), pair_id: format!("pid-{uuid}"), symbol: "BTCUSDT".into(), status: PairState::Closing, entry: serde_json::to_value(env).unwrap() };
+        db.add_pair_if_not_pending(&row).unwrap();
+        clock.set(ts);
+        let close_long = dec("100") + dec(delta);
+        for (leg, action, ex, avg) in [
+            ("long", "open", "Binance", "100".to_string()),
+            ("short", "open", "Bybit", "100".to_string()),
+            ("long", "close", "Binance", close_long.to_string()),
+            ("short", "close", "Bybit", "100".to_string()),
+        ] {
+            append(
+                db,
+                "ORDER_SUBMITTED",
+                Some(uuid),
+                json!({
+                    "outcome": "accepted", "state": "Filled", "filled_quantity": "1", "avg_price": avg, "fee": "0", "fee_asset": "USDT",
+                    "client_order_id": format!("demo-{uuid}-{leg}-{action}"), "leg": leg, "action": action, "simulated": false, "exchange": ex, "symbol": "BTCUSDT",
+                }),
+            );
+        }
+        close(db, uuid, false);
     }
 }
 
@@ -319,6 +485,152 @@ mod tests {
             append(&fx.db, "ORDER_FILL", Some("p1"), json!({ "client_order_id": "demo-p1-long-close", "leg": "long", "action": "close", "exchange": "Binance", "filled_quantity": "0.02", "fee": "0.24", "fee_asset": "USDT" }));
             // the newest event of an order is its record: without a price the price PnL cannot be told
             assert_eq!(pair_amount(&fx.db, "p1", T), PairAmount::Unknown);
+        }
+    }
+
+    // ---- 2.3 the assessment ----------------------------------------------------------------------
+
+    mod assessment {
+        use super::*;
+        use crate::engine::actor::PairEnvelope;
+        use crate::store::state::NewPair;
+        use super::super::testkit::closed;
+        use tong_funding_core::pair::PairState;
+
+        fn dec(s: &str) -> Decimal {
+            s.parse().unwrap()
+        }
+
+        fn setup() -> (tempfile::TempDir, Db, crate::ports::ManualClock) {
+            let (d, db, clock) = open_tmp();
+            interval_start(&db).unwrap();
+            (d, db, clock)
+        }
+
+        #[test]
+        fn three_losses_in_a_row_trip_on_the_third_with_the_consecutive_reason() {
+            // spec scenario: limit 3, -0.5, -0.3, -1.2
+            let (_d, db, clock) = setup();
+            closed(&db, &clock, "a", 2_000_000, "-0.5");
+            closed(&db, &clock, "b", 2_100_000, "-0.3");
+            let a = assess(&db, dec("15"), 3, 3_000_000).unwrap();
+            assert!(!a.tripped() && a.state.consecutive == 2);
+            closed(&db, &clock, "c", 2_200_000, "-1.2");
+            let a = assess(&db, dec("15"), 3, 3_000_000).unwrap();
+            assert!(a.tripped());
+            assert_eq!(a.reason(), Some(TripReason::ConsecutiveLosses));
+            assert_eq!(a.pairs.iter().map(|p| p.pair.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+            let v = a.view();
+            assert_eq!((v.net_sum, v.loss_used, v.consecutive, v.max_consecutive, v.tripped, v.counted), (dec("-2.0"), dec("2.0"), 3, 3, true, 3));
+        }
+
+        #[test]
+        fn a_profit_in_between_resets_the_run() {
+            // spec scenario: -0.5, +0.2, -0.3, -1.2 with limit 3 -> not tripped
+            let (_d, db, clock) = setup();
+            for (i, delta) in ["-0.5", "0.2", "-0.3", "-1.2"].into_iter().enumerate() {
+                closed(&db, &clock, &format!("p{i}"), 2_000_000 + i as i64 * 1_000, delta);
+            }
+            let a = assess(&db, dec("15"), 3, 3_000_000).unwrap();
+            assert!(!a.tripped(), "{a:?}");
+            assert_eq!(a.state.consecutive, 2);
+        }
+
+        #[test]
+        fn the_cumulative_loss_trips_exactly_at_the_limit() {
+            let (_d, db, clock) = setup();
+            closed(&db, &clock, "a", 2_000_000, "-10");
+            closed(&db, &clock, "b", 2_100_000, "5");
+            closed(&db, &clock, "c", 2_200_000, "-9.99");
+            assert!(!assess(&db, dec("15"), 9, 3_000_000).unwrap().tripped(), "-14.99");
+            closed(&db, &clock, "d", 2_300_000, "-0.01");
+            let a = assess(&db, dec("15"), 9, 3_000_000).unwrap();
+            assert_eq!((a.reason(), a.state.net_sum), (Some(TripReason::MaxLoss), dec("-15.00")));
+        }
+
+        #[test]
+        fn a_pair_whose_amount_cannot_be_told_trips_with_the_unknown_reason() {
+            // spec scenario: a closed pair whose fill price cannot be had
+            let (_d, db, clock) = setup();
+            let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: 1, simulated: false, scan: json!({}) };
+            db.add_pair_if_not_pending(&NewPair { internal_uuid: "u".into(), pair_id: "pid-u".into(), symbol: "BTCUSDT".into(), status: PairState::Closing, entry: serde_json::to_value(env).unwrap() }).unwrap();
+            clock.set(2_000_000);
+            close(&db, "u", false);
+            let a = assess(&db, dec("15"), 3, 3_000_000).unwrap();
+            assert!(a.tripped());
+            assert_eq!(a.reason(), Some(TripReason::UnknownPnl));
+            assert_eq!(a.trip_payload()["reason_text"], json!("損益未知"));
+        }
+
+        #[test]
+        fn nothing_closed_is_a_clean_zero() {
+            let (_d, db, _c) = setup();
+            let a = assess(&db, dec("15"), 3, 3_000_000).unwrap();
+            let v = a.view();
+            assert!(!v.tripped && v.reason.is_none());
+            assert_eq!((v.net_sum, v.loss_used, v.consecutive, v.counted), (dec("0"), dec("0"), 0, 0));
+        }
+
+        #[test]
+        fn reopening_trading_starts_the_count_again() {
+            let (_d, db, clock) = setup();
+            closed(&db, &clock, "a", 2_000_000, "-20");
+            assert!(assess(&db, dec("15"), 3, 3_000_000).unwrap().tripped());
+            clock.set(3_000_000);
+            db.set_kill_switch(true).unwrap();
+            clock.set(3_100_000);
+            db.set_kill_switch(false).unwrap();
+            let a = assess(&db, dec("15"), 3, 3_200_000).unwrap();
+            assert!(!a.tripped());
+            assert_eq!(a.view().loss_used, dec("0"));
+        }
+
+        #[test]
+        fn a_trip_on_record_keeps_the_interval_tripped_even_when_the_numbers_get_better() {
+            let (_d, db, clock) = setup();
+            closed(&db, &clock, "a", 2_000_000, "-20");
+            let a = assess(&db, dec("15"), 3, 3_000_000).unwrap();
+            db.set_kill_switch_with_event(true, LOSS_BREAKER_TRIPPED, &a.trip_payload()).unwrap();
+            // a bigger limit now: the numbers alone would not trip, the record does
+            let b = assess(&db, dec("500"), 3, 3_000_000).unwrap();
+            assert!(!b.state.tripped && b.tripped() && b.view().tripped);
+            assert_eq!(b.reason(), Some(TripReason::MaxLoss), "the recorded reason is kept");
+            // the next interval starts clean
+            clock.set(4_000_000);
+            db.set_kill_switch(false).unwrap();
+            assert!(!assess(&db, dec("500"), 3, 4_100_000).unwrap().tripped());
+        }
+
+        #[test]
+        fn the_trip_payload_names_totals_thresholds_pairs_and_the_reason() {
+            let (_d, db, clock) = setup();
+            closed(&db, &clock, "a", 2_000_000, "-2");
+            closed(&db, &clock, "b", 2_100_000, "-1");
+            let p = assess(&db, dec("3"), 9, 3_000_000).unwrap().trip_payload();
+            assert_eq!(p["reason"], json!("MAX_LOSS"));
+            assert_eq!(p["loss_sum"], json!("3"));
+            assert_eq!(p["consecutive_losses"], json!(2));
+            assert_eq!(p["thresholds"]["loss_breaker_max_loss_usdt"], json!("3"));
+            assert_eq!(p["thresholds"]["loss_breaker_max_consecutive_losses"], json!(9));
+            assert_eq!(p["pairs"].as_array().unwrap().len(), 2);
+            assert_eq!(p["pairs"][0]["amount"], json!("-2"));
+            assert_eq!(p["provisional"], json!(true), "no PnL net yet: the amounts leave funding out");
+        }
+
+        #[test]
+        fn the_watermark_moves_with_closes_pnl_results_and_the_kill_switch_only() {
+            let (_d, db, clock) = setup();
+            let w0 = watermark(&db).unwrap();
+            append(&db, "ORDER_SUBMITTED", Some("x"), json!({}));
+            assert_eq!(watermark(&db).unwrap(), w0, "other events do not move it");
+            closed(&db, &clock, "a", 2_000_000, "-1");
+            let w1 = watermark(&db).unwrap();
+            assert!(w1 > w0);
+            append(&db, "PAIR_PNL_RECOMPUTED", Some("a"), json!({}));
+            assert!(watermark(&db).unwrap() > w1);
+            let w2 = watermark(&db).unwrap();
+            db.set_kill_switch(true).unwrap();
+            assert!(watermark(&db).unwrap() > w2);
         }
     }
 }

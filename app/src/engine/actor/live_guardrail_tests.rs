@@ -14,11 +14,11 @@ use crate::identity::ProcessIdentity;
 
 const SOL: &str = "SOLUSDT";
 
-fn live_risk() -> RiskConfig {
+pub(super) fn live_risk() -> RiskConfig {
     RiskConfig { live_max_leg_notional_usdt: Some(dec("10")), live_max_pairs_per_arming: Some(2), ..risk() }
 }
 
-fn live_deps(trigger: &'static str, cfg: &RiskConfig) -> (Rig, EngineDeps) {
+pub(super) fn live_deps(trigger: &'static str, cfg: &RiskConfig) -> (Rig, EngineDeps) {
     let (rig, mut deps) = rig(Opts { trigger, ..Opts::default() });
     deps.identity = ProcessIdentity::Live;
     store_risk(&rig.db, cfg);
@@ -44,7 +44,7 @@ fn of(db: &Db, label: &str) -> Vec<Value> {
     events(db).into_iter().filter(|(_, l, _)| l == label).map(|(_, _, p)| p).collect()
 }
 
-fn locked(rig: &Rig) -> bool {
+pub(super) fn locked(rig: &Rig) -> bool {
     rig.db.kill_switch_halted()
 }
 
@@ -76,14 +76,14 @@ fn opens(rig: &Rig) -> Vec<OrderRequest> {
     rig.sim.submitted().into_iter().filter(|r| !r.reduce_only).collect()
 }
 
-fn why(r: &CommandReply) -> String {
+pub(super) fn why(r: &CommandReply) -> String {
     match r {
         CommandReply::Rejected(w) => w.clone(),
         other => panic!("expected a rejection, got {other:?}"),
     }
 }
 
-fn manual(reduce_only: bool, qty: &str) -> Command {
+pub(super) fn manual(reduce_only: bool, qty: &str) -> Command {
     Command::ManualOrder(ManualOrder {
         exchange: Exchange::Binance,
         symbol: SYM.into(),
@@ -618,14 +618,14 @@ async fn flatten_leg_applies_only_to_a_locked_pair_in_live() {
 // ---- 3.4 automatic locks --------------------------------------------------------------------
 
 /// An Actor (not running) armed in memory with the stored caps, to drive `on_event` / `land` directly.
-fn armed_actor(rig_deps: (Rig, EngineDeps)) -> (Rig, Actor, EngineHandle) {
+pub(super) fn armed_actor(rig_deps: (Rig, EngineDeps)) -> (Rig, Actor, EngineHandle) {
     let (test_rig, deps) = rig_deps;
     let (mut actor, h) = Actor::with_probes(deps, FakeProbes::green());
     rearm(&test_rig, &mut actor);
     (test_rig, actor, h)
 }
 
-fn rearm(rig: &Rig, actor: &mut Actor) {
+pub(super) fn rearm(rig: &Rig, actor: &mut Actor) {
     let (risk, _) = load_risk_config(&rig.db).unwrap();
     actor.live.frozen = Some(FrozenCaps::from_risk(&risk).unwrap());
     rig.db.set_kill_switch(false).unwrap();
