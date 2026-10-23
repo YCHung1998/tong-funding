@@ -5,7 +5,7 @@
 
 ## 2. 引擎
 
-- [ ] 2.1 區間起點：最近一筆 `KILL_SWITCH_CHANGED {on:false}`，否則首次啟動寫 `LOSS_BREAKER_BASELINE`；測試（升級不追溯、重新開放即重置）
+- [x] 2.1 區間起點：最近一筆 `KILL_SWITCH_CHANGED {on:false}`，否則首次啟動寫 `LOSS_BREAKER_BASELINE`；測試（升級不追溯、重新開放即重置）
 - [ ] 2.2 逐筆金額：PnL 淨額，否則由 `assemble` + `compute_pnl` 重算「價格損益 − 手續費」，否則未知；測試
 - [ ] 2.3 評估時機（`CLOSE_CONFIRMED` 後、PnL 寫入或重算後、啟動時）與觸發效果（kill switch + `LOSS_BREAKER_TRIPPED` 同一交易、Live 解除武裝、通知、同區間只觸發一次）；流程測試
 - [ ] 2.4 發布狀態列所需的引擎狀態（交易許可與停止原因、觸發模式、排隊與最近進場時間、熔斷狀態、需處理件數）

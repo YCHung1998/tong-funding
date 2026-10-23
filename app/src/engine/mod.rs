@@ -25,6 +25,7 @@ pub mod ids;
 pub mod intent;
 pub mod latency;
 pub mod live_guard;
+pub mod loss_breaker;
 pub mod node0;
 pub mod ports;
 pub mod preflight;
