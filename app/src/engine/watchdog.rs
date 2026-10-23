@@ -24,12 +24,16 @@ pub const WATCHDOG_GRACE_MS: i64 = 5_000;
 pub const WATCHDOG_INTERVAL_MS: i64 = 5_000;
 /// A flatten order is sent at most this many times per alert entry; after that the conclusion is `Unknown`.
 pub const MAX_FLATTEN_ATTEMPTS: u32 = 3;
-/// This many consecutive rounds that still find an unfinished order end in `Unknown`.
+/// This many rounds (not reset by a read failure) that still find an unfinished order end in `Unknown`.
 pub const MAX_CANCEL_WAIT_ROUNDS: u32 = 3;
-/// This many consecutive rounds that could not READ what they need (a lookup failed, an order was not
+/// This many rounds (not reset by a wait) that could not READ what they need (a lookup failed, an order was not
 /// found, a position was unreadable, the round timed out) end in `Unknown`. A real contradiction
 /// (wrong side, beyond the tolerance, a position the record does not explain) is `Unknown` at once.
 pub const MAX_READ_FAIL_ROUNDS: u32 = 3;
+/// Rounds of ONE alert entry, whatever they concluded: a round past this that would still not conclude
+/// (`WaitForCancel`, `ReadFailed`, `Flatten`) is `Unknown`. Review round 2 (B2): the two counters above
+/// are independent and each only ever goes up until a flatten round, so no alternation can poll forever.
+pub const MAX_ROUNDS_PER_ALERT: u32 = 12;
 /// A round that has not read both legs by now is given up (`Unknown`): an exchange that does not
 /// answer is not "nothing there".
 pub const WATCHDOG_PROBE_TIMEOUT_MS: i64 = 30_000;
@@ -61,12 +65,14 @@ pub struct DecideInput<'a> {
     pub tolerance_pct: Decimal,
     /// `[long, short]`.
     pub legs: [LegRead; 2],
-    /// Earlier consecutive rounds of this entry that ended in `WaitForCancel`.
+    /// Earlier rounds of this entry that ended in `WaitForCancel` (see [`RoundCounts`]).
     pub waited_rounds: u32,
     /// Flatten orders already sent for this entry.
     pub attempts_sent: u32,
-    /// Earlier consecutive rounds of this entry that ended in `ReadFailed`.
+    /// Earlier rounds of this entry that ended in `ReadFailed` (see [`RoundCounts`]).
     pub read_failed_rounds: u32,
+    /// Rounds of this entry before this one (any conclusion), see [`MAX_ROUNDS_PER_ALERT`].
+    pub rounds_done: u32,
 }
 
 /// The conclusion of one round.
@@ -81,7 +87,7 @@ pub enum Decision {
     /// An order is not over yet: it is cancelled, nothing is sent, the next round looks again.
     WaitForCancel,
     /// Something could not be READ (lookup failed, order not found, position unreadable, timeout):
-    /// nothing is sent, the next round (5 s later) looks again; the third in a row is `Unknown`.
+    /// nothing is sent, the next round (5 s later) looks again; the third is `Unknown`.
     ReadFailed { reason: String },
     /// Not provable: nothing is sent, the engine is locked and the user is told why.
     Unknown { reason: String },
@@ -91,6 +97,15 @@ pub enum Decision {
 /// known), an unfinished order beats the position rules (positions are still moving), and the
 /// position rules are `plan_leg_close`'s, the same rules every close of this system uses.
 pub fn decide(input: &DecideInput<'_>) -> Decision {
+    let decision = decide_round(input);
+    // The round budget of one alert: whatever still goes on after it is not provable.
+    if matches!(decision, Decision::WaitForCancel | Decision::ReadFailed { .. } | Decision::Flatten { .. }) && input.rounds_done >= MAX_ROUNDS_PER_ALERT {
+        return Decision::Unknown { reason: format!("no conclusion after {MAX_ROUNDS_PER_ALERT} rounds of this alert (latest: {})", decision.conclusion().as_str()) };
+    }
+    decision
+}
+
+fn decide_round(input: &DecideInput<'_>) -> Decision {
     // 1. A read that failed means the leg is unknown: never "zero", never a guess.
     let mut failures = Vec::new();
     for l in &input.legs {
@@ -161,10 +176,10 @@ pub fn decide(input: &DecideInput<'_>) -> Decision {
     }
 }
 
-/// A round that could not read what it needs: `ReadFailed` until it is the third in a row, then `Unknown`.
-pub fn read_failure(reason: String, earlier_read_failed_rounds: u32) -> Decision {
+/// A round that could not read what it needs: `ReadFailed` until it is the third, then `Unknown`.
+fn read_failure(reason: String, earlier_read_failed_rounds: u32) -> Decision {
     if earlier_read_failed_rounds.saturating_add(1) >= MAX_READ_FAIL_ROUNDS {
-        return Decision::Unknown { reason: format!("{reason} (reading failed in {MAX_READ_FAIL_ROUNDS} rounds in a row)") };
+        return Decision::Unknown { reason: format!("{reason} (reading failed in {MAX_READ_FAIL_ROUNDS} rounds)") };
     }
     Decision::ReadFailed { reason }
 }
@@ -221,6 +236,26 @@ impl Conclusion {
     /// After one of these no further round runs for the alert entry (until the user acts).
     pub const fn ends_the_rounds(self) -> bool {
         matches!(self, Conclusion::Hedged | Conclusion::Flat | Conclusion::Unknown)
+    }
+}
+
+/// The two run counters of an alert entry. The ONE rule for updating them, used by the actor after each
+/// round and by the progress rebuilt after a restart: they are independent (a wait never clears the
+/// read failures and the other way round); a round that read everything and sent an order starts both
+/// over, and so does a conclusion that ends the rounds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RoundCounts {
+    pub waited: u32,
+    pub read_failed: u32,
+}
+
+impl RoundCounts {
+    pub fn after(self, conclusion: Conclusion) -> RoundCounts {
+        match conclusion {
+            Conclusion::WaitForCancel => RoundCounts { waited: self.waited.saturating_add(1), ..self },
+            Conclusion::ReadFailed => RoundCounts { read_failed: self.read_failed.saturating_add(1), ..self },
+            Conclusion::Flatten | Conclusion::Hedged | Conclusion::Flat | Conclusion::Unknown => RoundCounts::default(),
+        }
     }
 }
 
@@ -308,9 +343,9 @@ pub struct Progress {
     /// Flatten attempts of the watchdog for this entry: orders sent (`LEG_FLATTEN`) and orders that
     /// could not even be sent (`LEG_FLATTEN_ABORTED`), both with `by: "watchdog"`.
     pub attempts_sent: u32,
-    /// Consecutive newest rounds that concluded `WAIT_FOR_CANCEL`.
+    /// Rounds that concluded `WAIT_FOR_CANCEL` since the last flatten round (see [`RoundCounts`]).
     pub waited_rounds: u32,
-    /// Consecutive newest rounds that concluded `READ_FAILED`.
+    /// Rounds that concluded `READ_FAILED` since the last flatten round (see [`RoundCounts`]).
     pub read_failed_rounds: u32,
     /// Time of the newest watchdog record of this entry.
     pub last_record_ms: Option<i64>,
@@ -345,10 +380,11 @@ pub fn progress_from_records(alert_since_ms: i64, records: &[Record]) -> Progres
                     p.rounds = p.rounds.saturating_add(1);
                     p.last_record_ms = Some(r.ts_ms);
                     let conclusion = text("conclusion").and_then(Conclusion::parse);
-                    // each run counts only consecutive rounds of its own kind
-                    p.waited_rounds = if conclusion == Some(Conclusion::WaitForCancel) { p.waited_rounds.saturating_add(1) } else { 0 };
-                    p.read_failed_rounds = if conclusion == Some(Conclusion::ReadFailed) { p.read_failed_rounds.saturating_add(1) } else { 0 };
-                    p.terminal |= conclusion.is_some_and(Conclusion::ends_the_rounds);
+                    if let Some(c) = conclusion {
+                        let counts = RoundCounts { waited: p.waited_rounds, read_failed: p.read_failed_rounds }.after(c);
+                        (p.waited_rounds, p.read_failed_rounds) = (counts.waited, counts.read_failed);
+                        p.terminal |= c.ends_the_rounds();
+                    }
                 }
                 Some(KIND_ATTEMPT_RESULT) => p.last_record_ms = Some(r.ts_ms),
                 // notifications, skips and the like are not progress
@@ -511,7 +547,7 @@ pub enum Status {
     Waiting { due_ms: Option<i64> },
     /// An order of the pair is not over yet: it was cancelled, the next look is at `next_ms`.
     WaitingCancel { waited: u32, next_ms: i64 },
-    /// The round could not read what it needs (`failed` rounds in a row); the next look is at `next_ms`.
+    /// The round could not read what it needs (`failed` rounds so far); the next look is at `next_ms`.
     ReadRetry { failed: u32, reason: String, next_ms: i64 },
     /// A flatten order (attempt `attempt`) was sent and is awaited.
     Flattening { leg: Leg, quantity: Decimal, attempt: u32 },
@@ -652,7 +688,7 @@ mod tests {
     }
 
     fn input(long: LegRead, short: LegRead) -> DecideInput<'static> {
-        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], waited_rounds: 0, read_failed_rounds: 0, attempts_sent: 0 }
+        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], waited_rounds: 0, read_failed_rounds: 0, attempts_sent: 0, rounds_done: 0 }
     }
 
     fn unknown_reason(d: Decision) -> String {
@@ -818,7 +854,51 @@ mod tests {
         assert!(matches!(failing(0), Decision::ReadFailed { .. }), "round 1");
         assert!(matches!(failing(1), Decision::ReadFailed { .. }), "round 2");
         let why = unknown_reason(failing(MAX_READ_FAIL_ROUNDS - 1));
-        assert!(why.contains("exchange unreachable") && why.contains("3 rounds in a row"), "round 3: {why}");
+        assert!(why.contains("exchange unreachable") && why.contains("in 3 rounds"), "round 3: {why}");
+    }
+
+    /// Review round 2 (B2): the two run counters used to clear each other, so W,R,W,R,... never reached 3.
+    /// Played through the same two functions the actor uses (`decide` + `RoundCounts::after`).
+    #[test]
+    fn alternating_waits_and_read_failures_end_in_unknown() {
+        let mut counts = RoundCounts::default();
+        let mut concluded = None;
+        for round in 0..MAX_ROUNDS_PER_ALERT + 2 {
+            let mut i = if round % 2 == 0 {
+                input(read(Leg::Long, "100", "100", false), read(Leg::Short, "0", "0", true)) // an order is not over
+            } else {
+                let mut long = read(Leg::Long, "100", "100", true);
+                long.position = Err("exchange unreachable".into());
+                input(long, read(Leg::Short, "0", "0", true))
+            };
+            (i.waited_rounds, i.read_failed_rounds, i.rounds_done) = (counts.waited, counts.read_failed, round);
+            let d = decide(&i);
+            if matches!(d, Decision::Unknown { .. }) {
+                concluded = Some(round);
+                break;
+            }
+            counts = counts.after(d.conclusion());
+        }
+        let at = concluded.expect("it must end in Unknown, not poll forever");
+        assert!(at < MAX_ROUNDS_PER_ALERT, "ended after {at} rounds");
+    }
+
+    #[test]
+    fn a_round_past_the_budget_of_the_alert_that_would_not_conclude_is_unknown_but_a_conclusion_still_stands() {
+        let waiting = |rounds_done: u32| {
+            let mut i = input(read(Leg::Long, "100", "100", false), read(Leg::Short, "0", "0", true));
+            i.rounds_done = rounds_done;
+            decide(&i)
+        };
+        assert_eq!(waiting(MAX_ROUNDS_PER_ALERT - 1), Decision::WaitForCancel, "the 12th round may still wait");
+        let why = unknown_reason(waiting(MAX_ROUNDS_PER_ALERT));
+        assert!(why.contains("12 rounds") && why.contains("WAIT_FOR_CANCEL"), "{why}");
+        let mut flatten = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", true));
+        flatten.rounds_done = MAX_ROUNDS_PER_ALERT;
+        assert!(matches!(decide(&flatten), Decision::Unknown { .. }), "no order is sent past the budget");
+        let mut hedged = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "-100", "100", true));
+        hedged.rounds_done = MAX_ROUNDS_PER_ALERT;
+        assert_eq!(decide(&hedged), Decision::Hedged, "a final conclusion is not turned into Unknown");
     }
 
     #[test]
@@ -937,11 +1017,15 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_read_failures_are_counted_apart_from_waits_and_any_other_conclusion_resets_them() {
+    fn read_failures_and_waits_are_counted_independently_and_only_a_flatten_round_resets_them() {
         let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "READ_FAILED")]);
         assert_eq!((p.rounds, p.read_failed_rounds, p.waited_rounds, p.terminal), (2, 2, 0, false), "READ_FAILED alone does not end the rounds");
         let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "WAIT_FOR_CANCEL"), round(25_000, "READ_FAILED")]);
-        assert_eq!((p.read_failed_rounds, p.waited_rounds), (1, 0), "a wait in between broke the run");
+        assert_eq!((p.read_failed_rounds, p.waited_rounds), (2, 1), "review round 2 (B2): a wait in between does not clear the read failures");
+        let p = progress_from_records(10_000, &[round(15_000, "WAIT_FOR_CANCEL"), round(20_000, "READ_FAILED"), round(25_000, "WAIT_FOR_CANCEL"), round(30_000, "READ_FAILED")]);
+        assert_eq!((p.waited_rounds, p.read_failed_rounds), (2, 2), "W,R,W,R: neither run is ever reset by the other");
+        let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "WAIT_FOR_CANCEL"), round(25_000, "FLATTEN")]);
+        assert_eq!((p.waited_rounds, p.read_failed_rounds), (0, 0), "a round that read everything and sent an order starts over");
         let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "READ_FAILED"), round(25_000, "UNKNOWN")]);
         assert_eq!((p.read_failed_rounds, p.terminal), (0, true));
         assert_eq!(Conclusion::parse("READ_FAILED"), Some(Conclusion::ReadFailed));

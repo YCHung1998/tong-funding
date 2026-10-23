@@ -46,7 +46,7 @@ pub(super) struct WatchdogFlow {
     pub(super) rounds: u32,
     pub(super) attempts_sent: u32,
     pub(super) waited_rounds: u32,
-    /// Consecutive rounds that could not read what they need (the third is `Unknown`).
+    /// Rounds that could not read what they need since the last flatten round (the third is `Unknown`).
     pub(super) read_failed_rounds: u32,
     /// A conclusion that ends the rounds was reached: no further automatic action for this entry.
     pub(super) done: bool,
@@ -240,6 +240,8 @@ impl Actor {
             waited_rounds: w.waited_rounds,
             read_failed_rounds: w.read_failed_rounds,
             attempts_sent: w.attempts_sent,
+            // `w.rounds` already counts this round
+            rounds_done: w.rounds.saturating_sub(1),
         };
         let decision = wd::decide(&input);
         self.finish_round(&view, decision, Some((&probe, tolerance)), now);
@@ -255,20 +257,17 @@ impl Actor {
             w.phase = Phase::Idle;
         }
         self.dirty = true;
-        // each run counts only consecutive rounds of its own kind
-        if !matches!(decision, wd::Decision::ReadFailed { .. })
-            && let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut())
-        {
-            w.read_failed_rounds = 0;
+        // the ONE place the run counters change (independent of each other, see `wd::RoundCounts`)
+        if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+            let counts = wd::RoundCounts { waited: w.waited_rounds, read_failed: w.read_failed_rounds }.after(decision.conclusion());
+            (w.waited_rounds, w.read_failed_rounds) = (counts.waited, counts.read_failed);
         }
         // The action of the conclusion comes only after its record.
         match decision {
             // Something could not be read: nothing is decided yet, the next round (5 s later) looks
-            // again; the third failure in a row is `Unknown` (see `wd::read_failure`).
+            // again; the third failure is `Unknown` (see `wd::decide`).
             wd::Decision::ReadFailed { .. } => {
                 if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
-                    w.read_failed_rounds = w.read_failed_rounds.saturating_add(1);
-                    w.waited_rounds = 0;
                     w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
                 }
             }
@@ -279,7 +278,6 @@ impl Actor {
             // An order that is not over is cancelled; the next round (5 s later) looks again.
             wd::Decision::WaitForCancel => {
                 if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
-                    w.waited_rounds = w.waited_rounds.saturating_add(1);
                     w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
                 }
                 if let Some((probe, _)) = evidence {
@@ -300,7 +298,6 @@ impl Actor {
     /// No further automatic action for this entry until the user acts.
     fn end_rounds(&mut self, pair: &str) {
         if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
-            w.waited_rounds = 0;
             w.done = true;
         }
     }
@@ -352,10 +349,7 @@ impl Actor {
     /// intent first, nothing sent when it cannot be landed) and waits for its result.
     pub(super) fn begin_flatten(&mut self, view: &PairView, leg: Leg, qty: Decimal, position: Decimal, decision_recorded: bool, now: i64) {
         let pair = view.internal_uuid.as_str();
-        let Some(attempts_sent) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()).map(|w| {
-            w.waited_rounds = 0;
-            w.attempts_sent
-        }) else {
+        let Some(attempts_sent) = self.flows.get(pair).and_then(|f| f.watchdog.as_ref()).map(|w| w.attempts_sent) else {
             return;
         };
         let attempt = attempts_sent.saturating_add(1);

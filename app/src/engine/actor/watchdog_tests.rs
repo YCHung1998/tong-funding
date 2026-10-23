@@ -864,6 +864,7 @@ async fn an_aborted_flatten_counts_as_an_attempt_survives_a_restart_and_three_of
         waited_rounds: 0,
         read_failed_rounds: 0,
         attempts_sent: 3,
+        rounds_done: 0,
     });
     assert!(matches!(d, wd::Decision::Unknown { .. }), "{d:?}");
 }
