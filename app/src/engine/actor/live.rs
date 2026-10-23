@@ -322,6 +322,8 @@ impl Actor {
                 "live_max_pairs_per_arming": frozen.pairs_per_arming,
                 "max_concurrent_pairs": frozen.max_concurrent_pairs,
                 "max_leverage": frozen.max_leverage.normalize().to_string(),
+                "loss_breaker_max_loss_usdt": frozen.loss_breaker_max_loss_usdt.normalize().to_string(),
+                "loss_breaker_max_consecutive_losses": frozen.loss_breaker_max_consecutive_losses,
             },
         });
         if let Err(e) = self.db.set_kill_switch_with_event(false, LIVE_ARMED, &payload) {

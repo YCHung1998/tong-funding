@@ -194,6 +194,10 @@ async fn a_green_preflight_then_arm_lifts_the_kill_switch_freezes_the_caps_and_i
     let ev = of(&rig.db, LIVE_ARMED);
     assert_eq!(ev.len(), 1, "{ev:?}");
     assert_eq!(ev[0]["caps"]["live_max_leg_notional_usdt"], json!("10"));
+    // review round 2 (B6): the breaker limits in force at arming are on the record too
+    let risk = live_risk();
+    assert_eq!(ev[0]["caps"]["loss_breaker_max_loss_usdt"], json!(risk.loss_breaker_max_loss_usdt.normalize().to_string()));
+    assert_eq!(ev[0]["caps"]["loss_breaker_max_consecutive_losses"], json!(risk.loss_breaker_max_consecutive_losses));
     assert!(!ev[0].to_string().contains("真錢"), "the typed sentence is not stored: {}", ev[0]);
     // the preflight id is spent
     assert!(why(&ask(&h, arm_cmd(&rep)).await).contains("no preflight"), "single use");

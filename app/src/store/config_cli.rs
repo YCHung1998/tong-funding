@@ -13,7 +13,8 @@
 //!
 //! `set` validates with core (`RiskConfig::from_json` / `parse_overrides`) before writing, writes
 //! with optimistic locking and records a `CONFIG_UPDATED` event (`source: "cli"`). The value
-//! replaces the whole key. The database is single-instance: quit the app first.
+//! replaces the whole key. `set` takes the app's single-instance lock (review round 2, B3): while the app runs
+//! it is refused (exit 1) and says to close the app first; `show` is read-only and needs no lock.
 //! Exit codes: 0 ok, 1 refused or store error, 2 usage error.
 
 use std::io::Write;
@@ -89,16 +90,31 @@ pub fn validate(key: &str, value: &Value) -> Result<(), String> {
 
 /// Runs the subcommand on the default (or `--db`) database; returns the process exit code.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    run_with_clock(args, Arc::new(SystemClock), out, err)
+    let lock_dir = crate::instance_lock::data_dir_from(std::env::var("HOME").ok().as_deref());
+    run_with_clock(args, Arc::new(SystemClock), lock_dir, out, err)
 }
 
-fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+/// `lock_dir` = where the single-instance lock of the app lives (`Err` = it cannot be told: `set` refuses).
+fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, lock_dir: Result<PathBuf, crate::instance_lock::LockError>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let (cmd, path, identity) = match parse(args) {
         Ok(v) => v,
         Err(e) => {
             let _ = writeln!(err, "{e}\n{USAGE}");
             return 2;
         }
+    };
+    // `set` changes settings the running app reads and checks (frozen caps, the breaker): one program at a
+    // time, the same lock the app takes before it opens the database (review round 2, B3). `show` only reads.
+    let _lock = if matches!(cmd, Cmd::Set { .. }) {
+        match lock_dir.and_then(|d| crate::instance_lock::InstanceLock::acquire_in(&d)) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                let _ = writeln!(err, "{e}\nconfig set was refused, nothing was written: close the app first (it holds the database and checks these settings while it runs), then run it again");
+                return 1;
+            }
+        }
+    } else {
+        None
     };
     let db = match &path {
         Some(p) => Db::open_for(identity, p, clock),
@@ -248,7 +264,7 @@ mod tests {
         full.push("--db".into());
         full.push(db.display().to_string());
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), &mut out, &mut err);
+        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), Ok(db.parent().unwrap().to_path_buf()), &mut out, &mut err);
         (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
     }
 
@@ -343,7 +359,7 @@ mod tests {
         full.push("--db".into());
         full.push(db.display().to_string());
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), &mut out, &mut err);
+        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), Ok(db.parent().unwrap().to_path_buf()), &mut out, &mut err);
         (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
     }
 
@@ -479,5 +495,38 @@ mod tests {
         assert_eq!(code, 1);
         assert!(err.contains("halted"), "{err}");
         assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    // ---- review round 2, B3: `set` takes the single-instance lock, a running app keeps it out ----
+
+    #[test]
+    fn set_is_refused_while_the_app_holds_the_instance_lock_and_nothing_is_written() {
+        for live in [false, true] {
+            let dir = tempdir();
+            let p = dir.path().join(if live { "funding-live.db" } else { "funding.db" });
+            let app = crate::instance_lock::InstanceLock::acquire_in(dir.path()).expect("the running app");
+            let (code, _, err) = if live { call_live(&p, &["set", "risk", FULL]) } else { call(&p, &["set", "risk", FULL]) };
+            assert_eq!(code, 1, "live = {live}: {err}");
+            assert!(err.contains("already running") && err.contains("config set"), "says why and what to do: {err}");
+            assert!(!p.exists() || stored(&p, "risk").is_none(), "nothing was written");
+            // reading stays possible
+            let (code, out, _) = if live { call_live(&p, &["show"]) } else { call(&p, &["show"]) };
+            assert_eq!(code, 0, "show is read-only and needs no lock");
+            assert!(!out.contains("net_edge_threshold_pct\": \"0.01"), "the refused value is not there: {out}");
+            drop(app);
+            let (code, _, err) = if live { call_live(&p, &["set", "risk", FULL]) } else { call(&p, &["set", "risk", FULL]) };
+            assert_eq!(code, 0, "free again: {err}");
+        }
+    }
+
+    #[test]
+    fn set_cannot_tell_where_the_lock_is_so_it_refuses() {
+        let dir = tempdir();
+        let p = dir.path().join("funding.db");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let args = s(&["set", "risk", FULL, "--db", &p.display().to_string()]);
+        let unavailable = Err(crate::instance_lock::LockError::Unavailable("HOME is not set".into()));
+        assert_eq!(run_with_clock(&args, Arc::new(ManualClock::new(1_000)), unavailable, &mut out, &mut err), 1);
+        assert!(String::from_utf8(err).unwrap().contains("HOME is not set"));
     }
 }

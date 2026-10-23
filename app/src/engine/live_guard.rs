@@ -116,16 +116,19 @@ impl FrozenCaps {
     }
 }
 
-/// Hash of the four caps `Arm` is bound to (hex SHA-256). `None` while a live cap is unset.
+/// Hash of what `Arm` is bound to (hex SHA-256): the four caps and the two breaker limits, i.e. the
+/// fields of [`FrozenCaps`]. The UI and the engine both call this one function. `None` while a live cap is unset.
 pub fn caps_hash(risk: &RiskConfig) -> Option<String> {
     let leg = risk.live_max_leg_notional_usdt?;
     let pairs = risk.live_max_pairs_per_arming?;
     let text = format!(
-        "caps-v1|leg={}|pairs={}|concurrent={}|leverage={}",
+        "caps-v2|leg={}|pairs={}|concurrent={}|leverage={}|breaker_loss={}|breaker_losses={}",
         leg.normalize(),
         pairs,
         risk.max_concurrent_pairs,
-        risk.max_leverage.normalize()
+        risk.max_leverage.normalize(),
+        risk.loss_breaker_max_loss_usdt.normalize(),
+        risk.loss_breaker_max_consecutive_losses
     );
     Some(hex::encode(Sha256::digest(text.as_bytes())))
 }
@@ -401,7 +404,7 @@ mod tests {
     }
 
     #[test]
-    fn caps_hash_binds_exactly_the_four_caps() {
+    fn caps_hash_binds_exactly_the_four_caps_and_the_two_breaker_limits() {
         let r = risk("10", 2);
         let h = caps_hash(&r).unwrap();
         assert_eq!(h.len(), 64);
@@ -410,6 +413,10 @@ mod tests {
         assert_ne!(caps_hash(&risk("10", 3)), Some(h.clone()));
         assert_ne!(caps_hash(&RiskConfig { max_concurrent_pairs: 9, ..r.clone() }), Some(h.clone()));
         assert_ne!(caps_hash(&RiskConfig { max_leverage: d("7"), ..r.clone() }), Some(h.clone()));
+        // review round 2 (B6): the two breaker limits are frozen at arming, so they are part of what is armed
+        assert_ne!(caps_hash(&RiskConfig { loss_breaker_max_loss_usdt: d("4"), ..r.clone() }), Some(h.clone()));
+        assert_ne!(caps_hash(&RiskConfig { loss_breaker_max_consecutive_losses: 9, ..r.clone() }), Some(h.clone()));
+        assert_eq!(caps_hash(&RiskConfig { loss_breaker_max_loss_usdt: r.loss_breaker_max_loss_usdt * d("1.0"), ..r.clone() }), Some(h.clone()), "5 and 5.0 are the same");
         // anything else does not change it
         assert_eq!(caps_hash(&RiskConfig { stale_data_threshold_ms: 1, ..r.clone() }), Some(h));
         assert_eq!(caps_hash(&RiskConfig::default()), None);

@@ -447,3 +447,94 @@ async fn when_the_events_cannot_be_read_the_breaker_locks_a_live_engine_tells_th
     tick(&mut actor);
     assert_eq!(rig.notifier.breaker_calls().len(), 1, "and not again on every tick");
 }
+
+// ---- review round 2, B3: armed = min(stored, frozen); a Live row that lacks a limit is the Live default ----
+
+fn set_stored_breaker(db: &Db, loss: &str, consecutive: u32) {
+    let entry = db.config_get(CONFIG_RISK).unwrap().unwrap();
+    let mut v = entry.value.clone();
+    v["loss_breaker_max_loss_usdt"] = json!(loss);
+    v["loss_breaker_max_consecutive_losses"] = json!(consecutive);
+    db.config_set(CONFIG_RISK, &v, Some(entry.version)).unwrap(); // straight into the store, not through the app's checks
+}
+
+#[tokio::test(start_paused = true)]
+async fn while_armed_the_breaker_uses_the_stricter_of_the_stored_and_the_frozen_limit_and_still_trips_on_the_frozen_one() {
+    let cfg = RiskConfig { loss_breaker_max_loss_usdt: dec("5"), loss_breaker_max_consecutive_losses: 2, ..live_risk() };
+    let (rig, mut actor, _h) = armed_actor(live_deps("MANUAL", &cfg));
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2));
+    set_stored_breaker(&rig.db, "50", 10); // raised behind the app's back
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2), "armed: never looser than the frozen values");
+    set_stored_breaker(&rig.db, "4", 1);
+    assert_eq!(actor.breaker_limits(), (dec("4"), 1), "stricter than frozen is honoured at once");
+    set_stored_breaker(&rig.db, "50", 10);
+    for (i, delta) in ["-0.5", "-0.3"].into_iter().enumerate() {
+        closed(&rig.db, &rig.clock, &format!("p{i}"), rig.clock.now_ms() + 1_000, delta);
+        tick(&mut actor);
+    }
+    assert!(locked(&rig), "two losses trip the frozen limit of 2 although the stored one says 10");
+}
+
+#[tokio::test(start_paused = true)]
+async fn disarmed_the_stored_limit_counts_again() {
+    let cfg = RiskConfig { loss_breaker_max_loss_usdt: dec("5"), loss_breaker_max_consecutive_losses: 2, ..live_risk() };
+    let (rig, mut actor, _h) = armed_actor(live_deps("MANUAL", &cfg));
+    actor.live_disarm();
+    set_stored_breaker(&rig.db, "50", 10);
+    assert_eq!(actor.breaker_limits(), (dec("50"), 10), "nothing is frozen when not armed");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_live_row_that_lacks_a_limit_is_judged_by_the_live_default_not_the_looser_demo_one() {
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    let (actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    strip_breaker_keys(&rig.db, None); // after the start backfill: the row lacks both
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2), "5 / 2 of Live, not the 15 / 3 a missing field loads as");
+    strip_breaker_keys(&rig.db, Some("8"));
+    assert_eq!(actor.breaker_limits(), (dec("8"), 2), "a value that is there is used, the missing one is the Live default");
+    rig.db.config_set(CONFIG_RISK, &json!({ "max_leverage": "0" }), rig.db.config_get(CONFIG_RISK).unwrap().map(|e| e.version)).unwrap();
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2), "unreadable settings: the Live default too");
+    let (demo_rig, demo_deps) = rig_demo();
+    let (demo, _h2) = Actor::new(demo_deps);
+    strip_breaker_keys(&demo_rig.db, None);
+    assert_eq!(demo.breaker_limits(), (dec("15"), 3), "Demo is unchanged");
+}
+
+fn rig_demo() -> (Rig, EngineDeps) {
+    rig(Opts::default())
+}
+
+// ---- review round 2, B5: the backfill also covers "no risk row at all" and never fails silently ----
+
+#[tokio::test(start_paused = true)]
+async fn a_live_database_with_no_risk_row_at_all_gets_the_live_breaker_defaults_with_a_record() {
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    rig.db.with_raw_conn_for_tests(|c| Ok(c.execute("DELETE FROM config WHERE key = 'risk'", [])?)).unwrap();
+    assert!(rig.db.config_get(CONFIG_RISK).unwrap().is_none());
+    let before = count(&rig.db, "RISK_CONFIG_UPDATED");
+    let (actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    assert_eq!(stored_breaker(&rig.db), (json!("5"), json!(2)), "written as the Live defaults, not left to load as 15 / 3");
+    assert_eq!(count(&rig.db, "RISK_CONFIG_UPDATED"), before + 1);
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_backfill_that_fails_is_recorded_told_and_keeps_the_engine_locked() {
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    strip_breaker_keys(&rig.db, None);
+    // a value the settings path refuses: the backfill cannot be saved
+    let entry = rig.db.config_get(CONFIG_RISK).unwrap().unwrap();
+    let mut v = entry.value.clone();
+    v["max_leverage"] = json!("0");
+    rig.db.config_set(CONFIG_RISK, &v, Some(entry.version)).unwrap();
+    let (actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    let failed = events(&rig.db).into_iter().filter(|(_, l, _)| l == "LIVE_BREAKER_BACKFILL_FAILED").map(|(_, _, p)| p).collect::<Vec<_>>();
+    assert_eq!(failed.len(), 1, "{:?}", labels(&rig.db));
+    assert!(failed[0]["error"].as_str().unwrap().contains("max_leverage"), "{}", failed[0]);
+    assert!(locked(&rig) && !actor.armed(), "stays locked");
+    let reason = actor.live_status().last_lock_reason.expect("the arming panel says why");
+    assert!(reason.contains("breaker") || reason.contains("熔斷"), "{reason}");
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(rig.notifier.breaker_calls().len(), 1, "and the user is told");
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2), "meanwhile the Live default judges");
+}

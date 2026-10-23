@@ -16,16 +16,32 @@ use tong_funding_core::loss_breaker::TripReason;
 pub const LOSS_BREAKER_NOTIFY: &str = "LOSS_BREAKER_NOTIFY";
 
 impl Actor {
-    /// The stored limits; when the settings cannot be read, the defaults of this process (Live is the
-    /// stricter 5 USDT / 2 losses).
+    /// The limits the breaker judges by. Demo: the stored ones (the defaults of this process when they cannot
+    /// be read). Live (review round 2, B3): a limit the stored row lacks, or a row that cannot be read, is
+    /// the Live default (5 USDT / 2 losses), never the looser Demo default a missing field loads as; and
+    /// while armed neither is looser than the value frozen at arming (the stricter of the two counts).
     pub(super) fn breaker_limits(&self) -> (Decimal, u32) {
-        match self.load_risk() {
-            Ok((risk, _)) => (risk.loss_breaker_max_loss_usdt, risk.loss_breaker_max_consecutive_losses),
-            Err(_) => {
-                let risk = if self.live_on() { live_db_defaults().risk } else { RiskConfig::default() };
-                (risk.loss_breaker_max_loss_usdt, risk.loss_breaker_max_consecutive_losses)
+        if !self.live_on() {
+            return match self.load_risk() {
+                Ok((risk, _)) => (risk.loss_breaker_max_loss_usdt, risk.loss_breaker_max_consecutive_losses),
+                Err(_) => (RiskConfig::default().loss_breaker_max_loss_usdt, RiskConfig::default().loss_breaker_max_consecutive_losses),
+            };
+        }
+        let live = live_db_defaults().risk;
+        let (mut max_loss, mut max_consecutive) = (live.loss_breaker_max_loss_usdt, live.loss_breaker_max_consecutive_losses);
+        if let (Ok((stored, _)), Ok(Some(raw))) = (self.load_risk(), self.db.config_get(CONFIG_RISK)) {
+            if raw.value.get("loss_breaker_max_loss_usdt").is_some() {
+                max_loss = stored.loss_breaker_max_loss_usdt;
+            }
+            if raw.value.get("loss_breaker_max_consecutive_losses").is_some() {
+                max_consecutive = stored.loss_breaker_max_consecutive_losses;
             }
         }
+        if let Some(frozen) = self.live.frozen.as_ref() {
+            max_loss = max_loss.min(frozen.loss_breaker_max_loss_usdt);
+            max_consecutive = max_consecutive.min(frozen.loss_breaker_max_consecutive_losses);
+        }
+        (max_loss, max_consecutive)
     }
 
     /// Looks at the current interval, but only when one of the watched events (closes, hand-confirmed
@@ -115,17 +131,29 @@ impl Actor {
         });
     }
 
-    /// An existing Live database whose stored settings predate the breaker has neither limit: a missing
-    /// field would load as the looser Demo default (15 / 3). Once, at a Live start, the missing field(s)
-    /// are written as the Live defaults (5 / 2) through the settings path, with `RISK_CONFIG_UPDATED`
-    /// (before / after). A value that is there is never touched.
+    /// A Live database whose stored settings predate the breaker has neither limit (or no settings row at
+    /// all): a missing field would load as the looser Demo default (15 / 3). Once, at a Live start, the
+    /// missing field(s) are written as the Live defaults (5 / 2) through the settings path, with
+    /// `RISK_CONFIG_UPDATED` (before / after). A value that is there is never touched. A backfill that
+    /// cannot be written is never swallowed (review round 2, B5): `LIVE_BREAKER_BACKFILL_FAILED`, the
+    /// engine stays locked and the user is told; `breaker_limits` judges by the Live defaults meanwhile.
     pub(super) fn live_backfill_breaker_defaults(&mut self) {
         if !self.live_on() {
             return;
         }
-        let Ok(Some(entry)) = self.db.config_get(CONFIG_RISK) else { return };
-        let Value::Object(mut stored) = entry.value else { return };
-        let Ok(defaults) = serde_json::to_value(live_db_defaults().risk) else { return };
+        let stored = match self.db.config_get(CONFIG_RISK) {
+            Ok(Some(entry)) => match entry.value {
+                Value::Object(m) => m,
+                other => return self.backfill_failed(format!("stored risk settings are not an object: {other}")),
+            },
+            Ok(None) => serde_json::Map::new(),
+            Err(e) => return self.backfill_failed(format!("cannot read the risk settings: {e}")),
+        };
+        let defaults = match serde_json::to_value(live_db_defaults().risk) {
+            Ok(d) => d,
+            Err(e) => return self.backfill_failed(format!("cannot encode the Live defaults: {e}")),
+        };
+        let mut stored = stored;
         let mut changed = false;
         for key in ["loss_breaker_max_loss_usdt", "loss_breaker_max_consecutive_losses"] {
             if !stored.contains_key(key) {
@@ -139,9 +167,18 @@ impl Actor {
         let overrides = match self.db.config_get(CONFIG_RISK_OVERRIDES) {
             Ok(Some(e)) => e.value,
             Ok(None) => json!({}),
-            Err(_) => return,
+            Err(e) => return self.backfill_failed(format!("cannot read the risk overrides: {e}")),
         };
         // not armed at a start, so the frozen-caps check passes; a value that does not validate is refused here too
-        let _ = self.save_risk_settings(Value::Object(stored), overrides);
+        if let CommandReply::Rejected(why) = self.save_risk_settings(Value::Object(stored), overrides) {
+            self.backfill_failed(why);
+        }
+    }
+
+    fn backfill_failed(&mut self, error: String) {
+        let payload = json!({ "error": error, "defaults": { "loss_breaker_max_loss_usdt": "5", "loss_breaker_max_consecutive_losses": 2 } });
+        self.lock_new_entries("LIVE_BREAKER_BACKFILL_FAILED", &payload, format!("loss circuit breaker: the Live limits could not be written ({error})"));
+        let (max_loss, max_consecutive) = self.breaker_limits();
+        self.send_breaker_notice(BreakerNotice { identity: self.identity, reason: TripReason::Unreadable, loss_used: Decimal::ZERO, max_loss, consecutive: 0, max_consecutive, provisional: false });
     }
 }
