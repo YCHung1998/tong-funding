@@ -284,6 +284,11 @@ pub fn disabled_exchange_line(ex: Exchange) -> String {
     format!("{} 已停用（風控設定未勾選）", ex.name())
 }
 
+/// `OKX 已停用`: the short line in the scanner's source status bar.
+pub fn disabled_source_text(ex: Exchange) -> String {
+    format!("{} 已停用", ex.name())
+}
+
 /// The one muted line of a disabled exchange on a page, and what that page would have shown for it
 /// (the error, the state, the quote row), which only the expanded line draws.
 #[derive(Debug, Clone, PartialEq, Eq)]

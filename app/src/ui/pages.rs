@@ -55,12 +55,30 @@ pub fn load_state(v: &LoadView) -> Option<Div> {
     })
 }
 
-pub fn freshness_chip(label: &str, f: &Freshness) -> Div {
-    let color = match f.status {
+fn fresh_color(status: super::alerts::FreshStatus) -> u32 {
+    match status {
         super::alerts::FreshStatus::Online => theme::POSITIVE,
         super::alerts::FreshStatus::RateLimited | super::alerts::FreshStatus::Stale => theme::WARNING,
         super::alerts::FreshStatus::Offline | super::alerts::FreshStatus::Unknown => theme::NEGATIVE,
-    };
+    }
+}
+
+/// A source in the scanner header (scanner-layout): dot, name and `state · age · next poll`, each said
+/// once; an unticked exchange is one muted `已停用` line without dot or state.
+pub fn source_chip(c: &scanner::SourceChip) -> Div {
+    let mut row = div().id(SharedString::from(format!("source-{}", c.key()))).test_support().flex().items_center().gap_1();
+    if let Some(status) = c.dot() {
+        row = row.child(div().size(px(6.0)).rounded_full().bg(rgb(fresh_color(status))));
+    }
+    match c {
+        scanner::SourceChip::Disabled { .. } => row = row.child(small(c.label(), DISABLED_TONE.color())),
+        _ => row = row.child(small(c.label(), theme::TEXT_SECONDARY)).child(small(c.detail(), theme::TEXT_MUTED)),
+    }
+    div().child(row)
+}
+
+pub fn freshness_chip(label: &str, f: &Freshness) -> Div {
+    let color = fresh_color(f.status);
     div()
         .flex()
         .items_center()

@@ -11,7 +11,10 @@ use tong_funding_core::net_edge::{NetEdgeParams, best_opportunity_with, legs_set
 use tong_funding_core::risk::{EffectiveConfig, RiskConfig, RiskOverrides, effective_for_pair};
 use tong_funding_core::types::{Decimal, Exchange};
 
+use super::alerts::FreshStatus;
+use super::banner;
 use super::bridge::{ClockState, MarketFeed, Settings, SourceId, UiSnapshot, tradable_exchanges};
+use super::labels::disabled_source_text;
 use super::format::{self, DASH};
 use crate::ui::theme::{Tone, funding_tone};
 
@@ -643,6 +646,85 @@ pub fn countdown(target: Option<(i64, Exchange)>, clock: ClockState, now_ms: i64
 
 /// The sources shown in the scanner header: the Binance and Bybit WebSockets, Bybit and OKX polls.
 pub const HEADER_SOURCES: [SourceId; 4] = [SourceId::BinanceWs, SourceId::BybitWs, SourceId::MarketPoll(Exchange::Bybit), SourceId::MarketPoll(Exchange::Okx)];
+
+/// One source in the scanner header (scanner-layout): its name and its state, each said once.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SourceChip {
+    /// The exchange is not in `allowed_exchanges`: one muted line, no status, never a red OFFLINE.
+    Disabled { exchange: Exchange },
+    /// The Bybit WebSocket was switched off by the roll-back switch.
+    RolledBack { label: String },
+    Live { label: String, status: FreshStatus, age_s: Option<i64>, next_poll_s: Option<i64>, websocket: bool },
+}
+
+impl SourceChip {
+    /// Element id and ordering key.
+    pub fn key(&self) -> String {
+        match self {
+            SourceChip::Disabled { exchange } => format!("off-{}", exchange.name()),
+            SourceChip::RolledBack { label } | SourceChip::Live { label, .. } => label.clone(),
+        }
+    }
+    /// The source's name; for a disabled exchange the whole line (`OKX 已停用`).
+    pub fn label(&self) -> String {
+        match self {
+            SourceChip::Disabled { exchange } => disabled_source_text(*exchange),
+            SourceChip::RolledBack { label } | SourceChip::Live { label, .. } => label.clone(),
+        }
+    }
+    /// The state after the name: `ONLINE · 3 秒前 · 下次 7s`. The WebSockets use ONLINE / RECONNECTING /
+    /// OFFLINE, the polls the shared freshness words. Empty for a disabled exchange.
+    pub fn detail(&self) -> String {
+        match self {
+            SourceChip::Disabled { .. } => String::new(),
+            SourceChip::RolledBack { .. } => BYBIT_WS_DISABLED_TEXT.into(),
+            SourceChip::Live { status, age_s, next_poll_s, websocket, .. } => {
+                let word = if *websocket {
+                    match status {
+                        FreshStatus::Online => "ONLINE",
+                        FreshStatus::Stale | FreshStatus::RateLimited => "RECONNECTING",
+                        FreshStatus::Offline | FreshStatus::Unknown => "OFFLINE",
+                    }
+                } else {
+                    status.label()
+                };
+                let mut parts = vec![word.to_string()];
+                parts.extend(age_s.map(|a| format!("{a} 秒前")));
+                parts.extend(next_poll_s.map(|n| format!("下次 {n}s")));
+                parts.join(" · ")
+            }
+        }
+    }
+    /// Status dot, if the source has a status.
+    pub fn dot(&self) -> Option<FreshStatus> {
+        match self {
+            SourceChip::Live { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+}
+
+/// The header's source chips. A source of an exchange that is not ticked becomes one `已停用` line
+/// (a single one per exchange, even when it has both a WebSocket and a poll).
+pub fn source_chips(snap: &UiSnapshot, now_ms: i64) -> Vec<SourceChip> {
+    let mut out: Vec<SourceChip> = Vec::new();
+    for source in HEADER_SOURCES {
+        let ex = source.exchange();
+        let chip = if !snap.exchange_enabled(ex) {
+            SourceChip::Disabled { exchange: ex }
+        } else if source == SourceId::BybitWs && snap.bybit_ws_disabled {
+            SourceChip::RolledBack { label: source.label() }
+        } else {
+            let f = banner::freshness(snap, source, now_ms);
+            let websocket = matches!(source, SourceId::BinanceWs | SourceId::BybitWs);
+            SourceChip::Live { label: source.label(), status: f.status, age_s: f.age_s, next_poll_s: if websocket { None } else { f.next_poll_s }, websocket }
+        };
+        if !out.contains(&chip) {
+            out.push(chip);
+        }
+    }
+    out
+}
 
 /// Text of the Bybit WebSocket indicator when the roll-back switch turned it off.
 pub const BYBIT_WS_DISABLED_TEXT: &str = "已停用（TONG_FUNDING_BYBIT_FEED=rest）";

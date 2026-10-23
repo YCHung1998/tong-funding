@@ -551,26 +551,10 @@ impl Shell {
         let refreshing = self.source.refresh_in_progress();
         // Rows are two lines of text tall; the text follows the zoom, so the row height must too.
         let zoom_factor = super::zoom_ui::current(cx).factor();
-        let mut sources = div().flex().gap_4();
-        for s in scanner::HEADER_SOURCES {
-            let mut f = banner::freshness(&self.snap, s, self.now_ms);
-            let label = s.label();
-            let mut chip = pages::freshness_chip(&label, &f);
-            if s == SourceId::BybitWs && self.snap.bybit_ws_disabled {
-                sources = sources.child(div().flex().gap_1().child(small(label, theme::TEXT_SECONDARY)).child(small(scanner::BYBIT_WS_DISABLED_TEXT, theme::TEXT_MUTED)));
-                continue;
-            }
-            if matches!(s, SourceId::BinanceWs | SourceId::BybitWs) {
-                // The WebSocket header uses ONLINE / RECONNECTING / OFFLINE.
-                let word = match f.status {
-                    FreshStatus::Online => "ONLINE",
-                    FreshStatus::Stale | FreshStatus::RateLimited => "RECONNECTING",
-                    FreshStatus::Offline | FreshStatus::Unknown => "OFFLINE",
-                };
-                f.next_poll_s = None;
-                chip = div().flex().gap_1().child(pages::freshness_chip(&label, &f)).child(small(word, theme::TEXT_SECONDARY));
-            }
-            sources = sources.child(chip);
+        // One chip per source, each saying its state and age once; wraps instead of running into the toggle.
+        let mut sources = div().id("scan-sources").test_support().flex().flex_wrap().items_center().gap_x(rx(16.0)).gap_y(rx(4.0));
+        for chip in scanner::source_chips(&self.snap, self.now_ms) {
+            sources = sources.child(pages::source_chip(&chip));
         }
         let header = div()
             .flex()
@@ -627,6 +611,7 @@ impl Shell {
         let toggle_color = if vm.decidable { theme::TEXT_PRIMARY } else { theme::TEXT_MUTED };
         let toggle = div()
             .id("only-qualified")
+            .test_support()
             .flex()
             .gap_2()
             .items_center()
@@ -655,12 +640,16 @@ impl Shell {
                 cx.notify();
             }))
             .child(small(if refreshing { "刷新中…" } else { "立即刷新" }, if refreshing { theme::TEXT_MUTED } else { theme::ACCENT }));
+        // The toggle, the sources and the refresh group are a clear gap apart; on a narrow window they wrap.
         let controls = div()
             .flex()
-            .justify_between()
+            .flex_wrap()
             .items_center()
+            .gap_x(rx(24.0))
+            .gap_y(rx(8.0))
             .child(toggle)
-            .child(div().flex().gap_3().items_center().child(sources).child(small(format!("最新掃描 {} UTC", format::utc_hms(vm.computed_at)), theme::TEXT_MUTED)).child(refresh));
+            .child(sources)
+            .child(div().ml_auto().flex().gap_3().items_center().child(small(format!("最新掃描 {} UTC", format::utc_hms(vm.computed_at)), theme::TEXT_MUTED)).child(refresh));
 
         let mut body = div().flex().flex_col().gap_2();
         let candidate_list = self.candidate_panel(cx);

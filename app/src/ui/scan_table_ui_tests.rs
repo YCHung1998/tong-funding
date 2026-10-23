@@ -508,3 +508,42 @@ fn the_gross_labels_stay_inside_the_gross_column_clear_of_net_edge(cx: &mut Test
     let net_cell = bounds_of(&rig, SharedString::from("net-DDDUSDT"), cx);
     assert!(net_cell.left() >= gross.right(), "Net Edge starts after Gross ends");
 }
+
+// ---- scanner-layout 2.3: the status bar ---------------------------------------------------------------
+
+/// Minimum space between the "只顯示達標" toggle and the sources.
+const BAR_GAP_PX: f32 = 24.0;
+
+fn exists(rig: &Rig, id: impl Into<gpui_kit::ElementId>, cx: &mut TestAppContext) -> bool {
+    let id = id.into();
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).is_some()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_toggle_and_the_sources_are_a_clear_gap_apart_or_on_separate_lines(cx: &mut TestAppContext) {
+    for width in [DEFAULT_WIDTH, 1000.0, 700.0] {
+        let rig = open_with(cx, width, feed_with(okx_unticked()));
+        let toggle = bounds_of(&rig, "only-qualified", cx);
+        let sources = bounds_of(&rig, "scan-sources", cx);
+        let side_by_side = sources.left() - toggle.right() >= px(BAR_GAP_PX) - px(0.5);
+        let wrapped = sources.top() >= toggle.bottom();
+        assert!(side_by_side || wrapped, "at {width} px the toggle {toggle:?} and the sources {sources:?} touch");
+        assert!(sources.right() <= px(width), "the sources stay inside the window at {width} px: {sources:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_ticked_exchange_has_one_chip_and_an_unticked_one_is_a_single_disabled_line(cx: &mut TestAppContext) {
+    let rig = open_with(cx, DEFAULT_WIDTH, feed_with(okx_unticked()));
+    for id in ["source-Binance WebSocket", "source-Bybit WebSocket", "source-Bybit 行情", "source-off-OKX"] {
+        assert!(exists(&rig, SharedString::from(id), cx), "{id}");
+    }
+    assert!(!exists(&rig, SharedString::from("source-OKX 行情"), cx), "no OKX status chip while OKX is not ticked");
+    let all = open_with(cx, DEFAULT_WIDTH, feed_with(all_ticked()));
+    assert!(exists(&all, SharedString::from("source-OKX 行情"), cx));
+    assert!(!exists(&all, SharedString::from("source-off-OKX"), cx));
+}
