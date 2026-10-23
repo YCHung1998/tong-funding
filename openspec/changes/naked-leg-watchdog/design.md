@@ -16,7 +16,7 @@
 1. **決策是純函式**（`engine/watchdog.rs`，或 core）：輸入每腿的 `position: Result<Decimal>`、`recorded: Result<Decimal>`、`orders_terminal: Result<bool>`、容差；輸出 `Flatten { leg, qty } | Hedged | Flat | WaitForCancel | Unknown { reason }`。規則：
    - 任一腿任一輸入為 `Err`（讀取類錯誤：查詢失敗、找不到單、持倉讀不到、整輪逾時、探測任務遺失）→ `ReadFailed`（該輪只記錄、5 秒後再查，不送單、不鎖定）；第 3 輪 `ReadFailed` → `Unknown`。實質矛盾（方向錯、超出容差、持倉與記錄不符）不在此列，立即 `Unknown`。
    - 任一張單未終結 → `WaitForCancel`（引擎撤單後下一輪再查；累計 3 輪仍未終結 → `Unknown`）。
-   - 計數（審查第二輪 B2）：等待撤單與讀取失敗各自累計、互不歸零（原本互相歸零，W、R 交替會無限輪詢）；送出平倉單的那一輪與結束輪詢的結論才把兩者歸零。更新只在 `finish_round` 一處（純函式 `RoundCounts::after`），重啟由事件以同一規則重建。另設每次警示總輪數上限 `MAX_ROUNDS_PER_ALERT = 12`：第 13 輪起不能下結論（等待、讀取失敗、送單）者一律 `Unknown`，已有結論（已對沖、無部位、未知）不受影響。
+   - 計數（審查第二輪 B2）：等待撤單與讀取失敗各自累計、互不歸零（原本互相歸零，W、R 交替會無限輪詢）；送出平倉單的那一輪與結束輪詢的結論才把兩者歸零。更新只在 `finish_round` 一處（純函式 `RoundCounts::after`），重啟由事件以同一規則重建。（審查第三輪 C2）不另設每次警示的總輪數上限（原 `MAX_ROUNDS_PER_ALERT = 12` 已刪除）：輪數已由「等待撤單、讀取失敗各 3 輪即 Unknown、只有送出平倉單的那一輪歸零、最多送出 3 次」保證有界；總輪數上限反而會讓第 3 次平倉被提前判為 Unknown，與「最多送出 3 次」不符。
    - 每腿以 `plan_leg_close` 的規則判斷部位（方向錯或差距超出容差 → `Unknown`）。
    - 恰好一腿有部位、另一腿「為空」→ `Flatten`；「為空」明確指記錄成交 = 0 且持倉 = 0（不得只依 `plan_leg_close` 算出 0，容差 100 時它會把「記錄 50、持倉 0」也算成 0）；兩腿皆有 → `Hedged`（文案：兩腿都有部位（可能不平衡），列出兩腿數量）；兩腿皆無 → `Flat`。
    - 替代：沿用 `FlattenLeg` 手動路徑直接送單、不先判斷另一腿 → 無法滿足「確認另一腿確實沒成交」（使用者要求的緩衝）。

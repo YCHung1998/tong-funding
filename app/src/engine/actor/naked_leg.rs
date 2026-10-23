@@ -244,8 +244,6 @@ impl Actor {
             waited_rounds: w.waited_rounds,
             read_failed_rounds: w.read_failed_rounds,
             attempts_sent: w.attempts_sent,
-            // `w.rounds` already counts this round
-            rounds_done: w.rounds.saturating_sub(1),
         };
         let decision = wd::decide(&input);
         self.finish_round(&view, decision, Some((&probe, tolerance)), now);

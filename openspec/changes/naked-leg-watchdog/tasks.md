@@ -34,6 +34,10 @@
 ## 6. 審查第二輪修正
 
 - [x] 6.1 B1 手動 `FlattenLeg` 的 `client_order_id` 與逾時記在 flow（`flattens`）；`user_flatten_active` 只看未逾時的手動單，`send_flatten` 的拒絕只適用未逾時的單；一般平倉的未知殘單不再讓看門狗永遠不跑（回歸測試：走到 PARTIAL_FAILURE 後 300 秒必有看門狗事件並鎖定，先紅後綠；另測殘單逾時後手動可送）
-- [x] 6.2 B2 `waited_rounds`／`read_failed_rounds` 各自獨立累計，只在 `finish_round` 一處更新（`RoundCounts::after`，重啟同規則重建），加 `MAX_ROUNDS_PER_ALERT = 12`；測試 W,R,W,R… 最終 Unknown
+- [x] 6.2 B2 `waited_rounds`／`read_failed_rounds` 各自獨立累計，只在 `finish_round` 一處更新（`RoundCounts::after`，重啟同規則重建）；測試 W,R,W,R… 最終 Unknown（`MAX_ROUNDS_PER_ALERT` 已於 7.2 刪除）
 - [x] 6.3 B4 探測任務與手動 `FlattenLeg` 讀取任務加 Drop guard（`LostTaskGuard`）：沒送出結果（含 panic）就改送讀取失敗／清 `flatten_inflight` 並寫 abort；測試以會 panic 的替身驗證
 - [x] 6.4 簡化：`watchdog.rs` 模組 doc 與 `WatchdogProbe::unreadable` doc 的過時說明更正；`read_failure` 改私有
+
+## 7. 審查第三輪修正
+
+- [x] 7.2 C2 刪除 `MAX_ROUNDS_PER_ALERT`、`DecideInput.rounds_done` 與 `decide` 包裝：輪數由「W、R 各 3 輪即 Unknown、只有 Flatten 歸零、最多 3 次嘗試」保證有界；測試 W,R 交替最終 Unknown、W,R,W,R 後 3 次平倉都能送出（先紅：有上限時只送得出 2 次）

@@ -31,10 +31,6 @@ pub const MAX_CANCEL_WAIT_ROUNDS: u32 = 3;
 /// found, a position was unreadable, the round timed out) end in `Unknown`. A real contradiction
 /// (wrong side, beyond the tolerance, a position the record does not explain) is `Unknown` at once.
 pub const MAX_READ_FAIL_ROUNDS: u32 = 3;
-/// Rounds of ONE alert entry, whatever they concluded: a round past this that would still not conclude
-/// (`WaitForCancel`, `ReadFailed`, `Flatten`) is `Unknown`. Review round 2 (B2): the two counters above
-/// are independent and each only ever goes up until a flatten round, so no alternation can poll forever.
-pub const MAX_ROUNDS_PER_ALERT: u32 = 12;
 /// A round that has not read both legs by now is given up (`Unknown`): an exchange that does not
 /// answer is not "nothing there".
 pub const WATCHDOG_PROBE_TIMEOUT_MS: i64 = 30_000;
@@ -72,8 +68,6 @@ pub struct DecideInput<'a> {
     pub attempts_sent: u32,
     /// Earlier rounds of this entry that ended in `ReadFailed` (see [`RoundCounts`]).
     pub read_failed_rounds: u32,
-    /// Rounds of this entry before this one (any conclusion), see [`MAX_ROUNDS_PER_ALERT`].
-    pub rounds_done: u32,
 }
 
 /// The conclusion of one round.
@@ -98,15 +92,6 @@ pub enum Decision {
 /// known), an unfinished order beats the position rules (positions are still moving), and the
 /// position rules are `plan_leg_close`'s, the same rules every close of this system uses.
 pub fn decide(input: &DecideInput<'_>) -> Decision {
-    let decision = decide_round(input);
-    // The round budget of one alert: whatever still goes on after it is not provable.
-    if matches!(decision, Decision::WaitForCancel | Decision::ReadFailed { .. } | Decision::Flatten { .. }) && input.rounds_done >= MAX_ROUNDS_PER_ALERT {
-        return Decision::Unknown { reason: format!("no conclusion after {MAX_ROUNDS_PER_ALERT} rounds of this alert (latest: {})", decision.conclusion().as_str()) };
-    }
-    decision
-}
-
-fn decide_round(input: &DecideInput<'_>) -> Decision {
     // 1. A read that failed means the leg is unknown: never "zero", never a guess.
     let mut failures = Vec::new();
     for l in &input.legs {
@@ -689,7 +674,7 @@ mod tests {
     }
 
     fn input(long: LegRead, short: LegRead) -> DecideInput<'static> {
-        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], waited_rounds: 0, read_failed_rounds: 0, attempts_sent: 0, rounds_done: 0 }
+        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], waited_rounds: 0, read_failed_rounds: 0, attempts_sent: 0 }
     }
 
     fn unknown_reason(d: Decision) -> String {
@@ -859,12 +844,13 @@ mod tests {
     }
 
     /// Review round 2 (B2): the two run counters used to clear each other, so W,R,W,R,... never reached 3.
-    /// Played through the same two functions the actor uses (`decide` + `RoundCounts::after`).
+    /// Played through the same two functions the actor uses (`decide` + `RoundCounts::after`). Review round 3
+    /// (C2): the bound comes from the counters alone (no extra cap on the number of rounds).
     #[test]
     fn alternating_waits_and_read_failures_end_in_unknown() {
         let mut counts = RoundCounts::default();
         let mut concluded = None;
-        for round in 0..MAX_ROUNDS_PER_ALERT + 2 {
+        for round in 0..20usize {
             let mut i = if round % 2 == 0 {
                 input(read(Leg::Long, "100", "100", false), read(Leg::Short, "0", "0", true)) // an order is not over
             } else {
@@ -872,7 +858,7 @@ mod tests {
                 long.position = Err("exchange unreachable".into());
                 input(long, read(Leg::Short, "0", "0", true))
             };
-            (i.waited_rounds, i.read_failed_rounds, i.rounds_done) = (counts.waited, counts.read_failed, round);
+            (i.waited_rounds, i.read_failed_rounds) = (counts.waited, counts.read_failed);
             let d = decide(&i);
             if matches!(d, Decision::Unknown { .. }) {
                 concluded = Some(round);
@@ -881,25 +867,41 @@ mod tests {
             counts = counts.after(d.conclusion());
         }
         let at = concluded.expect("it must end in Unknown, not poll forever");
-        assert!(at < MAX_ROUNDS_PER_ALERT, "ended after {at} rounds");
+        assert!(at < (MAX_CANCEL_WAIT_ROUNDS + MAX_READ_FAIL_ROUNDS) as usize, "ended after {at} rounds");
     }
 
+    /// Review round 3 (C2): the longest stretch before each flatten (W,R,W,R) must not eat into the 3 attempts:
+    /// all `MAX_FLATTEN_ATTEMPTS` orders can be sent, however many rounds that takes, and only the 4th is `Unknown`.
     #[test]
-    fn a_round_past_the_budget_of_the_alert_that_would_not_conclude_is_unknown_but_a_conclusion_still_stands() {
-        let waiting = |rounds_done: u32| {
-            let mut i = input(read(Leg::Long, "100", "100", false), read(Leg::Short, "0", "0", true));
-            i.rounds_done = rounds_done;
-            decide(&i)
-        };
-        assert_eq!(waiting(MAX_ROUNDS_PER_ALERT - 1), Decision::WaitForCancel, "the 12th round may still wait");
-        let why = unknown_reason(waiting(MAX_ROUNDS_PER_ALERT));
-        assert!(why.contains("12 rounds") && why.contains("WAIT_FOR_CANCEL"), "{why}");
-        let mut flatten = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", true));
-        flatten.rounds_done = MAX_ROUNDS_PER_ALERT;
-        assert!(matches!(decide(&flatten), Decision::Unknown { .. }), "no order is sent past the budget");
-        let mut hedged = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "-100", "100", true));
-        hedged.rounds_done = MAX_ROUNDS_PER_ALERT;
-        assert_eq!(decide(&hedged), Decision::Hedged, "a final conclusion is not turned into Unknown");
+    fn every_flatten_attempt_can_be_sent_even_after_the_longest_stretch_of_waits_and_read_failures() {
+        let mut counts = RoundCounts::default();
+        let mut attempts = 0;
+        let mut rounds = 0;
+        'attempts: for _ in 0..=MAX_FLATTEN_ATTEMPTS {
+            for step in 0..5 {
+                let mut i = match step {
+                    0 | 2 => input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", false)), // an order is not over
+                    1 | 3 => {
+                        let mut long = read(Leg::Long, "100", "100", true);
+                        long.position = Err("exchange unreachable".into());
+                        input(long, read(Leg::Short, "0", "0", true))
+                    }
+                    _ => input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", true)), // the long leg is bare
+                };
+                (i.waited_rounds, i.read_failed_rounds, i.attempts_sent) = (counts.waited, counts.read_failed, attempts);
+                let d = decide(&i);
+                rounds += 1;
+                match d {
+                    Decision::Flatten { .. } => {
+                        attempts += 1;
+                        counts = counts.after(d.conclusion());
+                    }
+                    Decision::Unknown { .. } => break 'attempts,
+                    _ => counts = counts.after(d.conclusion()),
+                }
+            }
+        }
+        assert_eq!(attempts, MAX_FLATTEN_ATTEMPTS, "all attempts were sent, the next round was Unknown (after {rounds} rounds)");
     }
 
     #[test]
