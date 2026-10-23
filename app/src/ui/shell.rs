@@ -801,7 +801,7 @@ impl Shell {
         pages::system_log_page(self.log_vm.as_ref(), self.log_error.as_ref(), &selected, &on_type, on_older, self.snap.identity)
     }
 
-    fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.trading.load_forms(&self.snap, window, cx);
         let inner = match self.page {
             Page::Overview => pages::dashboard_page(&self.dashboard),
@@ -816,11 +816,19 @@ impl Shell {
         let replies = self.replies_strip();
         // `min_w_0`: a flex item never shrinks below its content, so without it a wide page (the scanner
         // table) pushed the whole page past the window edge instead of letting the table scroll inside.
-        div().id("content").flex_1().min_w_0().p_6().overflow_y_scroll().child(replies).child(inner)
+        let scrolling = div().id("content").test_support().flex_1().min_w_0().min_h_0().p_6().overflow_y_scroll().child(replies).child(inner);
+        if self.page == Page::RiskSettings {
+            // loss-circuit-breaker 3.3: the save bar stays at the bottom while the page scrolls above it.
+            let save_bar = self.risk_save_bar(cx);
+            return div().id("content-frame").flex_1().min_w_0().min_h_0().flex().flex_col().child(scrolling).child(save_bar).into_any_element();
+        }
+        scrolling.into_any_element()
     }
 
-    fn status_bar(&self, zoom_label: Option<String>) -> Div {
+    fn status_bar(&self, zoom_label: Option<String>) -> impl IntoElement {
         let bar = div()
+            .id("status-bar")
+            .test_support()
             .flex()
             .flex_wrap()
             .items_center()

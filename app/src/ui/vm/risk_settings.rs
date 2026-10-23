@@ -656,6 +656,119 @@ pub fn save(vm: &RiskVm, sink: &dyn CommandSink) -> bool {
     true
 }
 
+// ---- loss-circuit-breaker 3.3: groups and unsaved changes -----------------------------------------
+
+/// The page's blocks of fields (titles in Chinese). The "自動處理規則（授權 B）" block is not a group:
+/// it holds no field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// Net Edge threshold, minimum net profit, minimum 24h volume (and the allowed exchanges and coins, which are not `Field`s).
+    Entry,
+    /// Taker fees, estimated slippage, safety margin.
+    Cost,
+    /// Leverage, price drift, stale data, order timeout, leg imbalance, early exit.
+    Protection,
+    /// Concurrent pairs, the breaker, the Live caps.
+    Position,
+}
+
+impl Group {
+    pub const ALL: [Group; 4] = [Group::Entry, Group::Cost, Group::Protection, Group::Position];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Entry => "進場條件",
+            Group::Cost => "成本估計",
+            Group::Protection => "執行保護",
+            Group::Position => "部位與熔斷",
+        }
+    }
+
+    /// The fields of the block on the page of `identity`, in page order.
+    pub fn fields(self, identity: ProcessIdentity) -> Vec<Field> {
+        let mut out = match self {
+            Group::Entry => vec![Field::NetEdgeThresholdPct, Field::MinExpectedNetPnlPct, Field::Min24hVolumeUsdt],
+            Group::Cost => vec![Field::TakerFee(Exchange::Binance), Field::TakerFee(Exchange::Bybit), Field::TakerFee(Exchange::Okx), Field::EstSlippagePct, Field::SafetyMarginPct],
+            Group::Protection => vec![
+                Field::MaxLeverage,
+                Field::MaxPriceDriftPct,
+                Field::StaleDataThresholdMs,
+                Field::OrderTimeoutSeconds,
+                Field::MaxLegImbalancePct,
+                Field::EarlyExitMinMovePct,
+            ],
+            Group::Position => vec![Field::MaxConcurrentPairs, Field::LossBreakerMaxLossUsdt, Field::LossBreakerMaxConsecutiveLosses],
+        };
+        if self == Group::Position && identity.is_live() {
+            out.extend(LIVE_FIELDS);
+        }
+        out
+    }
+}
+
+/// The same number written differently (`15` and ` 15.0 `) is the same value.
+fn same_text(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    a == b || matches!((a.replace(',', "").parse::<Decimal>(), b.replace(',', "").parse::<Decimal>()), (Ok(x), Ok(y)) if x == y)
+}
+
+fn coin_set(text: &str) -> BTreeSet<String> {
+    text.split(',').map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty()).collect()
+}
+
+/// What the form holds that differs from the STORED settings, one entry per setting: field keys in page
+/// order, then `allowed_exchanges`, `allowed_coins`, then overrides (`overrides.<Exchange>.<field>`).
+pub fn changed_items(form: &RiskForm, base: &Settings) -> Vec<String> {
+    let identity = if form.live { ProcessIdentity::Live } else { ProcessIdentity::Demo };
+    let mut out: Vec<String> = global_fields(identity).into_iter().filter(|f| !same_text(&form.value(*f), &field_text(&base.risk, *f))).map(|f| f.key()).collect();
+    let stored_ex: BTreeSet<Exchange> = base.risk.allowed_exchanges.iter().copied().collect();
+    if form.allowed_exchanges != stored_ex {
+        out.push("allowed_exchanges".into());
+    }
+    if coin_set(&form.allowed_coins) != base.risk.allowed_coins.iter().map(|c| c.to_ascii_uppercase()).collect() {
+        out.push("allowed_coins".into());
+    }
+    let mut keys: BTreeSet<(Exchange, Field)> = form.overrides.keys().copied().collect();
+    for (ex, o) in &base.overrides {
+        keys.extend(OVERRIDE_FIELDS.iter().filter(|f| override_value_of(o, **f).is_some()).map(|f| (*ex, *f)));
+    }
+    for (ex, f) in keys {
+        let stored = base.overrides.get(&ex).and_then(|o| override_value_of(o, f));
+        let changed = match (form.overrides.get(&(ex, f)), stored) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !same_text(a, &b),
+            _ => true,
+        };
+        if changed {
+            out.push(format!("overrides.{ex:?}.{}", f.key()));
+        }
+    }
+    out
+}
+
+/// The bar fixed at the bottom of the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveBar {
+    /// 「有 N 項未儲存的變更」 or 「沒有未儲存的變更」.
+    pub text: String,
+    pub enabled: bool,
+    /// Why the save button is off (shown next to it); `None` when it can be pressed.
+    pub disabled_reason: Option<String>,
+}
+
+/// `changes` = `changed_items(..).len()`.
+pub fn save_bar(vm: &RiskVm, changes: usize) -> SaveBar {
+    let text = if changes == 0 { "沒有未儲存的變更".to_string() } else { format!("有 {changes} 項未儲存的變更") };
+    let errors: Vec<&String> = vm.field_errors.values().collect();
+    let disabled_reason = match (errors.as_slice(), changes) {
+        ([], 0) => Some("沒有變更可儲存".to_string()),
+        ([], _) => None,
+        ([one], _) => Some(format!("{one}，修正後才能儲存")),
+        (many, _) => Some(format!("有 {} 個欄位有錯誤，修正後才能儲存（{}）", many.len(), many[0])),
+    };
+    SaveBar { text, enabled: disabled_reason.is_none(), disabled_reason }
+}
+
 // ---- 3.4 execution mode ---------------------------------------------------------------------
 
 /// The only two modes the page offers (no LIVE).

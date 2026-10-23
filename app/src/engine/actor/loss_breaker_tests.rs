@@ -282,10 +282,10 @@ async fn the_snapshot_names_why_entries_stopped() {
 #[tokio::test(start_paused = true)]
 async fn a_live_engine_that_is_not_armed_is_stopped_and_an_armed_one_is_allowed() {
     let (rig, deps) = live_deps("MANUAL", &live_risk());
-    let (mut actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    let (actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
     let s = actor.snapshot().status;
     assert_eq!((s.trading_allowed, s.stop_reason), (false, Some(StopReason::LiveNotArmed)), "locked at start");
-    let (_r2, mut armed, _h2) = armed_actor(live_deps("MANUAL", &live_risk()));
+    let (_r2, armed, _h2) = armed_actor(live_deps("MANUAL", &live_risk()));
     let s = armed.snapshot().status;
     assert!(s.trading_allowed && s.stop_reason.is_none(), "{s:?}");
     let _ = &rig;
