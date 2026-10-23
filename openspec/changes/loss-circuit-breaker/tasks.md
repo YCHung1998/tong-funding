@@ -19,3 +19,15 @@
 ## 4. 驗證
 
 - [x] 4.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate loss-circuit-breaker --strict` 通過
+
+## 5. 審查第一輪修正
+
+- [x] 5.1 A2 人工確認而 FINALIZED 的配對計入（取 `CLOSE_CONFIRMED` 與轉入 FINALIZED 中較早者；watermark 也監看；模擬不計）
+- [x] 5.2 A3 既有 Live 資料庫缺熔斷欄位時，啟動一次性補寫 5／2（寫 `RISK_CONFIG_UPDATED`），已有值不動，Demo 不變
+- [x] 5.3 A4 Live 武裝期間熔斷兩欄納入 `FrozenCaps`（只准調低）；watermark 加入 `RISK_CONFIG_UPDATED`，改門檻後立即重評
+- [x] 5.4 A5 kill switch 已開時達到門檻仍寫 `LOSS_BREAKER_TRIPPED` 並通知，狀態列顯示「熔斷」
+- [x] 5.5 A6 區間起點只採用「前一個狀態為 ON」的 `KILL_SWITCH_CHANGED {on:false}`
+- [x] 5.6 A9 熔斷說明與通知文案：提前出場會暫停、排程出場照常；不承諾系統通知
+- [x] 5.7 A12 熔斷讀取失敗（含 watermark）失敗即封閉；`UNREADABLE` 通知、寫鎖定原因；三處鎖定共用 `lock_new_entries`
+- [x] 5.8 A13 `KILL_SWITCH_CHANGED` 帶 `cause`，狀態列改讀 cause
+- [x] 5.9 簡化：刪除觸發後多餘的第二次 assess、`force` 參數與重複的 `breaker_check`（評估放在 `dispatch(Tick)` 之前）；刪除 `EngineStatus.trading_allowed`

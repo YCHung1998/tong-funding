@@ -183,7 +183,7 @@ impl Actor {
     }
 
     /// Marks a round as started; returns the number of the entry it belongs to.
-    fn begin_round(&mut self, pair: &str, now: i64) -> Option<u64> {
+    fn begin_round(&mut self, pair: &str) -> Option<u64> {
         let w = self.flows.get_mut(pair)?.watchdog.as_mut()?;
         w.phase = Phase::Verifying;
         w.rounds = w.rounds.saturating_add(1);
@@ -198,12 +198,12 @@ impl Actor {
             Ok(o) => o,
             Err(why) => {
                 // Without the pair's own order list nothing can be proven.
-                self.begin_round(&pair, now);
+                self.begin_round(&pair);
                 let decision = wd::Decision::Unknown { reason: format!("order intents unreadable: {why}") };
                 return self.finish_round(view, decision, None, now);
             }
         };
-        let Some(entry_no) = self.begin_round(&pair, now) else { return };
+        let Some(entry_no) = self.begin_round(&pair) else { return };
         let (account, executor, tx) = (self.account_for(view.simulated), self.executor.clone(), self.event_tx.clone());
         let legs = [(Leg::Long, view.long_exchange), (Leg::Short, view.short_exchange)];
         let symbol = view.symbol.clone();

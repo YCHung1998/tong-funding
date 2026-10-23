@@ -928,7 +928,7 @@ async fn an_unknown_watchdog_conclusion_disarms_and_locks_a_live_engine() {
     actor.land(UUID, Ev::TimeoutPartialFill, json!({})).unwrap(); // PARTIAL_FAILURE locks a Live engine ...
     rearm(&rig, &mut actor); // ... the user arms it again
     assert!(actor.armed() && !locked(&rig), "armed before the round");
-    let (entry_no, now) = (actor.flows[UUID].watchdog.as_ref().unwrap().entry_no, rig.clock.now_ms());
+    let entry_no = actor.flows[UUID].watchdog.as_ref().unwrap().entry_no;
     {
         // the third failed read in a row is the verdict (A7): the two before it are already counted
         let w = actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap();

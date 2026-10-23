@@ -26,7 +26,7 @@ use super::env_label::{ConfirmKind, EnvLabel};
 use super::risk_settings::missing_display;
 use super::theme::Tone;
 use crate::engine::command::{Blocker, Command, PairView};
-use crate::engine::ports::{Leg, OrderSide};
+use crate::engine::ports::OrderSide;
 use crate::engine::timings::EngineTimings;
 use crate::engine::watchdog::{self, PairEvent};
 use crate::engine::watchdog_text;

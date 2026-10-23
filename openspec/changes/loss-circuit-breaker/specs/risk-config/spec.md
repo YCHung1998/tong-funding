@@ -16,6 +16,16 @@
 - **WHEN** 載入一份沒有熔斷欄位的既有設定
 - **THEN** 兩欄分別為 15 與 3，設定完整性不受影響
 
+#### Scenario: 既有 Live 資料庫的升級
+
+- **WHEN** Live 身分啟動，資料庫裡已存的風控設定沒有熔斷欄位
+- **THEN** 啟動時一次性把缺少的欄位補成 5 與 2（走既有的設定儲存路徑，寫 `RISK_CONFIG_UPDATED` 含 before／after）；已有值的欄位不動，Demo 不補
+
+#### Scenario: Live 武裝期間只能調低
+
+- **WHEN** Live 已武裝，使用者把熔斷兩欄之一調高
+- **THEN** 被拒絕並說明該欄位武裝中不能調高（調低允許）
+
 #### Scenario: 非法值
 
 - **WHEN** 把 `loss_breaker_max_consecutive_losses` 設為 0
