@@ -43,7 +43,7 @@
 
 ### Requirement: 設定命令列寫入前取得實例鎖
 
-`tong-funding config set`（Demo 與 Live 皆然）SHALL 在開啟資料庫之前取得與 App 相同的單一實例鎖；App 執行中（鎖被佔用）或無法確定鎖的位置時 SHALL 拒絕寫入、不改任何資料，並說明要先關閉 App。`config show` 為唯讀，SHALL NOT 需要鎖。
+`tong-funding config set`（Demo 與 Live 皆然）SHALL 在開啟資料庫之前取得與 App 相同的單一實例鎖；App 執行中（鎖被佔用）或無法確定鎖的位置時 SHALL 拒絕寫入、不改任何資料，並說明要先關閉 App。`config show` 為唯讀：SHALL 以唯讀方式開啟資料庫，不寫入任何資料（包含 Live 預設值）、不取得單一實例鎖、不執行遷移，資料庫檔不存在時也 SHALL NOT 建立檔案，因此 App 執行中仍可執行。
 
 #### Scenario: App 執行中不能用命令列改設定
 

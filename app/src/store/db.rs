@@ -594,6 +594,62 @@ fn open_inner(path: &Path, migrations: &[Migration], existing: bool, identity: P
     Ok(conn)
 }
 
+/// Review round 3 (C3): a read-only view of the `config` table for `tong-funding config show`. It opens the file
+/// with SQLite's read-only flag, takes no single-instance lock, runs no migration, writes nothing and never
+/// creates the file, so it is safe next to a running app. It still refuses a database of another environment.
+pub struct ConfigReader {
+    conn: Connection,
+    path: PathBuf,
+}
+
+impl ConfigReader {
+    /// `Ok(None)` = the file does not exist (nothing is created). The database must carry this identity's
+    /// `db_venue`; an old database without one may be read by a Demo process only.
+    pub fn open(identity: ProcessIdentity, path: &Path) -> Result<Option<ConfigReader>, HaltReason> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(HaltReason::CannotOpen(e.to_string())),
+        }
+        reject_symlink(path)?;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(classify)?;
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).map_err(classify)?;
+        conn.busy_timeout(BUSY_TIMEOUT).map_err(classify)?;
+        let has_version_table: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'", [], |r| r.get(0))
+            .map_err(classify)?;
+        if has_version_table == 0 {
+            return Err(HaltReason::Corrupt("not a tong-funding database (no schema_version table)".into()));
+        }
+        let current = current_version(&conn)?;
+        if current >= VENUE_SCHEMA_VERSION {
+            check_venue(&conn, identity, path)?;
+        } else if identity == ProcessIdentity::Live {
+            return Err(HaltReason::VenueMismatch(format!(
+                "{} has no environment metadata (db_venue); a live process only opens databases it created",
+                path.display()
+            )));
+        }
+        Ok(Some(ConfigReader { conn, path: path.to_path_buf() }))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn get(&self, key: &str) -> Result<Option<super::state::ConfigEntry>, StoreError> {
+        use rusqlite::OptionalExtension;
+        let row: Option<(String, i64)> = self
+            .conn
+            .query_row("SELECT value_json, version FROM config WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(match row {
+            Some((json, version)) => Some(super::state::ConfigEntry { value: serde_json::from_str(&json)?, version }),
+            None => None,
+        })
+    }
+}
+
 impl Db {
     /// Open the database at the default path (reads the `HOME` environment variable).
     pub fn open_default(clock: Arc<dyn Clock>) -> Result<Db, StoreError> {

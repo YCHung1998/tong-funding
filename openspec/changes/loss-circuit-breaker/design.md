@@ -27,7 +27,7 @@
 - [PnL 重算後金額變好，已觸發不會自動解除] → 解除一律由使用者重新開放交易。
 - [提前出場在 kill switch 開啟時不動作] → 熔斷說明與通知寫「提前出場會暫停、排程出場照常」，不寫「進行中的配對照常出場」。
 - [既有 Live 資料庫缺熔斷欄位會以較鬆的 15／3 載入] → Live 啟動時一次性補寫 5／2（審查第二輪 B5：連「完全沒有 risk 列」也補；補寫失敗寫 `LIVE_BREAKER_BACKFILL_FAILED`、維持鎖定並通知）；補寫前或失敗時，Live 讀不到的欄位一律以 5／2 評估（B3）。
-- [武裝期間資料庫被繞過 App 改高] → 評估取 min(資料庫值, 凍結值)；`caps_hash` 與 `LIVE_ARMED` 也納入兩個熔斷值（UI 與引擎共用 `live_guard::caps_hash`）；`config set` 命令列寫入前取得單一實例鎖，App 執行中拒絕（`config show` 唯讀不取鎖）。
+- [武裝期間資料庫被繞過 App 改高] → 評估取 min(資料庫值, 凍結值)；`caps_hash` 與 `LIVE_ARMED` 也納入兩個熔斷值（UI 與引擎共用 `live_guard::caps_hash`）；`config set` 命令列寫入前取得單一實例鎖，App 執行中拒絕（`config show` 唯讀不取鎖；審查第三輪 C3：改以 SQLite 唯讀旗標開啟 `ConfigReader`，不呼叫 `apply_if_fresh`、不執行遷移、檔案不存在時不建立）。
 - [Live 預設 5 USDT 對每腿 10 USDT 而言約兩三筆最差情況] → 與使用者決定一致；可在風控頁調整。
 
 ## Migration Plan

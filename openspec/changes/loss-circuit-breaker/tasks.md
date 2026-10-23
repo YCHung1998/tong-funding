@@ -39,3 +39,7 @@
 - [x] 6.3 B6 `caps_hash`（改 `caps-v2`）與 `LIVE_ARMED` payload 納入兩個熔斷值（UI 與引擎同一函式）
 - [x] 6.4 B7 watermark 改監看 `MANUAL_CONFIRM_RESULT`，不再對全部 `PAIR_TRANSITION` 做 `json_extract`；計入規則不變
 - [x] 6.5 簡化：`lock_live` 改呼叫 `lock_new_entries`
+
+## 7. 審查第三輪修正
+
+- [x] 7.1 C3 `config show` 以唯讀方式開啟（`ConfigReader`，SQLite 唯讀旗標）：不寫入、不取 inode 鎖、不呼叫 `apply_if_fresh`、不遷移、檔案不存在不建立；測試：App 持有資料庫時 `show` 仍成功且 Live 預設值未被寫入、不存在的資料庫不被建立（先紅）

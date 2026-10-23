@@ -14,7 +14,8 @@
 //! `set` validates with core (`RiskConfig::from_json` / `parse_overrides`) before writing, writes
 //! with optimistic locking and records a `CONFIG_UPDATED` event (`source: "cli"`). The value
 //! replaces the whole key. `set` takes the app's single-instance lock (review round 2, B3): while the app runs
-//! it is refused (exit 1) and says to close the app first; `show` is read-only and needs no lock.
+//! it is refused (exit 1) and says to close the app first; `show` (review round 3, C3) opens the database read-only: no
+//! write, no lock, no migration, no `apply_if_fresh`, and it never creates the file.
 //! Exit codes: 0 ok, 1 refused or store error, 2 usage error.
 
 use std::io::Write;
@@ -27,7 +28,7 @@ use tong_funding_core::risk::{RiskConfig, parse_overrides};
 
 use crate::identity::ProcessIdentity;
 use crate::ports::{Clock, SystemClock};
-use crate::store::db::Db;
+use crate::store::db::{ConfigReader, Db};
 use crate::store::events::EventStore;
 
 pub const SUBCOMMAND: &str = "config";
@@ -116,16 +117,22 @@ fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, lock_dir: Result<PathB
     } else {
         None
     };
-    let db = match &path {
-        Some(p) => Db::open_for(identity, p, clock),
-        None => match Db::open_default_for(identity, clock) {
-            Ok(db) => db,
+    let path = match path {
+        Some(p) => p,
+        None => match crate::store::db::default_db_path_for(identity, std::env::var("HOME").ok().as_deref()) {
+            Ok(p) => p,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
                 return 1;
             }
         },
     };
+    // `show` only reads (review round 3, C3): no write, no database lock, nothing created
+    let (key, value) = match cmd {
+        Cmd::Show => return show(identity, &path, out, err),
+        Cmd::Set { key, value } => (key, value),
+    };
+    let db = Db::open_for(identity, &path, clock);
     if let Some(reason) = db.halt_reason() {
         let _ = writeln!(err, "store is halted, nothing was changed: {}", redact_secrets(&reason.to_string()));
         return 1;
@@ -135,17 +142,28 @@ fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, lock_dir: Result<PathB
         let _ = writeln!(err, "{why}");
         return 1;
     }
-    match cmd {
-        Cmd::Show => show(&db, out, err),
-        Cmd::Set { key, value } => set(&db, &key, value, out, err),
-    }
+    set(&db, &key, value, out, err)
 }
 
-fn show(db: &Db, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let _ = writeln!(out, "database: {}", db.path().display());
+fn show(identity: ProcessIdentity, path: &std::path::Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let reader = match ConfigReader::open(identity, path) {
+        Ok(r) => r,
+        Err(reason) => {
+            let _ = writeln!(err, "store is halted, nothing was changed: {}", redact_secrets(&reason.to_string()));
+            return 1;
+        }
+    };
+    match &reader {
+        Some(r) => {
+            let _ = writeln!(out, "database: {}", r.path().display());
+        }
+        None => {
+            let _ = writeln!(out, "database: {} (does not exist yet: nothing is set)", path.display());
+        }
+    }
     let mut risk = RiskConfig::default();
     for key in [KEY_RISK, KEY_RISK_OVERRIDES] {
-        match db.config_get(key) {
+        match reader.as_ref().map_or(Ok(None), |r| r.get(key)) {
             Ok(None) => {
                 let _ = writeln!(out, "{key}: (not set)");
             }
@@ -528,5 +546,39 @@ mod tests {
         let unavailable = Err(crate::instance_lock::LockError::Unavailable("HOME is not set".into()));
         assert_eq!(run_with_clock(&args, Arc::new(ManualClock::new(1_000)), unavailable, &mut out, &mut err), 1);
         assert!(String::from_utf8(err).unwrap().contains("HOME is not set"));
+    }
+
+    // ---- review round 3, C3: `show` is read-only: no write, no database lock -------------------------
+
+    #[test]
+    fn show_writes_nothing_and_works_while_the_app_has_the_database_open() {
+        for live in [false, true] {
+            let dir = tempdir();
+            let p = dir.path().join(if live { "funding-live.db" } else { "funding.db" });
+            let identity = if live { ProcessIdentity::Live } else { ProcessIdentity::Demo };
+            // the running app: it holds the database (and its inode lock) for as long as this handle lives
+            let app = Db::open_for(identity, &p, Arc::new(ManualClock::new(1)));
+            assert!(!app.is_halted());
+            let events_before = EventStore::new(app.clone()).list(100).unwrap().len();
+            let (code, out, err) = if live { call_live(&p, &["show"]) } else { call(&p, &["show"]) };
+            assert_eq!(code, 0, "live = {live}: show must not need the lock the app holds: {err}");
+            assert!(out.contains("risk: (not set)"), "{out}");
+            assert!(app.config_get(KEY_RISK).unwrap().is_none(), "live = {live}: show must not write the Live defaults");
+            assert!(app.config_get(crate::engine::actor::CONFIG_CONTRACT_TEMPLATE).unwrap().is_none(), "live = {live}");
+            assert_eq!(EventStore::new(app.clone()).list(100).unwrap().len(), events_before, "live = {live}: no event written");
+        }
+    }
+
+    #[test]
+    fn show_on_a_database_that_does_not_exist_creates_nothing() {
+        for live in [false, true] {
+            let dir = tempdir();
+            let p = dir.path().join(if live { "funding-live.db" } else { "funding.db" });
+            let (code, out, err) = if live { call_live(&p, &["show"]) } else { call(&p, &["show"]) };
+            assert_eq!(code, 0, "{err}");
+            assert!(out.contains("risk: (not set)") && out.contains("does not exist"), "{out}");
+            assert!(!p.exists(), "live = {live}: show must not create the database");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "live = {live}: no file at all");
+        }
     }
 }
