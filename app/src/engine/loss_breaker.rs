@@ -19,6 +19,8 @@ pub const KILL_SWITCH_CHANGED: &str = "KILL_SWITCH_CHANGED";
 pub const LOSS_BREAKER_BASELINE: &str = "LOSS_BREAKER_BASELINE";
 /// The breaker tripped: written in the same transaction as the kill switch turning ON.
 pub const LOSS_BREAKER_TRIPPED: &str = "LOSS_BREAKER_TRIPPED";
+/// The Live start could not write the missing breaker limits: the engine stays locked (kill switch cause, shown as a breaker stop).
+pub const LIVE_BREAKER_BACKFILL_FAILED: &str = "LIVE_BREAKER_BACKFILL_FAILED";
 
 /// What opened the current interval.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

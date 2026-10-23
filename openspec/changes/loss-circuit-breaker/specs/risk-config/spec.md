@@ -39,7 +39,7 @@
 #### Scenario: 資料庫完全沒有風控設定列
 
 - **WHEN** Live 資料庫沒有任何風控設定列（例如只有合約範本）
-- **THEN** 啟動時一次性寫入 5／2（`RISK_CONFIG_UPDATED`）；寫入失敗則寫 `LIVE_BREAKER_BACKFILL_FAILED`、維持鎖定並通知，不得吞掉
+- **THEN** 啟動時一次性寫入完整的 Live 預設設定（`live_db_defaults().risk`：手動觸發、提前出場 0、熔斷 5／2 等，不只熔斷兩欄；`RISK_CONFIG_UPDATED`）；寫入失敗則寫 `LIVE_BREAKER_BACKFILL_FAILED`、維持鎖定並通知，不得吞掉
 
 ### Requirement: 設定命令列寫入前取得實例鎖
 

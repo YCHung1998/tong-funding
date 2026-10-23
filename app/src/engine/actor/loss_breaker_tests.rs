@@ -3,6 +3,7 @@
 
 use super::live_guardrail_tests::{armed_actor, live_deps, live_risk, locked, manual, why};
 use super::*;
+use crate::engine::live_guard::live_db_defaults;
 use crate::engine::loss_breaker::testkit::{append, closed};
 use crate::engine::loss_breaker::{self as lb, LOSS_BREAKER_BASELINE, LOSS_BREAKER_TRIPPED};
 
@@ -537,4 +538,25 @@ async fn a_backfill_that_fails_is_recorded_told_and_keeps_the_engine_locked() {
     sleep(Duration::from_millis(50)).await;
     assert_eq!(rig.notifier.breaker_calls().len(), 1, "and the user is told");
     assert_eq!(actor.breaker_limits(), (dec("5"), 2), "meanwhile the Live default judges");
+    // review round 3 (C4): the status bar names it a breaker lock (not a manual stop), the payload reads the Live defaults
+    assert_eq!(crate::engine::status::latest_kill_cause(&rig.db), crate::engine::status::StopReason::LossBreaker);
+    let d = live_db_defaults().risk;
+    assert_eq!(
+        failed[0]["defaults"],
+        json!({ "loss_breaker_max_loss_usdt": d.loss_breaker_max_loss_usdt.to_string(), "loss_breaker_max_consecutive_losses": d.loss_breaker_max_consecutive_losses })
+    );
+}
+
+// ---- review round 3, C5: no risk row at all => the whole Live default settings are written ----
+
+#[tokio::test(start_paused = true)]
+async fn a_live_database_with_no_risk_row_gets_the_complete_live_defaults_not_only_the_breaker_pair() {
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    rig.db.with_raw_conn_for_tests(|c| Ok(c.execute("DELETE FROM config WHERE key = 'risk'", [])?)).unwrap();
+    let (actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    let stored = rig.db.config_get(CONFIG_RISK).unwrap().expect("written by the backfill").value;
+    assert_eq!(stored, serde_json::to_value(live_db_defaults().risk).unwrap(), "the full Live defaults (MANUAL trigger, early exit 0, breaker 5 / 2)");
+    assert_eq!(stored["trigger_mode"], json!("MANUAL"));
+    assert_eq!(actor.breaker_limits(), (dec("5"), 2));
+    assert_eq!(count(&rig.db, "RISK_CONFIG_UPDATED"), 1, "one record");
 }

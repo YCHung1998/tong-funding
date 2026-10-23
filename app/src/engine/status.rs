@@ -7,7 +7,9 @@ use tong_funding_core::pair::PairState;
 
 use super::alert::is_alert_state;
 use super::command::{Blocker, PairView};
-use super::loss_breaker::BreakerView;
+use super::live_guard::{LIVE_AUTO_LOCK, LIVE_STARTUP_LOCK};
+use super::loss_breaker::{BreakerView, LIVE_BREAKER_BACKFILL_FAILED, LOSS_BREAKER_TRIPPED};
+use super::watchdog::NAKED_LEG_WATCHDOG_LOCK;
 use super::timings::EngineTimings;
 use tong_funding_core::risk::ExecutionMode;
 
@@ -46,9 +48,9 @@ impl StopReason {
 /// the reason event written in the same transaction; `None` = a plain switch = manual).
 pub fn kill_cause(cause: Option<&str>) -> StopReason {
     match cause {
-        Some("LOSS_BREAKER_TRIPPED") => StopReason::LossBreaker,
-        Some("NAKED_LEG_WATCHDOG_LOCK") => StopReason::Watchdog,
-        Some("LIVE_AUTO_LOCK" | "LIVE_STARTUP_LOCK") => StopReason::LiveNotArmed,
+        Some(c) if c == LOSS_BREAKER_TRIPPED || c == LIVE_BREAKER_BACKFILL_FAILED => StopReason::LossBreaker,
+        Some(c) if c == NAKED_LEG_WATCHDOG_LOCK => StopReason::Watchdog,
+        Some(c) if c == LIVE_AUTO_LOCK || c == LIVE_STARTUP_LOCK => StopReason::LiveNotArmed,
         _ => StopReason::Manual,
     }
 }
@@ -138,6 +140,7 @@ mod tests {
         assert_eq!(kill_cause(Some("NAKED_LEG_WATCHDOG_LOCK")), StopReason::Watchdog);
         assert_eq!(kill_cause(Some("LIVE_AUTO_LOCK")), StopReason::LiveNotArmed);
         assert_eq!(kill_cause(Some("LIVE_STARTUP_LOCK")), StopReason::LiveNotArmed);
+        assert_eq!(kill_cause(Some("LIVE_BREAKER_BACKFILL_FAILED")), StopReason::LossBreaker, "review round 3 (C4): the breaker limits could not be written");
         assert_eq!(kill_cause(None), StopReason::Manual, "a plain switch");
         assert_eq!(kill_cause(Some("ORDER_SUBMITTED")), StopReason::Manual, "any other cause is not a reason");
     }

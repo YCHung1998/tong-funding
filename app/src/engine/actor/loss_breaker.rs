@@ -9,7 +9,7 @@
 use super::*;
 use crate::engine::alert::BreakerNotice;
 use crate::engine::live_guard::live_db_defaults;
-use crate::engine::loss_breaker::{self as lb, Assessment, LOSS_BREAKER_TRIPPED};
+use crate::engine::loss_breaker::{self as lb, Assessment, LIVE_BREAKER_BACKFILL_FAILED, LOSS_BREAKER_TRIPPED};
 use tong_funding_core::loss_breaker::TripReason;
 
 /// Result of the notification, for the system log.
@@ -133,7 +133,7 @@ impl Actor {
 
     /// A Live database whose stored settings predate the breaker has neither limit (or no settings row at
     /// all): a missing field would load as the looser Demo default (15 / 3). Once, at a Live start, the
-    /// missing field(s) are written as the Live defaults (5 / 2) through the settings path, with
+    /// missing field(s) are written as the Live defaults (5 / 2; with no row at all, the whole `live_db_defaults().risk`) through the settings path, with
     /// `RISK_CONFIG_UPDATED` (before / after). A value that is there is never touched. A backfill that
     /// cannot be written is never swallowed (review round 2, B5): `LIVE_BREAKER_BACKFILL_FAILED`, the
     /// engine stays locked and the user is told; `breaker_limits` judges by the Live defaults meanwhile.
@@ -141,20 +141,20 @@ impl Actor {
         if !self.live_on() {
             return;
         }
-        let stored = match self.db.config_get(CONFIG_RISK) {
-            Ok(Some(entry)) => match entry.value {
-                Value::Object(m) => m,
-                other => return self.backfill_failed(format!("stored risk settings are not an object: {other}")),
-            },
-            Ok(None) => serde_json::Map::new(),
-            Err(e) => return self.backfill_failed(format!("cannot read the risk settings: {e}")),
-        };
         let defaults = match serde_json::to_value(live_db_defaults().risk) {
             Ok(d) => d,
             Err(e) => return self.backfill_failed(format!("cannot encode the Live defaults: {e}")),
         };
-        let mut stored = stored;
-        let mut changed = false;
+        // No risk row at all (review round 3, C5): the whole Live default set is written, not only the breaker
+        // pair, or the start-up defaults (MANUAL trigger, early exit off, ...) would never be written afterwards.
+        let (mut stored, mut changed) = match self.db.config_get(CONFIG_RISK) {
+            Ok(Some(entry)) => match entry.value {
+                Value::Object(m) => (m, false),
+                other => return self.backfill_failed(format!("stored risk settings are not an object: {other}")),
+            },
+            Ok(None) => (defaults.as_object().cloned().unwrap_or_default(), true),
+            Err(e) => return self.backfill_failed(format!("cannot read the risk settings: {e}")),
+        };
         for key in ["loss_breaker_max_loss_usdt", "loss_breaker_max_consecutive_losses"] {
             if !stored.contains_key(key) {
                 stored.insert(key.to_string(), defaults[key].clone());
@@ -176,8 +176,12 @@ impl Actor {
     }
 
     fn backfill_failed(&mut self, error: String) {
-        let payload = json!({ "error": error, "defaults": { "loss_breaker_max_loss_usdt": "5", "loss_breaker_max_consecutive_losses": 2 } });
-        self.lock_new_entries("LIVE_BREAKER_BACKFILL_FAILED", &payload, format!("loss circuit breaker: the Live limits could not be written ({error})"));
+        let defaults = live_db_defaults().risk;
+        let payload = json!({
+            "error": error,
+            "defaults": { "loss_breaker_max_loss_usdt": defaults.loss_breaker_max_loss_usdt.to_string(), "loss_breaker_max_consecutive_losses": defaults.loss_breaker_max_consecutive_losses },
+        });
+        self.lock_new_entries(LIVE_BREAKER_BACKFILL_FAILED, &payload, format!("loss circuit breaker: the Live limits could not be written ({error})"));
         let (max_loss, max_consecutive) = self.breaker_limits();
         self.send_breaker_notice(BreakerNotice { identity: self.identity, reason: TripReason::Unreadable, loss_used: Decimal::ZERO, max_loss, consecutive: 0, max_consecutive, provisional: false });
     }
