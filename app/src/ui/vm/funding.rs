@@ -19,7 +19,7 @@ use crate::store::db::Db;
 use crate::store::funding_ledger::FUNDING_LEDGER_CONFLICT;
 use crate::store::funding_slots::{ManualReason, Resolution, SlotRow, SlotState as TraceState};
 use crate::store::state::PairRow;
-use crate::ui::theme::{Tone, funding_tone};
+use crate::ui::theme::{Tone, pnl_tone};
 
 pub const SPREAD_NOTE: &str = "價差，未含 funding 與手續費";
 pub const NOT_INCLUDING_CLOSE: &str = "尚未包含平倉成本";
@@ -264,10 +264,10 @@ pub fn recheckable(f: &PairFunding) -> bool {
     f.trace.iter().any(|t| t.state != TraceState::Settled)
 }
 
-/// The "Funding 收到" cell: value and tone (theme's funding colour function), or "—" with a reason.
+/// The "Funding 收到" cell: value and tone (theme's profit-and-loss colour function (money, not a rate)), or "—" with a reason.
 pub fn leg_cell(f: Option<&LegFunding>) -> (String, Tone) {
     match f {
-        Some(LegFunding::Received(v)) => (format!("{} USDT", format::signed(*v, 2)), funding_tone(*v)),
+        Some(LegFunding::Received(v)) => (format!("{} USDT", format::signed(*v, 2)), pnl_tone(*v)),
         Some(LegFunding::Unavailable(why)) => (format!("{DASH}（{why}）"), Tone::Muted),
         Some(LegFunding::Simulated) => (SIMULATED_LABEL.to_string(), Tone::Muted),
         None => (format!("{DASH}（尚未取得）"), Tone::Muted),
@@ -293,7 +293,7 @@ pub fn pair_funding_text(f: &PairFunding) -> (String, Tone) {
         Some(total) => {
             let (l, _) = leg_cell(Some(&f.legs[0]));
             let (s, _) = leg_cell(Some(&f.legs[1]));
-            (format!("Funding 收到 {} USDT（{l} / {s}）{updated}", format::signed(total, 2)), funding_tone(total))
+            (format!("Funding 收到 {} USDT（{l} / {s}）{updated}", format::signed(total, 2)), pnl_tone(total))
         }
         None => {
             let why = f.legs.iter().find_map(|l| match l {
@@ -348,7 +348,7 @@ pub fn timeline_rows(f: &PairFunding) -> Vec<TimelineRow> {
                 Side::Short => "SHORT",
             };
             let (state, tone) = match s.state {
-                SlotState::Received => ("已收到".to_string(), s.amount.map_or(Tone::Muted, funding_tone)),
+                SlotState::Received => ("已收到".to_string(), s.amount.map_or(Tone::Muted, pnl_tone)),
                 SlotState::Pending => ("待結算".to_string(), Tone::Muted),
                 SlotState::Missing => ("缺少（PnL 不完整）".to_string(), Tone::Warning),
             };

@@ -1,6 +1,6 @@
 ## 1. 顏色（先寫失敗測試）
 
-- [ ] 1.1 `theme.rs` 新增 rate 正向、負向兩個中性 token（非紅綠、對比度 ≥ 4.5:1）；funding rate 與趨勢的顏色函式改用它們；`theme_tests.rs` 更新；Net Edge 與損益仍用成功／危險色
+- [x] 1.1 `theme.rs` 新增 rate 正向、負向兩個中性 token（非紅綠、對比度 ≥ 4.5:1）；funding rate 與趨勢的顏色函式改用它們；`theme_tests.rs` 更新；Net Edge 與損益仍用成功／危險色
 
 ## 2. 掃幣表
 

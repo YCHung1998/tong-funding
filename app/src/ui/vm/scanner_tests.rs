@@ -541,3 +541,18 @@ fn kind_does_not_change_the_qualified_filter_or_the_default_order() {
     };
     assert_eq!(shown.iter().map(|r| r.symbol.clone()).collect::<Vec<_>>(), by_net);
 }
+
+// ---- scanner-layout: rates are not coloured as good or bad ----
+
+#[test]
+fn rate_cells_use_the_neutral_rate_tones_while_net_edge_keeps_success_and_danger() {
+    let vm = build(&snap(complete_settings("0.01"), &[(Binance, "BTCUSDT", "0.0003"), (Bybit, "BTCUSDT", "-0.0001")]), NOW);
+    let r = row(&vm, "BTCUSDT");
+    assert_eq!(cell(r, Binance).tone(), Tone::RatePositive);
+    assert_eq!(cell(r, Bybit).tone(), Tone::RateNegative);
+    assert_eq!(cell(r, Okx).tone(), Tone::Muted, "no data: muted");
+    for e in [Binance, Bybit] {
+        assert!(cell(r, e).tone() != Tone::Positive && cell(r, e).tone() != Tone::Negative);
+    }
+    assert_eq!(r.net_edge.tone(), Tone::Negative, "Net Edge stays danger-coloured when negative");
+}
