@@ -27,7 +27,7 @@
 - [PnL 重算後金額變好，已觸發不會自動解除] → 解除一律由使用者重新開放交易。
 - [提前出場在 kill switch 開啟時不動作] → 熔斷說明與通知寫「提前出場會暫停、排程出場照常」，不寫「進行中的配對照常出場」。
 - [既有 Live 資料庫缺熔斷欄位會以較鬆的 15／3 載入] → Live 啟動時一次性補寫 5／2（審查第二輪 B5：連「完全沒有 risk 列」也補，第三輪 C5 起此情況寫入完整的 `live_db_defaults().risk`，否則之後 `apply_if_fresh` 永遠跳過、手動觸發與提前出場 0 不會被寫入；補寫失敗寫 `LIVE_BREAKER_BACKFILL_FAILED`、維持鎖定並通知，狀態列顯示「熔斷」，第三輪 C4）；補寫前或失敗時，Live 讀不到的欄位一律以 5／2 評估（B3）。
-- [武裝期間資料庫被繞過 App 改高] → 評估取 min(資料庫值, 凍結值)；`caps_hash` 與 `LIVE_ARMED` 也納入兩個熔斷值（UI 與引擎共用 `live_guard::caps_hash`）；`config set` 命令列寫入前取得單一實例鎖，App 執行中拒絕（`config show` 唯讀不取鎖；審查第三輪 C3：改以 SQLite 唯讀旗標開啟 `ConfigReader`，不呼叫 `apply_if_fresh`、不執行遷移、檔案不存在時不建立）。
+- [武裝期間資料庫被繞過 App 改高] → 評估取 min(資料庫值, 凍結值)；`caps_hash` 與 `LIVE_ARMED` 也納入兩個熔斷值（UI 與引擎共用 `live_guard::caps_hash`）；`config set` 命令列寫入前取得單一實例鎖，App 執行中拒絕（`config show` 唯讀不取鎖；審查第三輪 C3：改以 SQLite 唯讀旗標開啟 `ConfigReader`，不呼叫 `apply_if_fresh`、不執行遷移、檔案不存在時不建立；審查第四輪 D4：主檔不會被修改，但 SQLite 可能在資料庫旁建立 -shm／-wal 輔助檔，`config show` 說明提醒請勿以 sudo 執行，其錯誤訊息改為「cannot read the database」）。
 - [Live 預設 5 USDT 對每腿 10 USDT 而言約兩三筆最差情況] → 與使用者決定一致；可在風控頁調整。
 
 ## Migration Plan

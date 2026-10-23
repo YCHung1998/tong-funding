@@ -45,3 +45,10 @@
 - [x] 7.1 C3 `config show` 以唯讀方式開啟（`ConfigReader`，SQLite 唯讀旗標）：不寫入、不取 inode 鎖、不呼叫 `apply_if_fresh`、不遷移、檔案不存在不建立；測試：App 持有資料庫時 `show` 仍成功且 Live 預設值未被寫入、不存在的資料庫不被建立（先紅）
 - [x] 7.2 C4 `status::kill_cause` 認得 `LIVE_BREAKER_BACKFILL_FAILED`（顯示為熔斷）；cause 字串改用常數（`LOSS_BREAKER_TRIPPED`、`NAKED_LEG_WATCHDOG_LOCK`、`LIVE_AUTO_LOCK`、`LIVE_STARTUP_LOCK`、新增 `LIVE_BREAKER_BACKFILL_FAILED`）；回填失敗 payload 的 5／2 改讀 `live_db_defaults().risk`；測試（先紅）
 - [x] 7.3 C5 Live 回填在完全沒有 risk 列時寫入完整的 `live_db_defaults().risk`（先紅：原本只寫熔斷兩欄）
+
+## 8. 審查第四輪清理
+
+- [x] 8.1 D1 刪除誤加的空檔 `app/src/engine/atchdog.rs`
+- [x] 8.2 D2 抽出 `read_config_row`，`Db::config_get` 與 `ConfigReader::get` 共用
+- [x] 8.3 D3 抽出 `check_existing_db`（schema_version、Live 環境檢查、VenueMismatch），`open_inner` 與 `ConfigReader::open` 共用；Live 不可讀 Demo 資料庫的規則不變，既有測試全綠為證
+- [x] 8.4 D4 刪除 `ConfigReader.path`／`path()`；`config show` 錯誤訊息改為唯讀說法（cannot read the database）；說明、design 與 risk-config spec 註明可能建立 -shm／-wal、請勿以 sudo 執行

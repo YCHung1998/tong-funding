@@ -15,7 +15,9 @@
 //! with optimistic locking and records a `CONFIG_UPDATED` event (`source: "cli"`). The value
 //! replaces the whole key. `set` takes the app's single-instance lock (review round 2, B3): while the app runs
 //! it is refused (exit 1) and says to close the app first; `show` (review round 3, C3) opens the database read-only: no
-//! write, no lock, no migration, no `apply_if_fresh`, and it never creates the file.
+//! write, no lock, no migration, no `apply_if_fresh`, and it never creates the file. The main database file is
+//! never modified, but SQLite may create `-shm` / `-wal` helper files next to it, so do not run `show` with
+//! `sudo` (they would then be owned by root).
 //! Exit codes: 0 ok, 1 refused or store error, 2 usage error.
 
 use std::io::Write;
@@ -38,7 +40,7 @@ pub const KEY_RISK: &str = "risk";
 pub const KEY_RISK_OVERRIDES: &str = "risk_overrides";
 pub const CONFIG_UPDATED: &str = "CONFIG_UPDATED";
 
-const USAGE: &str = "usage:\n  tong-funding config show [--live] [--db <funding.db>]\n  tong-funding config set <risk|risk_overrides> '<json>' [--live] [--db <funding.db>]\n\nexample:\n  tong-funding config set risk '{\"net_edge_threshold_pct\":\"0.01\",\"est_slippage_pct\":\"0.02\",\"taker_fee_pct\":{\"Binance\":\"0.05\",\"Bybit\":\"0.055\",\"Okx\":\"0.05\"}}'\n  tong-funding config set risk_overrides '{\"Bybit\":{\"est_slippage_pct\":\"0.03\"}}'";
+const USAGE: &str = "usage:\n  tong-funding config show [--live] [--db <funding.db>]\n  tong-funding config set <risk|risk_overrides> '<json>' [--live] [--db <funding.db>]\n\n`show` only reads: the database file is not modified, but SQLite may create -shm/-wal helper files next to it, so do not run it with sudo.\n\nexample:\n  tong-funding config set risk '{\"net_edge_threshold_pct\":\"0.01\",\"est_slippage_pct\":\"0.02\",\"taker_fee_pct\":{\"Binance\":\"0.05\",\"Bybit\":\"0.055\",\"Okx\":\"0.05\"}}'\n  tong-funding config set risk_overrides '{\"Bybit\":{\"est_slippage_pct\":\"0.03\"}}'";
 
 #[derive(Debug, PartialEq)]
 enum Cmd {
@@ -149,17 +151,14 @@ fn show(identity: ProcessIdentity, path: &std::path::Path, out: &mut dyn Write, 
     let reader = match ConfigReader::open(identity, path) {
         Ok(r) => r,
         Err(reason) => {
-            let _ = writeln!(err, "store is halted, nothing was changed: {}", redact_secrets(&reason.to_string()));
+            let _ = writeln!(err, "cannot read the database: {}", redact_secrets(&reason.to_string()));
             return 1;
         }
     };
-    match &reader {
-        Some(r) => {
-            let _ = writeln!(out, "database: {}", r.path().display());
-        }
-        None => {
-            let _ = writeln!(out, "database: {} (does not exist yet: nothing is set)", path.display());
-        }
+    if reader.is_some() {
+        let _ = writeln!(out, "database: {}", path.display());
+    } else {
+        let _ = writeln!(out, "database: {} (does not exist yet: nothing is set)", path.display());
     }
     let mut risk = RiskConfig::default();
     for key in [KEY_RISK, KEY_RISK_OVERRIDES] {

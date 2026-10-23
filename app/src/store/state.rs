@@ -159,20 +159,23 @@ pub struct PortfolioPoint {
     pub total_usdt: String,
 }
 
+/// One `config` row by key, shared by `Db::config_get` and the read-only `ConfigReader`.
+pub(super) fn read_config_row(c: &rusqlite::Connection, key: &str) -> Result<Option<ConfigEntry>, StoreError> {
+    let row: Option<(String, i64)> = c
+        .query_row("SELECT value_json, version FROM config WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    Ok(match row {
+        Some((json, version)) => Some(ConfigEntry { value: serde_json::from_str(&json)?, version }),
+        None => None,
+    })
+}
+
 impl Db {
     // ---- config -----------------------------------------------------------------------
 
     /// `Ok(None)` = key never written. A read failure halts the store.
     pub fn config_get(&self, key: &str) -> Result<Option<ConfigEntry>, StoreError> {
-        let res = self.with_conn(|c| {
-            let row: Option<(String, i64)> = c
-                .query_row("SELECT value_json, version FROM config WHERE key = ?1", [key], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            Ok(match row {
-                Some((json, version)) => Some(ConfigEntry { value: serde_json::from_str(&json)?, version }),
-                None => None,
-            })
-        });
+        let res = self.with_conn(|c| read_config_row(c, key));
         self.fail_closed(res, HaltReason::ConfigReadFailed)
     }
 

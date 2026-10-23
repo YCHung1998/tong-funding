@@ -43,3 +43,7 @@
 - [x] 7.1 C1 `LostTaskGuard::drop` 在事件佇列滿時改以 `tokio::spawn` 補送兜底；`ManualDoneGuard` 併入 `LostTaskGuard`（`LostTaskGuard::new(..., Event::ManualSubmitted{...Unknown...})` 與 `disarm()`）；測試：佇列滿時 panic 的任務最終仍送達兜底（先紅）
 - [x] 7.2 C2 刪除 `MAX_ROUNDS_PER_ALERT`、`DecideInput.rounds_done` 與 `decide` 包裝：輪數由「W、R 各 3 輪即 Unknown、只有 Flatten 歸零、最多 3 次嘗試」保證有界；測試 W,R 交替最終 Unknown、W,R,W,R 後 3 次平倉都能送出（先紅：有上限時只送得出 2 次）
 - [x] 7.3 C6 簡化：`finish_round` 的 phase、計數、下一輪時間在單一 `get_mut` 區塊一次設定；`RoundCounts` 直接作為 `WatchdogFlow`、`Progress`、`DecideInput` 的欄位（事件 payload 格式不變），既有測試全綠為證
+
+## 8. 審查第四輪清理
+
+- [x] 8.1 D1 刪除誤加的空檔 `app/src/engine/atchdog.rs`（其餘 D2-D4 見 loss-circuit-breaker 的 tasks.md 第 8 節）；測試與行為不變
