@@ -419,6 +419,10 @@ impl Actor {
             Leg::Long => view.long_exchange,
             Leg::Short => view.short_exchange,
         };
+        // A close of this leg that is not over yet is never overwritten (nor doubled): refuse.
+        if let Some(open) = self.flows.get(pair).and_then(|f| f.close.as_ref()).and_then(|s| s.legs[idx(leg)].as_ref()).filter(|o| !o.is_over()) {
+            return Err(format!("a close order of the {} leg ({}) is already in flight; nothing sent", leg.as_str(), open.req.client_order_id));
+        }
         let prefix = self.id_prefix();
         let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, qty);
         // intent first: if it cannot be landed nothing is sent
@@ -455,6 +459,10 @@ impl Actor {
         }
         let manual = FlattenBy::Manual;
         let Some(view) = self.pairs.get(pair).cloned() else { return };
+        // The watchdog got to the pair while the reads were out: it decides, one close only.
+        if self.watchdog_busy(pair) {
+            return self.flatten_aborted(pair, leg, "the naked-leg watchdog is checking or flattening this pair; nothing sent".into(), None, manual);
+        }
         if !alert::is_alert_state(view.state) {
             return self.flatten_aborted(pair, leg, format!("pair is {} now; nothing sent", view.state), None, manual);
         }

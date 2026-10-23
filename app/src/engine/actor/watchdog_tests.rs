@@ -715,3 +715,139 @@ async fn after_a_restart_the_wait_is_counted_from_the_entry_and_a_lost_simulated
     assert_eq!(second.watchdog_calls().len(), 1);
     assert!(second.calls().is_empty(), "the pair alert itself is not notified again after a restart");
 }
+
+// ---- review round 1, A1: the manual flatten and the watchdog exclude each other ---------------
+
+/// An armed Live engine (simulation executor behind [`Watched`]) whose pair has a bare long leg.
+/// Returns the time the pair entered PARTIAL_FAILURE.
+async fn live_bare_long() -> (Rig, EngineHandle, Arc<Watched>, i64) {
+    use super::live_guardrail_tests::{arm_ok, live_deps, live_risk, pair_n};
+    let (rig, mut deps) = live_deps("MANUAL", &live_risk());
+    let watched = Watched::new(rig.sim.clone());
+    deps.simulator = watched.clone();
+    let h = start_with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
+    sleep(Duration::from_millis(50)).await;
+    arm_ok(&h).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Open), SimBehavior::Reject("scripted refusal".into()));
+    assert_eq!(ask(&h, Command::AddPrepared(pair_n(UUID, SYM, "9"))).await, CommandReply::Accepted);
+    run_until(&rig.clock, T - 13_000).await;
+    assert_eq!(ask(&h, Command::ManualEnter { pair: UUID.into() }).await, CommandReply::Accepted);
+    run_until(&rig.clock, T - 9_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+    let since = ts_of(&rig.db, "PARTIAL_FAILURE")[0];
+    (rig, h, watched, since)
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_flatten_whose_reads_are_slow_and_the_watchdogs_first_round_send_only_one_close() {
+    let (rig, h, watched, since) = live_bare_long().await;
+    run_until(&rig.clock, since + 3_000).await;
+    watched.hold(true); // the exchange answers slowly: every lookup waits
+    run_until(&rig.clock, since + 4_000).await;
+    assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }).await, CommandReply::Accepted);
+    run_until(&rig.clock, since + 5_500).await; // the watchdog's first round is due at +5 s
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG), 0, "while the user's flatten reads, the watchdog does not start a round");
+    run_until(&rig.clock, since + 6_000).await;
+    watched.hold(false); // the reads come back
+    sleep(Duration::from_millis(50)).await;
+    run_until(&rig.clock, since + 20_000).await;
+    let closes = reduce_only_orders(&rig);
+    assert_eq!(closes.len(), 1, "one close order, never two for the same position: {closes:?}");
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO);
+    assert_eq!(events_of(&rig.db, "LEG_FLATTEN").len(), 1);
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_manual_close_still_in_flight_holds_the_watchdogs_next_round_back() {
+    let (rig, deps) = rig(Opts::default());
+    seed_pair(&rig.db, UUID, PairState::FillMonitor, true);
+    let (mut actor, _h) = Actor::new(deps);
+    actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
+    rig.clock.advance(6_000);
+    // a close order of the user's is out and not over: the order's own lookups run on the tick
+    let view = actor.pairs.get(UUID).cloned().unwrap();
+    let req = actor.close_request(actor.id_prefix(), UUID, Leg::Long, Exchange::Binance, SYM, dec("10"));
+    let flow = actor.flows.entry(UUID.to_string()).or_default();
+    flow.close = Some(OrderSet { sent_at_ms: rig.clock.now_ms(), eff: effective_for_pair(&risk(), &RiskOverrides::new(), Exchange::Binance, Exchange::Bybit), legs: [Some(LegOrder::new(req, Decimal::ONE)), None], cancel_started: false });
+    assert!(actor.flatten_pending(UUID));
+    actor.watchdog_tick(&view, rig.clock.now_ms());
+    assert_eq!(count(&rig.db, wd::NAKED_LEG_WATCHDOG), 0);
+    assert!(!actor.watchdog_busy(UUID), "no round was started: the user's order is looked at first");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_manual_flatten_that_finds_the_watchdog_busy_when_its_reads_return_sends_nothing() {
+    use super::live_guardrail_tests::{live_deps, live_risk, seed_state};
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    seed_state(&rig.db, UUID, SYM, PairState::FillMonitor);
+    let (rig, mut actor, _h) = super::live_guardrail_tests::armed_actor((rig, deps));
+    actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
+    assert_eq!(actor.dispatch(Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }), CommandReply::Accepted);
+    // the watchdog got a round going meanwhile
+    actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap().phase = naked_leg::Phase::Verifying { started_ms: rig.clock.now_ms() };
+    actor.on_flatten_position(UUID, Leg::Long, Ok(dec("10")), Ok(dec("10")));
+    assert!(rig.sim.submitted().is_empty(), "nothing sent");
+    let aborted = events_of(&rig.db, "LEG_FLATTEN_ABORTED");
+    assert_eq!(aborted.len(), 1, "{aborted:?}");
+    assert!(aborted[0].1["reason"].as_str().unwrap().contains("watchdog"), "{}", aborted[0].1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_second_flatten_of_a_leg_whose_order_is_not_over_is_refused_and_the_tracked_order_stays() {
+    let (rig, deps) = rig(Opts::default());
+    seed_pair(&rig.db, UUID, PairState::FillMonitor, true);
+    let (mut actor, _h) = Actor::new(deps);
+    actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
+    let view = actor.pairs.get(UUID).cloned().unwrap();
+    let eff = effective_for_pair(&risk(), &RiskOverrides::new(), Exchange::Binance, Exchange::Bybit);
+    let plan = || live::FlattenPlan { leg: Leg::Long, qty: dec("10"), position: dec("10") };
+    let first = actor.send_flatten(&view, plan(), &eff, live::FlattenBy::Manual, None).expect("the first goes out");
+    let second = actor.send_flatten(&view, plan(), &eff, live::FlattenBy::Watchdog, Some(1));
+    assert!(second.is_err_and(|why| why.contains("already")), "refused");
+    let tracked = actor.flows[UUID].close.as_ref().unwrap().legs[0].as_ref().unwrap().req.client_order_id.clone();
+    assert_eq!(tracked, first, "the order in flight stays the tracked one");
+    assert_eq!(events_of(&rig.db, "LEG_FLATTEN").len(), 1, "and only one was recorded");
+}
+
+// ---- review round 1, A11: a flatten that could not even be sent counts as an attempt -----------
+
+#[tokio::test(start_paused = true)]
+async fn an_aborted_flatten_counts_as_an_attempt_survives_a_restart_and_three_of_them_are_unknown() {
+    let (rig, deps) = rig(Opts::default());
+    seed_pair(&rig.db, UUID, PairState::FillMonitor, true);
+    let (mut actor, h) = Actor::new(deps);
+    actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})).unwrap();
+    rig.clock.advance(6_000);
+    let view = actor.pairs.get(UUID).cloned().unwrap();
+    // the long leg has a close order in flight (so no second one may go out): every attempt aborts
+    let eff = effective_for_pair(&risk(), &RiskOverrides::new(), Exchange::Binance, Exchange::Bybit);
+    let blocker = actor.close_request(actor.id_prefix(), UUID, Leg::Long, Exchange::Binance, SYM, dec("10"));
+    actor.flows.entry(UUID.to_string()).or_default().close = Some(OrderSet { sent_at_ms: rig.clock.now_ms(), eff, legs: [Some(LegOrder::new(blocker, Decimal::ONE)), None], cancel_started: false });
+    for n in 1..=3_u32 {
+        let now = rig.clock.now_ms();
+        actor.begin_flatten(&view, Leg::Long, dec("10"), dec("10"), true, now);
+        assert_eq!(actor.flows[UUID].watchdog.as_ref().unwrap().attempts_sent, n, "attempt {n} counts although nothing was sent");
+        rig.clock.advance(5_000);
+    }
+    assert_eq!(events_of(&rig.db, "LEG_FLATTEN_ABORTED").len(), 3);
+    assert_eq!(events_of(&rig.db, "LEG_FLATTEN").len(), 0, "nothing was ever sent");
+    // the three are on record: a restart counts them too
+    drop((actor, h));
+    let (mut second, _h2) = Actor::new(restarted(&rig, Arc::new(RecordingNotifier::default())));
+    assert!(second.ensure_watchdog(UUID));
+    assert_eq!(second.flows[UUID].watchdog.as_ref().unwrap().attempts_sent, 3);
+    // and with three used the decision is Unknown, not a fourth try
+    let d = wd::decide(&wd::DecideInput {
+        symbol: SYM,
+        simulated: true,
+        tolerance_pct: dec("1"),
+        legs: [
+            wd::LegRead { leg: Leg::Long, exchange: Exchange::Binance, position: Ok(dec("10")), recorded: Ok(dec("10")), orders_terminal: Ok(true) },
+            wd::LegRead { leg: Leg::Short, exchange: Exchange::Bybit, position: Ok(dec("0")), recorded: Ok(dec("0")), orders_terminal: Ok(true) },
+        ],
+        waited_rounds: 0,
+        attempts_sent: 3,
+    });
+    assert!(matches!(d, wd::Decision::Unknown { .. }), "{d:?}");
+}

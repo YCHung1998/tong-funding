@@ -12,7 +12,7 @@ use tong_funding_core::pair::PairState;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::actor::{LegClosePlanError, plan_leg_close};
-use super::live_guard::LEG_FLATTEN;
+use super::live_guard::{LEG_FLATTEN, LEG_FLATTEN_ABORTED};
 use super::ports::{Leg, OrderAction};
 use super::transition::PAIR_TRANSITION;
 use crate::store::db::{Db, StoreError};
@@ -232,7 +232,8 @@ pub struct Progress {
     /// When the pair entered its current alert state (the entry's `PAIR_TRANSITION` time).
     pub alert_since_ms: i64,
     pub rounds: u32,
-    /// Flatten orders the watchdog sent for this entry (`LEG_FLATTEN` with `by: "watchdog"`).
+    /// Flatten attempts of the watchdog for this entry: orders sent (`LEG_FLATTEN`) and orders that
+    /// could not even be sent (`LEG_FLATTEN_ABORTED`), both with `by: "watchdog"`.
     pub attempts_sent: u32,
     /// Consecutive newest rounds that concluded `WAIT_FOR_CANCEL`.
     pub waited_rounds: u32,
@@ -258,7 +259,7 @@ pub fn progress_from_records(alert_since_ms: i64, records: &[Record]) -> Progres
         let text = |k: &str| r.payload.get(k).and_then(Value::as_str);
         match r.event_type.as_str() {
             // Only the watchdog's own flatten orders are its attempts (a manual one is the user's).
-            LEG_FLATTEN if text("by") == Some("watchdog") => {
+            LEG_FLATTEN | LEG_FLATTEN_ABORTED if text("by") == Some("watchdog") => {
                 p.attempts_sent = p.attempts_sent.saturating_add(1);
                 p.last_record_ms = Some(r.ts_ms);
             }
@@ -298,8 +299,8 @@ pub fn load_progress(db: &Db, pair: &str, state: PairState, now_ms: i64) -> Resu
             )
             .optional()?;
         let (after_id, alert_since_ms) = entry.unwrap_or((0, now_ms));
-        let mut st = c.prepare("SELECT ts_ms, event_type, payload FROM events WHERE pair_id = ?1 AND id > ?2 AND event_type IN (?3, ?4) ORDER BY id")?;
-        let rows = st.query_map(rusqlite::params![pair, after_id, NAKED_LEG_WATCHDOG, LEG_FLATTEN], |r| {
+        let mut st = c.prepare("SELECT ts_ms, event_type, payload FROM events WHERE pair_id = ?1 AND id > ?2 AND event_type IN (?3, ?4, ?5) ORDER BY id")?;
+        let rows = st.query_map(rusqlite::params![pair, after_id, NAKED_LEG_WATCHDOG, LEG_FLATTEN, LEG_FLATTEN_ABORTED], |r| {
             let payload: String = r.get(2)?;
             Ok(Record { ts_ms: r.get(0)?, event_type: r.get(1)?, payload: serde_json::from_str(&payload).unwrap_or(Value::Null) })
         })?;
@@ -467,7 +468,12 @@ pub fn status_from_records(alert_since_ms: Option<i64>, records: &[Record]) -> S
 
     let mut flattened: Option<(Leg, Decimal)> = None;
     let mut newest: Option<&Record> = None;
-    for r in records.iter().filter(|r| r.event_type == NAKED_LEG_WATCHDOG) {
+    for r in records.iter().filter(|r| r.event_type == NAKED_LEG_WATCHDOG || (r.event_type == LEG_FLATTEN_ABORTED && text(r, "by").as_deref() == Some("watchdog"))) {
+        // an order that could not even be sent is a failed attempt like any other
+        if r.event_type == LEG_FLATTEN_ABORTED {
+            newest = Some(r);
+            continue;
+        }
         match text(r, "kind").as_deref() {
             Some(KIND_ATTEMPT_RESULT) => {
                 if r.payload.get("ok").and_then(Value::as_bool) == Some(true)
@@ -485,6 +491,9 @@ pub fn status_from_records(alert_since_ms: Option<i64>, records: &[Record]) -> S
     let waiting = Status::Waiting { due_ms: alert_since_ms.map(|t| t.saturating_add(WATCHDOG_GRACE_MS)) };
     let Some(r) = newest else { return waiting };
     let next_ms = r.ts_ms.saturating_add(WATCHDOG_INTERVAL_MS);
+    if r.event_type == LEG_FLATTEN_ABORTED {
+        return Status::Retrying { attempt: attempt_of(r), reason: text(r, "reason").unwrap_or_default(), next_ms };
+    }
     match text(r, "kind").as_deref() {
         Some(KIND_SKIPPED) => Status::Skipped { reason: text(r, "reason").unwrap_or_default() },
         Some(KIND_ATTEMPT_RESULT) => {
@@ -535,7 +544,7 @@ pub fn status_of_pair(state: PairState, events: &[PairEvent]) -> Status {
     };
     let records: Vec<Record> = after
         .iter()
-        .filter(|e| e.event_type == NAKED_LEG_WATCHDOG || e.event_type == LEG_FLATTEN)
+        .filter(|e| e.event_type == NAKED_LEG_WATCHDOG || e.event_type == LEG_FLATTEN || e.event_type == LEG_FLATTEN_ABORTED)
         .map(|e| Record { ts_ms: e.ts_ms, event_type: e.event_type.clone(), payload: e.payload.clone() })
         .collect();
     status_from_records(alert_since_ms, &records)
@@ -794,6 +803,16 @@ mod tests {
     }
 
     #[test]
+    fn a_watchdog_flatten_that_could_not_be_sent_is_an_attempt_too() {
+        // review round 1 (A11): an abort (e.g. the intent could not be landed) used up an attempt
+        let aborted = |ts, by: Option<&str>| rec(ts, LEG_FLATTEN_ABORTED, by.map_or(json!({ "leg": "long" }), |b| json!({ "leg": "long", "by": b })));
+        let records = [aborted(16_000, Some("watchdog")), aborted(18_000, Some("manual")), rec(19_000, LEG_FLATTEN, json!({ "by": "watchdog" })), aborted(22_000, Some("watchdog"))];
+        let p = progress_from_records(10_000, &records);
+        assert_eq!(p.attempts_sent, 3, "two aborts and one order of the watchdog's; the manual abort is the user's");
+        assert_eq!(p.last_record_ms, Some(22_000));
+    }
+
+    #[test]
     fn a_conclusion_that_ends_the_rounds_makes_the_progress_terminal() {
         for (c, terminal) in [("HEDGED", true), ("FLAT", true), ("UNKNOWN", true), ("FLATTEN", false), ("WAIT_FOR_CANCEL", false)] {
             let p = progress_from_records(0, &[round(5_000, c)]);
@@ -958,6 +977,15 @@ mod tests {
     fn a_failed_attempt_is_retrying_with_its_reason_and_the_next_look() {
         let r = [flatten_round(15_000, 1), attempt_result(16_000, false, 1)];
         assert_eq!(status_from_records(Some(10_000), &r), Status::Retrying { attempt: 1, reason: "order rejected: risk limit".into(), next_ms: 21_000 });
+    }
+
+    #[test]
+    fn an_aborted_watchdog_flatten_is_a_failed_attempt_with_its_reason() {
+        let aborted = at(16_000, LEG_FLATTEN_ABORTED, json!({ "by": "watchdog", "leg": "long", "attempt": 2, "reason": "order intent not landed (x); nothing sent" }));
+        let r = [flatten_round(15_000, 2), aborted.clone()];
+        assert_eq!(status_from_records(Some(10_000), &r), Status::Retrying { attempt: 2, reason: "order intent not landed (x); nothing sent".into(), next_ms: 21_000 });
+        let manual = at(17_000, LEG_FLATTEN_ABORTED, json!({ "by": "manual", "leg": "long", "reason": "already flat" }));
+        assert_eq!(status_from_records(Some(10_000), &[flatten_round(15_000, 2), aborted, manual]), Status::Retrying { attempt: 2, reason: "order intent not landed (x); nothing sent".into(), next_ms: 21_000 }, "the user's abort is not the watchdog's status");
     }
 
     #[test]

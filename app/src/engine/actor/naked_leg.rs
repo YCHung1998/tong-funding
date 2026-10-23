@@ -7,6 +7,7 @@
 
 use super::live::{FlattenBy, FlattenPlan};
 use super::*;
+use crate::engine::live_guard::LEG_FLATTEN_ABORTED;
 use crate::engine::watchdog as wd;
 
 /// What the watchdog is doing for a pair right now.
@@ -48,12 +49,14 @@ pub(super) struct WatchdogFlow {
     /// A conclusion that ends the rounds was reached: no further automatic action for this entry.
     pub(super) done: bool,
     pub(super) phase: Phase,
+    /// `client_order_id`s of the flatten orders this entry sent itself (the others in flight are the user's).
+    pub(super) own_orders: Vec<String>,
 }
 
 impl WatchdogFlow {
     /// The pair entered `state` at `now`: nothing happened yet, the first round waits out the grace.
     fn fresh(entry_no: u64, state: PairState, now: i64) -> WatchdogFlow {
-        WatchdogFlow { entry_no, state, alert_since_ms: now, next_round_ms: now.saturating_add(wd::WATCHDOG_GRACE_MS), rounds: 0, attempts_sent: 0, waited_rounds: 0, done: false, phase: Phase::Idle }
+        WatchdogFlow { entry_no, state, alert_since_ms: now, next_round_ms: now.saturating_add(wd::WATCHDOG_GRACE_MS), rounds: 0, attempts_sent: 0, waited_rounds: 0, done: false, phase: Phase::Idle, own_orders: Vec::new() }
     }
 
     /// Rebuilt from the stored events of the current entry.
@@ -68,6 +71,7 @@ impl WatchdogFlow {
             waited_rounds: p.waited_rounds,
             done: p.terminal,
             phase: Phase::Idle,
+            own_orders: Vec::new(),
         }
     }
 }
@@ -135,6 +139,9 @@ impl Actor {
             return;
         }
         match phase {
+            // A flatten of the user's (reading, or its order not over) goes first: two closes of one
+            // position are never sent. The round comes when that is over.
+            Phase::Idle if now >= next_round_ms && self.user_flatten_active(pair) => {}
             Phase::Idle if now >= next_round_ms => self.start_round(view, now),
             Phase::Idle => {}
             // The round's result is overdue (its event was lost): give it up, never wait for ever.
@@ -150,6 +157,17 @@ impl Actor {
     /// The watchdog is checking or flattening this pair right now (the manual flatten waits).
     pub(super) fn watchdog_busy(&self, pair: &str) -> bool {
         self.flows.get(pair).and_then(|f| f.watchdog.as_ref()).is_some_and(|w| !w.done && w.phase != Phase::Idle)
+    }
+
+    /// The user's manual flatten is reading the exchange, or a close order that is not the watchdog's
+    /// own is not over yet.
+    pub(super) fn user_flatten_active(&self, pair: &str) -> bool {
+        let Some(flow) = self.flows.get(pair) else { return false };
+        if flow.flatten_inflight.iter().any(|b| *b) {
+            return true;
+        }
+        let own: &[String] = flow.watchdog.as_ref().map_or(&[], |w| w.own_orders.as_slice());
+        flow.close.as_ref().is_some_and(|set| set.legs.iter().flatten().any(|o| !o.is_over() && !own.contains(&o.req.client_order_id)))
     }
 
     /// The pair's own orders per leg (open and close), from its order intents.
@@ -323,7 +341,7 @@ impl Actor {
 
     /// Sends the one reduce-only close of the bare leg (through the same path as the manual flatten:
     /// intent first, nothing sent when it cannot be landed) and waits for its result.
-    fn begin_flatten(&mut self, view: &PairView, leg: Leg, qty: Decimal, position: Decimal, decision_recorded: bool, now: i64) {
+    pub(super) fn begin_flatten(&mut self, view: &PairView, leg: Leg, qty: Decimal, position: Decimal, decision_recorded: bool, now: i64) {
         let pair = view.internal_uuid.as_str();
         let Some(attempts_sent) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()).map(|w| {
             w.waited_rounds = 0;
@@ -331,32 +349,40 @@ impl Actor {
         }) else {
             return;
         };
-        let retry_later = |this: &mut Actor| {
+        let attempt = attempts_sent.saturating_add(1);
+        // Whatever happens, this is attempt `attempt`: one that could not even be sent (no record, no
+        // intent, a close already in flight) uses it up too, so three of them end in `Unknown`.
+        let aborted = |this: &mut Actor, why: String| {
+            this.watchdog_attempt_aborted(pair, leg, why, attempt);
             if let Some(w) = this.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
+                w.attempts_sent = attempt;
                 w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
             }
         };
         // no record, no order
         if !decision_recorded {
-            self.flatten_aborted(pair, leg, "the conclusion could not be recorded; nothing sent".into(), None, FlattenBy::Watchdog);
-            return retry_later(self);
+            return aborted(self, "the conclusion could not be recorded; nothing sent".into());
         }
         // like every close: never held back by unreadable settings (defaults then)
         let (risk, overrides) = self.load_risk().unwrap_or_else(|_| (RiskConfig::default(), RiskOverrides::new()));
         let eff = effective_for_pair(&risk, &overrides, view.long_exchange, view.short_exchange);
-        let attempt = attempts_sent.saturating_add(1);
         match self.send_flatten(view, FlattenPlan { leg, qty, position }, &eff, FlattenBy::Watchdog, Some(attempt)) {
             Ok(client_order_id) => {
                 if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
                     w.attempts_sent = attempt;
+                    w.own_orders.push(client_order_id.clone());
                     w.phase = Phase::Flattening(Flattening { leg, quantity: qty, client_order_id, attempt, timeout_at_ms: fill::timeout_at_ms(&eff, now) });
                 }
             }
-            Err(why) => {
-                self.flatten_aborted(pair, leg, why, None, FlattenBy::Watchdog);
-                retry_later(self);
-            }
+            Err(why) => aborted(self, why),
         }
+    }
+
+    /// `LEG_FLATTEN_ABORTED` of the watchdog's attempt number `attempt` (the number is what a restart counts).
+    fn watchdog_attempt_aborted(&mut self, pair: &str, leg: Leg, reason: String, attempt: u32) {
+        let payload = json!({ "leg": leg.as_str(), "reason": reason, "by": FlattenBy::Watchdog.as_str(), "attempt": attempt });
+        self.note(LEG_FLATTEN_ABORTED, Some(pair), payload);
+        self.dirty = true;
     }
 
     /// Looks at the flatten order in flight: filled, refused, ended without being filled, or not

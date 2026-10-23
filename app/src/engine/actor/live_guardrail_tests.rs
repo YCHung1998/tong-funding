@@ -34,7 +34,7 @@ async fn live_started(cfg: &RiskConfig) -> (Rig, EngineHandle, Arc<FakeProbes>) 
     (rig, h, probes)
 }
 
-fn pair_n(uuid: &str, symbol: &str, notional: &str) -> NewPreparedPair {
+pub(super) fn pair_n(uuid: &str, symbol: &str, notional: &str) -> NewPreparedPair {
     let mut p = pair_at(uuid, symbol, T);
     p.entry["notional_usdt"] = json!(notional);
     p
@@ -65,7 +65,7 @@ fn arm_cmd(rep: &PreflightReport) -> Command {
 }
 
 /// Preflight and Arm with everything right.
-async fn arm_ok(h: &EngineHandle) {
+pub(super) async fn arm_ok(h: &EngineHandle) {
     let rep = preflight(h).await;
     assert!(rep.passed(), "{:?}", rep.failures());
     assert_eq!(ask(h, arm_cmd(&rep)).await, CommandReply::Accepted);
@@ -631,7 +631,7 @@ pub(super) fn rearm(rig: &Rig, actor: &mut Actor) {
     rig.db.set_kill_switch(false).unwrap();
 }
 
-fn seed_state(db: &Db, uuid: &str, symbol: &str, state: PairState) {
+pub(super) fn seed_state(db: &Db, uuid: &str, symbol: &str, state: PairState) {
     let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: T + 3_600_000, simulated: true, scan: json!({}) };
     let p = crate::store::state::NewPair { internal_uuid: uuid.into(), pair_id: format!("pid-{uuid}"), symbol: symbol.into(), status: state, entry: serde_json::to_value(env).unwrap() };
     db.add_pair_if_not_pending(&p).unwrap();
