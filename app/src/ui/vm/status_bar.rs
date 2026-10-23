@@ -77,10 +77,8 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> StatusBarVm {
         };
     };
     let trading = match status.stop_reason {
-        None if status.trading_allowed => Cell::plain("交易：允許"),
+        None => Cell::plain("交易：允許"),
         Some(r) => Cell::plain(format!("交易：已停止（{}）", r.label())),
-        // not allowed without a reason cannot happen; say it rather than show "允許"
-        None => Cell::plain("交易：已停止"),
     };
     let trigger = match engine.trigger_mode {
         TriggerMode::Auto => Cell::toned("觸發：自動", Tone::Warning),

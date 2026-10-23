@@ -240,7 +240,7 @@ async fn the_snapshot_says_allowed_when_nothing_blocks_and_counts_the_queue() {
     let (_rig, deps) = rig(Opts::default());
     let (mut actor, _h) = Actor::new(deps);
     let s = actor.snapshot().status;
-    assert!(s.trading_allowed && s.stop_reason.is_none(), "{s:?}");
+    assert!(s.stop_reason.is_none(), "{s:?}");
     assert_eq!((s.queued_pairs, s.next_entry_ms, s.needs_handling), (0, None, 0));
     let b = s.breaker.expect("the breaker numbers are always published");
     assert_eq!((b.loss_used, b.consecutive, b.max_loss, b.max_consecutive, b.tripped), (dec("0"), 0, dec("15"), 3, false));
@@ -257,7 +257,6 @@ async fn the_snapshot_names_why_entries_stopped() {
     // by hand
     rig.db.set_kill_switch(true).unwrap();
     let s = actor.snapshot().status;
-    assert!(!s.trading_allowed);
     assert_eq!(s.stop_reason, Some(StopReason::Manual));
     // by the watchdog
     rig.db.set_kill_switch(false).unwrap();
@@ -270,13 +269,13 @@ async fn the_snapshot_names_why_entries_stopped() {
     }
     tick(&mut actor);
     let s = actor.snapshot().status;
-    assert_eq!((s.trading_allowed, s.stop_reason), (false, Some(StopReason::LossBreaker)));
+    assert_eq!(s.stop_reason, Some(StopReason::LossBreaker));
     assert!(s.breaker.unwrap().tripped);
     // opened again: allowed
     rig.db.set_kill_switch(false).unwrap();
     tick(&mut actor);
     let s = actor.snapshot().status;
-    assert!(s.trading_allowed && s.stop_reason.is_none() && !s.breaker.unwrap().tripped);
+    assert!(s.stop_reason.is_none() && !s.breaker.unwrap().tripped);
 }
 
 #[tokio::test(start_paused = true)]
@@ -284,10 +283,10 @@ async fn a_live_engine_that_is_not_armed_is_stopped_and_an_armed_one_is_allowed(
     let (rig, deps) = live_deps("MANUAL", &live_risk());
     let (actor, _h) = Actor::with_probes(deps, crate::engine::preflight::fakes::FakeProbes::green());
     let s = actor.snapshot().status;
-    assert_eq!((s.trading_allowed, s.stop_reason), (false, Some(StopReason::LiveNotArmed)), "locked at start");
+    assert_eq!(s.stop_reason, Some(StopReason::LiveNotArmed), "locked at start");
     let (_r2, armed, _h2) = armed_actor(live_deps("MANUAL", &live_risk()));
     let s = armed.snapshot().status;
-    assert!(s.trading_allowed && s.stop_reason.is_none(), "{s:?}");
+    assert!(s.stop_reason.is_none(), "{s:?}");
     let _ = &rig;
 }
 

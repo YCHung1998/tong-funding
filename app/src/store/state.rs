@@ -283,7 +283,8 @@ impl Db {
         })
     }
 
-    /// live-guardrails: persist the kill switch and write `KILL_SWITCH_CHANGED` plus one more event
+    /// live-guardrails: persist the kill switch and write `KILL_SWITCH_CHANGED` (its payload carries
+    /// `cause` = the type of the reason event) plus one more event
     /// (`LIVE_ARMED` / `LIVE_AUTO_LOCK` / `LIVE_STARTUP_LOCK`) in the SAME transaction: the lock and
     /// its reason are recorded together or not at all.
     pub fn set_kill_switch_with_event(&self, on: bool, event_type: &str, payload: &Value) -> Result<(), StoreError> {
@@ -291,7 +292,7 @@ impl Db {
             let now = self.now_ms();
             let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             upsert_flag(&tx, FLAG_KILL_SWITCH, if on { KILL_ON } else { KILL_OFF }, now)?;
-            insert_event_on(&tx, now, "KILL_SWITCH_CHANGED", None, &serde_json::json!({ "on": on }))
+            insert_event_on(&tx, now, "KILL_SWITCH_CHANGED", None, &serde_json::json!({ "on": on, "cause": event_type }))
                 .map_err(|e| self.event_write_failed("KILL_SWITCH_CHANGED", &e))?;
             insert_event_on(&tx, now, event_type, None, payload).map_err(|e| self.event_write_failed(event_type, &e))?;
             tx.commit()?;
@@ -854,6 +855,10 @@ mod tests {
         assert!(db.kill_switch_halted());
         assert_eq!(events_of(&db, "KILL_SWITCH_CHANGED").len(), 1);
         assert_eq!(events_of(&db, "LIVE_AUTO_LOCK"), vec![(None, json!({ "reason": "x" }))]);
+        // review round 1 (A13): the switch event names its cause, so nobody has to guess from the next id
+        assert_eq!(events_of(&db, "KILL_SWITCH_CHANGED")[0].1, json!({ "on": true, "cause": "LIVE_AUTO_LOCK" }));
+        db.set_kill_switch(false).unwrap();
+        assert_eq!(events_of(&db, "KILL_SWITCH_CHANGED")[1].1, json!({ "on": false }), "a plain switch has no cause");
         // A failing event write leaves the flag untouched (all or nothing).
         db.set_kill_switch(false).unwrap();
         break_event_inserts(&db);

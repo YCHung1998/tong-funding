@@ -42,10 +42,10 @@ impl StopReason {
     }
 }
 
-/// The reason behind the newest kill-switch-ON, from the event written in the same transaction right
-/// after `KILL_SWITCH_CHANGED` (`None` = no reason event = a plain switch).
-pub fn kill_cause(reason_event: Option<&str>) -> StopReason {
-    match reason_event {
+/// The reason behind a kill-switch-ON, from the `cause` the switch event itself carries (the type of
+/// the reason event written in the same transaction; `None` = a plain switch = manual).
+pub fn kill_cause(cause: Option<&str>) -> StopReason {
+    match cause {
         Some("LOSS_BREAKER_TRIPPED") => StopReason::LossBreaker,
         Some("NAKED_LEG_WATCHDOG_LOCK") => StopReason::Watchdog,
         Some("LIVE_AUTO_LOCK" | "LIVE_STARTUP_LOCK") => StopReason::LiveNotArmed,
@@ -53,24 +53,16 @@ pub fn kill_cause(reason_event: Option<&str>) -> StopReason {
     }
 }
 
-/// The cause of the kill switch being ON right now, read from the events: the newest
-/// `KILL_SWITCH_CHANGED` and the event written right after it in the same transaction.
+/// The cause of the kill switch being ON right now: the `cause` of the newest `KILL_SWITCH_CHANGED`
+/// when that one turned it on.
 pub fn latest_kill_cause(db: &crate::store::db::Db) -> StopReason {
     let read = db.with_conn(|c| {
-        let last: Option<(i64, String)> = rusqlite::OptionalExtension::optional(c.query_row(
-            "SELECT id, payload FROM events WHERE event_type = 'KILL_SWITCH_CHANGED' ORDER BY id DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        ))?;
-        let Some((id, payload)) = last else { return Ok(None) };
-        if serde_json::from_str::<serde_json::Value>(&payload).ok().and_then(|v| v["on"].as_bool()) != Some(true) {
-            return Ok(None);
-        }
-        let next: Option<String> = rusqlite::OptionalExtension::optional(c.query_row("SELECT event_type FROM events WHERE id = ?1", [id + 1], |r| r.get(0)))?;
-        Ok(Some(next))
+        let last: Option<String> =
+            rusqlite::OptionalExtension::optional(c.query_row("SELECT payload FROM events WHERE event_type = 'KILL_SWITCH_CHANGED' ORDER BY id DESC LIMIT 1", [], |r| r.get(0)))?;
+        Ok(last.and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok()))
     });
     match read {
-        Ok(Some(next)) => kill_cause(next.as_deref()),
+        Ok(Some(v)) if v["on"].as_bool() == Some(true) => kill_cause(v["cause"].as_str()),
         _ => StopReason::Manual,
     }
 }
@@ -106,7 +98,6 @@ pub fn needs_handling(pairs: &[PairView]) -> usize {
 /// Published with every engine snapshot.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineStatus {
-    pub trading_allowed: bool,
     pub stop_reason: Option<StopReason>,
     pub queued_pairs: usize,
     /// Earliest entry time (UTC ms) among the queued pairs.
@@ -118,7 +109,7 @@ pub struct EngineStatus {
 impl Default for EngineStatus {
     /// Before the engine published anything nothing is allowed (fail closed).
     fn default() -> Self {
-        EngineStatus { trading_allowed: false, stop_reason: Some(StopReason::SystemHalt), queued_pairs: 0, next_entry_ms: None, breaker: None, needs_handling: 0 }
+        EngineStatus { stop_reason: Some(StopReason::SystemHalt), queued_pairs: 0, next_entry_ms: None, breaker: None, needs_handling: 0 }
     }
 }
 
@@ -148,7 +139,7 @@ mod tests {
         assert_eq!(kill_cause(Some("LIVE_AUTO_LOCK")), StopReason::LiveNotArmed);
         assert_eq!(kill_cause(Some("LIVE_STARTUP_LOCK")), StopReason::LiveNotArmed);
         assert_eq!(kill_cause(None), StopReason::Manual, "a plain switch");
-        assert_eq!(kill_cause(Some("ORDER_SUBMITTED")), StopReason::Manual, "any other neighbour is not a reason");
+        assert_eq!(kill_cause(Some("ORDER_SUBMITTED")), StopReason::Manual, "any other cause is not a reason");
     }
 
     #[test]
@@ -228,8 +219,25 @@ mod tests {
     }
 
     #[test]
+    fn the_cause_comes_from_the_switch_event_itself_not_from_the_event_after_it() {
+        use crate::store::db::test_support::open_tmp;
+        use crate::store::events::EventStore;
+        let (_d, db, _c) = open_tmp();
+        let es = EventStore::new(db.clone());
+        // the newest switch event names its cause; an unrelated event right after it changes nothing
+        es.append("KILL_SWITCH_CHANGED", None, serde_json::json!({ "on": true, "cause": "LOSS_BREAKER_TRIPPED" })).unwrap();
+        es.append("SOMETHING_ELSE", None, serde_json::json!({})).unwrap();
+        assert_eq!(latest_kill_cause(&db), StopReason::LossBreaker);
+        // a switch event without a cause (a plain switch, or one written before causes existed) is manual,
+        // even when the next event happens to be a lock event
+        es.append("KILL_SWITCH_CHANGED", None, serde_json::json!({ "on": true })).unwrap();
+        es.append("NAKED_LEG_WATCHDOG_LOCK", None, serde_json::json!({})).unwrap();
+        assert_eq!(latest_kill_cause(&db), StopReason::Manual);
+    }
+
+    #[test]
     fn the_default_status_allows_nothing() {
         let s = EngineStatus::default();
-        assert!(!s.trading_allowed && s.stop_reason.is_some());
+        assert!(s.stop_reason.is_some());
     }
 }

@@ -30,7 +30,7 @@ fn breaker(used: &str, consecutive: u32, tripped: bool) -> BreakerView {
 }
 
 fn status(stop: Option<StopReason>) -> EngineStatus {
-    EngineStatus { trading_allowed: stop.is_none(), stop_reason: stop, queued_pairs: 0, next_entry_ms: None, breaker: Some(breaker("0", 0, false)), needs_handling: 0 }
+    EngineStatus { stop_reason: stop, queued_pairs: 0, next_entry_ms: None, breaker: Some(breaker("0", 0, false)), needs_handling: 0 }
 }
 
 fn snap(identity: ProcessIdentity, mode: ExecutionMode, trigger: TriggerMode, s: EngineStatus) -> UiSnapshot {

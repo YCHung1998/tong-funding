@@ -2937,7 +2937,6 @@ impl Actor {
         let stop_reason = status::stop_reason(blockers, self.execution_mode, cause, live_armed);
         let (queued_pairs, next_entry_ms) = status::queue_summary(pairs, &self.timings);
         status::EngineStatus {
-            trading_allowed: stop_reason.is_none(),
             stop_reason,
             queued_pairs,
             next_entry_ms,
