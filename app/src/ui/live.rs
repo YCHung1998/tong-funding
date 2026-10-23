@@ -727,6 +727,7 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                             ctx.shared.push(SourceUpdate::Pairs(pair_infos(&rows)));
                         }
                         ctx.shared.push(SourceUpdate::PairEntries(pair_entries(&rows)));
+                        ctx.shared.push(SourceUpdate::PairRecords(pair_records(&rows)));
                         // funding-pnl: read-only funding / PnL data of the same pairs.
                         ctx.shared.push(SourceUpdate::Funding(crate::ui::funding::load_pair_funding(db, &rows, clock_now(&ctx.clock))));
                         if let Some(tx) = ctx.shared.rules_tx.get() {
@@ -803,6 +804,24 @@ fn trade_events_query() -> EventQuery {
 }
 
 /// `pairs.entry_json.scan` by internal uuid (the engine's envelope keeps the scan snapshot there).
+/// Every stored pair, closed ones too, by internal uuid: the symbol and exchanges the history views
+/// (last execution results) need after the engine's snapshot has dropped the pair.
+pub fn pair_records(rows: &[PairRow]) -> BTreeMap<String, crate::ui::bridge::PairRecord> {
+    rows.iter()
+        .map(|r| {
+            let leg = |k: &str| r.entry.get(k).cloned().and_then(|v| serde_json::from_value::<Exchange>(v).ok());
+            let record = crate::ui::bridge::PairRecord {
+                pair_id: r.pair_id.clone(),
+                symbol: r.symbol.clone(),
+                long_exchange: leg("long_exchange"),
+                short_exchange: leg("short_exchange"),
+                status: r.status.clone(),
+            };
+            (r.internal_uuid.clone(), record)
+        })
+        .collect()
+}
+
 pub fn pair_entries(rows: &[PairRow]) -> BTreeMap<String, serde_json::Value> {
     rows.iter().map(|r| (r.internal_uuid.clone(), r.entry.get("scan").cloned().unwrap_or(serde_json::Value::Null))).collect()
 }
@@ -1416,6 +1435,17 @@ mod tests {
         assert!(pair_infos(&[row("FINALIZED", legs.clone())]).is_empty(), "closed pairs are not shown");
         assert!(pair_infos(&[row("WEIRD", legs)])[0].state.is_err());
         assert!(pair_infos(&[row("RECONCILED", json!({}))])[0].state.is_err());
+    }
+
+    #[test]
+    fn pair_records_keep_every_pair_including_closed_ones_by_internal_uuid() {
+        let legs = json!({"long_exchange": "Bybit", "short_exchange": "Okx", "settlement_ms": 0, "simulated": false, "scan": {}});
+        let r = pair_records(&[row("BLOCKED", legs.clone()), PairRow { internal_uuid: "u2".into(), pair_id: "p2".into(), symbol: "ETHUSDT".into(), ..row("FINALIZED", json!({})) }]);
+        assert_eq!(r.len(), 2, "closed pairs are kept: the history views need them");
+        let a = &r["u"];
+        assert_eq!((a.pair_id.as_str(), a.symbol.as_str(), a.status.as_str()), ("p1", "BTCUSDT", "BLOCKED"));
+        assert_eq!((a.long_exchange, a.short_exchange), (Some(Exchange::Bybit), Some(Exchange::Okx)));
+        assert_eq!((r["u2"].long_exchange, r["u2"].short_exchange), (None, None), "an unreadable entry names no exchange");
     }
 
     #[test]

@@ -15,7 +15,7 @@ use super::bridge::{tradable_exchanges, AccountState, PairInfo, UiSnapshot};
 use super::env_label::EnvLabel;
 use super::format::{self, DASH};
 use super::funding::{self as fv, PairFunding, PnlPanel, TimelineRow};
-use super::labels::{plain_error, DisabledNote, DISABLED_WITH_POSITIONS};
+use super::labels::{pair_state_text, plain_error, DisabledNote, DISABLED_WITH_POSITIONS};
 use crate::exchange::signed::models::Position;
 use crate::ui::theme::Tone;
 
@@ -140,7 +140,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
     }
     for p in &snap.pairs {
         let warning = match &p.state {
-            Ok(st) if st.is_locked() => format!("{} · {MANUAL_NOTE}", st.as_str()),
+            Ok(st) if st.is_locked() => format!("{} · {MANUAL_NOTE}", pair_state_text(st.as_str())),
             Err(_) => format!("狀態無法讀取 · {MANUAL_NOTE}"),
             Ok(_) => continue,
         };

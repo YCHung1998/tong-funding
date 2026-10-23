@@ -267,3 +267,12 @@ mod unticked_exchange {
         assert!(quote("BTCUSDT", d("1200"), &s, NOW).iter().all(|q| q.disabled.is_none()));
     }
 }
+
+#[test]
+fn the_boundary_names_the_world_in_plain_words_with_the_code_after_it() {
+    let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo)));
+    assert_eq!((vm.mode_label, vm.mode_text.as_str()), ("EXCHANGE_DEMO", "Demo 帳戶（EXCHANGE_DEMO）"));
+    let live = crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo);
+    assert_eq!(evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(live)).mode_text, "真錢（LIVE）");
+    assert_eq!(evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), None).mode_text, "未知");
+}

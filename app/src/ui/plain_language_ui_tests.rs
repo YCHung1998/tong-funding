@@ -194,3 +194,22 @@ fn with_every_exchange_ticked_no_page_has_a_disabled_line(cx: &mut TestAppContex
         assert!(!rig.has(cx, id), "{id}: OKX is ticked again");
     }
 }
+
+#[gpui_kit::test]
+fn the_staged_page_draws_a_blocked_attempt_of_a_pair_the_engine_no_longer_holds(cx: &mut TestAppContext) {
+    use super::bridge::PairRecord;
+    use crate::store::event_query::StoredEvent;
+    let now = super::shell::wall_ms();
+    let mut updates = okx_unticked_and_failing();
+    updates.push(SourceUpdate::PairRecords(
+        [("ui-1-0-ptbusdt".to_string(), PairRecord { pair_id: "PTBUSDT-1".into(), symbol: "PTBUSDT".into(), long_exchange: Some(Binance), short_exchange: Some(Bybit), status: "BLOCKED".into() })].into(),
+    ));
+    let ev = |id: i64, ts: i64, payload: serde_json::Value| StoredEvent { id, ts_ms: ts, event_type: "PAIR_TRANSITION".into(), pair_id: Some("ui-1-0-ptbusdt".into()), payload: payload.to_string(), imported: false };
+    updates.push(SourceUpdate::TradeEvents(vec![
+        ev(2, now - 9_000, serde_json::json!({"from": "PRE_TRADE_CHECK", "to": "BLOCKED", "detail": {"block": "pre-trade fetch failed: request timed out", "simulated": false}})),
+        ev(1, now - 10_000, serde_json::json!({"from": "PREPARED", "to": "PRE_TRADE_CHECK", "detail": {"simulated": false}})),
+    ]));
+    let rig = open(cx, updates);
+    rig.go(cx, Page::StagedOrders);
+    assert!(rig.has(cx, "disabled-staged-OKX"), "the page drew with the history block present");
+}

@@ -216,3 +216,12 @@ fn an_exchange_is_enabled_when_allowed_exchanges_lists_it_and_unreadable_setting
     s.settings.error = Some("config.risk is not valid JSON".into());
     assert!(Exchange::ALL.iter().all(|e| s.exchange_enabled(*e)));
 }
+
+#[test]
+fn stored_pair_records_replace_the_previous_ones() {
+    let rec = |sym: &str| PairRecord { pair_id: "p".into(), symbol: sym.into(), long_exchange: Some(Exchange::Binance), short_exchange: None, status: "BLOCKED".into() };
+    let mut s = UiSnapshot::default();
+    apply_update(&mut s, SourceUpdate::PairRecords([("u1".to_string(), rec("A"))].into()));
+    apply_update(&mut s, SourceUpdate::PairRecords([("u2".to_string(), rec("B"))].into()));
+    assert_eq!(s.pair_records.keys().collect::<Vec<_>>(), ["u2"]);
+}

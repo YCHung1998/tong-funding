@@ -334,6 +334,19 @@ pub struct PairInfo {
     pub state: Result<PairState, String>,
 }
 
+/// A stored pair row as the history views need it. Closed pairs and pairs from before a restart are in
+/// the store but no longer in the engine's snapshot, yet their symbol and exchanges must still be shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairRecord {
+    pub pair_id: String,
+    pub symbol: String,
+    /// `None` = the stored entry names no exchange (unreadable).
+    pub long_exchange: Option<Exchange>,
+    pub short_exchange: Option<Exchange>,
+    /// `pairs.status` as stored.
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillSwitchState {
     Off,
@@ -367,6 +380,8 @@ pub struct UiSnapshot {
     pub clocks: BTreeMap<Exchange, ClockState>,
     pub settings: Settings,
     pub pairs: Vec<PairInfo>,
+    /// Every stored pair by internal uuid, closed ones included (the engine's snapshot drops them on restart).
+    pub pair_records: BTreeMap<String, PairRecord>,
     pub system: SystemFlags,
     /// This run's `SCAN_RUN` buffer (oldest first) and its capacity.
     pub scan_runs: Vec<ScanRecord>,
@@ -447,6 +462,8 @@ pub enum SourceUpdate {
     Clock { exchange: Exchange, state: ClockState },
     Settings(Settings),
     Pairs(Vec<PairInfo>),
+    /// Replaces the stored pair records.
+    PairRecords(BTreeMap<String, PairRecord>),
     System(SystemFlags),
     ScanRuns { records: Vec<ScanRecord>, capacity: usize },
     Engine(EngineState),
@@ -529,6 +546,7 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         }
         SourceUpdate::Settings(s) => snap.settings = s,
         SourceUpdate::Pairs(p) => snap.pairs = p,
+        SourceUpdate::PairRecords(m) => snap.pair_records = m,
         SourceUpdate::System(s) => snap.system = s,
         SourceUpdate::ScanRuns { records, capacity } => {
             snap.scan_runs = records;

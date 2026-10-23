@@ -9,7 +9,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 use super::bridge::{CommandSink, ContractTemplate, Settings, UiSnapshot};
 use super::env_label::EnvLabel;
 use super::format;
-use super::labels::{plain_error, DisabledNote};
+use super::labels::{execution_mode_text, plain_error, DisabledNote};
 use crate::engine::command::Command;
 use crate::engine::ports::OrderRules;
 
@@ -58,6 +58,8 @@ pub struct ContractVm {
     pub can_save: bool,
     /// The current `execution_mode` for the boundary table (`未知` while the engine is not running).
     pub mode_label: &'static str,
+    /// The same world in plain words with the code after it (`Demo 帳戶（EXCHANGE_DEMO）`).
+    pub mode_text: String,
 }
 
 fn parse_positive(label: &str, raw: &str, errors: &mut Vec<String>) -> Option<Decimal> {
@@ -123,6 +125,7 @@ pub fn evaluate(form: &ContractForm, settings: &Settings, env: Option<EnvLabel>)
         errors,
         leverage_warning,
         mode_label: mode_text(env),
+        mode_text: env.map_or_else(|| "未知".to_string(), |l| execution_mode_text(l.identity, l.mode)),
     }
 }
 

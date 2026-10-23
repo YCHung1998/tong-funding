@@ -653,7 +653,6 @@ impl Shell {
 
     pub(crate) fn staged_orders_page(&mut self, cx: &mut Context<Self>) -> Div {
         let vm = staged_orders::build(&self.snap, &self.trading.staged_sel, self.now_ms);
-        let trigger = vm.trigger_mode.map_or("未知".to_string(), |t| format!("{t:?}").to_uppercase());
         let header = div()
             .flex()
             .justify_between()
@@ -664,9 +663,9 @@ impl Shell {
                     .flex()
                     .gap_3()
                     .items_center()
-                    .child(small(format!("模板：{} · 市價單 · 暫存 {} 筆 · 已選 {} 筆", vm.mode_label(), vm.staged_count, vm.selected_count), theme::TEXT_SECONDARY))
-                    .child(small(format!("trigger_mode {trigger}"), theme::TEXT_SECONDARY))
-                    .child(btn("trigger-toggle", "切換 AUTO / MANUAL", vm.trigger_mode.is_some(), self.click(cx, |this, _| {
+                    .child(small(format!("模板：{} · 市價單 · 暫存 {} 筆 · 已選 {} 筆", vm.mode_text(), vm.staged_count, vm.selected_count), theme::TEXT_SECONDARY))
+                    .child(small(format!("觸發模式 {}", vm.trigger_text()), theme::TEXT_SECONDARY))
+                    .child(btn("trigger-toggle", "切換 自動 / 手動", vm.trigger_mode.is_some(), self.click(cx, |this, _| {
                         let vm = staged_orders::build(&this.snap, &this.trading.staged_sel, this.now_ms);
                         staged_orders::toggle_trigger_mode(&vm, this.sink.as_ref());
                     }))),
@@ -713,7 +712,7 @@ impl Shell {
                     .child(btn("confirm-yes", p.button(), true, self.click(cx, |this, _| {
                         if let Some(p) = this.trading.staged_confirm.take() {
                             let out = staged_orders::confirm(&p, &this.snap, this.sink.as_ref());
-                            this.trading.staged_note = (!out.excluded.is_empty()).then(|| format!("已排除（已不是 PREPARED）：{}", out.excluded.join("、")));
+                            this.trading.staged_note = (!out.excluded.is_empty()).then(|| staged_orders::excluded_note(&out.excluded));
                         }
                     })))
                     .child(btn("confirm-no", "取消", true, self.click(cx, |this, _| this.trading.staged_confirm = None))),
@@ -783,7 +782,7 @@ impl Shell {
         page = page.child(table);
 
         if !vm.running.is_empty() {
-            let mut run = card().child(text("進行中（RECONCILED）", theme::TEXT_PRIMARY));
+            let mut run = card().child(text(staged_orders::running_title(), theme::TEXT_PRIMARY));
             for r in &vm.running {
                 let row = r.clone();
                 let mut line = div().flex().gap_3().items_center().child(small(r.symbol.clone(), theme::TEXT_PRIMARY)).child(small(format!("平倉倒數 {}", format::hms(r.exit_in_ms)), theme::TEXT_SECONDARY));
@@ -840,7 +839,7 @@ impl Shell {
                 if let Err(why) = &h.confirm_closed {
                     actions = actions.child(small(why.clone(), theme::WARNING));
                 }
-                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs).child(actions);
+                m = m.child(small(h.heading(), theme::TEXT_PRIMARY)).child(legs).child(actions);
                 // live-guardrails (Live only): the exchange pages and the flatten of one bare leg.
                 if let [(long, _), (short, _)] = h.legs[..] {
                     let mut links = div().flex().flex_wrap().gap_2();
@@ -893,9 +892,15 @@ impl Shell {
             hist = hist.child(small("尚無執行紀錄", theme::TEXT_MUTED));
         }
         for a in &vm.last_results {
-            hist = hist.child(small(format!("{} UTC · {}", format::utc_hms(a.at), a.headline), if a.needs_manual { theme::NEGATIVE } else { theme::TEXT_PRIMARY }));
+            // date, symbol and the result in plain words; the codes and the raw message are the muted line,
+            // each leg keeps its exchange, side and status, and the order id is secondary text
+            hist = hist.child(small(a.headline.clone(), if a.needs_manual { theme::NEGATIVE } else { theme::TEXT_PRIMARY })).child(small(a.codes.clone(), theme::TEXT_MUTED));
             for l in &a.legs {
-                hist = hist.child(small(format!("  {} · {} · {} · {} · {}", l.leg, l.exchange, side_text(l.side), l.status.text(), l.order_id_text), theme::TEXT_SECONDARY));
+                let mut leg = div().flex().gap_2().pl(rx(14.0)).child(small(l.summary(), theme::TEXT_SECONDARY));
+                if let Some(order) = l.order_text() {
+                    leg = leg.child(small(order, theme::TEXT_MUTED));
+                }
+                hist = hist.child(leg);
             }
         }
         page.child(hist)
@@ -945,7 +950,7 @@ impl Shell {
             contract_settings::save(&vm, this.sink.as_ref());
         })));
         let boundary = card()
-            .child(text(format!("計算與執行邊界 · execution_mode {}", vm.mode_label), theme::TEXT_PRIMARY))
+            .child(text(format!("計算與執行邊界 · 執行環境 {}", vm.mode_text), theme::TEXT_PRIMARY))
             .child(small(format!("每腿：Notional {} · Initial Margin {}", opt_money(vm.notional), opt_money(vm.margin)), theme::TEXT_SECONDARY))
             .child(small(format!("雙腿合計：Notional {} · Initial Margin {}", opt_money(vm.pair_notional), opt_money(vm.pair_margin)), theme::TEXT_SECONDARY))
             .child(small("預期數量：LONG / SHORT 兩腿同一幣數，名目本金為上限（不跨所加總）", theme::TEXT_SECONDARY))

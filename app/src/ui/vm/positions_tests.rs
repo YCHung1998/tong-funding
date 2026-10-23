@@ -139,7 +139,7 @@ fn locked_pair_state_is_shown_in_warning_with_manual_handling() {
     s.pairs[0].state = Ok(PairState::PartialFailure);
     let vm = build(&s, &Filter::default(), NOW);
     let c = vm.pair_cards.iter().find(|c| c.symbol == "BTCUSDT").unwrap();
-    assert_eq!(c.state_warning.as_deref(), Some("PARTIAL_FAILURE · 需人工處理"));
+    assert_eq!(c.state_warning.as_deref(), Some("單腿失敗（PARTIAL_FAILURE） · 需人工處理"));
     // grouping is RECONCILED-only: the BTC legs are unpaired and only one pair remains grouped
     assert_eq!(vm.title, "4 OPEN · 1 PAIRS");
     assert_eq!(rows(&vm).iter().filter(|r| r.unpaired).count(), 2);
@@ -450,5 +450,15 @@ mod unticked_exchange {
         let vm = build(&s, &Filter::default(), NOW);
         assert!(vm.disabled.is_empty());
         assert!(vm.notices.iter().any(|n| n.contains("OKX 持倉讀取失敗")));
+    }
+}
+
+#[test]
+fn every_locked_state_reads_in_plain_words_with_the_code_after_it() {
+    for (st, text) in [(PairState::PartialFailure, "單腿失敗（PARTIAL_FAILURE） · 需人工處理"), (PairState::Imbalanced, "兩腿不平衡（IMBALANCED） · 需人工處理"), (PairState::Unresolved, "狀態不明（UNRESOLVED） · 需人工處理")] {
+        let mut s = four();
+        s.pairs[0].state = Ok(st);
+        let vm = build(&s, &Filter::default(), NOW);
+        assert_eq!(vm.pair_cards.iter().find(|c| c.symbol == "BTCUSDT").unwrap().state_warning.as_deref(), Some(text));
     }
 }
