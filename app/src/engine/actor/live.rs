@@ -531,6 +531,12 @@ fn event_errors(ev: &Event) -> Texts {
             errs("position read", position, &mut out);
             errs("position read", recorded, &mut out);
         }
+        Event::WatchdogProbed { probe, .. } => {
+            for l in &probe.legs {
+                errs("position read", &l.read.position, &mut out);
+                errs("order lookup", &l.read.recorded, &mut out);
+            }
+        }
         Event::OpenPrepared { result, .. } => errs("pre-send barrier", result, &mut out),
         Event::ReconciliationDone { result } => errs("reconciliation", result, &mut out),
         Event::PreflightDone { .. } => {}

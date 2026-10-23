@@ -2266,6 +2266,10 @@ mod spread_tag_tests;
 #[path = "live_guardrail_tests.rs"]
 mod live_guardrail_tests;
 
+// naked-leg-watchdog: verification rounds, the one-leg flatten, retries and the lock.
+#[path = "watchdog_tests.rs"]
+mod watchdog_tests;
+
 // ---- candidate-readd-after-close: engine side ---------------------------------------------
 
 /// Recorded case NMRUSDT: flat confirmed, CLOSING while the funding PnL waits. The snapshot says so

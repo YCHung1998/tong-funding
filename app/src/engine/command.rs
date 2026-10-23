@@ -8,6 +8,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::preflight::PreflightReport;
 use super::ports::{FreshQuote, Leg, OrderAction, OrderRules, OrderSide, QueryOutcome, SubmitOutcome};
+use super::watchdog::WatchdogProbe;
 
 /// Saved risk settings (global + overrides), with before / after values, in the same transaction
 /// as the settings (ui-trading-pages 3.1).
@@ -196,6 +197,9 @@ pub enum Event {
     PreflightDone { report: PreflightReport },
     /// live-guardrails `FlattenLeg`: the leg's signed position and the pair's recorded fill on it.
     FlattenPositionFetched { pair: PairUuid, leg: Leg, position: Result<Decimal, String>, recorded: Result<Decimal, String> },
+    /// naked-leg-watchdog: what one verification round read on both legs. `entry_no` numbers the
+    /// alert entry that asked for it; the result of an older entry is dropped.
+    WatchdogProbed { pair: PairUuid, entry_no: u64, probe: WatchdogProbe },
 }
 
 /// What made a leg reach the early-exit threshold (recorded with the `LEG_EARLY_EXIT` event).

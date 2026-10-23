@@ -76,6 +76,7 @@ use crate::store::state::{AddPairOutcome, ConfigChange, FLAG_EXECUTION_MODE, Int
 #[cfg(test)]
 pub(crate) mod flow_tests;
 mod live;
+mod naked_leg;
 mod pnl_gate;
 
 /// Command queue bound: a UI that floods commands waits (backpressure) instead of growing memory.
@@ -458,6 +459,8 @@ struct Flow {
     live_worst_price: [Option<Decimal>; 2],
     /// live-guardrails `FlattenLeg`: the position / recorded-fill read of a leg is in flight.
     flatten_inflight: [bool; 2],
+    /// naked-leg-watchdog: progress for the pair's current alert entry (`None` outside an alert state).
+    watchdog: Option<naked_leg::WatchdogFlow>,
 }
 
 /// Progress of one leg's early exit.
@@ -538,6 +541,8 @@ struct Actor {
     notify_started: BTreeSet<(PairUuid, i64)>,
     /// "Confirm closed" re-queries in flight, with the replies waiting for them.
     pending_confirms: BTreeMap<PairUuid, Vec<oneshot::Sender<CommandReply>>>,
+    /// naked-leg-watchdog: numbers each alert entry so a late result of an older entry is dropped.
+    watchdog_entries: u64,
     cmd_rx: mpsc::Receiver<CommandMsg>,
     event_tx: mpsc::Sender<Event>,
     event_rx: mpsc::Receiver<Event>,
@@ -636,6 +641,7 @@ impl Actor {
             alert_reasons: BTreeMap::new(),
             notify_started: BTreeSet::new(),
             pending_confirms: BTreeMap::new(),
+            watchdog_entries: 0,
             cmd_rx,
             event_tx,
             event_rx,
@@ -904,9 +910,13 @@ impl Actor {
                     self.poll(&id, OrderAction::Open);
                     self.check_fills(&id, now);
                 }
-                // live-guardrails: a FlattenLeg order of a locked pair is looked up like any close
-                PairState::PartialFailure | PairState::Imbalanced | PairState::Unresolved if !orphan && self.flatten_pending(&id) => {
-                    self.poll(&id, OrderAction::Close);
+                // live-guardrails: a FlattenLeg order of a locked pair is looked up like any close;
+                // naked-leg-watchdog: the watchdog's round / flatten for the pair runs on the same tick
+                PairState::PartialFailure | PairState::Imbalanced | PairState::Unresolved if !orphan => {
+                    if self.flatten_pending(&id) {
+                        self.poll(&id, OrderAction::Close);
+                    }
+                    self.watchdog_tick(&view, now);
                 }
                 PairState::Closing if !orphan && self.awaiting_pnl(&id) => self.finalize_closed(&id),
                 PairState::Closing if !orphan => {
@@ -2415,6 +2425,7 @@ impl Actor {
             Event::EarlyPositionFetched { pair, leg, position, recorded, trigger } => self.on_early_position(&pair, leg, position, recorded, trigger),
             Event::PreflightDone { report } => self.on_preflight_done(report),
             Event::FlattenPositionFetched { pair, leg, position, recorded } => self.on_flatten_position(&pair, leg, position, recorded),
+            Event::WatchdogProbed { pair, entry_no, probe } => self.on_watchdog_probed(&pair, entry_no, probe),
         }
     }
 
@@ -2558,6 +2569,7 @@ impl Actor {
                 } else if from == PairState::OrderSubmit {
                     self.live_pair_left_order_submit(pair);
                 }
+                self.watchdog_state_changed(pair, to);
                 self.sync_alert_for(pair);
                 Ok(to)
             }
@@ -3215,7 +3227,7 @@ struct PairOrder {
 
 /// Why a leg cannot be closed on the strength of its position and the pair's recorded fill.
 #[derive(Debug, Clone, PartialEq)]
-enum LegClosePlanError {
+pub(crate) enum LegClosePlanError {
     /// The position is on the wrong side of the leg (reason text); left for the user.
     WrongSide(String),
     /// Position and recorded fill disagree (or the fill is unknown): the `CLOSE_QUANTITY_MISMATCH` payload.
@@ -3225,7 +3237,7 @@ enum LegClosePlanError {
 /// Close quantity of one leg = min(the pair's recorded fill, |actual position|), plus the signed
 /// position expected to remain (exposure that is not the pair's). Shared by the scheduled close
 /// and the early exit (decision 2026-10-05 evening). `pos` is signed (long positive).
-fn plan_leg_close(
+pub(crate) fn plan_leg_close(
     leg: Leg,
     exchange: Exchange,
     symbol: &str,

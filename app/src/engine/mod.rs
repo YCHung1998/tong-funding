@@ -33,3 +33,4 @@ pub mod schedule;
 pub mod sim;
 pub mod timings;
 pub mod transition;
+pub mod watchdog;
