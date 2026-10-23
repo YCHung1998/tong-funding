@@ -4,6 +4,7 @@ pub mod edge_kind;
 pub mod cost_attribution;
 pub mod funding;
 pub mod grouping;
+pub mod loss_breaker;
 pub mod net_edge;
 pub mod pair;
 pub mod pnl;

@@ -57,6 +57,7 @@ mod tests {
         assert_eq!(risk.trigger_mode, TriggerMode::Manual);
         assert!(risk.early_exit_min_move_pct.is_zero());
         assert_eq!((risk.live_max_leg_notional_usdt, risk.live_max_pairs_per_arming), (None, None), "caps stay unset: no default arming");
+        assert_eq!((risk.loss_breaker_max_loss_usdt, risk.loss_breaker_max_consecutive_losses), (rust_decimal::Decimal::from(5), 2), "loss-circuit-breaker: a stricter breaker for real money");
         let t = crate::ui::bridge::ContractTemplate::from_json(&db.config_get(CONFIG_CONTRACT_TEMPLATE).unwrap().unwrap().value).unwrap();
         assert_eq!(t.notional_usdt, live_db_defaults().template_notional_usdt);
         // idempotent: a second start changes nothing

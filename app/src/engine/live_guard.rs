@@ -236,7 +236,7 @@ pub fn classify_error(text: &str) -> Option<LockCause> {
 }
 
 /// What a freshly created live database starts with (`live_db_defaults`): MANUAL trigger, no early
-/// exit, a contract template below any cap. The live caps stay unset on purpose (no default, so
+/// exit, a loss breaker of 5 USDT or 2 losses, a contract template below any cap. The live caps stay unset on purpose (no default, so
 /// arming is impossible until the user fills them in).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveDbDefaults {
@@ -250,6 +250,9 @@ pub fn live_db_defaults() -> LiveDbDefaults {
     let risk = RiskConfig {
         trigger_mode: TriggerMode::Manual,
         early_exit_min_move_pct: Decimal::ZERO,
+        // loss-circuit-breaker: real money starts with a stricter breaker (5 USDT or 2 losses in a row).
+        loss_breaker_max_loss_usdt: Decimal::from(5),
+        loss_breaker_max_consecutive_losses: 2,
         ..RiskConfig::default()
     };
     LiveDbDefaults {
@@ -439,5 +442,15 @@ mod tests {
         assert_eq!(d.risk.live_max_pairs_per_arming, None);
         assert!(d.template_notional_usdt > Decimal::ZERO && d.template_notional_usdt <= LIVE_CAP_CEILING_LEG_NOTIONAL_USDT);
         assert!(d.risk.validate().is_ok());
+    }
+
+    #[test]
+    fn a_new_live_database_starts_with_a_breaker_of_5_usdt_or_2_losses() {
+        // loss-circuit-breaker 1.2: stricter than the Demo default of 15 / 3
+        let d = live_db_defaults();
+        assert_eq!(d.risk.loss_breaker_max_loss_usdt, Decimal::from(5));
+        assert_eq!(d.risk.loss_breaker_max_consecutive_losses, 2);
+        assert!(d.risk.validate().is_ok());
+        assert_eq!(RiskConfig::default().loss_breaker_max_loss_usdt, Decimal::from(15), "the Demo default is untouched");
     }
 }
