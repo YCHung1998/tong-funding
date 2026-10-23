@@ -40,4 +40,5 @@
 
 ## 7. 審查第三輪修正
 
+- [x] 7.1 C1 `LostTaskGuard::drop` 在事件佇列滿時改以 `tokio::spawn` 補送兜底；`ManualDoneGuard` 併入 `LostTaskGuard`（`LostTaskGuard::new(..., Event::ManualSubmitted{...Unknown...})` 與 `disarm()`）；測試：佇列滿時 panic 的任務最終仍送達兜底（先紅）
 - [x] 7.2 C2 刪除 `MAX_ROUNDS_PER_ALERT`、`DecideInput.rounds_done` 與 `decide` 包裝：輪數由「W、R 各 3 輪即 Unknown、只有 Flatten 歸零、最多 3 次嘗試」保證有界；測試 W,R 交替最終 Unknown、W,R,W,R 後 3 次平倉都能送出（先紅：有上限時只送得出 2 次）

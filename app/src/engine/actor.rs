@@ -392,25 +392,11 @@ struct EntryContext {
 
 type QuotePair = (Result<FreshQuote, String>, Result<FreshQuote, String>);
 
-/// Reports a manual order whose task ended without an answer (a panic), so its in-flight entry is cleared.
-/// The entry is cleared by a definite outcome or a lookup that settled an Unknown one (`resolved`); a lost task
-/// (this guard) leaves it to the safety-net expiry, like an Unknown outcome whose lookup failed.
-struct ManualDoneGuard {
-    tx: mpsc::Sender<Event>,
-    id: Option<String>,
-}
-
-impl Drop for ManualDoneGuard {
-    fn drop(&mut self) {
-        if let Some(client_order_id) = self.id.take() {
-            let _ = self.tx.try_send(Event::ManualSubmitted { client_order_id, outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() }, resolved: false });
-        }
-    }
-}
-
-/// Review round 2 (B4): holds the event a task must report when it ends without its own result (a panic
-/// in an adapter). `disarm` once the real result is sent; dropped armed, the fallback is sent instead
-/// (`try_send`: a drop must not wait), so the pair is never left "in flight" by a lost task.
+/// Review round 2 (B4), round 3 (C1): holds the event a task must report when it ends without its own result
+/// (a panic in an adapter): a lost watchdog round, a lost flatten read, a lost manual order. `disarm` once the
+/// real result is sent; dropped armed, the fallback is sent instead, so the pair is never left "in flight" by a
+/// lost task. A drop must not wait: `try_send` first, and when the event queue is full the send is handed to a
+/// spawned task, so the fallback still arrives once there is room.
 struct LostTaskGuard {
     tx: mpsc::Sender<Event>,
     fallback: Option<Event>,
@@ -428,8 +414,18 @@ impl LostTaskGuard {
 
 impl Drop for LostTaskGuard {
     fn drop(&mut self) {
-        if let Some(event) = self.fallback.take() {
-            let _ = self.tx.try_send(event);
+        let Some(event) = self.fallback.take() else { return };
+        match self.tx.try_send(event) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                // a guard dropped outside any runtime (the engine is gone) has nothing left to tell
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let tx = self.tx.clone();
+                    runtime.spawn(async move {
+                        let _ = tx.send(event).await;
+                    });
+                }
+            }
         }
     }
 }
@@ -2242,7 +2238,10 @@ impl Actor {
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
         tokio::spawn(async move {
             // if this task ends without reporting (a panic), the guard still tells the actor
-            let mut guard = ManualDoneGuard { tx: tx.clone(), id: Some(id.clone()) };
+            let mut guard = LostTaskGuard::new(
+                tx.clone(),
+                Event::ManualSubmitted { client_order_id: id.clone(), outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() }, resolved: false },
+            );
             // The deadline covers only the part before an answer exists: gate + leverage + submit, each bounded by
             // a 5 s request timeout (<= 15 s, MANUAL_DEADLINE_MS 20 s). The lookup after an Unknown answer is NOT cut.
             let (outcome, resolved) = match intent::land_intent(&db, &key, leg, &req) {
@@ -2270,7 +2269,7 @@ impl Actor {
                     }
                 }
             };
-            guard.id = None;
+            guard.disarm();
             let _ = tx.send(Event::ManualSubmitted { client_order_id: id, outcome, resolved }).await;
         });
         CommandReply::Accepted

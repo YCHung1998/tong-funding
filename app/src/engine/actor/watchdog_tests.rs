@@ -987,3 +987,42 @@ async fn a_manual_flatten_read_that_panics_clears_its_guard_and_is_recorded_as_a
     watched.panic_queries(false);
     assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }).await, CommandReply::Accepted, "not stuck on `already in progress`");
 }
+
+// ---- review round 3, C1: the lost-task fallback survives a full event queue -------------------------
+
+/// A task that panics while the actor's event queue is full used to lose its fallback (`try_send` failed):
+/// the round stayed "in flight". The guard now hands the event to a spawned send, so it arrives once there is room.
+#[tokio::test(start_paused = true)]
+async fn a_lost_task_fallback_is_delivered_even_when_the_event_queue_is_full() {
+    let (tx, mut rx) = mpsc::channel::<Event>(1);
+    // the queue is full of something else
+    tx.try_send(Event::ManualCancelled { exchange: Exchange::Binance, symbol: SYM.into(), client_order_id: "x".into(), outcome: QueryOutcome::Failed { reason: "filler".into() } }).unwrap();
+    let legs = [(Leg::Long, Exchange::Binance), (Leg::Short, Exchange::Bybit)];
+    let lost = wd::WatchdogProbe::unreadable(legs, "the verification task ended without a result");
+    let task_tx = tx.clone();
+    let task = tokio::spawn(async move {
+        let _guard = LostTaskGuard::new(task_tx.clone(), Event::WatchdogProbed { pair: UUID.into(), entry_no: 7, probe: lost });
+        panic!("scripted adapter panic");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    // room appears: the filler goes first, then the fallback that could not be queued at the drop
+    assert!(matches!(rx.recv().await, Some(Event::ManualCancelled { .. })));
+    let Some(Event::WatchdogProbed { pair, entry_no, probe }) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.expect("the fallback must still arrive") else {
+        panic!("expected the fallback probe");
+    };
+    assert_eq!((pair.as_str(), entry_no), (UUID, 7));
+    assert!(probe.legs.iter().all(|l| l.read.position.is_err()), "an unreadable round, which the decision treats as READ_FAILED");
+}
+
+/// The manual order task shares the same guard: a lost task reports the order as Unknown.
+#[tokio::test(start_paused = true)]
+async fn a_lost_manual_order_task_reports_an_unknown_outcome() {
+    let (tx, mut rx) = mpsc::channel::<Event>(4);
+    let task_tx = tx.clone();
+    let task = tokio::spawn(async move {
+        let _guard = LostTaskGuard::new(task_tx, Event::ManualSubmitted { client_order_id: "m1".into(), outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() }, resolved: false });
+        panic!("scripted adapter panic");
+    });
+    assert!(task.await.unwrap_err().is_panic());
+    assert!(matches!(rx.recv().await, Some(Event::ManualSubmitted { outcome: SubmitOutcome::Unknown { .. }, resolved: false, .. })));
+}

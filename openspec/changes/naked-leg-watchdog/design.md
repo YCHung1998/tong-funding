@@ -32,7 +32,7 @@
 ## Risks / Trade-offs
 
 - [通知機制尚未接上 macOS 系統通知（`LogNotifier` 只寫系統日誌）] → 文案一律寫「在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）」，不寫「通知你」。
-- [看門狗一輪的結果事件遺失（探測本身有 30 秒逾時，不再另設兜底）] → 探測一律由逾時包住並回報；任務本身 panic 時 `LostTaskGuard`（Drop）改送 `WatchdogProbe::unreadable` 算讀取失敗，手動 `FlattenLeg` 的讀取任務同理（清 `flatten_inflight` 並寫 `LEG_FLATTEN_ABORTED`），遺失只會發生在引擎已停止時。
+- [看門狗一輪的結果事件遺失（探測本身有 30 秒逾時，不再另設兜底）] → 探測一律由逾時包住並回報；任務本身 panic 時 `LostTaskGuard`（Drop）改送 `WatchdogProbe::unreadable` 算讀取失敗，手動 `FlattenLeg` 的讀取任務同理（清 `flatten_inflight` 並寫 `LEG_FLATTEN_ABORTED`），（審查第三輪 C1）事件佇列已滿而 `try_send` 失敗時，改由 `tokio::spawn` 非同步補送，兜底仍會送達；遺失只會發生在引擎已停止時。手動單任務原本的 `ManualDoneGuard` 已併入同一個 `LostTaskGuard`。
 - [另一腿其實晚到成交，系統已平掉一腿] → 先撤單並查證每張單都已終結、另一腿成交量 = 0 且持倉 = 0 才送；仍可能在毫秒級競態下發生，屆時變成反向單腿，下一輪查證會看到「另一腿有部位、這腿沒有」而再次處理，並留下事件。
 - [交易所帳戶裡同幣種有其他部位（手動交易）] → `plan_leg_close` 的容差檢查會判定不符 → `Unknown`，不送單。
 - [查詢 API 故障導致頻繁 Unknown 而鎖定] → 寧可鎖定；通知中寫明原因。
