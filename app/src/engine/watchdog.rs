@@ -1,6 +1,7 @@
 //! naked-leg-watchdog (authorization B): the pure part. One round of verification reads, per leg,
 //! the exchange position, the pair's recorded fill and whether every one of the pair's own orders on
-//! that leg is over; [`decide`] turns those reads into exactly one of five conclusions. Nothing here
+//! that leg is over; [`decide`] turns those reads into exactly one of six conclusions (the five of the
+//! spec and `ReadFailed`, a round that could not read: the third is `Unknown`). Nothing here
 //! touches the store, an exchange or the clock: the actor (`actor::naked_leg`) reads, writes events
 //! and sends the one kind of order the watchdog may send (a reduce-only market close of ONE leg).
 //!
@@ -205,7 +206,7 @@ fn mismatch_text(leg: Leg, alert: &Value) -> String {
     )
 }
 
-/// The five conclusions as written in `NAKED_LEG_WATCHDOG.conclusion`.
+/// The conclusions as written in `NAKED_LEG_WATCHDOG.conclusion` (the five final ones and `ReadFailed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Conclusion {
     Flatten,
@@ -450,8 +451,8 @@ pub struct WatchdogProbe {
 }
 
 impl WatchdogProbe {
-    /// A round that could not read anything (it did not finish in time): every read failed with `why`,
-    /// so [`decide`] concludes `Unknown`.
+    /// A round that could not read anything (it did not finish in time, or its task was lost): every read
+    /// failed with `why`, so [`decide`] concludes `ReadFailed` (the third of them `Unknown`).
     pub fn unreadable(legs: [(Leg, Exchange); 2], why: &str) -> WatchdogProbe {
         let leg = |(leg, exchange): (Leg, Exchange)| LegProbe {
             read: LegRead { leg, exchange, position: Err(why.to_string()), recorded: Err(why.to_string()), orders_terminal: Err(why.to_string()) },

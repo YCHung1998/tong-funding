@@ -54,22 +54,14 @@ impl Actor {
         self.publish_live();
     }
 
-    /// The one automatic lock: frozen caps dropped (disarmed in memory first), kill switch ON and a
-    /// `LIVE_AUTO_LOCK` event with the reason, in one transaction. Closing and cancelling stay open.
+    /// The Live automatic lock: `lock_new_entries` with `LIVE_AUTO_LOCK` and the reason. Closing and
+    /// cancelling stay open.
     pub(super) fn lock_live(&mut self, reason: &str) {
         if !self.live_on() {
             return;
         }
-        self.live.frozen = None;
-        self.live.last_lock_reason = Some(reason.to_string());
         let payload = json!({ "reason": reason, "pairs_entered": self.live.pairs_entered });
-        if let Err(e) = self.db.set_kill_switch_with_event(true, LIVE_AUTO_LOCK, &payload)
-            && !self.db.is_halted()
-        {
-            self.db.halt(HaltReason::KillSwitchReadFailed(format!("auto lock could not be written: {e}")));
-        }
-        self.dirty = true;
-        self.publish_live();
+        self.lock_new_entries(LIVE_AUTO_LOCK, &payload, reason.to_string());
     }
 
     /// Error texts of an event (HTTP status / exchange answers) that lock an armed engine:

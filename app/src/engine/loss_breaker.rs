@@ -260,14 +260,15 @@ impl Assessment {
     }
 }
 
-/// The highest event id among the events the breaker reacts to (closes, hand-confirmed finalizations,
-/// PnL results, kill switch changes, trips, baselines, risk settings changes): the engine re-assesses
-/// only when this moved.
+/// The highest event id among the events the breaker reacts to (closes, hand confirmations, PnL results,
+/// kill switch changes, trips, baselines, risk settings changes): the engine re-assesses only when this
+/// moved. Event types only (review round 2, B7): a hand confirmation is seen through `MANUAL_CONFIRM_RESULT`,
+/// which the engine writes right after the transition into FINALIZED lands, in the same actor step, so the
+/// look that follows it already sees the transition; what COUNTS is still that transition (`closed_pairs_since`).
 pub fn watermark(db: &Db) -> Result<i64, String> {
     db.with_conn(|c| {
         Ok(c.query_row(
-            "SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type IN ('CLOSE_CONFIRMED', 'PAIR_PNL_COMPUTED', 'PAIR_PNL_RECOMPUTED', 'KILL_SWITCH_CHANGED', 'LOSS_BREAKER_TRIPPED', 'LOSS_BREAKER_BASELINE', 'RISK_CONFIG_UPDATED') \
-             OR (event_type = 'PAIR_TRANSITION' AND json_extract(payload, '$.to') = 'FINALIZED')",
+            "SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type IN ('CLOSE_CONFIRMED', 'PAIR_PNL_COMPUTED', 'PAIR_PNL_RECOMPUTED', 'KILL_SWITCH_CHANGED', 'LOSS_BREAKER_TRIPPED', 'LOSS_BREAKER_BASELINE', 'RISK_CONFIG_UPDATED', 'MANUAL_CONFIRM_RESULT')",
             [],
             |r| r.get::<_, i64>(0),
         )?)
@@ -297,9 +298,12 @@ pub(crate) mod testkit {
         append(db, crate::engine::actor::CLOSE_CONFIRMED, Some(pair), json!({ "verified_flat": true, "simulated": simulated }))
     }
 
-    /// The manual "confirm closed" of a pair in an alert state: `PAIR_TRANSITION` `from` -> FINALIZED.
+    /// The manual "confirm closed" of a pair in an alert state: `PAIR_TRANSITION` `from` -> FINALIZED, then
+    /// the `MANUAL_CONFIRM_RESULT` the engine writes right after it (what the watermark watches). Returns the transition's id.
     pub(crate) fn finalize_by_hand(db: &Db, pair: &str, from: &str, simulated: bool) -> i64 {
-        append(db, crate::engine::transition::PAIR_TRANSITION, Some(pair), json!({ "from": from, "to": "FINALIZED", "event": "Manual(ConfirmClosed)", "detail": { "simulated": simulated } }))
+        let id = append(db, crate::engine::transition::PAIR_TRANSITION, Some(pair), json!({ "from": from, "to": "FINALIZED", "event": "Manual(ConfirmClosed)", "detail": { "simulated": simulated } }));
+        append(db, crate::engine::actor::MANUAL_CONFIRM_RESULT, Some(pair), json!({ "accepted": true, "simulated": simulated }));
+        id
     }
 
     /// A closed demo pair worth `delta` (long closes `delta` away from its open, no fees) at `ts`.
@@ -557,9 +561,13 @@ mod tests {
         let w0 = watermark(&db).unwrap();
         append(&db, "PAIR_TRANSITION", Some("a"), json!({ "from": "PREPARED", "to": "ORDER_SUBMIT" }));
         assert_eq!(watermark(&db).unwrap(), w0, "an ordinary transition is not watched");
+        // review round 2 (B7): the transition itself is not looked at (that needed a json_extract over every
+        // PAIR_TRANSITION); the engine writes MANUAL_CONFIRM_RESULT right after a hand confirmation lands
+        append(&db, "PAIR_TRANSITION", Some("a"), json!({ "from": "UNRESOLVED", "to": "FINALIZED", "event": "Manual(ConfirmClosed)" }));
+        assert_eq!(watermark(&db).unwrap(), w0, "a bare transition into FINALIZED is not watched either");
         testkit::finalize_by_hand(&db, "a", "UNRESOLVED", false);
         let w1 = watermark(&db).unwrap();
-        assert!(w1 > w0);
+        assert!(w1 > w0, "the hand confirmation's own result event moves it");
         append(&db, "RISK_CONFIG_UPDATED", None, json!({}));
         assert!(watermark(&db).unwrap() > w1, "new limits are looked at at once");
     }
