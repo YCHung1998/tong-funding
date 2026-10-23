@@ -45,9 +45,9 @@ pub(super) struct WatchdogFlow {
     pub(super) next_round_ms: i64,
     pub(super) rounds: u32,
     pub(super) attempts_sent: u32,
-    pub(super) waited_rounds: u32,
-    /// Rounds that could not read what they need since the last flatten round (the third is `Unknown`).
-    pub(super) read_failed_rounds: u32,
+    /// Rounds that waited for a cancel / could not read what they need since the last flatten round (the third
+    /// of either is `Unknown`).
+    pub(super) counts: wd::RoundCounts,
     /// A conclusion that ends the rounds was reached: no further automatic action for this entry.
     pub(super) done: bool,
     pub(super) phase: Phase,
@@ -59,7 +59,7 @@ pub(super) struct WatchdogFlow {
 impl WatchdogFlow {
     /// The pair entered `state` at `now`: nothing happened yet, the first round waits out the grace.
     fn fresh(entry_no: u64, state: PairState, now: i64) -> WatchdogFlow {
-        WatchdogFlow { entry_no, state, alert_since_ms: now, next_round_ms: now.saturating_add(wd::WATCHDOG_GRACE_MS), rounds: 0, attempts_sent: 0, waited_rounds: 0, read_failed_rounds: 0, done: false, phase: Phase::Idle, sent: Vec::new() }
+        WatchdogFlow { entry_no, state, alert_since_ms: now, next_round_ms: now.saturating_add(wd::WATCHDOG_GRACE_MS), rounds: 0, attempts_sent: 0, counts: wd::RoundCounts::default(), done: false, phase: Phase::Idle, sent: Vec::new() }
     }
 
     /// Rebuilt from the stored events of the current entry.
@@ -71,8 +71,7 @@ impl WatchdogFlow {
             next_round_ms: p.next_round_ms(),
             rounds: p.rounds,
             attempts_sent: p.attempts_sent,
-            waited_rounds: p.waited_rounds,
-            read_failed_rounds: p.read_failed_rounds,
+            counts: p.counts,
             done: p.terminal,
             phase: Phase::Idle,
             sent: p.sent.clone(),
@@ -241,8 +240,7 @@ impl Actor {
             simulated: view.simulated,
             tolerance_pct: tolerance,
             legs: [probe.legs[0].read.clone(), probe.legs[1].read.clone()],
-            waited_rounds: w.waited_rounds,
-            read_failed_rounds: w.read_failed_rounds,
+            counts: w.counts,
             attempts_sent: w.attempts_sent,
         };
         let decision = wd::decide(&input);
@@ -255,33 +253,27 @@ impl Actor {
         let Some(w) = self.flows.get(pair).and_then(|f| f.watchdog.clone()) else { return };
         let payload = round_payload(view, &w, &decision, evidence);
         let recorded = self.events.append(wd::NAKED_LEG_WATCHDOG, Some(pair), payload).is_ok();
+        self.dirty = true;
+        // The ONE place the run counters change (independent of each other, see `wd::RoundCounts`), together with
+        // the phase and the time of the next round: a round that concluded nothing looks again one interval later.
+        let looks_again = matches!(decision, wd::Decision::ReadFailed { .. } | wd::Decision::WaitForCancel);
         if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
             w.phase = Phase::Idle;
-        }
-        self.dirty = true;
-        // the ONE place the run counters change (independent of each other, see `wd::RoundCounts`)
-        if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
-            let counts = wd::RoundCounts { waited: w.waited_rounds, read_failed: w.read_failed_rounds }.after(decision.conclusion());
-            (w.waited_rounds, w.read_failed_rounds) = (counts.waited, counts.read_failed);
+            w.counts = w.counts.after(decision.conclusion());
+            if looks_again {
+                w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
+            }
         }
         // The action of the conclusion comes only after its record.
         match decision {
-            // Something could not be read: nothing is decided yet, the next round (5 s later) looks
-            // again; the third failure is `Unknown` (see `wd::decide`).
-            wd::Decision::ReadFailed { .. } => {
-                if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
-                    w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
-                }
-            }
+            // Something could not be read: nothing is decided yet; the third failure is `Unknown` (see `wd::decide`).
+            wd::Decision::ReadFailed { .. } => {}
             wd::Decision::Flatten { leg, qty } => {
                 let position = evidence.and_then(|(probe, _)| probe.legs[idx(leg)].read.position.clone().ok()).unwrap_or_default();
                 self.begin_flatten(view, leg, qty, position, recorded, now);
             }
             // An order that is not over is cancelled; the next round (5 s later) looks again.
             wd::Decision::WaitForCancel => {
-                if let Some(w) = self.flows.get_mut(pair).and_then(|f| f.watchdog.as_mut()) {
-                    w.next_round_ms = now.saturating_add(wd::WATCHDOG_INTERVAL_MS);
-                }
                 if let Some((probe, _)) = evidence {
                     self.cancel_unfinished(view, probe);
                 }
@@ -520,8 +512,8 @@ fn round_payload(view: &PairView, w: &WatchdogFlow, decision: &wd::Decision, evi
         "pair_id": view.pair_id,
         "symbol": view.symbol,
         "simulated": view.simulated,
-        "waited_rounds": w.waited_rounds,
-        "read_failed_rounds": w.read_failed_rounds,
+        "waited_rounds": w.counts.waited,
+        "read_failed_rounds": w.counts.read_failed,
         "attempts_sent": w.attempts_sent,
     });
     if let Some((probe, tolerance)) = evidence {

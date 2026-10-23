@@ -62,12 +62,10 @@ pub struct DecideInput<'a> {
     pub tolerance_pct: Decimal,
     /// `[long, short]`.
     pub legs: [LegRead; 2],
-    /// Earlier rounds of this entry that ended in `WaitForCancel` (see [`RoundCounts`]).
-    pub waited_rounds: u32,
+    /// Earlier rounds of this entry that ended in `WaitForCancel` / `ReadFailed` (see [`RoundCounts`]).
+    pub counts: RoundCounts,
     /// Flatten orders already sent for this entry.
     pub attempts_sent: u32,
-    /// Earlier rounds of this entry that ended in `ReadFailed` (see [`RoundCounts`]).
-    pub read_failed_rounds: u32,
 }
 
 /// The conclusion of one round.
@@ -107,13 +105,13 @@ pub fn decide(input: &DecideInput<'_>) -> Decision {
         }
     }
     if !failures.is_empty() {
-        return read_failure(failures.join("; "), input.read_failed_rounds);
+        return read_failure(failures.join("; "), input.counts.read_failed);
     }
 
     // 2. An order that is not over can still fill: cancel it and look again, a bounded number of times.
     let unfinished: Vec<&str> = input.legs.iter().filter(|l| matches!(l.orders_terminal, Ok(false))).map(|l| l.leg.as_str()).collect();
     if !unfinished.is_empty() {
-        if input.waited_rounds.saturating_add(1) >= MAX_CANCEL_WAIT_ROUNDS {
+        if input.counts.waited.saturating_add(1) >= MAX_CANCEL_WAIT_ROUNDS {
             return Decision::Unknown {
                 reason: format!("{} order(s) still not over after {MAX_CANCEL_WAIT_ROUNDS} rounds of waiting for the cancel", unfinished.join(" and ")),
             };
@@ -329,10 +327,8 @@ pub struct Progress {
     /// Flatten attempts of the watchdog for this entry: orders sent (`LEG_FLATTEN`) and orders that
     /// could not even be sent (`LEG_FLATTEN_ABORTED`), both with `by: "watchdog"`.
     pub attempts_sent: u32,
-    /// Rounds that concluded `WAIT_FOR_CANCEL` since the last flatten round (see [`RoundCounts`]).
-    pub waited_rounds: u32,
-    /// Rounds that concluded `READ_FAILED` since the last flatten round (see [`RoundCounts`]).
-    pub read_failed_rounds: u32,
+    /// Rounds that concluded `WAIT_FOR_CANCEL` / `READ_FAILED` since the last flatten round.
+    pub counts: RoundCounts,
     /// Time of the newest watchdog record of this entry.
     pub last_record_ms: Option<i64>,
     /// A conclusion that ends the rounds was reached.
@@ -352,7 +348,7 @@ impl Progress {
 
 /// `records` = the watchdog-relevant events of the pair after its entry, oldest first.
 pub fn progress_from_records(alert_since_ms: i64, records: &[Record]) -> Progress {
-    let mut p = Progress { alert_since_ms, rounds: 0, attempts_sent: 0, waited_rounds: 0, read_failed_rounds: 0, last_record_ms: None, terminal: false, sent: sent_from_records(records) };
+    let mut p = Progress { alert_since_ms, rounds: 0, attempts_sent: 0, counts: RoundCounts::default(), last_record_ms: None, terminal: false, sent: sent_from_records(records) };
     for r in records {
         let text = |k: &str| r.payload.get(k).and_then(Value::as_str);
         match r.event_type.as_str() {
@@ -367,8 +363,7 @@ pub fn progress_from_records(alert_since_ms: i64, records: &[Record]) -> Progres
                     p.last_record_ms = Some(r.ts_ms);
                     let conclusion = text("conclusion").and_then(Conclusion::parse);
                     if let Some(c) = conclusion {
-                        let counts = RoundCounts { waited: p.waited_rounds, read_failed: p.read_failed_rounds }.after(c);
-                        (p.waited_rounds, p.read_failed_rounds) = (counts.waited, counts.read_failed);
+                        p.counts = p.counts.after(c);
                         p.terminal |= c.ends_the_rounds();
                     }
                 }
@@ -674,7 +669,7 @@ mod tests {
     }
 
     fn input(long: LegRead, short: LegRead) -> DecideInput<'static> {
-        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], waited_rounds: 0, read_failed_rounds: 0, attempts_sent: 0 }
+        DecideInput { symbol: "BTCUSDT", simulated: false, tolerance_pct: dec("1"), legs: [long, short], counts: RoundCounts::default(), attempts_sent: 0 }
     }
 
     fn unknown_reason(d: Decision) -> String {
@@ -834,7 +829,7 @@ mod tests {
             let mut long = read(Leg::Long, "100", "100", true);
             long.position = Err("exchange unreachable".into());
             let mut i = input(long, read(Leg::Short, "0", "0", true));
-            i.read_failed_rounds = earlier;
+            i.counts.read_failed = earlier;
             decide(&i)
         };
         assert!(matches!(failing(0), Decision::ReadFailed { .. }), "round 1");
@@ -858,7 +853,7 @@ mod tests {
                 long.position = Err("exchange unreachable".into());
                 input(long, read(Leg::Short, "0", "0", true))
             };
-            (i.waited_rounds, i.read_failed_rounds) = (counts.waited, counts.read_failed);
+            i.counts = counts;
             let d = decide(&i);
             if matches!(d, Decision::Unknown { .. }) {
                 concluded = Some(round);
@@ -888,7 +883,7 @@ mod tests {
                     }
                     _ => input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", true)), // the long leg is bare
                 };
-                (i.waited_rounds, i.read_failed_rounds, i.attempts_sent) = (counts.waited, counts.read_failed, attempts);
+                (i.counts, i.attempts_sent) = (counts, attempts);
                 let d = decide(&i);
                 rounds += 1;
                 match d {
@@ -922,14 +917,14 @@ mod tests {
         let d = decide(&input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", false)));
         assert_eq!(d, Decision::WaitForCancel);
         let mut i = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", false));
-        i.waited_rounds = 1;
+        i.counts.waited = 1;
         assert_eq!(decide(&i), Decision::WaitForCancel, "the second round still waits");
     }
 
     #[test]
     fn the_third_consecutive_unfinished_round_is_unknown() {
         let mut i = input(read(Leg::Long, "100", "100", true), read(Leg::Short, "0", "0", false));
-        i.waited_rounds = MAX_CANCEL_WAIT_ROUNDS - 1;
+        i.counts.waited = MAX_CANCEL_WAIT_ROUNDS - 1;
         let why = unknown_reason(decide(&i));
         assert!(why.contains("short") && why.contains("3"), "{why}");
     }
@@ -997,17 +992,17 @@ mod tests {
     #[test]
     fn without_any_record_the_first_round_is_due_when_the_grace_has_passed() {
         let p = progress_from_records(10_000, &[]);
-        assert_eq!((p.alert_since_ms, p.rounds, p.attempts_sent, p.waited_rounds, p.terminal, p.last_record_ms), (10_000, 0, 0, 0, false, None));
+        assert_eq!((p.alert_since_ms, p.rounds, p.attempts_sent, p.counts.waited, p.terminal, p.last_record_ms), (10_000, 0, 0, 0, false, None));
         assert_eq!(p.next_round_ms(), 15_000, "alert_since + 5 s");
     }
 
     #[test]
     fn consecutive_waits_are_counted_and_any_other_conclusion_resets_them() {
         let p = progress_from_records(10_000, &[round(15_000, "WAIT_FOR_CANCEL"), round(20_000, "WAIT_FOR_CANCEL")]);
-        assert_eq!((p.rounds, p.waited_rounds, p.terminal, p.last_record_ms), (2, 2, false, Some(20_000)));
+        assert_eq!((p.rounds, p.counts.waited, p.terminal, p.last_record_ms), (2, 2, false, Some(20_000)));
         assert_eq!(p.next_round_ms(), 25_000, "one interval after the newest record");
         let p = progress_from_records(10_000, &[round(15_000, "WAIT_FOR_CANCEL"), round(20_000, "FLATTEN"), round(30_000, "WAIT_FOR_CANCEL")]);
-        assert_eq!((p.rounds, p.waited_rounds), (3, 1), "the FLATTEN round in between broke the run");
+        assert_eq!((p.rounds, p.counts.waited), (3, 1), "the FLATTEN round in between broke the run");
     }
 
     #[test]
@@ -1022,15 +1017,15 @@ mod tests {
     #[test]
     fn read_failures_and_waits_are_counted_independently_and_only_a_flatten_round_resets_them() {
         let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "READ_FAILED")]);
-        assert_eq!((p.rounds, p.read_failed_rounds, p.waited_rounds, p.terminal), (2, 2, 0, false), "READ_FAILED alone does not end the rounds");
+        assert_eq!((p.rounds, p.counts.read_failed, p.counts.waited, p.terminal), (2, 2, 0, false), "READ_FAILED alone does not end the rounds");
         let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "WAIT_FOR_CANCEL"), round(25_000, "READ_FAILED")]);
-        assert_eq!((p.read_failed_rounds, p.waited_rounds), (2, 1), "review round 2 (B2): a wait in between does not clear the read failures");
+        assert_eq!((p.counts.read_failed, p.counts.waited), (2, 1), "review round 2 (B2): a wait in between does not clear the read failures");
         let p = progress_from_records(10_000, &[round(15_000, "WAIT_FOR_CANCEL"), round(20_000, "READ_FAILED"), round(25_000, "WAIT_FOR_CANCEL"), round(30_000, "READ_FAILED")]);
-        assert_eq!((p.waited_rounds, p.read_failed_rounds), (2, 2), "W,R,W,R: neither run is ever reset by the other");
+        assert_eq!((p.counts.waited, p.counts.read_failed), (2, 2), "W,R,W,R: neither run is ever reset by the other");
         let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "WAIT_FOR_CANCEL"), round(25_000, "FLATTEN")]);
-        assert_eq!((p.waited_rounds, p.read_failed_rounds), (0, 0), "a round that read everything and sent an order starts over");
+        assert_eq!((p.counts.waited, p.counts.read_failed), (0, 0), "a round that read everything and sent an order starts over");
         let p = progress_from_records(10_000, &[round(15_000, "READ_FAILED"), round(20_000, "READ_FAILED"), round(25_000, "UNKNOWN")]);
-        assert_eq!((p.read_failed_rounds, p.terminal), (0, true));
+        assert_eq!((p.counts.read_failed, p.terminal), (0, true));
         assert_eq!(Conclusion::parse("READ_FAILED"), Some(Conclusion::ReadFailed));
     }
 
@@ -1086,7 +1081,7 @@ mod tests {
         es.append(NAKED_LEG_WATCHDOG, Some("p2"), json!({ "kind": KIND_ROUND, "conclusion": "HEDGED" })).unwrap();
         let p = load_progress(&db, "p1", PairState::PartialFailure, 999_999).unwrap();
         assert_eq!(p.alert_since_ms, 60_000, "the newest transition into the state, not the first");
-        assert_eq!((p.rounds, p.waited_rounds, p.attempts_sent, p.terminal, p.last_record_ms), (1, 1, 1, false, Some(66_000)));
+        assert_eq!((p.rounds, p.counts.waited, p.attempts_sent, p.terminal, p.last_record_ms), (1, 1, 1, false, Some(66_000)));
     }
 
     #[test]

@@ -166,7 +166,7 @@ async fn a_pair_entering_an_alert_state_records_the_time_it_entered() {
     assert_eq!(actor.land(UUID, SystemEvent::TimeoutPartialFill, json!({})), Ok(PairState::PartialFailure));
     let w = watchdog_of(&actor, UUID).expect("the watchdog tracks the entry");
     assert_eq!((w.alert_since_ms, w.next_round_ms, w.state), (now, now + 5_000, PairState::PartialFailure));
-    assert_eq!((w.rounds, w.attempts_sent, w.waited_rounds, w.done), (0, 0, 0, false));
+    assert_eq!((w.rounds, w.attempts_sent, w.counts.waited, w.done), (0, 0, 0, false));
     // a manual close leaves the alert state: the progress goes with it
     assert_eq!(actor.land(UUID, ManualEvent::RequestClose, json!({})), Ok(PairState::Closing));
     assert!(watchdog_of(&actor, UUID).is_none());
@@ -222,7 +222,7 @@ async fn after_a_restart_what_the_watchdog_already_did_is_not_done_again() {
     let (mut second, _h2) = Actor::new(restarted(&rig, Arc::new(RecordingNotifier::default())));
     assert!(second.ensure_watchdog(UUID));
     let w = watchdog_of(&second, UUID).unwrap();
-    assert_eq!((w.rounds, w.attempts_sent, w.waited_rounds), (2, 1, 0), "only the watchdog's own flatten counts as an attempt");
+    assert_eq!((w.rounds, w.attempts_sent, w.counts.waited), (2, 1, 0), "only the watchdog's own flatten counts as an attempt");
     assert!(w.done, "an UNKNOWN conclusion stays final until the user acts: a restart must not retry it");
 }
 
@@ -868,8 +868,7 @@ async fn an_aborted_flatten_counts_as_an_attempt_survives_a_restart_and_three_of
             wd::LegRead { leg: Leg::Long, exchange: Exchange::Binance, position: Ok(dec("10")), recorded: Ok(dec("10")), orders_terminal: Ok(true) },
             wd::LegRead { leg: Leg::Short, exchange: Exchange::Bybit, position: Ok(dec("0")), recorded: Ok(dec("0")), orders_terminal: Ok(true) },
         ],
-        waited_rounds: 0,
-        read_failed_rounds: 0,
+        counts: wd::RoundCounts::default(),
         attempts_sent: 3,
     });
     assert!(matches!(d, wd::Decision::Unknown { .. }), "{d:?}");

@@ -937,7 +937,7 @@ async fn an_unknown_watchdog_conclusion_disarms_and_locks_a_live_engine() {
         // the third failed read in a row is the verdict (A7): the two before it are already counted
         let w = actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap();
         w.phase = naked_leg::Phase::Verifying;
-        w.read_failed_rounds = 2;
+        w.counts.read_failed = 2;
     }
     let probe = WatchdogProbe::unreadable([(Leg::Long, Exchange::Binance), (Leg::Short, Exchange::Bybit)], "exchange unreachable (scripted)");
     actor.on_event(Event::WatchdogProbed { pair: UUID.into(), entry_no, probe });
