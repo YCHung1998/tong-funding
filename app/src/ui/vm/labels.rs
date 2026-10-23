@@ -248,15 +248,15 @@ pub fn block_reason_label(raw: &str) -> String {
         let names = quoted(raw);
         return if names.is_empty() { "設定不完整".to_string() } else { format!("設定不完整：{}", names.join("、")) };
     }
-    if raw.starts_with("InvalidEntry {") {
-        if let Some(reason) = debug_reason(raw) {
-            return format!("進場快照無法使用：{reason}");
-        }
+    if raw.starts_with("InvalidEntry {")
+        && let Some(reason) = debug_reason(raw)
+    {
+        return format!("進場快照無法使用：{reason}");
     }
-    if raw.starts_with("DataMismatch {") {
-        if let Some(reason) = debug_reason(raw) {
-            return format!("報價資料與配對不符：{reason}");
-        }
+    if raw.starts_with("DataMismatch {")
+        && let Some(reason) = debug_reason(raw)
+    {
+        return format!("報價資料與配對不符：{reason}");
     }
     if raw.starts_with("Checks {") {
         let failed = failed_in_debug(raw);
