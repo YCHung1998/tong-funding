@@ -10,4 +10,4 @@
 
 ## 3. 驗證
 
-- [ ] 3.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate scanner-layout --strict` 通過
+- [x] 3.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate scanner-layout --strict` 通過

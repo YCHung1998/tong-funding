@@ -261,7 +261,7 @@ fn the_exchange_columns_fit_their_widest_cell_on_both_lines() {
         for c in &cells {
             assert!(need(&c.first_line()) <= col.width(), "{:?}: line 1 of {c:?} needs {} px", col, need(&c.first_line()));
             if let Some(l2) = c.second_line() {
-                assert!(need(&[l2.clone()]) <= col.width(), "{:?}: line 2 {l2:?} needs {} px", col, need(&[l2.clone()]));
+                assert!(need(std::slice::from_ref(&l2)) <= col.width(), "{:?}: line 2 {l2:?} needs {} px", col, need(std::slice::from_ref(&l2)));
             }
         }
     }
@@ -312,7 +312,9 @@ fn the_other_columns_fit_their_longest_fixed_texts() {
 #[test]
 fn rows_are_tall_enough_for_two_lines_of_cell_text() {
     // two lines of 10 px text at the line height of 1.6, and the cell's top and bottom padding
-    assert!(ROW_HEIGHT_PX >= 2.0 * CELL_FONT_PX * 1.6 + 8.0, "{ROW_HEIGHT_PX}");
+    const NEEDED: f32 = 2.0 * CELL_FONT_PX * 1.6 + 8.0;
+    let height = std::hint::black_box(ROW_HEIGHT_PX);
+    assert!(height >= NEEDED, "{height} < {NEEDED}");
 }
 
 #[test]
