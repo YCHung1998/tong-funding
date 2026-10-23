@@ -36,6 +36,9 @@ pub enum Field {
     /// live-guardrails 4.2b: Live only (never shown or parsed by a Demo page); blank = not set.
     LiveMaxLegNotionalUsdt,
     LiveMaxPairsPerArming,
+    /// loss-circuit-breaker: global only, with defaults (never blank).
+    LossBreakerMaxLossUsdt,
+    LossBreakerMaxConsecutiveLosses,
 }
 
 /// Which way a field tightens the risk gate. The source of truth is the conservative merge in
@@ -99,7 +102,7 @@ pub const STALE_NOTE: &str = "建議 3000 ms：送單前檢查用的是送單前
 
 /// Global Limits, Layer 1 and Net Edge fields, in page order. Funding Threshold, Max Concurrent
 /// Trades (legs), Hedge Threshold and a single Max Slippage do not exist.
-pub const GLOBAL_FIELDS: [Field; 15] = [
+pub const GLOBAL_FIELDS: [Field; 17] = [
     Field::MaxLeverage,
     Field::MaxPriceDriftPct,
     Field::StaleDataThresholdMs,
@@ -115,6 +118,8 @@ pub const GLOBAL_FIELDS: [Field; 15] = [
     Field::TakerFee(Exchange::Bybit),
     Field::TakerFee(Exchange::Okx),
     Field::EarlyExitMinMovePct,
+    Field::LossBreakerMaxLossUsdt,
+    Field::LossBreakerMaxConsecutiveLosses,
 ];
 
 /// The two caps a Live process must fill in (live-guardrails 4.2b); global only, not overridable.
@@ -159,6 +164,8 @@ impl Field {
             Field::EarlyExitMinMovePct => "early_exit_min_move_pct".into(),
             Field::LiveMaxLegNotionalUsdt => "live_max_leg_notional_usdt".into(),
             Field::LiveMaxPairsPerArming => "live_max_pairs_per_arming".into(),
+            Field::LossBreakerMaxLossUsdt => "loss_breaker_max_loss_usdt".into(),
+            Field::LossBreakerMaxConsecutiveLosses => "loss_breaker_max_consecutive_losses".into(),
         }
     }
 
@@ -179,6 +186,8 @@ impl Field {
             Field::EarlyExitMinMovePct => "提早平倉最小有利幅度（0 = 停用）",
             Field::LiveMaxLegNotionalUsdt => "每腿名目上限 USDT（Live，天花板 100）",
             Field::LiveMaxPairsPerArming => "每次武裝最多進場筆數（Live，天花板 5）",
+            Field::LossBreakerMaxLossUsdt => "熔斷：累計虧損上限",
+            Field::LossBreakerMaxConsecutiveLosses => "熔斷：連續虧損筆數上限",
         }
     }
 
@@ -188,8 +197,8 @@ impl Field {
             Field::StaleDataThresholdMs => "ms",
             Field::MaxConcurrentPairs => "pairs",
             Field::OrderTimeoutSeconds => "秒",
-            Field::Min24hVolumeUsdt | Field::LiveMaxLegNotionalUsdt => "USDT",
-            Field::LiveMaxPairsPerArming => "筆",
+            Field::Min24hVolumeUsdt | Field::LiveMaxLegNotionalUsdt | Field::LossBreakerMaxLossUsdt => "USDT",
+            Field::LiveMaxPairsPerArming | Field::LossBreakerMaxConsecutiveLosses => "筆",
             Field::MaxPriceDriftPct
             | Field::MaxLegImbalancePct
             | Field::MinExpectedNetPnlPct
@@ -204,7 +213,7 @@ impl Field {
     pub fn strictness(self) -> Strictness {
         match self {
             Field::NetEdgeThresholdPct | Field::MinExpectedNetPnlPct | Field::SafetyMarginPct | Field::EstSlippagePct | Field::Min24hVolumeUsdt | Field::EarlyExitMinMovePct => Strictness::HigherStricter,
-            Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => Strictness::LowerStricter,
+            Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming | Field::LossBreakerMaxLossUsdt | Field::LossBreakerMaxConsecutiveLosses => Strictness::LowerStricter,
             Field::TakerFee(_) => Strictness::Fact,
         }
     }
@@ -248,6 +257,16 @@ impl Field {
                 formula: None,
                 affects: &[Pretrade, Execution],
             },
+            Field::LossBreakerMaxLossUsdt => FieldHelp {
+                meaning: "熔斷：自最近一次開放交易（kill switch 關閉，Live 為武裝）起，已平倉配對的累計虧損達此 USDT 數，就自動打開 kill switch，只停止開新倉、平倉與進行中的配對照常；Live 同時解除武裝。每筆金額用 PnL 淨額，淨額未知時用價格損益扣兩邊手續費（暫計，不含資金費）；金額算不出來也會觸發。預設 15（新的 Live 資料庫預設 5），越低越嚴。",
+                formula: Some("區間內各筆金額加總 ≤ −上限 → 觸發；重新開放交易後重新計算"),
+                affects: &[Execution],
+            },
+            Field::LossBreakerMaxConsecutiveLosses => FieldHelp {
+                meaning: "熔斷：自最近一次開放交易起，結尾連續虧損（金額小於 0）的已平倉配對達此筆數，就自動打開 kill switch，只停止開新倉；獲利或持平的一筆會讓連虧歸零。預設 3（新的 Live 資料庫預設 2），越低越嚴。",
+                formula: Some("結尾連續虧損筆數 ≥ 上限 → 觸發"),
+                affects: &[Execution],
+            },
         }
     }
 
@@ -279,6 +298,8 @@ pub fn field_text(cfg: &RiskConfig, f: Field) -> String {
         Field::EarlyExitMinMovePct => dtext(cfg.early_exit_min_move_pct),
         Field::LiveMaxLegNotionalUsdt => cfg.live_max_leg_notional_usdt.map(dtext).unwrap_or_default(),
         Field::LiveMaxPairsPerArming => cfg.live_max_pairs_per_arming.map(|n| n.to_string()).unwrap_or_default(),
+        Field::LossBreakerMaxLossUsdt => dtext(cfg.loss_breaker_max_loss_usdt),
+        Field::LossBreakerMaxConsecutiveLosses => cfg.loss_breaker_max_consecutive_losses.to_string(),
     }
 }
 
@@ -361,7 +382,7 @@ fn override_value_of(o: &RiskOverride, f: Field) -> Option<String> {
         Field::NetEdgeThresholdPct => o.net_edge_threshold_pct.map(dtext),
         Field::EstSlippagePct => o.est_slippage_pct.map(dtext),
         Field::SafetyMarginPct => o.safety_margin_pct.map(dtext),
-        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => None,
+        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming | Field::LossBreakerMaxLossUsdt | Field::LossBreakerMaxConsecutiveLosses => None,
     }
 }
 
@@ -479,6 +500,11 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                     cfg.order_timeout_seconds = v;
                 }
             }
+            Field::LossBreakerMaxConsecutiveLosses => {
+                if let Some(v) = parse_int::<u32>(f, &text, &mut errors, "") {
+                    cfg.loss_breaker_max_consecutive_losses = v;
+                }
+            }
             _ => {
                 if let Some(v) = parse_dec(f, &text, &mut errors, "") {
                     match (f, v) {
@@ -489,6 +515,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                         (Field::MinExpectedNetPnlPct, Some(v)) => cfg.min_expected_net_pnl_pct = v,
                         (Field::SafetyMarginPct, Some(v)) => cfg.safety_margin_pct = v,
                         (Field::EarlyExitMinMovePct, Some(v)) => cfg.early_exit_min_move_pct = v,
+                        (Field::LossBreakerMaxLossUsdt, Some(v)) => cfg.loss_breaker_max_loss_usdt = v,
                         (Field::NetEdgeThresholdPct, v) => cfg.net_edge_threshold_pct = v,
                         (Field::EstSlippagePct, v) => cfg.est_slippage_pct = v,
                         (Field::TakerFee(e), Some(v)) => {
@@ -555,7 +582,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                     Field::NetEdgeThresholdPct => o.net_edge_threshold_pct = v,
                     Field::EstSlippagePct => o.est_slippage_pct = v,
                     Field::SafetyMarginPct => o.safety_margin_pct = v,
-                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => {}
+                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming | Field::LossBreakerMaxLossUsdt | Field::LossBreakerMaxConsecutiveLosses => {}
                 }
             }
         }
