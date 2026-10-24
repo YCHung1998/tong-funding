@@ -247,6 +247,23 @@ fn okx_is_alerted_like_the_other_exchanges_while_it_is_allowed_and_silent_when_i
 }
 
 #[test]
+fn an_unticked_okx_with_an_unfinished_pair_is_alerted_until_the_pair_is_finished() {
+    // the risk page lets OKX be unticked while a pair is open on it: its lost connection must still show
+    let mut s = healthy();
+    s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
+    s.settings.risk.allowed_exchanges = vec![Binance, Bybit];
+    s.pairs = vec![crate::ui::testkit::pair("p1", "ETHUSDT", Binance, Okx, PairState::Reconciled)];
+    let msgs: Vec<_> = alerts(&s, NOW).into_iter().map(|a| a.message).collect();
+    assert!(msgs.contains(&"OKX 帳戶未連線：Keychain 沒有 API key".to_string()), "{msgs:?}");
+    // a stored (not yet finished) record counts too, a finished one does not
+    s.pairs.clear();
+    s.pair_records = [("u1".to_string(), crate::ui::bridge::PairRecord { pair_id: "p1".into(), symbol: "ETHUSDT".into(), long_exchange: Some(Okx), short_exchange: Some(Bybit), status: "CLOSING".into() })].into();
+    assert!(alerts(&s, NOW).iter().any(|a| a.message.contains("OKX 帳戶未連線")));
+    s.pair_records.get_mut("u1").unwrap().status = "FINALIZED".into();
+    assert!(alerts(&s, NOW).iter().all(|a| !a.message.contains("OKX")));
+}
+
+#[test]
 fn an_account_the_system_cannot_use_by_its_setting_is_a_notice_not_a_disconnect() {
     // The OKX account is in spot mode (acctLv 1): not a lost connection, nothing the banner can fix.
     let mut s = healthy();
@@ -314,4 +331,57 @@ fn a_healthy_disabled_or_not_allowed_bybit_websocket_has_no_alert() {
 fn the_bybit_websocket_has_its_own_source_id_and_belongs_to_bybit() {
     assert_eq!(SourceId::BybitWs.label(), "Bybit WebSocket");
     assert_eq!(SourceId::BybitWs.exchange(), Bybit);
+}
+
+// ---- ui-clarity red-team E1 / E3 ----
+
+fn lost_connection(positions: Vec<crate::exchange::signed::models::Position>, ex: Exchange) -> AccountState {
+    // what the live source now keeps when a poll finds the account not connected
+    let mut a = loaded(vec![], positions, NOW - 5_000);
+    if let AccountState::Loaded { error, .. } = &mut a {
+        *error = Some((format!("{}Keychain 沒有 API key", crate::ui::bridge::NOT_CONNECTED_ERROR_PREFIX), NOW));
+    }
+    let _ = ex;
+    a
+}
+
+#[test]
+fn an_unticked_okx_that_held_a_position_keeps_its_alerts_after_it_turns_not_connected() {
+    let mut s = healthy();
+    s.settings.risk.allowed_exchanges = vec![Binance, Bybit];
+    s.accounts.insert(Okx, lost_connection(vec![crate::ui::testkit::position(Okx, "ETHUSDT", "-0.07", "1500", "1500", "3", "0", None)], Okx));
+    s.clocks.insert(Okx, ClockState::Unsynced);
+    let a = alerts(&s, NOW);
+    let disconnected = a.iter().find(|a| a.category == Category::Disconnected && a.source == SourceId::Account(Okx).label()).expect("a lost connection to an exchange holding a position");
+    assert_eq!(disconnected.message, "OKX 帳戶未連線：Keychain 沒有 API key");
+    assert!(a.iter().any(|a| a.message == "OKX 時鐘未校時"), "{a:?}");
+    // nothing held: unticked and quiet, so no alert (same as before)
+    s.accounts.insert(Okx, lost_connection(vec![], Okx));
+    assert!(alerts(&s, NOW).iter().all(|a| !a.message.contains("OKX")));
+}
+
+#[test]
+fn a_ticked_exchange_that_turns_not_connected_with_old_data_is_still_a_disconnect() {
+    let mut s = healthy();
+    s.accounts.insert(Bybit, lost_connection(vec![], Bybit));
+    let a = alerts(&s, NOW);
+    let d = a.iter().find(|a| a.category == Category::Disconnected && a.message.contains("Bybit 帳戶未連線")).expect("the banner must not go quiet");
+    assert_eq!(d.message, "Bybit 帳戶未連線：Keychain 沒有 API key");
+}
+
+#[test]
+fn a_live_process_never_alerts_about_okx_even_for_a_record_that_names_no_exchange() {
+    use crate::identity::ProcessIdentity::Live;
+    let mut s = healthy();
+    s.identity = Live;
+    s.settings.risk.allowed_exchanges = vec![Binance, Bybit];
+    s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
+    s.clocks.insert(Okx, ClockState::Unsynced);
+    // a stored unfinished pair that names no exchange could be on any of them, but Live trades two
+    s.pair_records = [("u1".to_string(), crate::ui::bridge::PairRecord { pair_id: "p1".into(), symbol: "ETHUSDT".into(), long_exchange: None, short_exchange: None, status: "RECONCILED".into() })].into();
+    let msgs: Vec<_> = alerts(&s, NOW).into_iter().map(|a| a.message).collect();
+    assert!(msgs.iter().all(|m| !m.contains("OKX")), "{msgs:?}");
+    // the same records in a Demo process still alert (OKX is tradable there)
+    s.identity = crate::identity::ProcessIdentity::Demo;
+    assert!(alerts(&s, NOW).iter().any(|a| a.message.contains("OKX 帳戶未連線")));
 }

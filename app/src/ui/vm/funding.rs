@@ -6,10 +6,11 @@
 use std::collections::BTreeMap;
 
 use serde_json::Value;
-use tong_funding_core::pnl::{CompareItem, Comparison, Component, FundingFetchState, PnlBreakdown, SlotState, match_slots};
+use tong_funding_core::pnl::{CompareItem, Comparison, Component, FundingFetchState, PnlBreakdown, PnlStatus, SlotState, match_slots};
+use tong_funding_core::risk::ExecutionMode;
 use tong_funding_core::types::{Decimal, Exchange, Side};
 
-use super::env_label::EnvLabel;
+use super::labels::{execution_mode_text, pnl_status_text};
 use super::format::{self, DASH};
 use crate::identity::ProcessIdentity;
 use crate::funding::pnl_record::{assemble, latest_pnl, pair_events};
@@ -18,7 +19,7 @@ use crate::store::db::Db;
 use crate::store::funding_ledger::FUNDING_LEDGER_CONFLICT;
 use crate::store::funding_slots::{ManualReason, Resolution, SlotRow, SlotState as TraceState};
 use crate::store::state::PairRow;
-use crate::ui::theme::{Tone, funding_tone};
+use crate::ui::theme::{Tone, pnl_tone};
 
 pub const SPREAD_NOTE: &str = "價差，未含 funding 與手續費";
 pub const NOT_INCLUDING_CLOSE: &str = "尚未包含平倉成本";
@@ -112,6 +113,11 @@ pub struct PairFunding {
     pub trace: Vec<SlotTrace>,
 }
 
+/// `NMRUSDT PnL 不完整（INCOMPLETE）：缺少結算流水；對帳差異`.
+pub fn incomplete_alert_text(symbol: &str, status: &str, reasons: &[String]) -> String {
+    format!("{symbol} PnL {}：{}", pnl_status_text(status), reasons.join("；"))
+}
+
 // ---- loading (read-only) ----------------------------------------------------------------------
 
 fn leg_funding(simulated: bool, held: bool, fetch: &FundingFetchState, amount: Decimal) -> LegFunding {
@@ -185,9 +191,9 @@ pub fn load_pair_funding(db: &Db, rows: &[PairRow], now_ms: i64) -> BTreeMap<Str
             alerts.push(FundingAlert { event_id: r.id, ts_ms: r.ts_ms, event_type: PNL_RECONCILIATION.into(), text: format!("{} 對帳 {result}", row.symbol) });
         }
         if let Some(p) = &pnl
-            && p.status != "COMPLETE"
+            && p.status != PnlStatus::Complete.as_str()
         {
-            alerts.push(FundingAlert { event_id: p.event_id, ts_ms: pnl_ts_ms.unwrap_or(now_ms), event_type: "PNL".into(), text: format!("{} PnL INCOMPLETE：{}", row.symbol, p.reasons.join("；")) });
+            alerts.push(FundingAlert { event_id: p.event_id, ts_ms: pnl_ts_ms.unwrap_or(now_ms), event_type: "PNL".into(), text: incomplete_alert_text(&row.symbol, &p.status, &p.reasons) });
         }
         if !a.simulated {
             let exchanges: Vec<Exchange> = a.input.legs.iter().filter(|l| !l.fills.is_empty()).map(|l| l.exchange).collect();
@@ -258,10 +264,10 @@ pub fn recheckable(f: &PairFunding) -> bool {
     f.trace.iter().any(|t| t.state != TraceState::Settled)
 }
 
-/// The "Funding 收到" cell: value and tone (theme's funding colour function), or "—" with a reason.
+/// The "Funding 收到" cell: value and tone (theme's profit-and-loss colour function (money, not a rate)), or "—" with a reason.
 pub fn leg_cell(f: Option<&LegFunding>) -> (String, Tone) {
     match f {
-        Some(LegFunding::Received(v)) => (format!("{} USDT", format::signed(*v, 2)), funding_tone(*v)),
+        Some(LegFunding::Received(v)) => (format!("{} USDT", format::signed(*v, 2)), pnl_tone(*v)),
         Some(LegFunding::Unavailable(why)) => (format!("{DASH}（{why}）"), Tone::Muted),
         Some(LegFunding::Simulated) => (SIMULATED_LABEL.to_string(), Tone::Muted),
         None => (format!("{DASH}（尚未取得）"), Tone::Muted),
@@ -287,7 +293,7 @@ pub fn pair_funding_text(f: &PairFunding) -> (String, Tone) {
         Some(total) => {
             let (l, _) = leg_cell(Some(&f.legs[0]));
             let (s, _) = leg_cell(Some(&f.legs[1]));
-            (format!("Funding 收到 {} USDT（{l} / {s}）{updated}", format::signed(total, 2)), funding_tone(total))
+            (format!("Funding 收到 {} USDT（{l} / {s}）{updated}", format::signed(total, 2)), pnl_tone(total))
         }
         None => {
             let why = f.legs.iter().find_map(|l| match l {
@@ -342,9 +348,9 @@ pub fn timeline_rows(f: &PairFunding) -> Vec<TimelineRow> {
                 Side::Short => "SHORT",
             };
             let (state, tone) = match s.state {
-                SlotState::Received => ("已收到".to_string(), s.amount.map_or(Tone::Muted, funding_tone)),
+                SlotState::Received => ("已收到".to_string(), s.amount.map_or(Tone::Muted, pnl_tone)),
                 SlotState::Pending => ("待結算".to_string(), Tone::Muted),
-                SlotState::Missing => ("缺少（PnL 為 INCOMPLETE）".to_string(), Tone::Warning),
+                SlotState::Missing => ("缺少（PnL 不完整）".to_string(), Tone::Warning),
             };
             if let Some(a) = s.amount {
                 cum += a;
@@ -388,12 +394,12 @@ fn money_or_dash(b: &PnlBreakdown, c: Component, v: Decimal) -> String {
 
 /// The "預期對實際" panel of a pair, `None` while no PnL exists.
 pub fn pnl_panel(f: &PairFunding, identity: ProcessIdentity) -> Option<PnlPanel> {
-    let mode = EnvLabel::of_pair(identity, f.simulated).env_name().to_string();
+    let mode = execution_mode_text(identity, if f.simulated { ExecutionMode::Simulation } else { ExecutionMode::ExchangeDemo });
     if f.simulated {
         return Some(PnlPanel { mode, status_line: Some(SIMULATED_NO_PNL.into()), lines: Vec::new(), safety_margin: None, settlement_note: None, breakdown: Vec::new() });
     }
     let p = f.pnl.as_ref()?;
-    let status_line = (p.status != "COMPLETE").then(|| format!("{} · {}", p.status, p.reasons.join("；")));
+    let status_line = (p.status != PnlStatus::Complete.as_str()).then(|| format!("{} · {}", pnl_status_text(&p.status), p.reasons.join("；")));
     let mut lines = Vec::new();
     let (mut safety_margin, mut settlement_note) = (None, None);
     match &p.comparison {

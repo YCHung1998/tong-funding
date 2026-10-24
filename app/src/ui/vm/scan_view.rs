@@ -3,11 +3,21 @@
 //! and the shell only wire it up. Sorting never changes `ScanRow.rank` (the default-order rank).
 
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::scanner::{Qualified, RateCell, RowsView, ScanRow, ScannerVm};
+
+/// Row height at 100% zoom: two lines of cell text (10 px, line height 1.6) plus the cell's top and
+/// bottom padding.
+pub const ROW_HEIGHT_PX: f32 = 44.0;
+
+/// Font size of the second line of a rate cell (the 8h equivalent), one step below the cell text, so
+/// the long `8h 等效 …（僅供顯示）` fits a narrow column.
+pub const RATE_NOTE_FONT_PX: f32 = 9.0;
+/// Font size of the table's header titles (what `Size::Medium` gave before the rows grew taller).
+pub const HEADER_FONT_PX: f32 = 14.0;
 
 /// The columns of the Funding Rate Matrix, in display order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -41,6 +51,15 @@ impl ScanColumn {
         ScanColumn::Qualified,
         ScanColumn::Add,
     ];
+
+    /// The rate column of `ex`.
+    pub fn for_exchange(ex: Exchange) -> ScanColumn {
+        match ex {
+            Exchange::Binance => ScanColumn::Binance,
+            Exchange::Bybit => ScanColumn::Bybit,
+            Exchange::Okx => ScanColumn::Okx,
+        }
+    }
 
     pub fn key(self) -> &'static str {
         match self {
@@ -76,18 +95,21 @@ impl ScanColumn {
         }
     }
 
+    /// Width in px at 100% zoom. Each is the widest content the column draws plus the cell padding
+    /// (the width model in `scan_view_tests` keeps them in step with the texts), so nothing is
+    /// cut off or runs into the next column (scanner-layout).
     pub fn width(self) -> f32 {
         match self {
             ScanColumn::Rank => 50.0,
-            ScanColumn::Symbol => 120.0,
+            ScanColumn::Symbol => 132.0,
             ScanColumn::Coverage => 50.0,
-            ScanColumn::Countdown => 110.0,
-            ScanColumn::Binance | ScanColumn::Bybit | ScanColumn::Okx => 150.0,
-            ScanColumn::Direction => 160.0,
+            ScanColumn::Countdown => 88.0,
+            ScanColumn::Binance | ScanColumn::Bybit | ScanColumn::Okx => 160.0,
+            ScanColumn::Direction => 100.0,
             ScanColumn::Gross => 120.0,
-            ScanColumn::NetEdge => 200.0,
-            ScanColumn::Qualified => 60.0,
-            ScanColumn::Add => 130.0,
+            ScanColumn::NetEdge => 164.0,
+            ScanColumn::Qualified => 70.0,
+            ScanColumn::Add => 120.0,
         }
     }
 
@@ -107,34 +129,46 @@ impl ScanColumn {
     }
 }
 
-/// Which columns the user hid (session only, spec: not persisted).
+/// Which columns are shown (session only, spec: not persisted). A column's visibility is the user's
+/// explicit choice when there is one, otherwise a default: shown, except the rate column of an
+/// exchange that is not in `allowed_exchanges` (scanner-layout).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ColumnVisibility {
-    hidden: BTreeSet<ScanColumn>,
+    /// What the user clicked: `true` = shown, `false` = hidden.
+    choice: BTreeMap<ScanColumn, bool>,
+    /// Columns hidden by default because their exchange is not enabled.
+    disabled: BTreeSet<ScanColumn>,
 }
 
 impl ColumnVisibility {
+    /// Tells which exchanges are not enabled (the shell calls this on every recompute). Only the
+    /// default changes; the user's explicit choices stay.
+    pub fn set_disabled_exchanges(&mut self, exchanges: &[Exchange]) {
+        self.disabled = exchanges.iter().map(|e| ScanColumn::for_exchange(*e)).collect();
+    }
+
     /// Returns whether anything changed (`Symbol` never changes).
     pub fn toggle(&mut self, col: ScanColumn) -> bool {
         if !col.hideable() {
             return false;
         }
-        if !self.hidden.remove(&col) {
-            self.hidden.insert(col);
-        }
+        let now = self.is_visible(col);
+        self.choice.insert(col, !now);
         true
     }
 
+    /// Shows all twelve columns (spec scanner-table-controls), including a disabled exchange's.
     pub fn reset(&mut self) {
-        self.hidden.clear();
+        self.choice.clear();
+        self.choice.extend(self.disabled.iter().map(|c| (*c, true)));
     }
 
     pub fn is_visible(&self, col: ScanColumn) -> bool {
-        !self.hidden.contains(&col)
+        !col.hideable() || self.choice.get(&col).copied().unwrap_or(!self.disabled.contains(&col))
     }
 
     pub fn is_all_visible(&self) -> bool {
-        self.hidden.is_empty()
+        ScanColumn::ALL.iter().all(|c| self.is_visible(*c))
     }
 
     /// The shown columns in display order.

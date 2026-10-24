@@ -13,6 +13,7 @@ use std::collections::BTreeSet;
 
 use serde_json::Value;
 use tong_funding_core::pair::PairState;
+use tong_funding_core::pnl::{Component, PnlStatus};
 use tong_funding_core::risk::{effective_for_pair, ExecutionMode, TriggerMode};
 use tong_funding_core::trade_cost::{estimate_cost, CostEstimate, CostInput};
 use tong_funding_core::types::{Decimal, Exchange};
@@ -22,6 +23,8 @@ use super::contract_settings::{pair_quantity, QuoteCell};
 use super::leverage_cap::{self, CapCheck};
 use super::positions::{spread_view, SpreadView};
 use super::engine_view::{blocker_text, refusing_blockers};
+use super::disabled::{self, DisabledStatus};
+use super::labels::{block_reason_label, execution_mode_text, failed_checks_text, pair_state_label, pair_state_plain, pair_state_text, plain_error, trigger_mode_text, DisabledNote, DISABLED_WITH_EXPOSURE};
 use super::env_label::{ConfirmKind, EnvLabel};
 use super::risk_settings::missing_display;
 use super::theme::Tone;
@@ -144,7 +147,7 @@ impl DisabledReason {
             DisabledReason::ConfigIncomplete(m) => format!("設定不完整：{}", m.join("、")),
             DisabledReason::KillSwitchOn => "緊急停止中".into(),
             DisabledReason::Halted(r) => r.clone(),
-            DisabledReason::NotPrepared(s) => format!("已不是 PREPARED：{}", s.join("、")),
+            DisabledReason::NotPrepared(s) => format!("已不是「{}」狀態：{}", pair_state_plain(PairState::Prepared), s.join("、")),
             DisabledReason::EngineUnavailable => "引擎未啟動".into(),
         }
     }
@@ -219,6 +222,27 @@ pub struct AttemptLeg {
     pub order_id_text: String,
 }
 
+impl AttemptLeg {
+    /// `long · Binance · BUY · 成功`: the primary text of a leg (the order id is secondary, see [`order_text`](Self::order_text)).
+    pub fn summary(&self) -> String {
+        let side = match self.side {
+            OrderSide::Buy => "BUY",
+            OrderSide::Sell => "SELL",
+        };
+        format!("{} · {} · {side} · {}", self.leg, self.exchange, self.status.text())
+    }
+
+    /// `訂單 8389765` (a simulated leg: `訂單 模擬 · <client id>`); `None` when no order was sent.
+    pub fn order_text(&self) -> Option<String> {
+        (self.order_id_text != NO_ORDER).then(|| format!("訂單 {}", self.order_id_text))
+    }
+}
+
+const NO_ORDER: &str = "—";
+/// Shown where neither the engine, the store nor an order event names the symbol / an exchange: never blank.
+pub const UNKNOWN_SYMBOL: &str = "（幣種未知）";
+pub const UNKNOWN_EXCHANGE: &str = "（交易所未知）";
+
 /// The latest entry attempt of one pair, rebuilt from stored events (survives restarts).
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttemptView {
@@ -226,17 +250,22 @@ pub struct AttemptView {
     pub symbol: String,
     pub at: i64,
     pub simulated: bool,
-    pub mode_label: &'static str,
+    pub mode_text: String,
     pub legs: Vec<AttemptLeg>,
     pub state: String,
+    pub state_text: String,
     pub failed_checks: Vec<String>,
+    pub block_reason: Option<String>,
     pub needs_manual: bool,
+    pub when: String,
     pub headline: String,
     /// naked-leg-watchdog: the ONE exception to "never suggest the system repaired anything" (spec
     /// staged-orders-page): when the watchdog really sent and finished the flatten of the bare leg, the
     /// result says what the system did (leg, exchange, quantity) and still asks for the confirmation.
     /// Empty in every other case.
     pub watchdog: Vec<String>,
+    pub codes: String,
+    pub net_pnl: Option<String>,
 }
 
 /// A leg to close by hand (reduce-only; quantity = the account's actual position).
@@ -271,6 +300,11 @@ pub struct ManualHandling {
 }
 
 impl ManualHandling {
+    /// `BTCUSDT · 單腿失敗（PARTIAL_FAILURE） · Demo 帳戶（EXCHANGE_DEMO）`.
+    pub fn heading(&self) -> String {
+        format!("{} · {} · {}", self.symbol, pair_state_text(self.state.as_str()), execution_mode_text(self.env.identity, self.env.mode))
+    }
+
     /// The only two actions: the page offers no repair and no automatic flatten (what the engine's
     /// watchdog did is shown in `watchdog`, not triggered from here).
     pub fn actions(&self) -> [&'static str; 2] {
@@ -337,20 +371,26 @@ pub struct StagedVm {
     pub mode: Option<ExecutionMode>,
     pub identity: crate::identity::ProcessIdentity,
     pub trigger_mode: Option<TriggerMode>,
-    /// Binance / Bybit available margin text (never 0 for unknown).
+    /// Available margin text of each ENABLED exchange (never 0 for unknown).
     pub margins: Vec<(Exchange, String)>,
+    /// Exchanges the risk settings left unticked: one muted line each, their margin text behind it.
+    pub disabled_exchanges: Vec<DisabledNote>,
     pub last_results: Vec<AttemptView>,
     pub manual: Vec<ManualHandling>,
     pub running: Vec<RunningRow>,
 }
 
 impl StagedVm {
-    pub fn mode_label(&self) -> &'static str {
-        match self.mode {
-            Some(m) => EnvLabel::of(self.identity, m).env_name(),
-            None => "未知",
-        }
+    /// The execution world in plain words with the code after it (`Demo 帳戶（EXCHANGE_DEMO）`).
+    pub fn mode_text(&self) -> String {
+        self.mode.map_or_else(|| "未知".to_string(), |m| execution_mode_text(self.identity, m))
     }
+
+    /// The trigger mode in plain words with the code after it (`自動（AUTO）`).
+    pub fn trigger_text(&self) -> String {
+        self.trigger_mode.map_or_else(|| "未知".to_string(), trigger_mode_text)
+    }
+
 }
 
 fn dec_of(v: &Value, k: &str) -> Option<Decimal> {
@@ -469,7 +509,7 @@ fn row_of(snap: &UiSnapshot, p: &PairView, selection: &BTreeSet<String>, now_ms:
     let cap = notional.zip(leverage).map(|(n, l)| leverage_cap::check(snap, p.long_exchange, p.short_exchange, &p.symbol, n, l, now_ms));
     let mode = snap.engine.as_ref().map(|e| e.execution_mode);
     let selectable = if p.state != PairState::Prepared {
-        Err(format!("狀態 {}", p.state))
+        Err(format!("狀態 {}", pair_state_text(p.state.as_str())))
     } else if matches!(long_qty, QuoteCell::BelowMinimum) || matches!(short_qty, QuoteCell::BelowMinimum) {
         Err("低於最小下單量".into())
     } else if let Some(why) = cap.as_ref().and_then(|c| c.blocked_reason(mode)) {
@@ -512,7 +552,7 @@ fn margin_text(acc: Option<&LegAccount>) -> String {
         None => "未知（尚未查詢）".into(),
         Some(a) => match &a.available_margin {
             Ok(m) => format!("{} USDT", super::format::money(*m, 2)),
-            Err(e) => format!("未知（{e}）"),
+            Err(e) => format!("未知（{}）", plain_error(e)),
         },
     }
 }
@@ -561,7 +601,25 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         }
     }
 
-    let margins = tradable_exchanges(snap.identity).iter().map(|ex| (*ex, margin_text(snap.leg_accounts.get(&(false, *ex))))).collect();
+    // ui-plain-language: an exchange the risk settings left unticked has no margin line, only its muted line.
+    let (mut margins, mut disabled_exchanges) = (Vec::new(), Vec::new());
+    for ex in tradable_exchanges(snap.identity).iter().copied() {
+        let text = margin_text(snap.leg_accounts.get(&(false, ex)));
+        if snap.exchange_enabled(ex) {
+            margins.push((ex, text));
+            continue;
+        }
+        // a line only when its positions are confirmed to be nothing or cannot be confirmed; an
+        // exchange with exposure keeps its margin row, with the note
+        match disabled::status(snap, ex, now_ms) {
+            DisabledStatus::Exposed => margins.push((ex, format!("{text} · {DISABLED_WITH_EXPOSURE}"))),
+            DisabledStatus::Unconfirmed { reason } => disabled_exchanges.push(DisabledNote::unconfirmed(ex, &reason, Some(format!("可用保證金：{text}")))),
+            DisabledStatus::Quiet => {
+                let age = disabled::read_age_note(snap, ex, now_ms).map(|a| format!(" · {a}")).unwrap_or_default();
+                disabled_exchanges.push(DisabledNote::new(ex, Some(format!("可用保證金：{text}{age}"))));
+            }
+        }
+    }
     let manual = pairs.iter().filter(|p| is_alert(p.state)).map(|p| handling(snap, p, now_ms)).collect();
     let exit_delay = EngineTimings::default().exit_delay_ms;
     let trigger_mode = engine.map(|e| e.trigger_mode);
@@ -588,10 +646,21 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         identity: snap.identity,
         trigger_mode,
         margins,
+        disabled_exchanges,
         last_results: last_results(snap, 5),
         manual,
         running,
     }
+}
+
+/// `已排除（已不是「已暫存」狀態）：BTCUSDT`: pairs that left PREPARED while the confirmation was open.
+pub fn excluded_note(symbols: &[String]) -> String {
+    format!("已排除（已不是「{}」狀態）：{}", pair_state_plain(PairState::Prepared), symbols.join("、"))
+}
+
+/// `進行中（持倉中）`: the title of the RECONCILED block.
+pub fn running_title() -> String {
+    format!("進行中（{}）", pair_state_plain(PairState::Reconciled))
 }
 
 /// "全選": every selectable row.
@@ -781,9 +850,29 @@ fn str_of<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(Value::as_str)
 }
 
+/// `淨損益 +1.23 USDT` of a finished (FINALIZED) real pair: the net of its newest PnL event
+/// (`breakdown.total.net`). `—` when that net cannot be computed, `（PnL 不完整）` when the PnL is
+/// INCOMPLETE; `None` when there is no PnL (not finished, simulated, not computed yet).
+fn net_pnl_text(snap: &UiSnapshot, pair_id: Option<&str>, state: &str) -> Option<String> {
+    if state != PairState::Finalized.as_str() {
+        return None;
+    }
+    let f = snap.funding.get(pair_id?)?;
+    if f.simulated {
+        return None;
+    }
+    let p = f.pnl.as_ref()?;
+    let b = p.breakdown.as_ref()?;
+    let note = if p.status == PnlStatus::Complete.as_str() { "" } else { "（PnL 不完整）" };
+    let net = if b.missing.contains(&Component::Net) { super::format::DASH.to_string() } else { format!("{} USDT", super::format::signed(b.total.net, 2)) };
+    Some(format!("淨損益 {net}{note}"))
+}
+
 /// The latest entry attempt of up to `limit` pairs, newest first. An attempt starts at the
 /// pair's PREPARED → PRE_TRADE_CHECK transition; legs come from its `ORDER_SUBMITTED` (open)
-/// events; the state is the pair's latest transition. Never says "rolled back".
+/// events; the state is the pair's latest transition. Never says "rolled back". The symbol and the
+/// exchanges come from the pair (the engine's view, else the stored pair), so an attempt of a pair
+/// the engine no longer holds is not blank; a BLOCKED attempt carries the reason from its transition.
 pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
     let mut events: Vec<&StoredEvent> = snap.trade_events.iter().collect();
     events.sort_by_key(|e| (e.ts_ms, e.id));
@@ -804,12 +893,18 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
         .map(|(pair, ts, id, simulated)| {
             let after = events.iter().filter(|e| e.pair_id.as_deref() == Some(pair) && (e.ts_ms, e.id) >= (ts, id));
             let view = snap.engine.as_ref().and_then(|e| e.pair(pair));
-            let mut symbol = view.map(|v| v.symbol.clone()).unwrap_or_default();
-            let mut state = view.map(|v| v.state.to_string());
+            let record = snap.pair_records.get(pair);
+            let pair_id = view.map(|v| v.pair_id.clone()).or_else(|| record.map(|r| r.pair_id.clone()));
+            let mut symbol = view.map(|v| v.symbol.clone()).or_else(|| record.map(|r| r.symbol.clone())).filter(|s| !s.is_empty());
+            let mut state = view.map(|v| v.state.to_string()).or_else(|| record.map(|r| r.status.clone()));
+            let exchange_of = |leg: usize| {
+                view.map(|v| [v.long_exchange, v.short_exchange][leg]).or_else(|| record.and_then(|r| [r.long_exchange, r.short_exchange][leg])).map(|e| e.name().to_string()).unwrap_or_default()
+            };
             let mut failed_checks = Vec::new();
+            let mut block_reason = None;
             let mut legs: Vec<AttemptLeg> = vec![
-                AttemptLeg { leg: "long", exchange: view.map(|v| v.long_exchange.name().to_string()).unwrap_or_default(), side: OrderSide::Buy, status: LegStatus::NotSent, order_id_text: "—".into() },
-                AttemptLeg { leg: "short", exchange: view.map(|v| v.short_exchange.name().to_string()).unwrap_or_default(), side: OrderSide::Sell, status: LegStatus::NotSent, order_id_text: "—".into() },
+                AttemptLeg { leg: "long", exchange: exchange_of(0), side: OrderSide::Buy, status: LegStatus::NotSent, order_id_text: NO_ORDER.into() },
+                AttemptLeg { leg: "short", exchange: exchange_of(1), side: OrderSide::Sell, status: LegStatus::NotSent, order_id_text: NO_ORDER.into() },
             ];
             let mut last_to = None;
             for e in after {
@@ -819,10 +914,13 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
                     if let Some(list) = p.pointer("/detail/failed_checks").and_then(Value::as_array) {
                         failed_checks = list.iter().filter_map(Value::as_str).map(str::to_string).collect();
                     }
+                    if str_of(&p, "to") == Some(PairState::Blocked.as_str()) {
+                        block_reason = p.pointer("/detail/block").or_else(|| p.pointer("/detail/reason")).and_then(Value::as_str).map(str::to_string);
+                    }
                 } else if e.event_type == crate::engine::actor::ORDER_SUBMITTED && str_of(&p, "action") == Some("open") {
                     let idx = if str_of(&p, "leg") == Some("short") { 1 } else { 0 };
                     if let Some(s) = str_of(&p, "symbol") {
-                        symbol = s.to_string();
+                        symbol = Some(s.to_string());
                     }
                     if let Some(x) = str_of(&p, "exchange") {
                         legs[idx].exchange = x.to_string();
@@ -845,16 +943,35 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
                 state = last_to;
             }
             let state = state.unwrap_or_else(|| "未知".into());
+            let symbol = symbol.unwrap_or_else(|| UNKNOWN_SYMBOL.to_string());
+            for l in &mut legs {
+                if l.exchange.is_empty() {
+                    l.exchange = UNKNOWN_EXCHANGE.to_string();
+                }
+            }
             let alert_state = matches!(state.as_str(), "PARTIAL_FAILURE" | "IMBALANCED" | "UNRESOLVED");
             let leg_failed = legs.iter().any(|l| matches!(l.status, LegStatus::Rejected(_) | LegStatus::Unknown(_)));
             let needs_manual = alert_state || leg_failed;
-            let mode_label = EnvLabel::of_pair(snap.identity, simulated).env_name();
-            let headline = if needs_manual {
-                format!("{mode_label} · {symbol} · 需人工處理（目前狀態 {state}）")
-            } else if !failed_checks.is_empty() {
-                format!("{mode_label} · {symbol} · 送單前檢查未通過：{}", failed_checks.join("、"))
+            let mode_text = execution_mode_text(snap.identity, if simulated { ExecutionMode::Simulation } else { ExecutionMode::ExchangeDemo });
+            let state_text = pair_state_label(&state);
+            let net_pnl = net_pnl_text(snap, pair_id.as_deref(), &state);
+            let when = format!("{} UTC", super::format::utc_md_hms(ts));
+            let is_blocked = state == PairState::Blocked.as_str() || !failed_checks.is_empty();
+            let mut result = if needs_manual {
+                format!("需人工處理（目前狀態：{state_text}）")
+            } else if is_blocked {
+                // every failed check by plain name; else the engine's own reason in plain words; else just the result
+                let why = if !failed_checks.is_empty() {
+                    Some(failed_checks_text(&failed_checks))
+                } else {
+                    block_reason.as_deref().map(block_reason_label)
+                };
+                match why {
+                    Some(w) => format!("{}：{w}", pair_state_plain(PairState::Blocked)),
+                    None => pair_state_plain(PairState::Blocked).to_string(),
+                }
             } else {
-                format!("{mode_label} · {symbol} · 狀態 {state}")
+                state_text.clone()
             };
             // the exception of the spec: only a flatten the watchdog really finished is written down here
             let watchdog = view
@@ -865,7 +982,20 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
                     _ => Vec::new(),
                 })
                 .unwrap_or_default();
-            AttemptView { uuid: pair.to_string(), symbol, at: ts, simulated, mode_label, legs, state, failed_checks, needs_manual, headline, watchdog }
+            if let Some(n) = &net_pnl {
+                result = format!("{result} · {n}");
+            }
+            // a real-money process names its world on the headline itself (live-banners); the others keep
+            // it on the secondary line
+            if snap.identity.is_live() {
+                result = format!("{result} · {mode_text}");
+            }
+            let headline = format!("{when} · {symbol} · {result}");
+            let mut codes = vec![format!("環境 {mode_text}"), format!("狀態碼 {state}")];
+            if let Some(raw) = &block_reason {
+                codes.push(format!("原始訊息 {raw}"));
+            }
+            AttemptView { uuid: pair.to_string(), symbol, at: ts, simulated, mode_text, legs, state, state_text, failed_checks, block_reason, needs_manual, when, headline, watchdog, codes: codes.join(" · "), net_pnl }
         })
         .collect()
 }

@@ -50,6 +50,8 @@ pub mod staged_orders;
 pub mod status_bar;
 #[path = "vm/dashboard.rs"]
 pub mod dashboard;
+#[path = "vm/disabled.rs"]
+pub mod disabled;
 #[path = "vm/env_label.rs"]
 pub mod env_label;
 #[path = "vm/engine_view.rs"]
@@ -58,6 +60,8 @@ pub mod engine_view;
 pub mod format;
 #[path = "vm/funding.rs"]
 pub mod funding;
+#[path = "vm/labels.rs"]
+pub mod labels;
 #[path = "vm/positions.rs"]
 pub mod positions;
 #[path = "vm/scan_view.rs"]
@@ -74,6 +78,8 @@ pub mod zoom;
 #[path = "vm/testkit.rs"]
 mod testkit;
 
+#[cfg(test)]
+mod plain_language_ui_tests;
 #[cfg(test)]
 mod risk_help_ui_tests;
 #[cfg(test)]

@@ -8,7 +8,7 @@ use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, Entity, Pixels, ScrollDelta, SharedString, TestAppContext, WindowHandle, base::Root, point, px, size};
 use tong_funding_core::types::Exchange;
 
-use super::bridge::{CommandSink, ReadOnlyDataSource, RefreshRequest, SourceUpdate};
+use super::bridge::{CommandSink, ReadOnlyDataSource, RefreshRequest, Settings, SourceUpdate};
 use super::nav::Page;
 use super::scan_view::{ScanColumn, SortDir, SortState};
 use super::shell::Shell;
@@ -43,10 +43,14 @@ fn wall_ms() -> i64 {
 
 /// Four symbols; default order (gross spread, settings incomplete) is DDD, BBB, CCC, AAA.
 fn feed() -> Vec<SourceUpdate> {
+    feed_with(complete_settings("0.01"))
+}
+
+fn feed_with(settings: Settings) -> Vec<SourceUpdate> {
     let now = wall_ms();
     let next = now + 4 * 3_600_000;
     let rates = [("AAAUSDT", "0.0001", "0.0000"), ("BBBUSDT", "0.0008", "-0.0002"), ("CCCUSDT", "0.0003", "-0.0001"), ("DDDUSDT", "0.0020", "-0.0010")];
-    let mut v = vec![SourceUpdate::Settings(complete_settings("0.01"))];
+    let mut v = vec![SourceUpdate::Settings(settings)];
     for (e, idx) in [(Exchange::Binance, 1), (Exchange::Bybit, 2)] {
         let observations = rates.iter().map(|r| obs(e, r.0, if idx == 1 { r.1 } else { r.2 }, 28_800, next, now)).collect();
         v.push(SourceUpdate::Market { exchange: e, observations, at: now });
@@ -68,11 +72,15 @@ fn open(cx: &mut TestAppContext) -> Rig {
 }
 
 fn open_sized(cx: &mut TestAppContext, width: f32) -> Rig {
+    open_with(cx, width, feed())
+}
+
+fn open_with(cx: &mut TestAppContext, width: f32, updates: Vec<SourceUpdate>) -> Rig {
     cx.update(|cx| {
         gpui_kit::init(cx);
         super::component_theme::apply(cx);
     });
-    let source: Arc<dyn ReadOnlyDataSource> = Arc::new(FakeSource(Mutex::new(feed())));
+    let source: Arc<dyn ReadOnlyDataSource> = Arc::new(FakeSource(Mutex::new(updates)));
     let sink: Arc<dyn CommandSink> = Arc::new(NullSink);
     let (window, shell) = cx.update(|cx| {
         let (w, shell) = gpui_kit::open_window(
@@ -346,7 +354,9 @@ fn scrolling_brings_the_last_column_into_view(cx: &mut TestAppContext) {
             let drawn: Vec<usize> = (0..12usize).filter(|i| window.try_find(("scan-th", *i)).is_some()).collect();
             // Rank and Symbol (0, 1) are fixed on the left: they stay drawn while the others scroll away.
             assert!(drawn.contains(&0) && drawn.contains(&1), "fixed columns must stay drawn: {drawn:?}");
-            let target = *drawn.iter().find(|i| **i >= 2).expect("some scrolling header is drawn");
+            // a header fully inside the window (a drawn one can be clipped away and cannot take the wheel)
+            let inside = |i: &usize| window.try_find(("scan-th", *i)).is_some_and(|e| e.visible());
+            let target = *drawn.iter().find(|i| **i >= 2 && inside(i)).expect("a scrolling header is drawn inside the window");
             window.scroll(("scan-th", target), ScrollDelta::Pixels(point(px(-400.), px(0.))), cx);
         })
         .unwrap();
@@ -354,4 +364,191 @@ fn scrolling_brings_the_last_column_into_view(cx: &mut TestAppContext) {
     }
     let after = last(&rig, cx).expect("after scrolling the last column is drawn");
     assert!(after <= px(NARROW) + px(0.5), "and it is fully inside the window: {after:?}");
+}
+
+// ---- scanner-layout 2.1: an exchange that is not enabled starts hidden --------------------------
+
+/// Complete settings with only Binance and Bybit ticked.
+fn okx_unticked() -> Settings {
+    let mut s = complete_settings("0.01");
+    s.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+    s
+}
+
+fn without_okx() -> Vec<ScanColumn> {
+    ScanColumn::ALL.into_iter().filter(|c| *c != ScanColumn::Okx).collect()
+}
+
+#[gpui_kit::test]
+fn the_okx_column_starts_hidden_when_okx_is_not_ticked_and_the_order_is_unchanged(cx: &mut TestAppContext) {
+    let rig = open_with(cx, WIDE, feed_with(okx_unticked()));
+    assert_eq!(rig.view(cx).0, without_okx());
+    // its button is still there so the user can show it
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.find(("col-chip", idx(ScanColumn::Okx)));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn showing_the_okx_column_by_hand_is_kept_through_refreshes_and_page_changes(cx: &mut TestAppContext) {
+    let rig = open_with(cx, WIDE, feed_with(okx_unticked()));
+    rig.click(("col-chip", idx(ScanColumn::Okx)), cx);
+    assert_eq!(rig.view(cx).0, ScanColumn::ALL, "shown at its place");
+    rig.settle(cx);
+    rig.goto(Page::Overview, cx);
+    rig.goto(Page::Scanner, cx);
+    assert_eq!(rig.view(cx).0, ScanColumn::ALL, "the manual choice is not overwritten by the default");
+    rig.click(("col-chip", idx(ScanColumn::Okx)), cx);
+    assert_eq!(rig.view(cx).0, without_okx(), "and it can be hidden again");
+}
+
+#[gpui_kit::test]
+fn every_column_shows_when_every_exchange_is_ticked(cx: &mut TestAppContext) {
+    assert_eq!(open(cx).view(cx).0, ScanColumn::ALL);
+}
+
+// ---- scanner-layout 2.2: the default window shows the main actions and nothing is cut or overlapped ----
+
+/// The window of the screenshot that prompted scanner-layout: 3164 x 2070 physical px on a 2x
+/// Retina display = about 1,470 logical px including the border, zoom 100%. The table gets about
+/// 1,220 of it (side bar and margins take 248).
+const DEFAULT_WIDTH: f32 = 1470.0;
+
+/// Like `feed_with`, but every Binance rate is a 4 h rate against Bybit's 8 h: each row shows the
+/// interval difference, the 8 h equivalent on Binance, and (when core classifies it) the kind tag.
+fn mixed_interval_feed(settings: Settings) -> Vec<SourceUpdate> {
+    let mut v = feed_with(settings);
+    for u in &mut v {
+        if let SourceUpdate::Market { exchange: Exchange::Binance, observations, .. } = u {
+            for o in observations.iter_mut() {
+                o.funding_interval_secs = Some(14_400);
+            }
+        }
+    }
+    v
+}
+
+fn all_ticked() -> Settings {
+    complete_settings("0.01")
+}
+
+/// Bounds of a column header by logical column (None = not drawn: scrolled out of the table).
+fn header(rig: &Rig, c: ScanColumn, cx: &mut TestAppContext) -> Option<gpui_kit::Bounds<Pixels>> {
+    let at = rig.view(cx).0.iter().position(|x| *x == c)?;
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(("col-header", at)).map(|e| e.bounds())
+    })
+    .unwrap()
+}
+
+fn bounds_of(rig: &Rig, id: impl Into<gpui_kit::ElementId>, cx: &mut TestAppContext) -> gpui_kit::Bounds<Pixels> {
+    let id = id.into();
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.find(id).bounds()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn at_the_default_width_the_qualified_and_add_columns_are_in_view_without_scrolling(cx: &mut TestAppContext) {
+    // Spec scanner-layout: with OKX unticked. (All three exchanges need about 1,360 px and scroll.)
+    {
+        let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(okx_unticked()));
+        for c in [ScanColumn::Qualified, ScanColumn::Add] {
+            let b = header(&rig, c, cx).unwrap_or_else(|| panic!("{c:?} is not drawn: it is scrolled out of the table"));
+            assert!(b.right() <= px(DEFAULT_WIDTH), "{c:?} ends at {:?}, past the {DEFAULT_WIDTH} px window", b.right());
+            assert!(b.size.width >= px(c.width() - 1.0), "{c:?} is cut to {:?}", b.size.width);
+        }
+        let table = bounds_of(&rig, "scan-table", cx);
+        let add = header(&rig, ScanColumn::Add, cx).unwrap();
+        assert!(add.right() <= table.right(), "inside the table, so no horizontal scroll is needed: {:?} vs {:?}", add.right(), table.right());
+    }
+}
+
+#[gpui_kit::test]
+fn a_rate_cell_is_two_stacked_lines_inside_its_column_and_inside_its_row(cx: &mut TestAppContext) {
+    let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(okx_unticked()));
+    let col = header(&rig, ScanColumn::Binance, cx).expect("Binance column");
+    let cell = bounds_of(&rig, SharedString::from("rate-DDDUSDT-Binance"), cx);
+    let (line1, line2) = (bounds_of(&rig, SharedString::from("rate-line1-DDDUSDT-Binance"), cx), bounds_of(&rig, SharedString::from("rate-line2-DDDUSDT-Binance"), cx));
+    assert!(line2.top() >= line1.bottom(), "the 8h equivalent is under the rate, not beside it: {line1:?} / {line2:?}");
+    for b in [cell, line1, line2] {
+        assert!(b.left() >= col.left() && b.right() <= col.right(), "{b:?} leaves its column {col:?}");
+    }
+    // the row pitch is the row height: the whole cell (its 4 px padding top and bottom included) fits it
+    let next = bounds_of(&rig, SharedString::from("rate-BBBUSDT-Binance"), cx);
+    let pitch = next.top() - cell.top();
+    assert_eq!(pitch, px(super::scan_view::ROW_HEIGHT_PX), "rows are tall enough for two lines");
+    assert!(cell.size.height + px(8.0) <= pitch, "two lines ({:?}) do not fit the {pitch:?} row", cell.size.height);
+    // an 8 h rate has just the one line
+    let eight = cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(SharedString::from("rate-line2-DDDUSDT-Bybit")).is_some()
+    });
+    assert!(!eight.unwrap(), "Bybit is 8h: no second line");
+}
+
+#[gpui_kit::test]
+fn the_gross_labels_stay_inside_the_gross_column_clear_of_net_edge(cx: &mut TestAppContext) {
+    let rig = open_with(cx, DEFAULT_WIDTH, mixed_interval_feed(okx_unticked()));
+    let gross = header(&rig, ScanColumn::Gross, cx).expect("Gross column");
+    let net = header(&rig, ScanColumn::NetEdge, cx).expect("Net Edge column");
+    assert!(gross.right() <= net.left(), "adjacent columns do not overlap");
+    let value = bounds_of(&rig, SharedString::from("gross-value-DDDUSDT"), cx);
+    let diff = bounds_of(&rig, SharedString::from("gross-diff-DDDUSDT"), cx);
+    let kind = cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(SharedString::from("edge-kind-DDDUSDT")).map(|e| e.bounds())
+    });
+    let kind = kind.unwrap().expect("the 4h/8h row is classified, so the kind tag is drawn");
+    for b in [value, diff, kind] {
+        assert!(b.left() >= gross.left() && b.right() <= gross.right(), "{b:?} leaves the Gross column {gross:?}");
+    }
+    assert!(diff.top() >= value.bottom(), "the labels are under the value: {value:?} / {diff:?}");
+    assert!(kind.left() >= diff.right(), "the two labels do not overlap each other: {diff:?} / {kind:?}");
+    let net_cell = bounds_of(&rig, SharedString::from("net-DDDUSDT"), cx);
+    assert!(net_cell.left() >= gross.right(), "Net Edge starts after Gross ends");
+}
+
+// ---- scanner-layout 2.3: the status bar ---------------------------------------------------------------
+
+/// Minimum space between the "只顯示達標" toggle and the sources.
+const BAR_GAP_PX: f32 = 24.0;
+
+fn exists(rig: &Rig, id: impl Into<gpui_kit::ElementId>, cx: &mut TestAppContext) -> bool {
+    let id = id.into();
+    cx.update_window(rig.window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.try_find(id).is_some()
+    })
+    .unwrap()
+}
+
+#[gpui_kit::test]
+fn the_toggle_and_the_sources_are_a_clear_gap_apart_or_on_separate_lines(cx: &mut TestAppContext) {
+    for width in [1850.0, DEFAULT_WIDTH, 1000.0, 700.0] {
+        let rig = open_with(cx, width, feed_with(okx_unticked()));
+        let toggle = bounds_of(&rig, "only-qualified", cx);
+        let sources = bounds_of(&rig, "scan-sources", cx);
+        let side_by_side = sources.left() - toggle.right() >= px(BAR_GAP_PX) - px(0.5);
+        let wrapped = sources.top() >= toggle.bottom();
+        assert!(side_by_side || wrapped, "at {width} px the toggle {toggle:?} and the sources {sources:?} touch");
+        assert!(sources.right() <= px(width), "the sources stay inside the window at {width} px: {sources:?}");
+    }
+}
+
+#[gpui_kit::test]
+fn a_ticked_exchange_has_one_chip_and_an_unticked_one_is_a_single_disabled_line(cx: &mut TestAppContext) {
+    let rig = open_with(cx, DEFAULT_WIDTH, feed_with(okx_unticked()));
+    for id in ["source-Binance WebSocket", "source-Bybit WebSocket", "source-Bybit 行情", "source-off-OKX"] {
+        assert!(exists(&rig, SharedString::from(id), cx), "{id}");
+    }
+    assert!(!exists(&rig, SharedString::from("source-OKX 行情"), cx), "no OKX status chip while OKX is not ticked");
+    let all = open_with(cx, DEFAULT_WIDTH, feed_with(all_ticked()));
+    assert!(exists(&all, SharedString::from("source-OKX 行情"), cx));
+    assert!(!exists(&all, SharedString::from("source-off-OKX"), cx));
 }

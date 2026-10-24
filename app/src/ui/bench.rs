@@ -9,7 +9,7 @@ use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
 use gpui_kit::*;
 
 use super::frame_stats::{drops, split_paused, summarize};
-use super::theme::{self, funding_tone};
+use super::theme::{self, funding_tone, pnl_tone};
 
 const ROWS: usize = 528; // trading USDT perpetuals on Binance, measured 2026-10-05
 const WARMUP_FRAMES: usize = 30;
@@ -86,7 +86,7 @@ impl TableDelegate for BenchRows {
             2 => (format!("{:+.3}", r.binance), funding_tone(r.binance).color()),
             3 => (format!("{:+.3}", r.bybit), funding_tone(r.bybit).color()),
             4 => (format!("{spread:.3}"), theme::TEXT_SECONDARY),
-            5 => (format!("{:+.3}", spread - 0.2), funding_tone(spread - 0.2).color()),
+            5 => (format!("{:+.3}", spread - 0.2), pnl_tone(spread - 0.2).color()), // Net Edge: good or bad, not a funding sign
             6 => (if r.binance < r.bybit { "L Binance / S Bybit" } else { "L Bybit / S Binance" }.to_string(), theme::TEXT_SECONDARY),
             _ => (if spread > 0.1 { "✓" } else { "-" }.to_string(), theme::TEXT_SECONDARY),
         };

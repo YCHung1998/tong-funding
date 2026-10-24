@@ -55,6 +55,8 @@ pub struct TradingState {
     pub staged_sel: BTreeSet<String>,
     pub staged_confirm: Option<PendingConfirm>,
     pub staged_note: Option<String>,
+    /// Disabled-exchange lines the user opened (`<page>-<exchange>`, all pages); never persisted.
+    pub expanded: BTreeSet<String>,
     pub close_confirm: Option<CloseConfirm>,
     pub close_now_confirm: Option<RunningRow>,
     c_notional: In,
@@ -130,6 +132,7 @@ impl TradingState {
             staged_sel: BTreeSet::new(),
             staged_confirm: None,
             staged_note: None,
+            expanded: BTreeSet::new(),
             close_confirm: None,
             close_now_confirm: None,
             c_notional: new_input(window, cx, "1000"),
@@ -418,10 +421,10 @@ fn auto_rules_card(b: &risk_settings::AutoRulesBlock) -> impl IntoElement {
     c
 }
 
-fn mode_text(identity: crate::identity::ProcessIdentity, m: Option<ExecutionMode>) -> &'static str {
+fn mode_text(identity: crate::identity::ProcessIdentity, m: Option<ExecutionMode>) -> String {
     match m {
-        Some(m) => risk_settings::mode_label(identity, m),
-        None => "未知（引擎未啟動）",
+        Some(m) => super::labels::execution_mode_text(identity, m),
+        None => "未知（引擎未啟動）".to_string(),
     }
 }
 
@@ -502,6 +505,35 @@ impl Shell {
                 })))
                 .child(btn("flatten-no", "取消", true, self.click(cx, |this, _| this.trading.flatten_confirm = None))),
         ))
+    }
+
+    /// Opens or closes one disabled-exchange line (`key` = `<page>-<exchange>`).
+    pub(crate) fn toggle_note(&mut self, key: &str) {
+        if !self.trading.expanded.remove(key) {
+            self.trading.expanded.insert(key.to_string());
+        }
+    }
+
+    /// The click handler of the disabled-exchange line `key`.
+    pub(crate) fn note_toggle(&self, cx: &Context<Self>, key: String) -> ClickFn {
+        Box::new(cx.listener(move |this: &mut Shell, _: &ClickEvent, _, cx| {
+            this.toggle_note(&key);
+            cx.notify();
+        }))
+    }
+
+    /// The overview page; its disabled-exchange lines open and close here.
+    pub(crate) fn dashboard_page(&self, cx: &Context<Self>) -> Div {
+        let open = |k: &str| self.trading.expanded.contains(k);
+        let toggle = |k: String| self.note_toggle(cx, k);
+        super::pages::dashboard_page(&self.dashboard, &super::pages::Notes { open: &open, toggle: &toggle })
+    }
+
+    /// One disabled-exchange line of the page `page`.
+    fn note_line(&self, n: &super::labels::DisabledNote, page: &str, cx: &Context<Self>) -> Div {
+        let open = |k: &str| self.trading.expanded.contains(k);
+        let toggle = |k: String| self.note_toggle(cx, k);
+        super::pages::Notes { open: &open, toggle: &toggle }.line(n, page)
     }
 
     fn click(&self, cx: &mut Context<Self>, f: impl Fn(&mut Shell, &mut Context<Shell>) + 'static) -> ClickFn {
@@ -644,7 +676,6 @@ impl Shell {
 
     pub(crate) fn staged_orders_page(&mut self, cx: &mut Context<Self>) -> Div {
         let vm = staged_orders::build(&self.snap, &self.trading.staged_sel, self.now_ms);
-        let trigger = vm.trigger_mode.map_or("未知".to_string(), |t| format!("{t:?}").to_uppercase());
         let header = div()
             .flex()
             .justify_between()
@@ -655,9 +686,9 @@ impl Shell {
                     .flex()
                     .gap_3()
                     .items_center()
-                    .child(small(format!("模板：{} · 市價單 · 暫存 {} 筆 · 已選 {} 筆", vm.mode_label(), vm.staged_count, vm.selected_count), theme::TEXT_SECONDARY))
-                    .child(small(format!("trigger_mode {trigger}"), theme::TEXT_SECONDARY))
-                    .child(btn("trigger-toggle", "切換 AUTO / MANUAL", vm.trigger_mode.is_some(), self.click(cx, |this, _| {
+                    .child(small(format!("模板：{} · 市價單 · 暫存 {} 筆 · 已選 {} 筆", vm.mode_text(), vm.staged_count, vm.selected_count), theme::TEXT_SECONDARY))
+                    .child(small(format!("觸發模式 {}", vm.trigger_text()), theme::TEXT_SECONDARY))
+                    .child(btn("trigger-toggle", "切換 自動 / 手動", vm.trigger_mode.is_some(), self.click(cx, |this, _| {
                         let vm = staged_orders::build(&this.snap, &this.trading.staged_sel, this.now_ms);
                         staged_orders::toggle_trigger_mode(&vm, this.sink.as_ref());
                     }))),
@@ -673,6 +704,9 @@ impl Shell {
         let mut margins = div().flex().gap_4();
         for (ex, t) in &vm.margins {
             margins = margins.child(small(format!("{} 可用保證金：{t}", ex.name()), theme::TEXT_SECONDARY));
+        }
+        for n in &vm.disabled_exchanges {
+            margins = margins.child(self.note_line(n, "staged", cx));
         }
         let enabled = vm.disabled.is_empty();
         let mut submit = div().flex().gap_3().items_center().child(btn("submit-selected", "一鍵送出已選取", enabled, self.click(cx, |this, _| {
@@ -701,7 +735,7 @@ impl Shell {
                     .child(btn("confirm-yes", p.button(), true, self.click(cx, |this, _| {
                         if let Some(p) = this.trading.staged_confirm.take() {
                             let out = staged_orders::confirm(&p, &this.snap, this.sink.as_ref());
-                            this.trading.staged_note = (!out.excluded.is_empty()).then(|| format!("已排除（已不是 PREPARED）：{}", out.excluded.join("、")));
+                            this.trading.staged_note = (!out.excluded.is_empty()).then(|| staged_orders::excluded_note(&out.excluded));
                         }
                     })))
                     .child(btn("confirm-no", "取消", true, self.click(cx, |this, _| this.trading.staged_confirm = None))),
@@ -771,7 +805,7 @@ impl Shell {
         page = page.child(table);
 
         if !vm.running.is_empty() {
-            let mut run = card().child(text("進行中（RECONCILED）", theme::TEXT_PRIMARY));
+            let mut run = card().child(text(staged_orders::running_title(), theme::TEXT_PRIMARY));
             for r in &vm.running {
                 let row = r.clone();
                 let mut line = div().flex().gap_3().items_center().child(small(r.symbol.clone(), theme::TEXT_PRIMARY)).child(small(format!("平倉倒數 {}", format::hms(r.exit_in_ms)), theme::TEXT_SECONDARY));
@@ -830,7 +864,7 @@ impl Shell {
                 if let Err(why) = &h.confirm_closed {
                     actions = actions.child(small(why.clone(), theme::WARNING));
                 }
-                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs);
+                m = m.child(small(h.heading(), theme::TEXT_PRIMARY)).child(legs);
                 // what the watchdog did for this pair and what comes next (the words of watchdog_text)
                 let mut status = div().id(SharedString::from(format!("mwatchdog-{}", h.uuid))).test_support().flex().flex_col();
                 for line in &h.watchdog {
@@ -889,9 +923,15 @@ impl Shell {
             hist = hist.child(small("尚無執行紀錄", theme::TEXT_MUTED));
         }
         for a in &vm.last_results {
-            hist = hist.child(small(format!("{} UTC · {}", format::utc_hms(a.at), a.headline), if a.needs_manual { theme::NEGATIVE } else { theme::TEXT_PRIMARY }));
+            // date, symbol and the result in plain words; the codes and the raw message are the muted line,
+            // each leg keeps its exchange, side and status, and the order id is secondary text
+            hist = hist.child(small(a.headline.clone(), if a.needs_manual { theme::NEGATIVE } else { theme::TEXT_PRIMARY })).child(small(a.codes.clone(), theme::TEXT_MUTED));
             for l in &a.legs {
-                hist = hist.child(small(format!("  {} · {} · {} · {} · {}", l.leg, l.exchange, side_text(l.side), l.status.text(), l.order_id_text), theme::TEXT_SECONDARY));
+                let mut leg = div().flex().gap_2().pl(rx(14.0)).child(small(l.summary(), theme::TEXT_SECONDARY));
+                if let Some(order) = l.order_text() {
+                    leg = leg.child(small(order, theme::TEXT_MUTED));
+                }
+                hist = hist.child(leg);
             }
             // the one exception: what the watchdog really flattened is written down, with the confirmation still due
             for line in &a.watchdog {
@@ -945,7 +985,7 @@ impl Shell {
             contract_settings::save(&vm, this.sink.as_ref());
         })));
         let boundary = card()
-            .child(text(format!("計算與執行邊界 · execution_mode {}", vm.mode_label), theme::TEXT_PRIMARY))
+            .child(text(format!("計算與執行邊界 · 執行環境 {}", vm.mode_text), theme::TEXT_PRIMARY))
             .child(small(format!("每腿：Notional {} · Initial Margin {}", opt_money(vm.notional), opt_money(vm.margin)), theme::TEXT_SECONDARY))
             .child(small(format!("雙腿合計：Notional {} · Initial Margin {}", opt_money(vm.pair_notional), opt_money(vm.pair_margin)), theme::TEXT_SECONDARY))
             .child(small("預期數量：LONG / SHORT 兩腿同一幣數，名目本金為上限（不跨所加總）", theme::TEXT_SECONDARY))
@@ -954,9 +994,10 @@ impl Shell {
         match vm.notional {
             Some(n) => {
                 for q in contract_settings::quote(&symbol, n, &self.snap, self.now_ms) {
-                    let price = q.price.map_or_else(|| DASH.into(), |p| p.normalize().to_string());
-                    let age = q.observed_at.map_or_else(|| DASH.into(), |t| format!("{} 秒前", format::secs(self.now_ms - t)));
-                    quote = quote.child(small(format!("{} · 現價 {price} · {age} · 預期數量 {}", q.exchange.name(), q.cell.text()), theme::TEXT_SECONDARY));
+                    quote = match &q.disabled {
+                        Some(note) => quote.child(self.note_line(note, "contract", cx)),
+                        None => quote.child(small(q.line(self.now_ms), theme::TEXT_SECONDARY)),
+                    };
                 }
                 // Pairs trade one shared quantity (matched-leg-quantity); the rows above are single-leg references.
                 quote = quote.child(small(contract_settings::pair_quote(&symbol, n, &self.snap, self.now_ms), theme::TEXT_PRIMARY));
@@ -1060,7 +1101,7 @@ impl Shell {
                     .flex()
                     .gap_2()
                     .items_center()
-                    .child(btn(SharedString::from(format!("mode-{}", risk_settings::mode_label(identity, m))), format!("{} {}", if on { "●" } else { "○" }, risk_settings::mode_label(identity, m)), enabled, self.click(cx, move |this, _| {
+                    .child(btn(SharedString::from(format!("mode-{}", risk_settings::mode_label(identity, m))), format!("{} {}", if on { "●" } else { "○" }, super::labels::execution_mode_text(identity, m)), enabled, self.click(cx, move |this, _| {
                         let Some(cur) = this.snap.engine.as_ref().map(|e| e.execution_mode) else { return };
                         match risk_settings::request_mode(this.snap.identity, cur, m, &this.snap.settings, this.snap.demo_keys.as_ref(), this.sink.as_ref()) {
                             Ok(risk_settings::ModeStep::Confirm(t)) => this.trading.mode_confirm = Some(t),

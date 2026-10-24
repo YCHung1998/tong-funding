@@ -106,7 +106,7 @@ fn staged_orders_rows_show_floored_quantities_and_the_net_edge() {
     assert_eq!(btc.net_edge_pct, Some(d("0.07")));
     assert_eq!((btc.notional, btc.leverage, btc.margin), (Some(d("1200")), Some(d("3")), Some(d("400"))));
     assert_eq!(btc.entry_in_ms, Some(T - 10_000 - NOW), "entry at T−10 s");
-    assert_eq!(vm.mode_label(), "SIMULATION");
+    assert_eq!(vm.mode_text(), "模擬（SIMULATION）");
 }
 
 #[test]
@@ -132,10 +132,10 @@ fn staged_orders_summary_is_hand_calculated() {
 }
 
 #[test]
-fn staged_orders_mode_label_follows_the_engine() {
+fn staged_orders_mode_text_follows_the_engine() {
     let mut s = snap();
     eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
-    assert_eq!(build(&s, &BTreeSet::new(), NOW).mode_label(), "EXCHANGE_DEMO");
+    assert_eq!(build(&s, &BTreeSet::new(), NOW).mode_text(), "Demo 帳戶（EXCHANGE_DEMO）");
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn a_simulation_result_is_labelled_and_shows_no_real_order_id() {
     s.trade_events = attempt("u-BTCUSDT", true, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": true, "outcome": "accepted", "client_order_id": "simso0001", "exchange_order_id": "sim-2"}), "RECONCILED");
     let vm = build(&s, &BTreeSet::new(), NOW);
     let a = &vm.last_results[0];
-    assert_eq!(a.mode_label, "SIMULATION");
+    assert_eq!(a.mode_text, "模擬（SIMULATION）");
     assert!(a.legs.iter().all(|l| l.order_id_text.starts_with("模擬")), "{:?}", a.legs);
     assert!(!a.needs_manual);
 }
@@ -282,7 +282,7 @@ fn an_exchange_demo_result_shows_the_exchange_order_id() {
     let mut s = snap();
     s.trade_events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "accepted", "client_order_id": "demoso0001", "exchange_order_id": "b-77"}), "RECONCILED");
     let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
-    assert_eq!(a.mode_label, "EXCHANGE_DEMO");
+    assert_eq!(a.mode_text, "Demo 帳戶（EXCHANGE_DEMO）");
     assert_eq!(a.legs[0].order_id_text, "8389765");
     assert_eq!(a.legs[1].order_id_text, "b-77");
 }
@@ -294,7 +294,8 @@ fn a_failed_leg_says_manual_handling_and_never_rolled_back() {
     s.trade_events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "rejected", "reason": "insufficient margin", "client_order_id": "demoso0001"}), "PARTIAL_FAILURE");
     let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
     assert!(a.needs_manual);
-    assert!(a.headline.contains("需人工處理") && a.headline.contains("PARTIAL_FAILURE"), "{}", a.headline);
+    assert!(a.headline.contains("需人工處理（目前狀態：單腿失敗）"), "{}", a.headline);
+    assert!(a.codes.contains("PARTIAL_FAILURE"), "the code stays as the secondary line: {}", a.codes);
     assert!(!a.headline.contains("回滾"));
     assert_eq!(a.legs[1].status, LegStatus::Rejected("insufficient margin".into()));
 }
@@ -733,11 +734,11 @@ fn a_demo_confirmation_has_no_real_money_wording() {
 #[test]
 fn staged_vm_and_rows_name_the_live_world() {
     let vm = build(&live_snap(ExecutionMode::ExchangeDemo), &BTreeSet::new(), NOW);
-    assert_eq!(vm.mode_label(), "LIVE");
+    assert_eq!(vm.mode_text(), "真錢（LIVE）");
     assert!(vm.rows.iter().all(|r| r.badge == Some("LIVE")));
     let demo = build(&snap(), &BTreeSet::new(), NOW);
     assert!(demo.rows.iter().all(|r| r.badge.is_none()));
-    assert_eq!(build(&live_snap(ExecutionMode::Simulation), &BTreeSet::new(), NOW).mode_label(), "LIVE SIMULATION");
+    assert_eq!(build(&live_snap(ExecutionMode::Simulation), &BTreeSet::new(), NOW).mode_text(), "模擬（LIVE SIMULATION）");
 }
 
 #[test]
@@ -745,8 +746,13 @@ fn a_live_result_and_its_headline_say_live() {
     let mut s = live_snap(ExecutionMode::ExchangeDemo);
     s.trade_events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "accepted", "client_order_id": "livedso1", "exchange_order_id": "b-77"}), "RECONCILED");
     let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
-    assert_eq!(a.mode_label, "LIVE");
-    assert!(a.headline.starts_with("LIVE"), "{}", a.headline);
+    assert_eq!(a.mode_text, "真錢（LIVE）");
+    assert!(a.headline.ends_with(" · 真錢（LIVE）"), "a real-money result names its world on the headline: {}", a.headline);
+    // a demo result keeps the plain headline of the spec (the world is on the secondary line)
+    let mut d = snap();
+    d.trade_events = attempt("u-BTCUSDT", true, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": true, "outcome": "accepted", "client_order_id": "x"}), "RECONCILED");
+    eng(&mut d).pairs[0].state = PairState::Reconciled;
+    assert!(!build(&d, &BTreeSet::new(), NOW).last_results[0].headline.contains('（'));
 }
 
 #[test]
@@ -925,7 +931,7 @@ fn the_last_result_says_what_the_watchdog_flattened_and_still_asks_for_the_confi
     // spec staged-orders-page: the one exception, 如實寫出系統做了什麼（哪一腿、數量），並仍提示需人工確認已平倉
     let s = failed_attempt_with(flatten_records());
     let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
-    assert!(a.needs_manual && a.headline.contains("需人工處理") && a.headline.contains("PARTIAL_FAILURE"), "{}", a.headline);
+    assert!(a.needs_manual && a.headline.contains("需人工處理") && a.codes.contains("PARTIAL_FAILURE"), "{} / {}", a.headline, a.codes);
     assert!(!a.headline.contains("回滾"), "still never 'rolled back': {}", a.headline);
     assert_eq!(
         a.watchdog,
@@ -962,4 +968,335 @@ fn a_flatten_of_an_earlier_entry_does_not_colour_the_result_of_the_current_one()
     records.push(ev(12, NOW - 2_000, "PAIR_TRANSITION", "u-BTCUSDT", json!({"from": "CLOSING", "to": "PARTIAL_FAILURE"})));
     let a = &build(&failed_attempt_with(records), &BTreeSet::new(), NOW).last_results[0];
     assert!(a.watchdog.is_empty(), "{:?}", a.watchdog);
+}
+
+// ---- ui-plain-language 2.2: the available-margin row and an exchange the risk settings left unticked ---
+
+mod unticked_exchange {
+    use super::*;
+
+    const OKX_SPOT: &str = "exchange error acct_mode_unsupported: 帳戶模式不支援 (acctLv 1, posMode net_mode)";
+
+    fn margin_failed(why: &str) -> LegAccount {
+        LegAccount { positions: Err(why.into()), open_orders: Err(why.into()), available_margin: Err(why.into()), fetched_at: NOW }
+    }
+
+    fn okx_failing() -> UiSnapshot {
+        let mut s = snap();
+        s.leg_accounts.insert((false, Exchange::Okx), margin_failed(&format!("OKX: {OKX_SPOT}")));
+        s
+    }
+
+    #[test]
+    fn an_unticked_exchange_has_no_margin_line_only_the_muted_line_with_the_error_behind_it() {
+        let mut s = okx_failing();
+        s.accounts.insert(Exchange::Okx, crate::ui::bridge::AccountState::Failed { error: OKX_SPOT.into(), at: NOW });
+        s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!(vm.margins.iter().map(|m| m.0).collect::<Vec<_>>(), [Exchange::Binance, Exchange::Bybit], "no margin line for OKX");
+        assert!(vm.margins.iter().all(|(_, t)| !t.contains("acct_mode_unsupported")), "{:?}", vm.margins);
+        assert_eq!(vm.disabled_exchanges.len(), 1);
+        let n = &vm.disabled_exchanges[0];
+        assert_eq!((n.exchange, n.text.as_str()), (Exchange::Okx, "OKX 已停用 · 無法確認持倉（OKX 帳戶模式不支援（在 OKX 改為單幣種或跨幣種保證金模式））"));
+        let detail = n.detail.as_deref().expect("detail behind the line");
+        assert!(detail.contains("可用保證金") && detail.contains("OKX 帳戶模式不支援") && detail.contains("在 OKX 改為單幣種或跨幣種保證金模式"), "{detail}");
+    }
+
+    #[test]
+    fn an_unticked_exchange_whose_positions_cannot_be_confirmed_is_a_warning_line() {
+        // no OKX account read at all (still loading): the margin row must not look like a settled "unticked"
+        let mut s = okx_failing();
+        s.accounts.remove(&Exchange::Okx);
+        s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        let n = &vm.disabled_exchanges[0];
+        assert_eq!((n.text.as_str(), n.tone), ("OKX 已停用 · 無法確認持倉（載入中）", crate::ui::theme::Tone::Warning));
+        assert!(n.detail.as_deref().is_some_and(|d| d.contains("可用保證金")), "{:?}", n.detail);
+    }
+
+    #[test]
+    fn an_unticked_exchange_with_an_unfinished_pair_keeps_its_margin_row_and_says_so() {
+        let mut s = okx_failing();
+        s.accounts.insert(Exchange::Okx, crate::ui::bridge::AccountState::Failed { error: OKX_SPOT.into(), at: NOW });
+        s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+        s.pair_records = [("u1".to_string(), crate::ui::bridge::PairRecord { pair_id: "p9".into(), symbol: "SOLUSDT".into(), long_exchange: Some(Exchange::Binance), short_exchange: Some(Exchange::Okx), status: "RECONCILED".into() })].into();
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert!(vm.disabled_exchanges.is_empty(), "{:?}", vm.disabled_exchanges);
+        let okx = vm.margins.iter().find(|m| m.0 == Exchange::Okx).expect("the OKX margin row stays");
+        assert!(okx.1.contains("此交易所已停用，但仍有持倉或持倉狀態未確認"), "{}", okx.1);
+    }
+
+    #[test]
+    fn a_ticked_exchange_with_the_known_error_reads_in_plain_words() {
+        let vm = build(&okx_failing(), &BTreeSet::new(), NOW);
+        assert!(vm.disabled_exchanges.is_empty());
+        let okx = vm.margins.iter().find(|m| m.0 == Exchange::Okx).expect("OKX is ticked");
+        assert_eq!(okx.1, "未知（OKX 帳戶模式不支援（在 OKX 改為單幣種或跨幣種保證金模式））");
+    }
+
+    #[test]
+    fn an_unticked_exchange_with_a_known_margin_is_still_one_line_and_the_margin_is_behind_it() {
+        let mut s = snap();
+        s.leg_accounts.insert((false, Exchange::Okx), account(vec![], vec![]));
+        s.accounts.insert(Exchange::Okx, crate::ui::testkit::loaded(vec![], vec![], NOW));
+        s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!(vm.disabled_exchanges.len(), 1);
+        assert_eq!(vm.disabled_exchanges[0].tone, crate::ui::theme::Tone::Muted);
+        assert_eq!(vm.disabled_exchanges[0].detail.as_deref(), Some("可用保證金：1,000.00 USDT · 0 秒前讀取"));
+        // an old read is no longer a quiet line
+        s.accounts.insert(Exchange::Okx, crate::ui::testkit::loaded(vec![], vec![], NOW - 100_000));
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!(vm.disabled_exchanges[0].tone, crate::ui::theme::Tone::Warning);
+        assert!(!vm.disabled_exchanges[0].text.contains("沒有持倉"), "{}", vm.disabled_exchanges[0].text);
+    }
+
+    #[test]
+    fn nothing_is_hidden_when_the_settings_cannot_be_read() {
+        let mut s = okx_failing();
+        s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+        s.settings.error = Some("config.risk is not valid JSON".into());
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert!(vm.disabled_exchanges.is_empty());
+        assert_eq!(vm.margins.len(), 3);
+    }
+}
+
+// ---- ui-plain-language 3.1: the last execution results ------------------------------------------
+
+mod last_results_plain {
+    use super::*;
+    use crate::ui::bridge::PairRecord;
+    use crate::ui::funding::{LegFunding, PairFunding, PnlSummary};
+    use tong_funding_core::pnl::{Component, Components, PnlBreakdown, PnlStatus};
+
+    /// 2026-10-22 12:00:00 UTC, 2026-10-21 15:59:50 UTC and 2026-10-22 00:59:50 UTC.
+    const T_PTB: i64 = 1_792_670_400_000;
+    const T_OLD: i64 = 1_792_598_390_000;
+    const T_NEW: i64 = 1_792_630_790_000;
+    const PTB: &str = "ui-1792668499226-0-ptbusdt";
+
+    fn record(symbol: &str, status: &str) -> PairRecord {
+        PairRecord { pair_id: format!("{symbol}-1"), symbol: symbol.into(), long_exchange: Some(Exchange::Binance), short_exchange: Some(Exchange::Bybit), status: status.into() }
+    }
+
+    fn start(id: i64, ts: i64, pair: &str, simulated: bool) -> StoredEvent {
+        ev(id, ts, "PAIR_TRANSITION", pair, json!({"from": "PREPARED", "to": "PRE_TRADE_CHECK", "detail": {"simulated": simulated}}))
+    }
+
+    fn blocked(id: i64, ts: i64, pair: &str, detail: serde_json::Value) -> StoredEvent {
+        ev(id, ts, "PAIR_TRANSITION", pair, json!({"from": "PRE_TRADE_CHECK", "to": "BLOCKED", "event": "System(CheckFailed)", "detail": detail}))
+    }
+
+    /// The PTBUSDT block of 2026-10-22: the pair is no longer in the engine's snapshot (restart).
+    fn ptb() -> UiSnapshot {
+        let mut s = snap();
+        s.pair_records.insert(PTB.into(), record("PTBUSDT", "BLOCKED"));
+        s.trade_events = vec![
+            blocked(2, T_PTB + 50, PTB, json!({"block": "pre-trade fetch failed: request timed out", "simulated": false})),
+            start(1, T_PTB, PTB, false),
+        ];
+        s
+    }
+
+    #[test]
+    fn a_blocked_attempt_reads_date_symbol_result_and_reason() {
+        let a = build(&ptb(), &BTreeSet::new(), NOW).last_results.into_iter().find(|a| a.uuid == PTB).expect("the attempt");
+        assert_eq!(a.headline, "10-22 12:00:00 UTC · PTBUSDT · 被擋下：送單前重抓價格逾時");
+        assert_eq!((a.symbol.as_str(), a.state.as_str(), a.state_text.as_str()), ("PTBUSDT", "BLOCKED", "被擋下"));
+        assert_eq!(a.block_reason.as_deref(), Some("pre-trade fetch failed: request timed out"));
+        assert_eq!(a.when, "10-22 12:00:00 UTC");
+        assert_eq!(a.mode_text, "Demo 帳戶（EXCHANGE_DEMO）");
+        for code in ["Demo 帳戶（EXCHANGE_DEMO）", "BLOCKED", "pre-trade fetch failed: request timed out"] {
+            assert!(a.codes.contains(code), "{code} stays as secondary text: {}", a.codes);
+        }
+        // the exchanges are the pair's, not blank, and nothing was sent
+        assert_eq!(a.legs.iter().map(|l| l.exchange.as_str()).collect::<Vec<_>>(), ["Binance", "Bybit"]);
+        assert!(a.legs.iter().all(|l| l.status == LegStatus::NotSent));
+        assert!(!a.needs_manual);
+    }
+
+    #[test]
+    fn the_reason_of_the_pretrade_timeout_and_of_a_restart_read_in_plain_words() {
+        let mut s = ptb();
+        s.trade_events[0] = blocked(2, T_PTB + 50, PTB, json!({"reason": "pre-trade check timed out", "detail": "nothing sent", "simulated": true}));
+        let a = &build(&s, &BTreeSet::new(), NOW).last_results.into_iter().find(|a| a.uuid == PTB).unwrap();
+        assert!(a.headline.ends_with("被擋下：送單前檢查逾時，沒有送出任何訂單"), "{}", a.headline);
+        // a reason the table does not know is shown as the engine wrote it
+        s.trade_events[0] = blocked(2, T_PTB + 50, PTB, json!({"block": "something new", "simulated": true}));
+        let a = build(&s, &BTreeSet::new(), NOW).last_results.into_iter().find(|a| a.uuid == PTB).unwrap();
+        assert!(a.headline.ends_with("被擋下：something new"), "{}", a.headline);
+        // no reason recorded: just the result
+        s.trade_events[0] = blocked(2, T_PTB + 50, PTB, json!({"simulated": true}));
+        let a = build(&s, &BTreeSet::new(), NOW).last_results.into_iter().find(|a| a.uuid == PTB).unwrap();
+        assert!(a.headline.ends_with("PTBUSDT · 被擋下"), "{}", a.headline);
+    }
+
+    #[test]
+    fn failed_checks_are_listed_by_plain_name_with_the_code_kept() {
+        let mut s = snap();
+        s.trade_events = vec![
+            blocked(2, T_PTB + 50, "u-BTCUSDT", json!({"block": "Checks { failed: [PriceDrift, Margin], notes: [] }", "failed_checks": ["PriceDrift", "Margin"], "simulated": true})),
+            start(1, T_PTB, "u-BTCUSDT", true),
+        ];
+        let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
+        assert_eq!(a.failed_checks, ["PriceDrift", "Margin"], "the raw names stay");
+        assert!(a.headline.ends_with("BTCUSDT · 被擋下：價格漂移過大（PriceDrift）、可用保證金不足（Margin）"), "{}", a.headline);
+    }
+
+    #[test]
+    fn symbol_and_exchanges_are_never_blank() {
+        // nothing known about the pair at all
+        let mut s = snap();
+        s.trade_events = vec![blocked(2, T_PTB + 50, "u-ghost", json!({"simulated": true})), start(1, T_PTB, "u-ghost", true)];
+        let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
+        assert_eq!(a.symbol, "（幣種未知）");
+        assert!(a.legs.iter().all(|l| l.exchange == "（交易所未知）"), "{:?}", a.legs);
+        assert!(!a.headline.contains(" ·  · "), "{}", a.headline);
+        // an order event names them
+        s.trade_events.insert(0, ev(3, T_PTB + 40, "ORDER_SUBMITTED", "u-ghost", json!({"leg": "long", "action": "open", "exchange": "Bybit", "symbol": "ETHUSDT", "outcome": "accepted", "client_order_id": "c1"})));
+        let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
+        assert_eq!((a.symbol.as_str(), a.legs[0].exchange.as_str(), a.legs[1].exchange.as_str()), ("ETHUSDT", "Bybit", "（交易所未知）"));
+        // the stored pair names them when the engine does not
+        let mut s = snap();
+        s.pair_records.insert("u-ghost".into(), record("SOLUSDT", "BLOCKED"));
+        s.trade_events = vec![blocked(2, T_PTB + 50, "u-ghost", json!({"simulated": true})), start(1, T_PTB, "u-ghost", true)];
+        let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
+        assert_eq!((a.symbol.as_str(), a.legs[0].exchange.as_str(), a.legs[1].exchange.as_str()), ("SOLUSDT", "Binance", "Bybit"));
+    }
+
+    #[test]
+    fn attempts_on_two_days_carry_their_date_and_run_newest_first() {
+        let mut s = snap();
+        s.pair_records.insert("u-old".into(), record("OLDUSDT", "BLOCKED"));
+        s.pair_records.insert("u-new".into(), record("NEWUSDT", "BLOCKED"));
+        // stored newest first, as the query returns them; the later time of day (15:59:50) is the OLDER day
+        s.trade_events = vec![
+            blocked(4, T_NEW + 50, "u-new", json!({"simulated": true})),
+            start(3, T_NEW, "u-new", true),
+            blocked(2, T_OLD + 50, "u-old", json!({"simulated": true})),
+            start(1, T_OLD, "u-old", true),
+        ];
+        let r = build(&s, &BTreeSet::new(), NOW).last_results;
+        assert_eq!(r.iter().map(|a| a.when.as_str()).collect::<Vec<_>>(), ["10-22 00:59:50 UTC", "10-21 15:59:50 UTC"]);
+        assert!(r[0].headline.starts_with("10-22 00:59:50 UTC · NEWUSDT") && r[1].headline.starts_with("10-21 15:59:50 UTC · OLDUSDT"));
+        // the order does not depend on the order the events arrive in
+        s.trade_events.reverse();
+        assert_eq!(build(&s, &BTreeSet::new(), NOW).last_results.iter().map(|a| a.when.clone()).collect::<Vec<_>>(), ["10-22 00:59:50 UTC", "10-21 15:59:50 UTC"]);
+    }
+
+    fn pnl(status: PnlStatus, net: &str, missing: &[Component]) -> PairFunding {
+        let total = Components { net: d(net), ..Default::default() };
+        let b = PnlBreakdown { legs: vec![], total, missing: missing.iter().copied().collect(), status: status.clone(), other_cost_included: false };
+        PairFunding {
+            simulated: false,
+            legs: [LegFunding::Received(d("0")), LegFunding::Received(d("0"))],
+            opening_fee: None,
+            updated_at_ms: None,
+            slots: vec![],
+            pnl: Some(PnlSummary { event_id: 9, status: status.as_str().into(), reasons: vec![], breakdown: Some(b), comparison: None }),
+            alerts: vec![],
+            trace: vec![],
+        }
+    }
+
+    fn finished(f: Option<PairFunding>) -> AttemptView {
+        let mut s = snap();
+        s.pair_records.insert("u-fin".into(), record("BTCUSDT", "FINALIZED"));
+        if let Some(f) = f {
+            s.funding.insert("BTCUSDT-1".into(), f);
+        }
+        s.trade_events = vec![
+            ev(2, T_PTB + 900, "PAIR_TRANSITION", "u-fin", json!({"from": "CLOSING", "to": "FINALIZED", "detail": {"simulated": false}})),
+            start(1, T_PTB, "u-fin", false),
+        ];
+        build(&s, &BTreeSet::new(), NOW).last_results.into_iter().find(|a| a.uuid == "u-fin").unwrap()
+    }
+
+    #[test]
+    fn a_finished_pair_shows_its_net_pnl_from_the_latest_pnl_event() {
+        let a = finished(Some(pnl(PnlStatus::Complete, "1.234", &[])));
+        assert_eq!(a.headline, "10-22 12:00:00 UTC · BTCUSDT · 已完成 · 淨損益 +1.23 USDT");
+        assert_eq!(a.net_pnl.as_deref(), Some("淨損益 +1.23 USDT"));
+        let loss = finished(Some(pnl(PnlStatus::Complete, "-0.82", &[])));
+        assert!(loss.headline.ends_with("已完成 · 淨損益 −0.82 USDT"), "{}", loss.headline);
+    }
+
+    #[test]
+    fn an_incomplete_pnl_says_so_and_a_missing_net_is_a_dash_never_zero() {
+        let part = finished(Some(pnl(PnlStatus::Incomplete(vec![]), "0.5", &[])));
+        assert!(part.headline.ends_with("已完成 · 淨損益 +0.50 USDT（PnL 不完整）"), "{}", part.headline);
+        let none = finished(Some(pnl(PnlStatus::Incomplete(vec![]), "0", &[Component::Net])));
+        assert!(none.headline.ends_with("已完成 · 淨損益 —（PnL 不完整）"), "{}", none.headline);
+    }
+
+    #[test]
+    fn without_a_pnl_or_when_not_finished_or_simulated_no_net_is_shown() {
+        let a = finished(None);
+        assert_eq!((a.headline.as_str(), a.net_pnl), ("10-22 12:00:00 UTC · BTCUSDT · 已完成", None));
+        let mut sim = pnl(PnlStatus::Complete, "9", &[]);
+        sim.simulated = true;
+        assert_eq!(finished(Some(sim)).net_pnl, None);
+        // a blocked pair has no PnL line even if some PnL data exists under its id
+        let mut s = ptb();
+        s.pair_records.insert(PTB.into(), record("PTBUSDT", "BLOCKED"));
+        s.funding.insert("PTBUSDT-1".into(), pnl(PnlStatus::Complete, "9", &[]));
+        assert_eq!(build(&s, &BTreeSet::new(), NOW).last_results.into_iter().find(|a| a.uuid == PTB).unwrap().net_pnl, None);
+    }
+
+    #[test]
+    fn every_leg_keeps_exchange_side_status_and_the_order_id_as_secondary_text() {
+        let mut s = snap();
+        eng(&mut s).pairs[0].state = PairState::Reconciled;
+        s.trade_events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "accepted", "client_order_id": "demoso0001", "exchange_order_id": "b-77"}), "RECONCILED");
+        let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
+        assert_eq!(a.legs[0].summary(), "long · Binance · BUY · 成功");
+        assert_eq!(a.legs[1].summary(), "short · Bybit · SELL · 成功");
+        assert_eq!(a.legs[0].order_text().as_deref(), Some("訂單 8389765"));
+        assert_eq!(a.legs[1].order_text().as_deref(), Some("訂單 b-77"));
+        assert_eq!((a.state_text.as_str(), a.headline.ends_with("BTCUSDT · 持倉中")), ("持倉中", true));
+        // a leg that was not sent has no order id to show
+        let b = build(&ptb(), &BTreeSet::new(), NOW).last_results.into_iter().find(|a| a.uuid == PTB).unwrap();
+        assert_eq!(b.legs[0].order_text(), None);
+        assert_eq!(b.legs[0].summary(), "long · Binance · BUY · 未送出");
+    }
+}
+
+// ---- ui-plain-language 3.2: states, modes and triggers on the staged orders page ------------------
+
+mod plain_texts {
+    use super::*;
+
+    #[test]
+    fn the_header_names_mode_and_trigger_in_plain_words_with_the_code_after_them() {
+        let mut s = snap();
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!((vm.mode_text().as_str(), vm.trigger_text().as_str()), ("模擬（SIMULATION）", "手動（MANUAL）"));
+        eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
+        eng(&mut s).trigger_mode = TriggerMode::Auto;
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!((vm.mode_text().as_str(), vm.trigger_text().as_str()), ("Demo 帳戶（EXCHANGE_DEMO）", "自動（AUTO）"));
+        s.engine = None;
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!((vm.mode_text().as_str(), vm.trigger_text().as_str()), ("未知", "未知"));
+    }
+
+    #[test]
+    fn the_not_prepared_reason_and_the_exclusion_note_use_the_plain_state_name() {
+        assert_eq!(DisabledReason::NotPrepared(vec!["BTCUSDT".into(), "ETHUSDT".into()]).text(), "已不是「已暫存」狀態：BTCUSDT、ETHUSDT");
+        assert_eq!(excluded_note(&["BTCUSDT".into()]), "已排除（已不是「已暫存」狀態）：BTCUSDT");
+    }
+
+    #[test]
+    fn a_pair_needing_manual_handling_is_titled_with_its_plain_state_and_world() {
+        let mut s = snap();
+        failed_pair(&mut s);
+        let h = build(&s, &BTreeSet::new(), NOW).manual.into_iter().next().unwrap();
+        assert_eq!(h.heading(), "BTCUSDT · 單腿失敗（PARTIAL_FAILURE） · Demo 帳戶（EXCHANGE_DEMO）");
+    }
+
+    #[test]
+    fn the_running_block_is_titled_in_plain_words() {
+        assert_eq!(running_title(), "進行中（持倉中）");
+    }
 }

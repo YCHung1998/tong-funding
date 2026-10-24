@@ -128,13 +128,248 @@ fn visible_index_maps_back_to_the_logical_column_after_hiding_a_middle_column() 
 fn total_width_shrinks_when_columns_are_hidden_and_decides_horizontal_scroll() {
     let mut v = ColumnVisibility::default();
     let full = v.total_width();
-    assert_eq!(full, 50.0 + 120.0 + 50.0 + 110.0 + 150.0 * 3.0 + 160.0 + 120.0 + 200.0 + 60.0 + 130.0);
+    assert_eq!(full, 50.0 + 132.0 + 50.0 + 88.0 + 160.0 * 3.0 + 100.0 + 120.0 + 164.0 + 70.0 + 120.0);
     assert!(v.needs_horizontal_scroll(1000.0), "12 columns do not fit 1000 px");
     for c in [ScanColumn::Direction, ScanColumn::NetEdge, ScanColumn::Okx, ScanColumn::Bybit, ScanColumn::Add, ScanColumn::Gross] {
         v.toggle(c);
     }
     assert!(v.total_width() < full);
     assert!(!v.needs_horizontal_scroll(1000.0), "after hiding six columns it fits: no sideways scroll");
+}
+
+// ---- scanner-layout 2.1: exchanges that are not enabled start hidden --------------------------
+
+#[test]
+fn a_column_maps_to_its_exchange_and_back() {
+    assert_eq!(ScanColumn::for_exchange(Binance), ScanColumn::Binance);
+    assert_eq!(ScanColumn::for_exchange(Bybit), ScanColumn::Bybit);
+    assert_eq!(ScanColumn::for_exchange(Okx), ScanColumn::Okx);
+}
+
+#[test]
+fn the_column_of_an_exchange_that_is_not_enabled_starts_hidden_and_the_order_is_unchanged() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Okx]);
+    assert!(!v.is_visible(ScanColumn::Okx));
+    let rest: Vec<_> = ScanColumn::ALL.into_iter().filter(|c| *c != ScanColumn::Okx).collect();
+    assert_eq!(v.visible(), rest);
+    assert!(!v.is_all_visible(), "the reset button has something to do");
+}
+
+#[test]
+fn nothing_is_hidden_when_every_exchange_is_enabled() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[]);
+    assert_eq!(v.visible(), ScanColumn::ALL);
+    assert!(v.is_all_visible());
+}
+
+#[test]
+fn showing_a_default_hidden_column_is_a_choice_that_survives_the_next_recompute() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Okx]);
+    assert!(v.toggle(ScanColumn::Okx), "one click shows it");
+    assert!(v.is_visible(ScanColumn::Okx));
+    assert_eq!(v.visible(), ScanColumn::ALL, "at its original place");
+    for _ in 0..3 {
+        v.set_disabled_exchanges(&[Okx]); // the shell syncs on every recompute
+    }
+    assert!(v.is_visible(ScanColumn::Okx), "the user's choice is not overwritten");
+    assert!(v.toggle(ScanColumn::Okx));
+    assert!(!v.is_visible(ScanColumn::Okx), "and a second click hides it again");
+}
+
+#[test]
+fn an_explicit_hide_stays_hidden_after_the_exchange_is_enabled_and_a_default_follows_the_setting() {
+    let mut v = ColumnVisibility::default();
+    v.toggle(ScanColumn::Bybit); // the user hid an enabled exchange
+    v.set_disabled_exchanges(&[]);
+    assert!(!v.is_visible(ScanColumn::Bybit));
+    // no choice about Okx: it follows the setting both ways
+    v.set_disabled_exchanges(&[Okx]);
+    assert!(!v.is_visible(ScanColumn::Okx));
+    v.set_disabled_exchanges(&[]);
+    assert!(v.is_visible(ScanColumn::Okx));
+}
+
+#[test]
+fn reset_shows_all_twelve_columns_even_when_an_exchange_is_not_enabled() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Okx]);
+    v.toggle(ScanColumn::Gross);
+    v.reset();
+    v.set_disabled_exchanges(&[Okx]);
+    assert_eq!(v.visible(), ScanColumn::ALL, "spec scanner-table-controls: reset = all columns shown");
+    assert!(v.is_all_visible());
+}
+
+#[test]
+fn symbol_stays_visible_whatever_the_disabled_set_says() {
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Binance, Bybit, Okx]);
+    assert!(v.is_visible(ScanColumn::Symbol));
+    assert!(v.is_visible(ScanColumn::Rank));
+}
+
+// ---- scanner-layout 2.2: column widths follow the widest content, rows have room for two lines ----
+
+use tong_funding_core::edge_kind::EdgeKind;
+
+use crate::ui::scanner::{Countdown, GROSS_INTERVALS_DIFFER};
+
+/// Font size of the table's cell text (`pages::small`), in px at 100% zoom.
+const CELL_FONT_PX: f32 = 10.0;
+/// Left plus right padding of a table cell.
+const CELL_PAD_PX: f32 = 16.0;
+/// Gap between the parts of one line in a cell (`gap_1`).
+const CELL_GAP_PX: f32 = 4.0;
+
+/// Width of `text` in one line, on the safe side: ASCII is as wide as a monospaced digit (0.6 em),
+/// anything else (Chinese, full-width brackets, the minus sign) counts as a full em.
+fn est_text_px(text: &str) -> f32 {
+    est_text_px_at(text, CELL_FONT_PX)
+}
+
+/// [`est_text_px`] at another font size.
+fn est_text_px_at(text: &str, font_px: f32) -> f32 {
+    text.chars().map(|c| if c.is_ascii() { 0.6 } else { 1.0 }).sum::<f32>() * font_px
+}
+
+/// Width a cell needs for `parts` laid out in one line, padding included.
+fn need(parts: &[String]) -> f32 {
+    need_at(parts, CELL_FONT_PX)
+}
+
+fn need_at(parts: &[String], font_px: f32) -> f32 {
+    parts.iter().map(|p| est_text_px_at(p, font_px)).sum::<f32>() + CELL_GAP_PX * parts.len().saturating_sub(1) as f32 + CELL_PAD_PX
+}
+
+fn rate(rate: &str, secs: i64, eq: Option<&str>, stale: bool) -> RateCell {
+    RateCell::Rate { rate: d(rate), interval_secs: secs, eq_8h: eq.map(d), stale }
+}
+
+#[test]
+fn the_width_model_counts_wide_characters_as_a_full_em() {
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+    assert!(close(est_text_px("0.0400"), 6.0 * 0.6 * CELL_FONT_PX));
+    assert!(close(est_text_px("週期不同"), 4.0 * CELL_FONT_PX));
+    assert!(close(est_text_px_at("0.0400", 9.0), 6.0 * 0.6 * 9.0));
+    assert!(close(est_text_px("−1"), CELL_FONT_PX + 0.6 * CELL_FONT_PX), "the minus sign is not ASCII: counted wide, on the safe side");
+}
+
+#[test]
+fn a_rate_cell_is_two_lines_rate_with_interval_then_the_8h_equivalent() {
+    let c = rate("0.0005", 14_400, Some("0.001"), false);
+    assert_eq!(c.first_line(), ["0.0500".to_string(), "4h".to_string()]);
+    assert_eq!(c.second_line().as_deref(), Some("8h 等效 0.1000（僅供顯示）"));
+    let eight = rate("0.0005", 28_800, None, false);
+    assert_eq!(eight.first_line(), ["0.0500".to_string(), "8h".to_string()]);
+    assert_eq!(eight.second_line(), None, "an 8h rate has no second line");
+    assert_eq!(rate("0.0005", 14_400, Some("0.001"), true).first_line().last().map(String::as_str), Some("過期"), "the stale marker stays on the first line");
+    assert_eq!(RateCell::Empty.first_line(), ["—".to_string()]);
+    assert_eq!(RateCell::DataError { interval_unknown: true }.first_line(), ["資料異常".to_string(), "週期未知".to_string()]);
+}
+
+#[test]
+fn the_exchange_columns_fit_their_widest_cell_on_both_lines() {
+    // -12.3456 % is far beyond any real funding rate; the 8h equivalent can be several times the rate.
+    let cells = [
+        rate("-0.123456", 3_600, Some("-0.987654"), true),
+        rate("0.0005", 14_400, Some("0.001"), true),
+        rate("0.0005", 1_800, Some("0.0001"), false),
+        RateCell::DataError { interval_unknown: true },
+        RateCell::Empty,
+    ];
+    for col in [ScanColumn::Binance, ScanColumn::Bybit, ScanColumn::Okx] {
+        for c in &cells {
+            assert!(need(&c.first_line()) <= col.width(), "{:?}: line 1 of {c:?} needs {} px", col, need(&c.first_line()));
+            if let Some(l2) = c.second_line() {
+                let n = need_at(std::slice::from_ref(&l2), RATE_NOTE_FONT_PX);
+                assert!(n <= col.width(), "{:?}: line 2 {l2:?} needs {n} px", col);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_gross_column_fits_the_value_and_both_labels_without_cutting_any() {
+    let mut r = row(1, "X");
+    r.gross_spread = Some(d("0.123456"));
+    r.intervals_differ = true;
+    assert_eq!(r.gross_text(), "12.3456");
+    for kind in [EdgeKind::IntervalMismatch, EdgeKind::RateGap] {
+        let tags = vec![GROSS_INTERVALS_DIFFER.to_string(), crate::ui::scanner::edge_kind_text(kind).to_string()];
+        assert!(need(&tags) <= ScanColumn::Gross.width(), "{tags:?} need {} px", need(&tags));
+    }
+    assert!(need(&[r.gross_text()]) <= ScanColumn::Gross.width());
+}
+
+#[test]
+fn the_symbol_column_fits_the_longest_real_symbols_without_cutting_them() {
+    // 1000000BABYDOGEUSDT (19 characters) is a real Binance perpetual; the column is as wide as it needs
+    for symbol in ["1000000BABYDOGEUSDT", "1000000MOGUSDT", "BTCUSDT"] {
+        let n = need(&[symbol.to_string()]);
+        assert!(n <= ScanColumn::Symbol.width(), "{symbol} needs {n} px, the column is {} px", ScanColumn::Symbol.width());
+    }
+}
+
+#[test]
+fn the_gross_labels_come_from_the_row_in_order_interval_difference_then_kind() {
+    let mut r = row(1, "X");
+    assert!(r.gross_tags().is_empty());
+    r.intervals_differ = true;
+    assert_eq!(r.gross_tags(), ["週期不同"]);
+}
+
+#[test]
+fn the_other_columns_fit_their_longest_fixed_texts() {
+    for q in [Qualified::Yes, Qualified::No, Qualified::NotConfigured, Qualified::NotApplicable, Qualified::NotSynchronized] {
+        assert!(need(&[q.text().to_string()]) <= ScanColumn::Qualified.width(), "{:?} needs {} px", q, need(&[q.text().to_string()]));
+    }
+    for c in [
+        Countdown::Remaining { ms: 99 * 3_600_000 + 59 * 60_000 + 59_000, calibrated: false },
+        Countdown::Remaining { ms: 1_000, calibrated: true },
+        Countdown::Settling,
+        Countdown::Unknown,
+    ] {
+        // two lines: the time (or 結算中), then the note (未校時 / 待更新)
+        for line in std::iter::once(c.first_line()).chain(c.second_line()) {
+            assert!(need(std::slice::from_ref(&line)) <= ScanColumn::Countdown.width(), "{c:?}: {line:?} needs {} px", need(std::slice::from_ref(&line)));
+        }
+    }
+    for (l, s) in [(Binance, Bybit), (Bybit, Binance), (Okx, Binance), (Binance, Okx)] {
+        let mut r = row(1, "X");
+        r.direction = Some((l, s));
+        let (long, short) = r.direction_lines().expect("a direction");
+        for line in [long, short] {
+            assert!(need(std::slice::from_ref(&line)) <= ScanColumn::Direction.width(), "{line:?} needs {} px", need(std::slice::from_ref(&line)));
+        }
+    }
+}
+
+#[test]
+fn countdown_and_direction_split_into_two_lines() {
+    let cal = Countdown::Remaining { ms: 3_723_000, calibrated: true };
+    assert_eq!((cal.first_line(), cal.second_line()), ("01:02:03".to_string(), None));
+    let un = Countdown::Remaining { ms: 3_723_000, calibrated: false };
+    assert_eq!((un.first_line(), un.second_line().as_deref()), ("01:02:03".to_string(), Some("（未校時）")));
+    assert_eq!((Countdown::Settling.first_line(), Countdown::Settling.second_line().as_deref()), ("結算中".to_string(), Some("待更新")));
+    assert_eq!((Countdown::Unknown.first_line(), Countdown::Unknown.second_line()), ("—".to_string(), None));
+    let mut r = row(1, "X");
+    assert_eq!(r.direction_lines(), None);
+    r.direction = Some((Bybit, Binance));
+    assert_eq!(r.direction_lines(), Some(("L Bybit".to_string(), "S Binance".to_string())));
+    assert_eq!(r.direction_text(), "L Bybit / S Binance");
+}
+
+#[test]
+fn the_columns_fit_the_default_1470_px_window_when_okx_is_not_ticked() {
+    // The page is 1470 - 248 (side bar and margins) wide, the table bordered by 2 px.
+    const TABLE_PX: f32 = 1470.0 - 248.0 - 2.0;
+    let mut v = ColumnVisibility::default();
+    v.set_disabled_exchanges(&[Okx]);
+    assert_eq!(v.visible().len(), 11);
+    assert!(v.total_width() <= TABLE_PX, "{} px > {TABLE_PX} px", v.total_width());
 }
 
 // ---- sort state transitions --------------------------------------------------------------------

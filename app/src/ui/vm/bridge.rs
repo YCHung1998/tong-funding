@@ -36,6 +36,10 @@ pub const ACCOUNT_EXCHANGES: [Exchange; 3] = Exchange::ALL;
 /// live-process 5.2: a live process trades Binance and Bybit only (OKX has no live path).
 pub const LIVE_TRADABLE_EXCHANGES: [Exchange; 2] = [Exchange::Binance, Exchange::Bybit];
 
+/// Starts the error of a `Loaded` account whose latest poll found it not connected (the last known
+/// data is kept, so a position it showed is not forgotten); the rest is the reason.
+pub const NOT_CONNECTED_ERROR_PREFIX: &str = "未連線：";
+
 /// The exchanges the pages and account reads cover under `identity`.
 pub fn tradable_exchanges(identity: crate::identity::ProcessIdentity) -> &'static [Exchange] {
     if identity.is_live() { &LIVE_TRADABLE_EXCHANGES } else { &TRADABLE_EXCHANGES }
@@ -334,6 +338,19 @@ pub struct PairInfo {
     pub state: Result<PairState, String>,
 }
 
+/// A stored pair row as the history views need it. Closed pairs and pairs from before a restart are in
+/// the store but no longer in the engine's snapshot, yet their symbol and exchanges must still be shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairRecord {
+    pub pair_id: String,
+    pub symbol: String,
+    /// `None` = the stored entry names no exchange (unreadable).
+    pub long_exchange: Option<Exchange>,
+    pub short_exchange: Option<Exchange>,
+    /// `pairs.status` as stored.
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillSwitchState {
     Off,
@@ -367,6 +384,11 @@ pub struct UiSnapshot {
     pub clocks: BTreeMap<Exchange, ClockState>,
     pub settings: Settings,
     pub pairs: Vec<PairInfo>,
+    /// Every stored pair by internal uuid, closed ones included (the engine's snapshot drops them on restart).
+    pub pair_records: BTreeMap<String, PairRecord>,
+    /// Why the stored pairs could not be read on the latest store tick; `None` = they were read. While
+    /// set, `pair_records` is the last good read, so "no unfinished pair" cannot be trusted.
+    pub pair_records_error: Option<String>,
     pub system: SystemFlags,
     /// This run's `SCAN_RUN` buffer (oldest first) and its capacity.
     pub scan_runs: Vec<ScanRecord>,
@@ -418,6 +440,12 @@ impl UiSnapshot {
     pub fn okx_ct_val(&self, symbol: &str) -> Option<Decimal> {
         self.rules.get(&(Exchange::Okx, symbol.to_string()))?.as_ref().ok()?.okx_ct_val.filter(|c| *c > Decimal::ZERO)
     }
+    /// Whether the risk setting `allowed_exchanges` lets the system trade on `e` (the pages show an
+    /// exchange that is not enabled as one muted line, ui-plain-language). Settings that could not be
+    /// read enable every exchange: nothing is hidden on a guess.
+    pub fn exchange_enabled(&self, e: Exchange) -> bool {
+        self.settings.error.is_some() || self.settings.risk.allowed_exchanges.contains(&e)
+    }
     pub fn health_of(&self, s: SourceId) -> Option<&SourceHealth> {
         self.health.iter().find(|h| h.source == s)
     }
@@ -444,6 +472,10 @@ pub enum SourceUpdate {
     Clock { exchange: Exchange, state: ClockState },
     Settings(Settings),
     Pairs(Vec<PairInfo>),
+    /// Replaces the stored pair records.
+    PairRecords(BTreeMap<String, PairRecord>),
+    /// The stored pairs could not be read: the last good records stay, marked as not trustworthy.
+    PairRecordsError(String),
     System(SystemFlags),
     ScanRuns { records: Vec<ScanRecord>, capacity: usize },
     Engine(EngineState),
@@ -528,6 +560,11 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         }
         SourceUpdate::Settings(s) => snap.settings = s,
         SourceUpdate::Pairs(p) => snap.pairs = p,
+        SourceUpdate::PairRecords(m) => {
+            snap.pair_records = m;
+            snap.pair_records_error = None;
+        }
+        SourceUpdate::PairRecordsError(why) => snap.pair_records_error = Some(why),
         SourceUpdate::System(s) => snap.system = s,
         SourceUpdate::ScanRuns { records, capacity } => {
             snap.scan_runs = records;

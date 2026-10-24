@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::component::table::{DataTable, TableState};
+use gpui_kit::component::{Size, Sizable};
 use gpui_kit::*;
 use tong_funding_core::types::Exchange;
 
@@ -51,7 +52,7 @@ pub struct Shell {
     pub(crate) scanner: ScannerVm,
     /// Trading pages' inputs, selections and pending confirmations (ui-trading-pages).
     pub(crate) trading: TradingState,
-    dashboard: DashboardVm,
+    pub(crate) dashboard: DashboardVm,
     positions: PositionsVm,
     pos_filter: positions::Filter,
     alerts: Vec<Alert>,
@@ -246,6 +247,9 @@ impl Shell {
     pub(crate) fn sync_table(&mut self, cx: &mut Context<Self>) {
         // Filtered and ordered here, so the candidate cells below line up with the rows as drawn.
         let rows = table_rows(&self.scanner, self.only_qualified, self.view.sort).unwrap_or_default();
+        // An exchange the risk settings left unticked has its column hidden unless the user showed it.
+        let disabled: Vec<Exchange> = Exchange::ALL.into_iter().filter(|e| !self.snap.exchange_enabled(*e)).collect();
+        self.view.visibility.set_disabled_exchanges(&disabled);
         let (visible, sort) = (self.view.visibility.visible(), self.view.sort);
         let (now, clocks) = (self.now_ms, self.snap.clocks.clone());
         let candidates = self.candidate_cells(&rows);
@@ -548,26 +552,12 @@ impl Shell {
     fn scanner_page(&self, cx: &mut Context<Self>) -> Div {
         let vm = &self.scanner;
         let refreshing = self.source.refresh_in_progress();
-        let mut sources = div().flex().gap_4();
-        for s in scanner::HEADER_SOURCES {
-            let mut f = banner::freshness(&self.snap, s, self.now_ms);
-            let label = s.label();
-            let mut chip = pages::freshness_chip(&label, &f);
-            if s == SourceId::BybitWs && self.snap.bybit_ws_disabled {
-                sources = sources.child(div().flex().gap_1().child(small(label, theme::TEXT_SECONDARY)).child(small(scanner::BYBIT_WS_DISABLED_TEXT, theme::TEXT_MUTED)));
-                continue;
-            }
-            if matches!(s, SourceId::BinanceWs | SourceId::BybitWs) {
-                // The WebSocket header uses ONLINE / RECONNECTING / OFFLINE.
-                let word = match f.status {
-                    FreshStatus::Online => "ONLINE",
-                    FreshStatus::Stale | FreshStatus::RateLimited => "RECONNECTING",
-                    FreshStatus::Offline | FreshStatus::Unknown => "OFFLINE",
-                };
-                f.next_poll_s = None;
-                chip = div().flex().gap_1().child(pages::freshness_chip(&label, &f)).child(small(word, theme::TEXT_SECONDARY));
-            }
-            sources = sources.child(chip);
+        // Rows are two lines of text tall; the text follows the zoom, so the row height must too.
+        let zoom_factor = super::zoom_ui::current(cx).factor();
+        // One chip per source, each saying its state and age once; wraps instead of running into the toggle.
+        let mut sources = div().id("scan-sources").test_support().flex().flex_wrap().items_center().gap_x(rx(16.0)).gap_y(rx(4.0));
+        for chip in scanner::source_chips(&self.snap, self.now_ms) {
+            sources = sources.child(pages::source_chip(&chip));
         }
         let header = div()
             .flex()
@@ -624,6 +614,7 @@ impl Shell {
         let toggle_color = if vm.decidable { theme::TEXT_PRIMARY } else { theme::TEXT_MUTED };
         let toggle = div()
             .id("only-qualified")
+            .test_support()
             .flex()
             .gap_2()
             .items_center()
@@ -652,12 +643,16 @@ impl Shell {
                 cx.notify();
             }))
             .child(small(if refreshing { "刷新中…" } else { "立即刷新" }, if refreshing { theme::TEXT_MUTED } else { theme::ACCENT }));
+        // The toggle, the sources and the refresh group are a clear gap apart; on a narrow window they wrap.
         let controls = div()
             .flex()
-            .justify_between()
+            .flex_wrap()
             .items_center()
+            .gap_x(rx(24.0))
+            .gap_y(rx(8.0))
             .child(toggle)
-            .child(div().flex().gap_3().items_center().child(sources).child(small(format!("最新掃描 {} UTC", format::utc_hms(vm.computed_at)), theme::TEXT_MUTED)).child(refresh));
+            .child(sources)
+            .child(div().ml_auto().flex().gap_3().items_center().child(small(format!("最新掃描 {} UTC", format::utc_hms(vm.computed_at)), theme::TEXT_MUTED)).child(refresh));
 
         let mut body = div().flex().flex_col().gap_2();
         let candidate_list = self.candidate_panel(cx);
@@ -675,7 +670,7 @@ impl Shell {
         if matches!(vm.visible(self.only_qualified), RowsView::NoneQualified) {
             body = body.child(text("目前沒有達標標的", theme::TEXT_MUTED));
         } else if !matches!(vm.state, ScanState::Loading) {
-            body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(rx(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true)));
+            body = body.child(div().id("scan-table").test_support().w_full().min_w_0().h(rx(560.0)).child(DataTable::new(&self.table).stripe(true).bordered(true).with_size(Size::Size(px(super::scan_view::ROW_HEIGHT_PX * zoom_factor)))));
         }
         let chips = self.column_chips(cx);
         div().flex().flex_col().gap_3().child(header).child(breakdown).child(cards).child(controls).child(chips).child(body).child(candidate_list)
@@ -768,7 +763,11 @@ impl Shell {
                 cx.notify();
             }))
         };
-        let page = pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin, &on_recheck, &on_open, &on_flatten);
+        let open = |k: &str| self.trading.expanded.contains(k);
+        let toggle = |k: String| self.note_toggle(cx, k);
+        let notes = pages::Notes { open: &open, toggle: &toggle };
+        let actions = pages::PairActions { on_recheck: &on_recheck, on_open: &on_open, on_flatten: &on_flatten };
+        let page = pages::positions_page(&self.positions, &sel_ex, &sel_coin, &on_ex, &on_coin, &actions, &notes);
         match self.flatten_panel(cx) {
             Some(p) => div().flex().flex_col().gap_3().child(p).child(page),
             None => page,
@@ -804,7 +803,7 @@ impl Shell {
     fn content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.trading.load_forms(&self.snap, window, cx);
         let inner = match self.page {
-            Page::Overview => pages::dashboard_page(&self.dashboard),
+            Page::Overview => self.dashboard_page(cx),
             Page::Scanner => self.scanner_page(cx),
             Page::Positions => self.positions_page(cx),
             Page::SystemLogs => self.system_log_page(cx),

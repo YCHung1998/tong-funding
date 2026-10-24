@@ -14,6 +14,7 @@ use super::banner::{BadgeVm, BannerItem, BannerVm, DrawerVm, Freshness, LoadView
 use super::bridge::ClockState;
 use super::dashboard::{self, ConnectedCard, DashboardVm, ExchangeCard, MarginDistribution};
 use super::format::{self, DASH};
+use super::labels::DisabledNote;
 use super::positions::{PairCard, PositionsVm, TableView};
 use super::scan_view::{ScanColumn, ScanEvent, SortDir, SortState};
 use super::scanner::{self, RateCell, ScanRow};
@@ -54,12 +55,30 @@ pub fn load_state(v: &LoadView) -> Option<Div> {
     })
 }
 
-pub fn freshness_chip(label: &str, f: &Freshness) -> Div {
-    let color = match f.status {
+fn fresh_color(status: super::alerts::FreshStatus) -> u32 {
+    match status {
         super::alerts::FreshStatus::Online => theme::POSITIVE,
         super::alerts::FreshStatus::RateLimited | super::alerts::FreshStatus::Stale => theme::WARNING,
         super::alerts::FreshStatus::Offline | super::alerts::FreshStatus::Unknown => theme::NEGATIVE,
-    };
+    }
+}
+
+/// A source in the scanner header (scanner-layout): dot, name and `state · age · next poll`, each said
+/// once; an unticked exchange is one muted `已停用` line without dot or state.
+pub fn source_chip(c: &scanner::SourceChip) -> Div {
+    let mut row = div().id(SharedString::from(format!("source-{}", c.key()))).test_support().flex().items_center().gap_1();
+    if let Some(status) = c.dot() {
+        row = row.child(div().size(px(6.0)).rounded_full().bg(rgb(fresh_color(status))));
+    }
+    match c {
+        scanner::SourceChip::Disabled { .. } => row = row.child(small(c.label(), Tone::Muted.color())),
+        _ => row = row.child(small(c.label(), theme::TEXT_SECONDARY)).child(small(c.detail(), theme::TEXT_MUTED)),
+    }
+    div().child(row)
+}
+
+pub fn freshness_chip(label: &str, f: &Freshness) -> Div {
+    let color = fresh_color(f.status);
     div()
         .flex()
         .items_center()
@@ -67,6 +86,41 @@ pub fn freshness_chip(label: &str, f: &Freshness) -> Div {
         .child(div().size(px(6.0)).rounded_full().bg(rgb(color)))
         .child(small(label.to_string(), theme::TEXT_SECONDARY))
         .child(small(f.text(), theme::TEXT_MUTED))
+}
+
+/// The one muted line of an exchange the risk settings left unticked (ui-plain-language). It opens
+/// to the detail (the error, the state, the quote row) when clicked; a line without detail is just text.
+/// `key` names the line (page and exchange) for the open state and the element id.
+pub fn disabled_note(n: &DisabledNote, key: &str, open: bool, on_toggle: ClickFn) -> Div {
+    let Some(detail) = &n.detail else {
+        return div().child(small(n.text.clone(), n.tone.color()));
+    };
+    let mut out = div().flex().flex_col().gap_1().child(
+        div()
+            .id(SharedString::from(format!("disabled-{key}")))
+            .test_support()
+            .cursor_pointer()
+            .on_click(on_toggle)
+            .child(small(format!("{} {}", if open { "▾" } else { "▸" }, n.text), n.tone.color())),
+    );
+    if open {
+        out = out.child(small(detail.clone(), theme::TEXT_MUTED).pl(rx(14.0)));
+    }
+    out
+}
+
+/// Whether a disabled-exchange line (by key) is open, and the click handler that flips it.
+pub struct Notes<'a> {
+    pub open: &'a dyn Fn(&str) -> bool,
+    pub toggle: &'a dyn Fn(String) -> ClickFn,
+}
+
+impl Notes<'_> {
+    /// The line of `n` on the page named `page` (`<page>-<exchange>` is its key and element id).
+    pub fn line(&self, n: &DisabledNote, page: &str) -> Div {
+        let key = format!("{page}-{}", n.exchange.name());
+        disabled_note(n, &key, (self.open)(&key), (self.toggle)(key.clone()))
+    }
 }
 
 // ---- banner ---------------------------------------------------------------------------------
@@ -237,12 +291,23 @@ fn legend(labels: Vec<(String, String)>) -> Div {
     col
 }
 
+/// The card of an exchange the risk settings left unticked but that still has exposure: the warning
+/// says so under the state the card already shows (ui-plain-language).
+fn with_disabled_note(card: Div, note: &Option<String>) -> Div {
+    match note {
+        Some(n) => card.child(small(n.clone(), theme::WARNING)),
+        None => card,
+    }
+}
+
 fn connected_card(c: &ConnectedCard) -> Div {
     let header = div()
         .flex()
         .justify_between()
         .child(text(c.exchange.name(), theme::TEXT_PRIMARY).text_size(fs(14.0)))
         .child(small(c.status_label.clone(), theme::POSITIVE));
+    // ui-plain-language: the exchange is not enabled but still holds positions, so its card stays.
+    let disabled = c.disabled_note.as_ref().map(|n| small(n.clone(), theme::WARNING));
     let total = div()
         .flex()
         .gap_2()
@@ -286,14 +351,14 @@ fn connected_card(c: &ConnectedCard) -> Div {
             ["合計".to_string(), String::new(), String::new(), format::money(c.value, 2), "100.0000%".into()].map(|s| small(s, theme::TEXT_PRIMARY).w(rx(110.0))),
         ))
         .child(small(dashboard::EQUITY_FOOTNOTE, theme::TEXT_MUTED));
-    let mut out = card().w(rx(560.0)).child(header).child(total).child(div().flex().gap_6().child(asset_chart).child(margin_chart)).child(table);
+    let mut out = card().w(rx(560.0)).child(header).children(disabled).child(total).child(div().flex().gap_6().child(asset_chart).child(margin_chart)).child(table);
     if let Some(n) = &c.stale_note {
         out = out.child(small(n.clone(), theme::WARNING));
     }
     out
 }
 
-pub fn dashboard_page(vm: &DashboardVm) -> Div {
+pub fn dashboard_page(vm: &DashboardVm, notes: &Notes) -> Div {
     let mut total = card()
         .child(small("Total Portfolio Value", theme::TEXT_MUTED))
         .child(text(format!("{} USDT", format::money(vm.total, 2)), theme::TEXT_PRIMARY).text_size(fs(21.0)))
@@ -319,15 +384,33 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
             .child(small(vm.positions_note.clone(), theme::TEXT_SECONDARY)),
     );
     let mut cards = div().flex().flex_wrap().gap_3();
+    let mut lines = div().flex().flex_col().gap_1();
+    let mut has_notes = false;
     for c in &vm.cards {
-        cards = cards.child(match c {
-            ExchangeCard::Connected(c) => connected_card(c),
-            ExchangeCard::NotConnected { exchange, reason } => card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small(format!("● 未連線 · {reason}"), theme::NEGATIVE)),
-            ExchangeCard::Loading { exchange } => card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small("載入中", theme::TEXT_MUTED)),
-            ExchangeCard::Failed { exchange, error, at } => card()
-                .child(text(exchange.name(), theme::TEXT_PRIMARY))
-                .child(small(format!("載入失敗：{error}（{} UTC）", format::utc_hms(*at)), theme::NEGATIVE)),
-        });
+        cards = match c {
+            ExchangeCard::Connected(c) => cards.child(connected_card(c)),
+            ExchangeCard::NotConnected { exchange, reason, disabled_note } => {
+                cards.child(with_disabled_note(card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small(format!("● 未連線 · {reason}"), theme::NEGATIVE)), disabled_note))
+            }
+            ExchangeCard::Loading { exchange, disabled_note } => {
+                cards.child(with_disabled_note(card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small("載入中", theme::TEXT_MUTED)), disabled_note))
+            }
+            ExchangeCard::Failed { exchange, error, plain, at, disabled_note } => {
+                // plain words first; the exchange's own message stays as the secondary line
+                let mut failed = card()
+                    .child(text(exchange.name(), theme::TEXT_PRIMARY))
+                    .child(small(format!("載入失敗：{plain}（{} UTC）", format::utc_hms(*at)), theme::NEGATIVE));
+                if plain != error {
+                    failed = failed.child(small(format!("原始訊息：{error}"), theme::TEXT_MUTED));
+                }
+                cards.child(with_disabled_note(failed, disabled_note))
+            }
+            ExchangeCard::Disabled(n) => {
+                lines = lines.child(notes.line(n, "overview"));
+                has_notes = true;
+                cards
+            }
+        };
     }
     let mut header = div().flex().justify_between().child(title("總覽", "Dashboard"));
     if let Some(r) = &vm.refresh_text {
@@ -340,6 +423,7 @@ pub fn dashboard_page(vm: &DashboardVm) -> Div {
         .child(header)
         .child(top)
         .child(cards)
+        .children(has_notes.then_some(lines))
         .child(card().child(small("曝險摘要", theme::TEXT_MUTED)).child(text(vm.exposure.clone(), tone(vm.exposure_tone))))
 }
 
@@ -453,15 +537,21 @@ fn pair_card(c: &PairCard, on_recheck: &dyn Fn(String) -> ClickFn, on_open: &dyn
 
 pub type ClickFn = Box<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
+/// What a click on a pair card does: re-query its funding, open the exchange's page, flatten a leg.
+pub struct PairActions<'a> {
+    pub on_recheck: &'a dyn Fn(String) -> ClickFn,
+    pub on_open: &'a dyn Fn(String) -> ClickFn,
+    pub on_flatten: &'a dyn Fn(super::live_actions::FlattenButton) -> ClickFn,
+}
+
 pub fn positions_page(
     vm: &PositionsVm,
     selected_ex: &dyn Fn(Exchange) -> bool,
     selected_coin: &dyn Fn(&str) -> bool,
     on_ex: &dyn Fn(Exchange) -> ClickFn,
     on_coin: &dyn Fn(String) -> ClickFn,
-    on_recheck: &dyn Fn(String) -> ClickFn,
-    on_open: &dyn Fn(String) -> ClickFn,
-    on_flatten: &dyn Fn(super::live_actions::FlattenButton) -> ClickFn,
+    actions: &PairActions,
+    notes: &Notes,
 ) -> Div {
     let chip = |id: SharedString, label: String, on: bool, f: ClickFn| {
         div()
@@ -522,6 +612,9 @@ pub fn positions_page(
                 if r.unpaired {
                     line = line.child(small("未配對", theme::WARNING));
                 }
+                if let Some(note) = r.note {
+                    line = line.child(small(note, theme::WARNING));
+                }
                 table = table.child(line);
             }
         }
@@ -530,6 +623,10 @@ pub fn positions_page(
     let mut notices = div().flex().flex_col();
     for n in &vm.notices {
         notices = notices.child(small(n.clone(), theme::WARNING));
+    }
+    // ui-plain-language: an unticked exchange is one muted line, its notice behind it.
+    for n in &vm.disabled {
+        notices = notices.child(notes.line(n, "positions"));
     }
     div()
         .flex()
@@ -540,7 +637,7 @@ pub fn positions_page(
         .child(cards)
         .child(notices)
         .child(card().child(table))
-        .child(div().flex().flex_wrap().gap_3().children(vm.pair_cards.iter().map(|c| pair_card(c, on_recheck, on_open, on_flatten))))
+        .child(div().flex().flex_wrap().gap_3().children(vm.pair_cards.iter().map(|c| pair_card(c, actions.on_recheck, actions.on_open, actions.on_flatten))))
 }
 
 // ---- system log -----------------------------------------------------------------------------
@@ -616,15 +713,33 @@ pub struct ScannerTable {
     pub events: std::rc::Rc<std::cell::RefCell<Vec<ScanEvent>>>,
 }
 
-fn rate_cell(c: &RateCell) -> Div {
-    let mut d = div().flex().gap_1().items_center().child(small(c.text(), tone(c.tone())));
-    if let Some(tag) = c.tag() {
-        d = d.child(small(tag, theme::INFO));
-    }
-    for n in c.notes() {
-        d = d.child(small(n, theme::TEXT_MUTED));
+/// A cell of up to two lines of the same colour.
+fn two_lines(first: String, second: Option<String>, color: u32) -> Div {
+    let mut d = div().flex().flex_col().child(small(first, color));
+    if let Some(s) = second {
+        d = d.child(small(s, color));
     }
     d
+}
+
+/// A rate cell is two lines (scanner-layout): the rate, its interval tag and the stale marker; under
+/// it the 8h equivalent. The ids follow the symbol and exchange (not the row index) for the tests.
+fn rate_cell(c: &RateCell, symbol: &str, exchange: Exchange) -> Div {
+    let key = format!("{symbol}-{}", exchange.name());
+    let mut line1 = div().id(SharedString::from(format!("rate-line1-{key}"))).test_support().flex().gap_1().items_center();
+    for (i, part) in c.first_line().into_iter().enumerate() {
+        let color = match (i, part.as_str()) {
+            (0, _) => c.tone().color(),
+            (_, scanner::STALE_NOTE) => theme::TEXT_MUTED,
+            _ => theme::INFO,
+        };
+        line1 = line1.child(small(part, color));
+    }
+    let mut cell = div().id(SharedString::from(format!("rate-{key}"))).test_support().flex().flex_col().child(line1);
+    if let Some(eq) = c.second_line() {
+        cell = cell.child(small(eq, theme::TEXT_MUTED).text_size(fs(super::scan_view::RATE_NOTE_FONT_PX)).id(SharedString::from(format!("rate-line2-{key}"))).test_support());
+    }
+    div().child(cell)
 }
 
 impl ScannerTable {
@@ -660,7 +775,8 @@ impl TableDelegate for ScannerTable {
     /// The header title is clickable too (the library only reacts to its small sort icon).
     fn render_th(&mut self, col_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> impl IntoElement {
         let c = self.visible.get(col_ix).copied().unwrap_or(ScanColumn::Symbol);
-        let mut title = div().id(("scan-th", col_ix)).test_support().size_full().child(c.title());
+        // The rows are sized by pixels (two lines tall), which drops the table's own header font: set it.
+        let mut title = div().id(("scan-th", col_ix)).test_support().size_full().text_size(fs(super::scan_view::HEADER_FONT_PX)).child(c.title());
         if c.sortable() {
             let events = self.events.clone();
             title = title.cursor_pointer().on_click(move |_, _, _| events.borrow_mut().push(ScanEvent::CycleSort(c)));
@@ -685,21 +801,27 @@ impl TableDelegate for ScannerTable {
             ScanColumn::Coverage => small(r.coverage_text(), theme::TEXT_SECONDARY),
             ScanColumn::Countdown => {
                 let clock = r.countdown_target.map(|(_, e)| self.clocks.get(&e).copied().unwrap_or(ClockState::Unsynced)).unwrap_or(ClockState::Unsynced);
-                small(scanner::countdown(r.countdown_target, clock, self.now_ms).text(), theme::TEXT_SECONDARY)
+                let cd = scanner::countdown(r.countdown_target, clock, self.now_ms);
+                two_lines(cd.first_line(), cd.second_line(), theme::TEXT_SECONDARY)
             }
-            ScanColumn::Binance => rate_cell(&r.cells[0].1),
-            ScanColumn::Bybit => rate_cell(&r.cells[1].1),
-            ScanColumn::Okx => rate_cell(&r.cells[2].1),
-            ScanColumn::Direction => small(r.direction_text(), theme::TEXT_SECONDARY),
+            ScanColumn::Binance => rate_cell(&r.cells[0].1, &r.symbol, r.cells[0].0),
+            ScanColumn::Bybit => rate_cell(&r.cells[1].1, &r.symbol, r.cells[1].0),
+            ScanColumn::Okx => rate_cell(&r.cells[2].1, &r.symbol, r.cells[2].0),
+            ScanColumn::Direction => match r.direction_lines() {
+                Some((long, short)) => two_lines(long, Some(short), theme::TEXT_SECONDARY),
+                None => small(r.direction_text(), theme::TEXT_SECONDARY),
+            },
             ScanColumn::Gross => {
-                let mut d = div().flex().gap_1().child(small(r.gross_text(), theme::TEXT_SECONDARY));
-                if r.intervals_differ {
-                    d = d.child(small("週期不同", theme::WARNING));
+                // The value on the first line, the labels under it: the column is as wide as the widest of
+                // them (not value + two labels side by side), and nothing is cut or reaches Net Edge.
+                let mut tags = div().id(SharedString::from(format!("gross-tags-{}", r.symbol))).flex().gap_1();
+                for tag in r.gross_tags() {
+                    tags = tags.child(small(tag, theme::WARNING).id(SharedString::from(format!("gross-diff-{}", r.symbol))).test_support());
                 }
                 if let (Some(label), Some(hint)) = (r.edge_kind_label(), r.edge_kind_hint()) {
                     // The id follows the symbol, not the row index: gpui keeps tooltip state per element id, so an
                     // index would show the previous row's text on whatever symbol a re-sort puts there.
-                    d = d.child(
+                    tags = tags.child(
                         div()
                             .id(SharedString::from(format!("edge-kind-{}", r.symbol)))
                             .test_support()
@@ -707,9 +829,23 @@ impl TableDelegate for ScannerTable {
                             .child(small(label, theme::TEXT_SECONDARY)),
                     );
                 }
-                d
+                div().child(
+                    div()
+                        .id(SharedString::from(format!("gross-{}", r.symbol)))
+                        .test_support()
+                        .flex()
+                        .flex_col()
+                        .child(small(r.gross_text(), theme::TEXT_SECONDARY).id(SharedString::from(format!("gross-value-{}", r.symbol))).test_support())
+                        .child(tags),
+                )
             }
-            ScanColumn::NetEdge => small(r.net_edge.text(), tone(r.net_edge.tone())),
+            ScanColumn::NetEdge => {
+                // A long "未設定（缺 …）" wraps onto the second line instead of running into the next column;
+                // the whole list stays in the tooltip (and in the formula block at the top of the page).
+                let full = r.net_edge.text();
+                let cell = small(full.clone(), tone(r.net_edge.tone())).id(SharedString::from(format!("net-{}", r.symbol))).test_support().whitespace_normal().line_clamp(2);
+                div().child(if matches!(r.net_edge, scanner::NetEdgeCell::NotConfigured(_)) { cell.tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx)).into_any_element() } else { cell.into_any_element() })
+            }
             ScanColumn::Add => {
                 let cell = self.candidates.get(row).cloned().unwrap_or_default();
                 let (mark, color) = match (&cell.blocked, cell.checked) {

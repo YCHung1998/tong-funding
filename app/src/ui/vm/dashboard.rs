@@ -7,7 +7,9 @@ use std::collections::BTreeMap;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{tradable_exchanges, AccountData, AccountState, ContractEquity, UiSnapshot};
+use super::disabled::{self, DisabledStatus};
 use super::format::{self, DASH};
+use super::labels::{disabled_exchange_line, plain_error, DisabledNote, DISABLED_WITH_EXPOSURE};
 use super::positions::{Grouped, group};
 use crate::exchange::signed::models::Position;
 use crate::ui::theme::Tone;
@@ -77,20 +79,28 @@ pub struct ConnectedCard {
     pub margin: MarginDistribution,
     /// `45 秒前的資料 · 可能已過期` when the latest poll failed.
     pub stale_note: Option<String>,
+    /// The exchange is not in `allowed_exchanges` but still holds positions: its card stays and says so.
+    pub disabled_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExchangeCard {
     Connected(ConnectedCard),
-    NotConnected { exchange: Exchange, reason: String },
-    Loading { exchange: Exchange },
-    Failed { exchange: Exchange, error: String, at: i64 },
+    /// `disabled_note` (here and on `Loading` and `Failed`): the exchange is not in `allowed_exchanges`
+    /// but still has exposure (positions or an unfinished pair) while its read is not good, so the
+    /// card stays with this warning instead of folding into a line.
+    NotConnected { exchange: Exchange, reason: String, disabled_note: Option<String> },
+    Loading { exchange: Exchange, disabled_note: Option<String> },
+    /// `error` is the message as the exchange adapter said it; `plain` is the same in plain words.
+    Failed { exchange: Exchange, error: String, plain: String, at: i64, disabled_note: Option<String> },
+    /// Not in `allowed_exchanges` and nothing to show: one muted line, the state behind it.
+    Disabled(DisabledNote),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DashboardVm {
     pub total: Decimal,
-    /// `Binance + Bybit + OKX` (a Live process: `Binance + Bybit`).
+    /// The exchanges the total counts, `Binance + Bybit + OKX`; `尚無已連線的交易所` when none is.
     pub exchanges_text: String,
     /// e.g. `不含未連線的交易所：Bybit`.
     pub excluded_note: Option<String>,
@@ -203,11 +213,57 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
     let grouped = group(snap);
     let mut cards = Vec::new();
     let mut excluded = Vec::new();
+    // unticked exchanges whose positions cannot be confirmed (named in the exposure summary)
+    let mut unconfirmed: Vec<&str> = Vec::new();
     let mut unvalued_total = 0;
     let mut used_total = Decimal::ZERO;
     let mut pnl_total = Decimal::ZERO;
     for e in tradable_exchanges(snap.identity).iter().copied() {
-        match snap.account(e) {
+        // ui-plain-language: an exchange the risk settings left unticked is one line ONLY when nothing
+        // about its exposure is open: muted when the latest read found nothing, in the warning tone
+        // when the positions cannot be confirmed. Positions, an incomplete list or an unfinished pair
+        // keep the card, with a note (exposure is never hidden).
+        let verdict = (!snap.exchange_enabled(e)).then(|| disabled::status(snap, e, now_ms));
+        let exposed = verdict == Some(DisabledStatus::Exposed);
+        let folded = |detail: String| -> ExchangeCard {
+            ExchangeCard::Disabled(match &verdict {
+                Some(DisabledStatus::Unconfirmed { reason }) => DisabledNote::unconfirmed(e, reason, Some(detail)),
+                _ => DisabledNote::new(e, Some(detail)),
+            })
+        };
+        let card_note = exposed.then(|| format!("{} · {DISABLED_WITH_EXPOSURE}", disabled_exchange_line(e)));
+        let fold = verdict.is_some() && !exposed;
+        if matches!(verdict, Some(DisabledStatus::Unconfirmed { .. })) {
+            // its value is not in the total and its positions are not known: say so in the notes
+            excluded.push(e.name());
+            unconfirmed.push(e.name());
+        }
+        let account = snap.account(e);
+        if fold {
+            // an unticked exchange without exposure: one muted line, the page it would have drawn behind it
+            let detail = match account {
+                AccountState::Loaded { data, fetched_at, .. } => {
+                    let value = asset_rows(&data).1;
+                    match verdict {
+                        Some(DisabledStatus::Unconfirmed { .. }) => format!("最後一次成功讀取是 {} 秒前；資產 {} USDT 未計入總資產", format::secs(now_ms - fetched_at), format::money(value, 2)),
+                        _ => {
+                            let age = disabled::read_age_note(snap, e, now_ms).map(|a| format!("（{a}）")).unwrap_or_default();
+                            format!("已連線，沒有持倉{age}；資產 {} USDT 未計入總資產", format::money(value, 2))
+                        }
+                    }
+                }
+                AccountState::NotConnected { reason } => format!("未連線：{reason}"),
+                AccountState::Failed { error, at } => {
+                    let plain = plain_error(&error);
+                    let raw = if plain == error { String::new() } else { format!(" · 原始訊息：{error}") };
+                    format!("載入失敗：{plain}（{} UTC）{raw}", format::utc_hms(at))
+                }
+                AccountState::Loading => "載入中".into(),
+            };
+            cards.push(folded(detail));
+            continue;
+        }
+        match account {
             AccountState::Loaded { data, fetched_at, error } => {
                 let (assets, value, unvalued) = asset_rows(&data);
                 let margin = margin_distribution(&data.positions);
@@ -224,19 +280,21 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
                     unvalued,
                     margin,
                     stale_note,
+                    disabled_note: card_note,
                 }));
             }
             AccountState::NotConnected { reason } => {
                 excluded.push(e.name());
-                cards.push(ExchangeCard::NotConnected { exchange: e, reason });
+                cards.push(ExchangeCard::NotConnected { exchange: e, reason, disabled_note: card_note });
             }
             AccountState::Failed { error, at } => {
+                let plain = plain_error(&error);
                 excluded.push(e.name());
-                cards.push(ExchangeCard::Failed { exchange: e, error, at });
+                cards.push(ExchangeCard::Failed { exchange: e, error, plain, at, disabled_note: card_note });
             }
             AccountState::Loading => {
                 excluded.push(e.name());
-                cards.push(ExchangeCard::Loading { exchange: e });
+                cards.push(ExchangeCard::Loading { exchange: e, disabled_note: card_note });
             }
         }
     }
@@ -248,12 +306,17 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
         }
     }
 
+    // The description lists the exchanges the total counts (the connected cards), nothing else.
+    let counted: Vec<&str> = cards.iter().filter_map(|c| if let ExchangeCard::Connected(c) = c { Some(c.exchange.name()) } else { None }).collect();
+    let exchanges_text = if counted.is_empty() { "尚無已連線的交易所".to_string() } else { counted.join(" + ") };
+
     let open_positions = grouped.rows.len();
     let pairs = grouped.grouping.groups.len();
     let unhedged = grouped.grouping.ungrouped.len();
     let legs = if unhedged == 0 { "無未避險單腿".to_string() } else { format!("{unhedged} 個未避險單腿") };
+    let unconfirmed_note = if unconfirmed.is_empty() { String::new() } else { format!("（{} 持倉無法確認）", unconfirmed.join("、")) };
     let exposure = format!(
-        "{} · 已用保證金 {} USDT · 未實現 PnL {} USDT · {legs}",
+        "{} · 已用保證金 {} USDT · 未實現 PnL {} USDT · {legs}{unconfirmed_note}",
         pairs_phrase(&grouped),
         format::money(used_total, 2),
         format::money(pnl_total, 2)
@@ -266,7 +329,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
 
     DashboardVm {
         total,
-        exchanges_text: tradable_exchanges(snap.identity).iter().map(|e| e.name()).collect::<Vec<_>>().join(" + "),
+        exchanges_text,
         excluded_note: (!excluded.is_empty()).then(|| format!("不含未連線的交易所：{}", excluded.join("、"))),
         unvalued_note: (unvalued_total > 0).then(|| format!("不含 {unvalued_total} 項無法估值的資產")),
         cards,
@@ -274,7 +337,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
         positions_note: format!("{pairs} 對避險組合 · {open_positions} 個交易所倉位"),
         exposure,
         unhedged,
-        exposure_tone: if unhedged > 0 { Tone::Warning } else { Tone::Muted },
+        exposure_tone: if unhedged > 0 || !unconfirmed.is_empty() { Tone::Warning } else { Tone::Muted },
         refresh_text,
     }
 }

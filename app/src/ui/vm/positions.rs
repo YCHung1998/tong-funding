@@ -15,6 +15,8 @@ use super::bridge::{tradable_exchanges, AccountState, PairInfo, UiSnapshot};
 use super::env_label::EnvLabel;
 use super::format::{self, DASH};
 use super::funding::{self as fv, PairFunding, PnlPanel, TimelineRow};
+use super::disabled::{self as rule, DisabledStatus};
+use super::labels::{disabled_exchange_line, pair_state_text, plain_error, DisabledNote, DISABLED_WITH_EXPOSURE};
 use crate::exchange::signed::models::Position;
 use crate::ui::theme::Tone;
 
@@ -139,7 +141,7 @@ fn pair_cards(snap: &UiSnapshot, g: &Grouped, now_ms: i64) -> Vec<PairCard> {
     }
     for p in &snap.pairs {
         let warning = match &p.state {
-            Ok(st) if st.is_locked() => format!("{} · {MANUAL_NOTE}", st.as_str()),
+            Ok(st) if st.is_locked() => format!("{} · {MANUAL_NOTE}", pair_state_text(st.as_str())),
             Err(_) => format!("狀態無法讀取 · {MANUAL_NOTE}"),
             Ok(_) => continue,
         };
@@ -179,6 +181,8 @@ pub struct PosRow {
     /// OKX only: the position in contracts (`quantity / ctVal`), when `ctVal` is known. Shown beside
     /// the coin amount; never used as the coin amount.
     pub contracts: Option<Decimal>,
+    /// `此交易所已停用，但仍有持倉或持倉狀態未確認` when the exchange is not in `allowed_exchanges`: the row is shown as usual, with this note.
+    pub note: Option<&'static str>,
 }
 
 impl PosRow {
@@ -318,8 +322,10 @@ pub struct PositionsVm {
     /// `Binance +4.00 · Bybit −4.00`.
     pub pnl_breakdown: String,
     pub pair_cards: Vec<PairCard>,
-    /// Incomplete lists (with the reason), unconnected exchanges.
+    /// Incomplete lists (with the reason), unconnected exchanges (enabled exchanges only).
     pub notices: Vec<String>,
+    /// Exchanges the risk settings left unticked: one muted line each, what would have been a notice behind it.
+    pub disabled: Vec<DisabledNote>,
 }
 
 /// An OKX position in contracts, from its coin amount and the instrument's `ctVal`; `None` for the
@@ -365,6 +371,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
             funding,
             funding_tone,
             contracts: contracts_of(snap, p),
+            note: (!snap.exchange_enabled(p.exchange)).then_some(DISABLED_WITH_EXPOSURE),
         })
         .collect();
 
@@ -407,19 +414,57 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
         by_ex.iter().map(|(e, v)| format!("{} {}", e.name(), format::signed(*v, 2))).collect::<Vec<_>>().join(" · ")
     };
 
-    let mut notices = Vec::new();
+    // What an exchange's account state says about its positions. An exchange the risk settings left
+    // unticked gets one muted line with these behind it instead of yellow notices (ui-plain-language).
+    let (mut notices, mut disabled) = (Vec::new(), Vec::new());
     for e in tradable_exchanges(snap.identity).iter().copied() {
+        let mut lines = Vec::new();
+        let mut raw_error = None;
         match snap.account(e) {
             AccountState::Loaded { data, .. } if data.positions_incomplete.is_some() => {
-                notices.push(format!("{} 持倉列表可能不完整", e.name()));
+                lines.push(format!("{} 持倉列表可能不完整", e.name()));
                 if let Some(why) = &data.positions_incomplete {
-                    notices.push(format!("{}：{why}", e.name()));
+                    lines.push(format!("{}：{why}", e.name()));
                 }
             }
-            AccountState::NotConnected { reason } => notices.push(format!("{} 未連線：{reason}", e.name())),
-            AccountState::Failed { error, .. } => notices.push(format!("{} 持倉讀取失敗：{error}", e.name())),
-            AccountState::Loading => notices.push(format!("{} 持倉載入中", e.name())),
+            AccountState::NotConnected { reason } => lines.push(format!("{} 未連線：{reason}", e.name())),
+            AccountState::Failed { error, .. } => {
+                lines.push(format!("{} 持倉讀取失敗：{}", e.name(), plain_error(&error)));
+                raw_error = Some(error);
+            }
+            AccountState::Loading => lines.push(format!("{} 持倉載入中", e.name())),
             _ => {}
+        }
+        let detail_of = |lines: &[String], raw_error: Option<&String>| {
+            let mut detail = (!lines.is_empty()).then(|| lines.join("；"));
+            if let (Some(d), Some(raw)) = (detail.as_mut(), raw_error.filter(|raw| plain_error(raw) != **raw)) {
+                d.push_str(&format!(" · 原始訊息：{raw}"));
+            }
+            detail
+        };
+        if snap.exchange_enabled(e) {
+            notices.extend(lines);
+            continue;
+        }
+        match rule::status(snap, e, now_ms) {
+            // exposure stays visible: the yellow notices and a note that says the exchange is unticked
+            DisabledStatus::Exposed => {
+                notices.extend(lines.iter().cloned());
+                if let Some(raw) = raw_error.as_ref().filter(|raw| plain_error(raw) != **raw) {
+                    notices.push(format!("{} 原始訊息：{raw}", e.name()));
+                }
+                let pairs = rule::unfinished_pair_symbols(snap, e);
+                if !pairs.is_empty() {
+                    notices.push(format!("{} 有未結束的配對：{}", e.name(), pairs.join("、")));
+                }
+                notices.push(format!("{} · {DISABLED_WITH_EXPOSURE}", disabled_exchange_line(e)));
+            }
+            DisabledStatus::Unconfirmed { reason } => disabled.push(DisabledNote::unconfirmed(e, &reason, detail_of(&lines, raw_error.as_ref()))),
+            DisabledStatus::Quiet => {
+                // behind the quiet line: what was said, and how old the read that made it quiet is
+                let detail = [detail_of(&lines, raw_error.as_ref()), rule::read_age_note(snap, e, now_ms)].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+                disabled.push(DisabledNote::new(e, (!detail.is_empty()).then_some(detail)));
+            }
         }
     }
 
@@ -436,6 +481,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
         pnl_breakdown,
         pair_cards: pair_cards(snap, &g, now_ms),
         notices,
+        disabled,
     }
 }
 

@@ -58,9 +58,9 @@ fn four_hour_interval_shows_tag_and_display_only_8h_equivalent() {
     let c = cell(r, Binance);
     assert_eq!(c.text(), "0.0500");
     assert_eq!(c.tag().as_deref(), Some("4h"));
-    assert!(c.notes().contains(&"8h 等效 0.1000（僅供顯示）".to_string()), "{:?}", c.notes());
+    assert!(c.second_line().as_deref() == Some("8h 等效 0.1000（僅供顯示）"), "{:?}", c.second_line());
     assert_eq!(cell(r, Bybit).tag().as_deref(), Some("8h"));
-    assert!(cell(r, Bybit).notes().iter().all(|n| !n.contains("8h 等效")));
+    assert!(cell(r, Bybit).second_line().is_none());
     assert!(r.intervals_differ, "4h vs 8h legs get the 週期不同 mark");
 }
 
@@ -89,7 +89,7 @@ fn okx_largest_spread_is_chosen_like_any_other_exchange() {
     assert_eq!(r.direction, Some((Okx, Bybit)), "long the lowest rate (OKX), short the highest (Bybit)");
     assert_eq!(r.gross_text(), "0.5200");
     assert_eq!(r.qualified, Qualified::Yes);
-    assert!(cell(r, Okx).notes().iter().all(|n| !n.contains("僅比價")), "{:?}", cell(r, Okx).notes());
+    assert!(cell(r, Okx).second_line().iter().all(|n| !n.contains("僅比價")), "{:?}", cell(r, Okx).second_line());
     assert_eq!(cell(r, Okx).text(), "−0.5000");
     assert_eq!(r.coverage_text(), "3/3");
 }
@@ -254,8 +254,8 @@ fn rows_have_independent_countdowns() {
     s.market.get_mut(&Binance).unwrap().observations.push(obs(Binance, "BUSDT", "0.0001", 28_800, NOW + 12 * H, NOW));
     let vm = build(&s, NOW);
     let synced = ClockState::Synced { offset_ms: 0 };
-    assert_eq!(countdown(row(&vm, "AUSDT").countdown_target, synced, NOW).text(), "04:00:00");
-    assert_eq!(countdown(row(&vm, "BUSDT").countdown_target, synced, NOW).text(), "12:00:00");
+    assert_eq!(countdown(row(&vm, "AUSDT").countdown_target, synced, NOW).first_line(), "04:00:00");
+    assert_eq!(countdown(row(&vm, "BUSDT").countdown_target, synced, NOW).first_line(), "12:00:00");
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn pair_countdown_targets_the_earlier_leg() {
     let vm = build(&s, now);
     let r = row(&vm, "BTCUSDT");
     assert_eq!(r.countdown_target.map(|t| t.0), Some(NOW));
-    assert_eq!(countdown(r.countdown_target, ClockState::Synced { offset_ms: 0 }, now).text(), "01:00:00");
+    assert_eq!(countdown(r.countdown_target, ClockState::Synced { offset_ms: 0 }, now).first_line(), "01:00:00");
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn countdown_uses_the_calibrated_exchange_time() {
 fn countdown_past_zero_is_settling_never_negative() {
     let c = countdown(Some((NOW - 1, Binance)), ClockState::Synced { offset_ms: 0 }, NOW);
     assert_eq!(c, Countdown::Settling);
-    assert_eq!(c.text(), "結算中 · 待更新");
+    assert_eq!((c.first_line(), c.second_line().as_deref()), ("結算中".to_string(), Some("待更新")));
     assert_eq!(countdown(Some((NOW, Binance)), ClockState::Synced { offset_ms: 0 }, NOW), Countdown::Settling);
     let u = countdown(Some((NOW + 1_000, Binance)), ClockState::Unsynced, NOW);
     assert_eq!(u, Countdown::Remaining { ms: 1_000, calibrated: false });
@@ -318,8 +318,8 @@ fn loading_unavailable_and_partial_failure_are_distinct() {
     let vm = build(&partial, NOW + 2);
     assert_eq!(vm.state, TableState::Ready);
     assert_eq!(vm.source_errors, vec![(Bybit, "request timed out".to_string())]);
-    assert!(cell(row(&vm, "BTCUSDT"), Bybit).notes().contains(&"過期".to_string()));
-    assert!(!cell(row(&vm, "BTCUSDT"), Binance).notes().contains(&"過期".to_string()));
+    assert!(cell(row(&vm, "BTCUSDT"), Bybit).first_line().contains(&"過期".to_string()));
+    assert!(!cell(row(&vm, "BTCUSDT"), Binance).first_line().contains(&"過期".to_string()));
 }
 
 #[test]
@@ -540,4 +540,129 @@ fn kind_does_not_change_the_qualified_filter_or_the_default_order() {
         v.iter().map(|r| r.symbol.clone()).collect()
     };
     assert_eq!(shown.iter().map(|r| r.symbol.clone()).collect::<Vec<_>>(), by_net);
+}
+
+// ---- scanner-layout: rates are not coloured as good or bad ----
+
+#[test]
+fn rate_cells_use_the_neutral_rate_tones_while_net_edge_keeps_success_and_danger() {
+    let vm = build(&snap(complete_settings("0.01"), &[(Binance, "BTCUSDT", "0.0003"), (Bybit, "BTCUSDT", "-0.0001")]), NOW);
+    let r = row(&vm, "BTCUSDT");
+    assert_eq!(cell(r, Binance).tone(), Tone::RatePositive);
+    assert_eq!(cell(r, Bybit).tone(), Tone::RateNegative);
+    assert_eq!(cell(r, Okx).tone(), Tone::Muted, "no data: muted");
+    for e in [Binance, Bybit] {
+        assert!(cell(r, e).tone() != Tone::Positive && cell(r, e).tone() != Tone::Negative);
+    }
+    assert_eq!(r.net_edge.tone(), Tone::Negative, "Net Edge stays danger-coloured when negative");
+}
+
+// ---- scanner-layout 2.3: one status and one age per source; a disabled exchange is one muted line ----
+
+fn health(source: SourceId, connected: bool, age_ms: i64, next_in_ms: Option<i64>) -> crate::ui::bridge::SourceHealth {
+    use crate::exchange::health::feed::HealthSnapshot;
+    crate::ui::bridge::SourceHealth {
+        source,
+        health: Some(HealthSnapshot { source: "x".into(), connected, last_success_at: Some(NOW - age_ms), consecutive_failures: 0, expected_period_ms: 10_000, stale_threshold_ms: 30_000, stale: false }),
+        next_poll_at: next_in_ms.map(|n| NOW + n),
+        rate_limited_until: None,
+    }
+}
+
+fn all_sources_snap(settings: Settings) -> UiSnapshot {
+    let mut s = UiSnapshot { settings, ..Default::default() };
+    s.health = vec![
+        health(SourceId::BinanceWs, true, 1_000, None),
+        health(SourceId::BybitWs, true, 2_000, None),
+        health(SourceId::MarketPoll(Bybit), true, 3_000, Some(7_000)),
+        health(SourceId::MarketPoll(Okx), false, 90_000, Some(7_000)),
+    ];
+    s
+}
+
+fn okx_unticked() -> Settings {
+    let mut s = complete_settings("0.01");
+    s.risk.allowed_exchanges = vec![Binance, Bybit];
+    s
+}
+
+fn chip_texts(chips: &[SourceChip]) -> Vec<String> {
+    chips.iter().map(|c| format!("{} {}", c.label(), c.detail()).trim().to_string()).collect()
+}
+
+#[test]
+fn each_websocket_chip_says_its_state_and_its_age_once() {
+    let chips = source_chips(&all_sources_snap(complete_settings("0.01")), NOW);
+    let texts = chip_texts(&chips);
+    assert_eq!(texts[0], "Binance WebSocket ONLINE · 1 秒前");
+    assert_eq!(texts[1], "Bybit WebSocket ONLINE · 2 秒前");
+    for t in &texts {
+        assert_eq!(t.matches("ONLINE").count() + t.matches("OFFLINE").count() + t.matches("RECONNECTING").count() + t.matches("STALE").count(), 1, "{t:?}: one status word");
+        assert!(t.matches("秒前").count() <= 1, "{t:?}: one age");
+    }
+}
+
+#[test]
+fn a_poll_chip_adds_the_time_to_the_next_poll() {
+    let texts = chip_texts(&source_chips(&all_sources_snap(complete_settings("0.01")), NOW));
+    assert_eq!(texts[2], "Bybit 行情 ONLINE · 3 秒前 · 下次 7s");
+    assert_eq!(texts[3], "OKX 行情 OFFLINE · 90 秒前 · 下次 7s", "OKX is ticked: its real state is shown");
+}
+
+#[test]
+fn a_websocket_that_stopped_updating_reads_reconnecting_and_a_dropped_one_offline() {
+    let mut s = all_sources_snap(complete_settings("0.01"));
+    s.health[0] = health(SourceId::BinanceWs, true, 40_000, None); // older than the 30 s threshold
+    s.health[1] = health(SourceId::BybitWs, false, 5_000, None);
+    let texts = chip_texts(&source_chips(&s, NOW));
+    assert_eq!(texts[0], "Binance WebSocket RECONNECTING · 40 秒前");
+    assert_eq!(texts[1], "Bybit WebSocket OFFLINE · 5 秒前");
+}
+
+#[test]
+fn an_exchange_that_is_not_ticked_is_one_muted_line_never_a_red_offline() {
+    let chips = source_chips(&all_sources_snap(okx_unticked()), NOW);
+    let texts = chip_texts(&chips);
+    assert_eq!(texts.len(), 4);
+    assert_eq!(texts[3], "OKX 已停用");
+    assert_eq!(chips[3], SourceChip::Disabled { exchange: Okx });
+    assert!(!texts[3].contains("OFFLINE") && !texts[3].contains("ONLINE") && !texts[3].contains("秒前"));
+    assert_eq!(chips[3].dot(), None, "no status dot: there is no status");
+    assert_eq!(texts[2], "Bybit 行情 ONLINE · 3 秒前 · 下次 7s", "the ticked ones are unchanged");
+}
+
+#[test]
+fn a_disabled_exchange_with_two_sources_gets_a_single_line() {
+    let mut settings = complete_settings("0.01");
+    settings.risk.allowed_exchanges = vec![Binance, Okx];
+    let texts = chip_texts(&source_chips(&all_sources_snap(settings), NOW));
+    assert_eq!(texts, ["Binance WebSocket ONLINE · 1 秒前", "Bybit 已停用", "OKX 行情 OFFLINE · 90 秒前 · 下次 7s"]);
+}
+
+#[test]
+fn unreadable_settings_disable_nothing() {
+    let mut settings = okx_unticked();
+    settings.error = Some("boom".into());
+    let texts = chip_texts(&source_chips(&all_sources_snap(settings), NOW));
+    assert_eq!(texts.len(), 4);
+    assert!(texts[3].starts_with("OKX 行情 OFFLINE"));
+}
+
+#[test]
+fn the_rolled_back_bybit_websocket_keeps_its_own_note_and_a_disabled_bybit_wins_over_it() {
+    let mut s = all_sources_snap(complete_settings("0.01"));
+    s.bybit_ws_disabled = true;
+    let texts = chip_texts(&source_chips(&s, NOW));
+    assert_eq!(texts[1], format!("Bybit WebSocket {BYBIT_WS_DISABLED_TEXT}"));
+    let mut off = all_sources_snap(complete_settings("0.01"));
+    off.settings.risk.allowed_exchanges = vec![Binance, Okx];
+    off.bybit_ws_disabled = true;
+    assert_eq!(chip_texts(&source_chips(&off, NOW))[1], "Bybit 已停用");
+}
+
+#[test]
+fn a_source_without_health_is_reported_not_hidden() {
+    let texts = chip_texts(&source_chips(&UiSnapshot::default(), NOW));
+    assert_eq!(texts[0], "Binance WebSocket OFFLINE");
+    assert_eq!(texts[2], "Bybit 行情 UNKNOWN");
 }

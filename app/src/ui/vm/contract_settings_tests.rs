@@ -28,7 +28,7 @@ fn leverage_mode_gives_margin_400_with_the_formula_and_pair_totals() {
     assert_eq!(vm.margin, Some(d("400")));
     assert_eq!(vm.formula.as_deref(), Some("1,200 ÷ 3 = 400 / leg"));
     assert_eq!((vm.pair_notional, vm.pair_margin), (Some(d("2400")), Some(d("800"))));
-    assert_eq!(vm.mode_label, "EXCHANGE_DEMO");
+    assert_eq!(vm.mode_text, "Demo 帳戶（EXCHANGE_DEMO）");
     assert!(vm.errors.is_empty() && vm.can_save);
 }
 
@@ -197,5 +197,82 @@ mod contract_quote {
 fn the_template_page_names_the_live_world_in_a_live_process() {
     let live = crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo);
     let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(live));
-    assert_eq!(vm.mode_label, "LIVE");
+    assert_eq!(vm.mode_text, "真錢（LIVE）");
+}
+
+// ---- ui-plain-language 2.2: the quote rows and an exchange the risk settings left unticked -----------
+
+mod unticked_exchange {
+    use super::*;
+    use tong_funding_core::types::Exchange::{Binance, Bybit, Okx};
+
+    const NOW: i64 = 1_000_000;
+    const OKX_SPOT: &str = "exchange error acct_mode_unsupported: 帳戶模式不支援 (acctLv 1, posMode net_mode)";
+
+    /// Prices for all three exchanges; OKX's rules failed with the spot-mode error.
+    fn snap_all() -> UiSnapshot {
+        let mut s = UiSnapshot::default();
+        for ex in Exchange::ALL {
+            let mut o = obs(ex, "BTCUSDT", "0.0001", 28_800, NOW + 3_600_000, NOW - 100);
+            o.mark_price = d("60200");
+            s.market.insert(ex, MarketFeed { observations: vec![o], last_success_at: Some(NOW - 100), last_error: None });
+        }
+        s.rules.insert((Binance, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("0.001"), min_qty: d("0.001") }, okx_ct_val: None }));
+        s.rules.insert((Bybit, "BTCUSDT".into()), Ok(OrderRules { lot: LotSize { step_size: d("0.001"), min_qty: d("0.001") }, okx_ct_val: None }));
+        s.rules.insert((Okx, "BTCUSDT".into()), Err(OKX_SPOT.into()));
+        s
+    }
+
+    #[test]
+    fn an_unticked_exchange_row_becomes_the_muted_line_with_the_quote_row_behind_it() {
+        let mut s = snap_all();
+        s.settings.risk.allowed_exchanges = vec![Binance, Bybit];
+        let rows = quote("BTCUSDT", d("1200"), &s, NOW);
+        assert_eq!(rows.len(), 3, "one row per exchange, in the same order");
+        let okx = rows.iter().find(|q| q.exchange == Okx).unwrap();
+        let n = okx.disabled.as_ref().expect("a disabled note");
+        assert_eq!(n.text, "OKX 已停用（風控設定未勾選）");
+        assert_eq!(n.detail.as_deref(), Some(okx.line(NOW).as_str()), "the whole row is what opens");
+        assert!(n.detail.as_deref().is_some_and(|d| d.starts_with("OKX · 現價 60200 · 0 秒前 · 預期數量 無法取得合約規格（OKX 帳戶模式不支援")), "{:?}", n.detail);
+        assert!(rows.iter().filter(|q| q.exchange != Okx).all(|q| q.disabled.is_none()), "ticked exchanges keep their rows");
+        // all ticked: no note at all
+        s.settings.risk.allowed_exchanges = Exchange::ALL.to_vec();
+        assert!(quote("BTCUSDT", d("1200"), &s, NOW).iter().all(|q| q.disabled.is_none()));
+    }
+
+    #[test]
+    fn the_row_text_is_the_one_the_page_used_to_build_itself() {
+        let rows = quote("BTCUSDT", d("1200"), &snap_all(), NOW);
+        let binance = rows.iter().find(|q| q.exchange == Binance).unwrap();
+        assert_eq!(binance.line(NOW), "Binance · 現價 60200 · 0 秒前 · 預期數量 0.019 BTC");
+        let none = quote("BTCUSDT", d("1200"), &UiSnapshot::default(), NOW);
+        assert_eq!(none[0].line(NOW), "Binance · 現價 — · — · 預期數量 無價格");
+    }
+
+    #[test]
+    fn a_ticked_exchange_with_the_known_error_reads_in_plain_words() {
+        let rows = quote("BTCUSDT", d("1200"), &snap_all(), NOW);
+        let okx = rows.iter().find(|q| q.exchange == Okx).unwrap();
+        assert!(okx.disabled.is_none());
+        assert_eq!(okx.cell.text(), "無法取得合約規格（OKX 帳戶模式不支援（在 OKX 改為單幣種或跨幣種保證金模式））");
+        // an error that is not in the table stays as it is
+        assert_eq!(QuoteCell::NoRules("step_size missing".into()).text(), "無法取得合約規格（step_size missing）");
+    }
+
+    #[test]
+    fn nothing_is_hidden_when_the_settings_cannot_be_read() {
+        let mut s = snap_all();
+        s.settings.risk.allowed_exchanges = vec![Binance, Bybit];
+        s.settings.error = Some("config.risk is not valid JSON".into());
+        assert!(quote("BTCUSDT", d("1200"), &s, NOW).iter().all(|q| q.disabled.is_none()));
+    }
+}
+
+#[test]
+fn the_boundary_names_the_world_in_plain_words_with_the_code_after_it() {
+    let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo)));
+    assert_eq!(vm.mode_text, "Demo 帳戶（EXCHANGE_DEMO）");
+    let live = crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo);
+    assert_eq!(evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(live)).mode_text, "真錢（LIVE）");
+    assert_eq!(evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), None).mode_text, "未知");
 }

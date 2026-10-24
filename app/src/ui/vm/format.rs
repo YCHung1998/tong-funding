@@ -100,6 +100,11 @@ pub fn utc_hms(ts_ms: i64) -> String {
     DateTime::from_timestamp_millis(ts_ms).map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(|| DASH.into())
 }
 
+/// `10-22 12:00:00` (UTC, month-day and time): for records that can span days.
+pub fn utc_md_hms(ts_ms: i64) -> String {
+    DateTime::from_timestamp_millis(ts_ms).map(|t| t.format("%m-%d %H:%M:%S").to_string()).unwrap_or_else(|| DASH.into())
+}
+
 /// A non-negative duration as `HH:MM:SS` (hours may exceed 24).
 pub fn hms(ms: i64) -> String {
     let s = ms.max(0) / 1000;
@@ -178,6 +183,14 @@ mod tests {
         assert_eq!(hms(4 * 3_600_000), "04:00:00");
         assert_eq!(hms(12 * 3_600_000 + 61_999), "12:01:01");
         assert_eq!(hms(-5), "00:00:00");
+    }
+
+    #[test]
+    fn date_and_time_for_records_that_span_days() {
+        assert_eq!(utc_md_hms(1_792_670_400_000), "10-22 12:00:00");
+        assert_eq!(utc_md_hms(1_792_598_390_000), "10-21 15:59:50");
+        assert_eq!(utc_md_hms(1_792_630_790_000), "10-22 00:59:50");
+        assert_eq!(utc_md_hms(i64::MAX), DASH);
     }
 
     #[test]
