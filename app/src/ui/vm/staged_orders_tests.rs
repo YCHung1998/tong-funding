@@ -796,15 +796,40 @@ mod unticked_exchange {
     #[test]
     fn an_unticked_exchange_has_no_margin_line_only_the_muted_line_with_the_error_behind_it() {
         let mut s = okx_failing();
+        s.accounts.insert(Exchange::Okx, crate::ui::bridge::AccountState::Failed { error: OKX_SPOT.into(), at: NOW });
         s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
         let vm = build(&s, &BTreeSet::new(), NOW);
         assert_eq!(vm.margins.iter().map(|m| m.0).collect::<Vec<_>>(), [Exchange::Binance, Exchange::Bybit], "no margin line for OKX");
         assert!(vm.margins.iter().all(|(_, t)| !t.contains("acct_mode_unsupported")), "{:?}", vm.margins);
         assert_eq!(vm.disabled_exchanges.len(), 1);
         let n = &vm.disabled_exchanges[0];
-        assert_eq!((n.exchange, n.text.as_str()), (Exchange::Okx, "OKX 已停用（風控設定未勾選）"));
+        assert_eq!((n.exchange, n.text.as_str()), (Exchange::Okx, "OKX 已停用 · 無法確認持倉（OKX 帳戶模式不支援（在 OKX 改為單幣種或跨幣種保證金模式））"));
         let detail = n.detail.as_deref().expect("detail behind the line");
         assert!(detail.contains("可用保證金") && detail.contains("OKX 帳戶模式不支援") && detail.contains("在 OKX 改為單幣種或跨幣種保證金模式"), "{detail}");
+    }
+
+    #[test]
+    fn an_unticked_exchange_whose_positions_cannot_be_confirmed_is_a_warning_line() {
+        // no OKX account read at all (still loading): the margin row must not look like a settled "unticked"
+        let mut s = okx_failing();
+        s.accounts.remove(&Exchange::Okx);
+        s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        let n = &vm.disabled_exchanges[0];
+        assert_eq!((n.text.as_str(), n.tone), ("OKX 已停用 · 無法確認持倉（載入中）", crate::ui::theme::Tone::Warning));
+        assert!(n.detail.as_deref().is_some_and(|d| d.contains("可用保證金")), "{:?}", n.detail);
+    }
+
+    #[test]
+    fn an_unticked_exchange_with_an_unfinished_pair_keeps_its_margin_row_and_says_so() {
+        let mut s = okx_failing();
+        s.accounts.insert(Exchange::Okx, crate::ui::bridge::AccountState::Failed { error: OKX_SPOT.into(), at: NOW });
+        s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
+        s.pair_records = [("u1".to_string(), crate::ui::bridge::PairRecord { pair_id: "p9".into(), symbol: "SOLUSDT".into(), long_exchange: Some(Exchange::Binance), short_exchange: Some(Exchange::Okx), status: "RECONCILED".into() })].into();
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert!(vm.disabled_exchanges.is_empty(), "{:?}", vm.disabled_exchanges);
+        let okx = vm.margins.iter().find(|m| m.0 == Exchange::Okx).expect("the OKX margin row stays");
+        assert!(okx.1.contains("此交易所已停用，但仍有持倉或持倉狀態未確認"), "{}", okx.1);
     }
 
     #[test]
@@ -819,9 +844,11 @@ mod unticked_exchange {
     fn an_unticked_exchange_with_a_known_margin_is_still_one_line_and_the_margin_is_behind_it() {
         let mut s = snap();
         s.leg_accounts.insert((false, Exchange::Okx), account(vec![], vec![]));
+        s.accounts.insert(Exchange::Okx, crate::ui::testkit::loaded(vec![], vec![], NOW));
         s.settings.risk.allowed_exchanges = vec![Exchange::Binance, Exchange::Bybit];
         let vm = build(&s, &BTreeSet::new(), NOW);
         assert_eq!(vm.disabled_exchanges.len(), 1);
+        assert_eq!(vm.disabled_exchanges[0].tone, crate::ui::theme::Tone::Muted);
         assert_eq!(vm.disabled_exchanges[0].detail.as_deref(), Some("可用保證金：1,000.00 USDT"));
     }
 

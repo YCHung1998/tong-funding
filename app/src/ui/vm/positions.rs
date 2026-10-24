@@ -15,7 +15,8 @@ use super::bridge::{tradable_exchanges, AccountState, PairInfo, UiSnapshot};
 use super::env_label::EnvLabel;
 use super::format::{self, DASH};
 use super::funding::{self as fv, PairFunding, PnlPanel, TimelineRow};
-use super::labels::{pair_state_text, plain_error, DisabledNote, DISABLED_WITH_POSITIONS};
+use super::disabled::{self as rule, DisabledStatus};
+use super::labels::{disabled_exchange_line, pair_state_text, plain_error, DisabledNote, DISABLED_WITH_EXPOSURE};
 use crate::exchange::signed::models::Position;
 use crate::ui::theme::Tone;
 
@@ -180,7 +181,7 @@ pub struct PosRow {
     /// OKX only: the position in contracts (`quantity / ctVal`), when `ctVal` is known. Shown beside
     /// the coin amount; never used as the coin amount.
     pub contracts: Option<Decimal>,
-    /// `此交易所已停用，仍有持倉` when the exchange is not in `allowed_exchanges`: the row is shown as usual, with this note.
+    /// `此交易所已停用，但仍有持倉或持倉狀態未確認` when the exchange is not in `allowed_exchanges`: the row is shown as usual, with this note.
     pub note: Option<&'static str>,
 }
 
@@ -370,7 +371,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
             funding,
             funding_tone,
             contracts: contracts_of(snap, p),
-            note: (!snap.exchange_enabled(p.exchange)).then_some(DISABLED_WITH_POSITIONS),
+            note: (!snap.exchange_enabled(p.exchange)).then_some(DISABLED_WITH_EXPOSURE),
         })
         .collect();
 
@@ -434,14 +435,32 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
             AccountState::Loading => lines.push(format!("{} 持倉載入中", e.name())),
             _ => {}
         }
-        if snap.exchange_enabled(e) {
-            notices.extend(lines);
-        } else {
+        let detail_of = |lines: &[String], raw_error: Option<&String>| {
             let mut detail = (!lines.is_empty()).then(|| lines.join("；"));
-            if let (Some(d), Some(raw)) = (detail.as_mut(), raw_error.filter(|raw| plain_error(raw) != *raw)) {
+            if let (Some(d), Some(raw)) = (detail.as_mut(), raw_error.filter(|raw| plain_error(raw) != **raw)) {
                 d.push_str(&format!(" · 原始訊息：{raw}"));
             }
-            disabled.push(DisabledNote::new(e, detail));
+            detail
+        };
+        if snap.exchange_enabled(e) {
+            notices.extend(lines);
+            continue;
+        }
+        match rule::status(snap, e) {
+            // exposure stays visible: the yellow notices and a note that says the exchange is unticked
+            DisabledStatus::Exposed => {
+                notices.extend(lines.iter().cloned());
+                if let Some(raw) = raw_error.as_ref().filter(|raw| plain_error(raw) != **raw) {
+                    notices.push(format!("{} 原始訊息：{raw}", e.name()));
+                }
+                let pairs = rule::unfinished_pair_symbols(snap, e);
+                if !pairs.is_empty() {
+                    notices.push(format!("{} 有未結束的配對：{}", e.name(), pairs.join("、")));
+                }
+                notices.push(format!("{} · {DISABLED_WITH_EXPOSURE}", disabled_exchange_line(e)));
+            }
+            DisabledStatus::Unconfirmed { reason } => disabled.push(DisabledNote::unconfirmed(e, &reason, detail_of(&lines, raw_error.as_ref()))),
+            DisabledStatus::Quiet => disabled.push(DisabledNote::new(e, detail_of(&lines, raw_error.as_ref()))),
         }
     }
 

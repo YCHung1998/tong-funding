@@ -31,7 +31,7 @@ fn live_panels_and_account_cards_never_list_okx_and_demo_keeps_all_three() {
             .iter()
             .map(|c| match c {
                 ExchangeCard::Connected(c) => c.exchange,
-                ExchangeCard::NotConnected { exchange, .. } | ExchangeCard::Loading { exchange } | ExchangeCard::Failed { exchange, .. } => *exchange,
+                ExchangeCard::NotConnected { exchange, .. } | ExchangeCard::Loading { exchange, .. } | ExchangeCard::Failed { exchange, .. } => *exchange,
                 ExchangeCard::Disabled(n) => n.exchange,
             })
             .collect();

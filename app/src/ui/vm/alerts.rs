@@ -11,9 +11,11 @@ use crate::exchange::signed::signing::RECV_WINDOW_MS;
 use crate::ui::nav::Page;
 
 /// The accounts whose keys and clock are watched: Binance and Bybit, and OKX while it is in
-/// `allowed_exchanges` (an exchange that is not traded needs no keys).
+/// `allowed_exchanges` (an exchange that is not traded needs no keys) or while it still holds
+/// positions or is on a leg of an unfinished pair (the risk page lets it be unticked then, and a
+/// lost connection to it must not go quiet).
 fn alert_accounts(snap: &UiSnapshot) -> Vec<Exchange> {
-    Exchange::ALL.into_iter().filter(|e| *e != Exchange::Okx || snap.settings.risk.allowed_exchanges.contains(e)).collect()
+    Exchange::ALL.into_iter().filter(|e| *e != Exchange::Okx || snap.settings.risk.allowed_exchanges.contains(e) || super::disabled::holds_exposure(snap, *e)).collect()
 }
 
 pub const MANUAL_TEXT: &str = "需人工處理，系統不會自動補單或平倉";

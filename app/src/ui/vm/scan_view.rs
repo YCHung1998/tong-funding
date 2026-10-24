@@ -117,9 +117,9 @@ impl ScanColumn {
     pub fn width(self) -> f32 {
         match self {
             ScanColumn::Rank => 50.0,
-            ScanColumn::Symbol => 104.0,
+            ScanColumn::Symbol => 132.0,
             ScanColumn::Coverage => 50.0,
-            ScanColumn::Countdown => 100.0,
+            ScanColumn::Countdown => 88.0,
             ScanColumn::Binance | ScanColumn::Bybit | ScanColumn::Okx => 160.0,
             ScanColumn::Direction => 100.0,
             ScanColumn::Gross => 120.0,

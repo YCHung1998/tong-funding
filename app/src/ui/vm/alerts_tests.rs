@@ -247,6 +247,23 @@ fn okx_is_alerted_like_the_other_exchanges_while_it_is_allowed_and_silent_when_i
 }
 
 #[test]
+fn an_unticked_okx_with_an_unfinished_pair_is_alerted_until_the_pair_is_finished() {
+    // the risk page lets OKX be unticked while a pair is open on it: its lost connection must still show
+    let mut s = healthy();
+    s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
+    s.settings.risk.allowed_exchanges = vec![Binance, Bybit];
+    s.pairs = vec![crate::ui::testkit::pair("p1", "ETHUSDT", Binance, Okx, PairState::Reconciled)];
+    let msgs: Vec<_> = alerts(&s, NOW).into_iter().map(|a| a.message).collect();
+    assert!(msgs.contains(&"OKX 帳戶未連線：Keychain 沒有 API key".to_string()), "{msgs:?}");
+    // a stored (not yet finished) record counts too, a finished one does not
+    s.pairs.clear();
+    s.pair_records = [("u1".to_string(), crate::ui::bridge::PairRecord { pair_id: "p1".into(), symbol: "ETHUSDT".into(), long_exchange: Some(Okx), short_exchange: Some(Bybit), status: "CLOSING".into() })].into();
+    assert!(alerts(&s, NOW).iter().any(|a| a.message.contains("OKX 帳戶未連線")));
+    s.pair_records.get_mut("u1").unwrap().status = "FINALIZED".into();
+    assert!(alerts(&s, NOW).iter().all(|a| !a.message.contains("OKX")));
+}
+
+#[test]
 fn an_account_the_system_cannot_use_by_its_setting_is_a_notice_not_a_disconnect() {
     // The OKX account is in spot mode (acctLv 1): not a lost connection, nothing the banner can fix.
     let mut s = healthy();

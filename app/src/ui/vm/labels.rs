@@ -43,7 +43,7 @@ pub const fn pair_state_plain(state: PairState) -> (&'static str, &'static str) 
         PairState::Reconciled => ("持倉中", "兩腿已成交且數量相符，等待平倉時間"),
         PairState::Imbalanced => ("兩腿不平衡", "兩腿成交數量差距超過容許值，需人工處理"),
         PairState::Closing => ("平倉中", "正在平倉，等待兩腿持倉歸零"),
-        PairState::Finalized => ("已完成", "已平倉並完成損益結算"),
+        PairState::Finalized => ("已完成", "已平倉並已記錄損益（可能不完整）"),
         PairState::Cancelled => ("已取消", "沒有留下持倉：使用者移除、兩腿都沒送出，或逾時沒有成交"),
         PairState::PartialFailure => ("單腿失敗", "只有一腿成功，另一腿失敗或平倉未完成，需人工處理"),
         PairState::Unresolved => ("狀態不明", "無法確認訂單結果（逾時或重啟後無法判定），需人工處理"),
@@ -276,8 +276,10 @@ pub fn block_reason_label(raw: &str) -> String {
 /// The tone of every disabled-exchange line: muted, never the red or yellow of an error.
 pub const DISABLED_TONE: Tone = Tone::Muted;
 
-/// Added to the positions of an exchange the risk settings left unticked: its exposure is shown, not hidden.
-pub const DISABLED_WITH_POSITIONS: &str = "此交易所已停用，仍有持倉";
+/// Added to the card, the positions and the margin row of an exchange the risk settings left unticked
+/// while it still holds positions, has a position list that is incomplete, or is on one leg of an
+/// unfinished pair: its exposure is shown (or its state is not confirmed), never hidden.
+pub const DISABLED_WITH_EXPOSURE: &str = "此交易所已停用，但仍有持倉或持倉狀態未確認";
 
 /// `OKX 已停用（風控設定未勾選）`: the one line shown for an exchange that is not in `allowed_exchanges`.
 pub fn disabled_exchange_line(ex: Exchange) -> String {
@@ -289,18 +291,27 @@ pub fn disabled_source_text(ex: Exchange) -> String {
     format!("{} 已停用", ex.name())
 }
 
-/// The one muted line of a disabled exchange on a page, and what that page would have shown for it
-/// (the error, the state, the quote row), which only the expanded line draws.
+/// The one line of a disabled exchange on a page, and what that page would have shown for it
+/// (the error, the state, the quote row), which only the expanded line draws. Muted when the latest
+/// read succeeded and found nothing; warning-toned when the positions cannot be confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DisabledNote {
     pub exchange: Exchange,
     pub text: String,
     pub detail: Option<String>,
+    pub tone: Tone,
 }
 
 impl DisabledNote {
+    /// `OKX 已停用（風控設定未勾選）`, muted.
     pub fn new(exchange: Exchange, detail: Option<String>) -> DisabledNote {
-        DisabledNote { exchange, text: disabled_exchange_line(exchange), detail }
+        DisabledNote { exchange, text: disabled_exchange_line(exchange), detail, tone: DISABLED_TONE }
+    }
+
+    /// `OKX 已停用 · 無法確認持倉（<reason>）` in the warning tone: the read failed, so "no positions"
+    /// must not be said.
+    pub fn unconfirmed(exchange: Exchange, reason: &str, detail: Option<String>) -> DisabledNote {
+        DisabledNote { exchange, text: format!("{} 已停用 · 無法確認持倉（{reason}）", exchange.name()), detail, tone: Tone::Warning }
     }
 }
 

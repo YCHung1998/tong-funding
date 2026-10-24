@@ -216,7 +216,7 @@ fn the_ten_pretrade_checks_and_the_leverage_cap_have_plain_names_with_the_code_k
 fn the_disabled_exchange_line_names_the_exchange_and_the_setting() {
     assert_eq!(disabled_exchange_line(Exchange::Okx), "OKX 已停用（風控設定未勾選）");
     assert_eq!(disabled_exchange_line(Exchange::Bybit), "Bybit 已停用（風控設定未勾選）");
-    assert_eq!(DISABLED_WITH_POSITIONS, "此交易所已停用，仍有持倉");
+    assert_eq!(DISABLED_WITH_EXPOSURE, "此交易所已停用，但仍有持倉或持倉狀態未確認");
 }
 
 #[test]
@@ -231,4 +231,21 @@ fn a_disabled_note_carries_the_line_and_keeps_the_detail_for_the_expanded_view()
     assert_eq!(n.text, "OKX 已停用（風控設定未勾選）");
     assert_eq!(n.detail.as_deref(), Some("載入失敗：OKX 帳戶模式不支援"));
     assert_eq!(DisabledNote::new(Exchange::Okx, None).detail, None);
+    assert_eq!(n.tone, Tone::Muted);
+}
+
+#[test]
+fn an_unconfirmed_note_names_the_reason_in_the_warning_tone_and_never_says_no_positions() {
+    let n = DisabledNote::unconfirmed(Exchange::Okx, "OKX 帳戶模式不支援", Some("原始訊息".into()));
+    assert_eq!(n.text, "OKX 已停用 · 無法確認持倉（OKX 帳戶模式不支援）");
+    assert_eq!(n.tone, Tone::Warning);
+    assert!(!n.text.contains("沒有持倉") && !n.text.contains("風控設定未勾選"), "{}", n.text);
+    assert_eq!(n.detail.as_deref(), Some("原始訊息"));
+}
+
+#[test]
+fn finalized_does_not_promise_a_complete_pnl() {
+    // a finished pair can still have an INCOMPLETE PnL (the funding ledger was not all there)
+    let (name, note) = pair_state_label("FINALIZED");
+    assert_eq!((name.as_str(), note.as_str()), ("已完成", "已平倉並已記錄損益（可能不完整）"));
 }

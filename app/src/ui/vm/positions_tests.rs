@@ -6,7 +6,9 @@ use super::*;
 use crate::engine::ports::OrderRules;
 use tong_funding_core::quantity::LotSize;
 use crate::ui::bridge::{AccountData, AccountState, UiSnapshot};
+use crate::ui::labels::DISABLED_WITH_EXPOSURE;
 use crate::ui::testkit::{d, loaded, pair, position};
+use crate::ui::theme::Tone;
 
 const NOW: i64 = 1_791_201_600_000;
 
@@ -387,7 +389,8 @@ mod unticked_exchange {
         assert!(vm.notices.iter().all(|n| !n.contains("OKX")), "no yellow OKX notice: {:?}", vm.notices);
         assert_eq!(vm.disabled.len(), 1, "exactly one line for the unticked exchange");
         let n = &vm.disabled[0];
-        assert_eq!((n.exchange, n.text.as_str()), (Okx, "OKX 已停用（風控設定未勾選）"));
+        // the read failed: the positions are not confirmed, so the line is a warning, not the quiet one
+        assert_eq!((n.exchange, n.text.as_str(), n.tone), (Okx, "OKX 已停用 · 無法確認持倉（OKX 帳戶模式不支援（在 OKX 改為單幣種或跨幣種保證金模式））", Tone::Warning));
         let detail = n.detail.as_deref().expect("detail behind the line");
         assert!(detail.contains("OKX 持倉讀取失敗") && detail.contains("OKX 帳戶模式不支援"), "{detail}");
         assert!(detail.contains("acct_mode_unsupported"), "the raw message stays reachable: {detail}");
@@ -400,13 +403,13 @@ mod unticked_exchange {
         unticked_okx(&mut s);
         let vm = build(&s, &Filter::default(), NOW);
         let okx = rows(&vm).iter().find(|r| r.exchange == Okx).expect("the position is listed");
-        assert_eq!(okx.note, Some("此交易所已停用，仍有持倉"));
+        assert_eq!(okx.note, Some("此交易所已停用，但仍有持倉或持倉狀態未確認"));
         assert_eq!(okx.cells()[3], "0.030000 BTC（3 張）", "the row itself is unchanged");
         assert!(rows(&vm).iter().filter(|r| r.exchange != Okx).all(|r| r.note.is_none()));
         assert_eq!(vm.title, "2 OPEN · 1 PAIRS", "the exposure is still counted and grouped");
         assert_eq!(vm.pair_cards.len(), 1);
-        let n = vm.disabled.iter().find(|n| n.exchange == Okx).expect("the one line is there too");
-        assert_eq!(n.text, "OKX 已停用（風控設定未勾選）");
+        assert!(vm.disabled.is_empty(), "an exchange with exposure is not folded into a line: {:?}", vm.disabled);
+        assert!(vm.notices.contains(&format!("OKX 已停用（風控設定未勾選） · {DISABLED_WITH_EXPOSURE}")), "{:?}", vm.notices);
         assert_eq!(vm.exchange_options, [Binance, Okx], "its filter chip stays while it has rows");
     }
 
@@ -438,6 +441,68 @@ mod unticked_exchange {
         s.accounts.insert(Okx, AccountState::NotConnected { reason: "Keychain 沒有 API key".into() });
         let vm = build(&s, &Filter::default(), NOW);
         assert!(vm.disabled[0].detail.as_deref().is_some_and(|d| d.contains("OKX 未連線：Keychain 沒有 API key")), "{:?}", vm.disabled);
+        assert!(vm.notices.iter().all(|n| !n.contains("OKX")));
+    }
+
+    const INCOMPLETE: &str = "ETHUSDT 空 7 張（無法換算：ctVal 未知）";
+
+    fn exposure_line() -> String {
+        format!("OKX 已停用（風控設定未勾選） · {DISABLED_WITH_EXPOSURE}")
+    }
+
+    #[test]
+    fn an_incomplete_list_of_an_unticked_exchange_stays_a_notice_and_is_not_folded() {
+        let mut s = four();
+        let mut okx = loaded(vec![], vec![], NOW);
+        if let AccountState::Loaded { data, .. } = &mut okx {
+            data.positions_incomplete = Some(INCOMPLETE.into());
+        }
+        s.accounts.insert(Okx, okx);
+        unticked_okx(&mut s);
+        let vm = build(&s, &Filter::default(), NOW);
+        assert!(vm.disabled.is_empty(), "{:?}", vm.disabled);
+        assert!(vm.notices.contains(&"OKX 持倉列表可能不完整".to_string()), "{:?}", vm.notices);
+        assert!(vm.notices.iter().any(|n| n.contains(INCOMPLETE)), "{:?}", vm.notices);
+        assert!(vm.notices.contains(&exposure_line()), "{:?}", vm.notices);
+    }
+
+    #[test]
+    fn old_data_with_a_failed_latest_read_of_an_unticked_exchange_is_unconfirmed_not_empty() {
+        let mut s = four();
+        let mut okx = loaded(vec![], vec![], NOW - 60_000);
+        if let AccountState::Loaded { error, .. } = &mut okx {
+            *error = Some(("request timed out".into(), NOW - 1_000));
+        }
+        s.accounts.insert(Okx, okx);
+        unticked_okx(&mut s);
+        let vm = build(&s, &Filter::default(), NOW);
+        assert_eq!(vm.disabled.len(), 1);
+        let n = &vm.disabled[0];
+        assert_eq!(n.tone, Tone::Warning);
+        assert!(n.text.starts_with("OKX 已停用 · 無法確認持倉（") && n.text.contains("request timed out"), "{}", n.text);
+        assert!(!n.text.contains("沒有持倉") && !n.detail.clone().unwrap_or_default().contains("沒有持倉"), "{n:?}");
+    }
+
+    #[test]
+    fn a_failed_read_with_an_unfinished_pair_on_the_unticked_exchange_is_a_notice_with_the_exposure_line() {
+        let mut s = four();
+        s.accounts.insert(Okx, AccountState::Failed { error: OKX_SPOT.into(), at: NOW });
+        s.pairs.push(pair("p3", "SOLUSDT", Binance, Okx, PairState::OrderSubmit));
+        unticked_okx(&mut s);
+        let vm = build(&s, &Filter::default(), NOW);
+        assert!(vm.disabled.is_empty(), "{:?}", vm.disabled);
+        assert!(vm.notices.iter().any(|n| n.contains("OKX 持倉讀取失敗")), "{:?}", vm.notices);
+        assert!(vm.notices.contains(&exposure_line()), "{:?}", vm.notices);
+    }
+
+    #[test]
+    fn a_successful_empty_read_is_the_quiet_line_even_with_finished_pairs_on_the_exchange() {
+        let mut s = four();
+        s.accounts.insert(Okx, loaded(vec![], vec![], NOW));
+        s.pair_records = [("u1".to_string(), crate::ui::bridge::PairRecord { pair_id: "p9".into(), symbol: "SOLUSDT".into(), long_exchange: Some(Binance), short_exchange: Some(Okx), status: "FINALIZED".into() })].into();
+        unticked_okx(&mut s);
+        let vm = build(&s, &Filter::default(), NOW);
+        assert_eq!((vm.disabled.len(), vm.disabled[0].tone, vm.disabled[0].text.as_str()), (1, Tone::Muted, "OKX 已停用（風控設定未勾選）"));
         assert!(vm.notices.iter().all(|n| !n.contains("OKX")));
     }
 

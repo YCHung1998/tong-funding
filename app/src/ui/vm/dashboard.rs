@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use tong_funding_core::types::{Decimal, Exchange};
 
 use super::bridge::{tradable_exchanges, AccountData, AccountState, ContractEquity, UiSnapshot};
+use super::disabled::{self, DisabledStatus};
 use super::format::{self, DASH};
-use super::labels::{disabled_exchange_line, plain_error, DisabledNote, DISABLED_WITH_POSITIONS};
+use super::labels::{disabled_exchange_line, plain_error, DisabledNote, DISABLED_WITH_EXPOSURE};
 use super::positions::{Grouped, group};
 use crate::exchange::signed::models::Position;
 use crate::ui::theme::Tone;
@@ -85,10 +86,13 @@ pub struct ConnectedCard {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExchangeCard {
     Connected(ConnectedCard),
-    NotConnected { exchange: Exchange, reason: String },
-    Loading { exchange: Exchange },
+    /// `disabled_note` (here and on `Loading` and `Failed`): the exchange is not in `allowed_exchanges`
+    /// but still has exposure (positions or an unfinished pair) while its read is not good, so the
+    /// card stays with this warning instead of folding into a line.
+    NotConnected { exchange: Exchange, reason: String, disabled_note: Option<String> },
+    Loading { exchange: Exchange, disabled_note: Option<String> },
     /// `error` is the message as the exchange adapter said it; `plain` is the same in plain words.
-    Failed { exchange: Exchange, error: String, plain: String, at: i64 },
+    Failed { exchange: Exchange, error: String, plain: String, at: i64, disabled_note: Option<String> },
     /// Not in `allowed_exchanges` and nothing to show: one muted line, the state behind it.
     Disabled(DisabledNote),
 }
@@ -213,15 +217,29 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
     let mut used_total = Decimal::ZERO;
     let mut pnl_total = Decimal::ZERO;
     for e in tradable_exchanges(snap.identity).iter().copied() {
-        // ui-plain-language: an exchange the risk settings left unticked is one muted line, unless it
-        // still holds positions (then its card stays, with a note: exposure is never hidden).
-        let enabled = snap.exchange_enabled(e);
-        let disabled_line = |detail: String| ExchangeCard::Disabled(DisabledNote::new(e, Some(detail)));
+        // ui-plain-language: an exchange the risk settings left unticked is one line ONLY when nothing
+        // about its exposure is open: muted when the latest read found nothing, in the warning tone
+        // when the positions cannot be confirmed. Positions, an incomplete list or an unfinished pair
+        // keep the card, with a note (exposure is never hidden).
+        let verdict = (!snap.exchange_enabled(e)).then(|| disabled::status(snap, e));
+        let exposed = verdict == Some(DisabledStatus::Exposed);
+        let folded = |detail: String| -> ExchangeCard {
+            ExchangeCard::Disabled(match &verdict {
+                Some(DisabledStatus::Unconfirmed { reason }) => DisabledNote::unconfirmed(e, reason, Some(detail)),
+                _ => DisabledNote::new(e, Some(detail)),
+            })
+        };
+        let card_note = exposed.then(|| format!("{} · {DISABLED_WITH_EXPOSURE}", disabled_exchange_line(e)));
+        let fold = verdict.is_some() && !exposed;
         match snap.account(e) {
             AccountState::Loaded { data, fetched_at, error } => {
                 let (assets, value, unvalued) = asset_rows(&data);
-                if !enabled && data.positions.is_empty() {
-                    cards.push(disabled_line(format!("已連線，沒有持倉；資產 {} USDT 未計入總資產", format::money(value, 2))));
+                if fold {
+                    let detail = match verdict {
+                        Some(DisabledStatus::Unconfirmed { .. }) => format!("最後一次成功讀取是 {} 秒前；資產 {} USDT 未計入總資產", format::secs(now_ms - fetched_at), format::money(value, 2)),
+                        _ => format!("已連線，沒有持倉；資產 {} USDT 未計入總資產", format::money(value, 2)),
+                    };
+                    cards.push(folded(detail));
                     continue;
                 }
                 let margin = margin_distribution(&data.positions);
@@ -238,29 +256,29 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
                     unvalued,
                     margin,
                     stale_note,
-                    disabled_note: (!enabled).then(|| format!("{} · {DISABLED_WITH_POSITIONS}", disabled_exchange_line(e))),
+                    disabled_note: card_note,
                 }));
             }
-            AccountState::NotConnected { reason } if enabled => {
+            AccountState::NotConnected { reason } if !fold => {
                 excluded.push(e.name());
-                cards.push(ExchangeCard::NotConnected { exchange: e, reason });
+                cards.push(ExchangeCard::NotConnected { exchange: e, reason, disabled_note: card_note });
             }
-            AccountState::NotConnected { reason } => cards.push(disabled_line(format!("未連線：{reason}"))),
+            AccountState::NotConnected { reason } => cards.push(folded(format!("未連線：{reason}"))),
             AccountState::Failed { error, at } => {
                 let plain = plain_error(&error);
-                if enabled {
+                if !fold {
                     excluded.push(e.name());
-                    cards.push(ExchangeCard::Failed { exchange: e, error, plain, at });
+                    cards.push(ExchangeCard::Failed { exchange: e, error, plain, at, disabled_note: card_note });
                 } else {
                     let raw = if plain == error { String::new() } else { format!(" · 原始訊息：{error}") };
-                    cards.push(disabled_line(format!("載入失敗：{plain}（{} UTC）{raw}", format::utc_hms(at))));
+                    cards.push(folded(format!("載入失敗：{plain}（{} UTC）{raw}", format::utc_hms(at))));
                 }
             }
-            AccountState::Loading if enabled => {
+            AccountState::Loading if !fold => {
                 excluded.push(e.name());
-                cards.push(ExchangeCard::Loading { exchange: e });
+                cards.push(ExchangeCard::Loading { exchange: e, disabled_note: card_note });
             }
-            AccountState::Loading => cards.push(disabled_line("載入中".into())),
+            AccountState::Loading => cards.push(folded("載入中".into())),
         }
     }
 

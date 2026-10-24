@@ -48,6 +48,8 @@ pub mod risk_settings;
 pub mod staged_orders;
 #[path = "vm/dashboard.rs"]
 pub mod dashboard;
+#[path = "vm/disabled.rs"]
+pub mod disabled;
 #[path = "vm/env_label.rs"]
 pub mod env_label;
 #[path = "vm/engine_view.rs"]

@@ -22,7 +22,8 @@ use super::contract_settings::{pair_quantity, QuoteCell};
 use super::leverage_cap::{self, CapCheck};
 use super::positions::{spread_view, SpreadView};
 use super::engine_view::{blocker_text, refusing_blockers};
-use super::labels::{block_reason_label, execution_mode_text, failed_checks_text, pair_state_label, pair_state_plain, pair_state_text, plain_error, trigger_mode_text, DisabledNote};
+use super::disabled::{self, DisabledStatus};
+use super::labels::{block_reason_label, execution_mode_text, failed_checks_text, pair_state_label, pair_state_plain, pair_state_text, plain_error, trigger_mode_text, DisabledNote, DISABLED_WITH_EXPOSURE};
 use super::env_label::{ConfirmKind, EnvLabel};
 use super::risk_settings::missing_display;
 use crate::engine::command::{Blocker, Command, PairView};
@@ -600,8 +601,14 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         let text = margin_text(snap.leg_accounts.get(&(false, ex)));
         if snap.exchange_enabled(ex) {
             margins.push((ex, text));
-        } else {
-            disabled_exchanges.push(DisabledNote::new(ex, Some(format!("可用保證金：{text}"))));
+            continue;
+        }
+        // a line only when its positions are confirmed to be nothing or cannot be confirmed; an
+        // exchange with exposure keeps its margin row, with the note
+        match disabled::status(snap, ex) {
+            DisabledStatus::Exposed => margins.push((ex, format!("{text} · {DISABLED_WITH_EXPOSURE}"))),
+            DisabledStatus::Unconfirmed { reason } => disabled_exchanges.push(DisabledNote::unconfirmed(ex, &reason, Some(format!("可用保證金：{text}")))),
+            DisabledStatus::Quiet => disabled_exchanges.push(DisabledNote::new(ex, Some(format!("可用保證金：{text}")))),
         }
     }
     let manual = pairs.iter().filter(|p| is_alert(p.state)).map(|p| handling(snap, p)).collect();

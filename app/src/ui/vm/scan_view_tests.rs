@@ -128,7 +128,7 @@ fn visible_index_maps_back_to_the_logical_column_after_hiding_a_middle_column() 
 fn total_width_shrinks_when_columns_are_hidden_and_decides_horizontal_scroll() {
     let mut v = ColumnVisibility::default();
     let full = v.total_width();
-    assert_eq!(full, 50.0 + 104.0 + 50.0 + 100.0 + 160.0 * 3.0 + 100.0 + 120.0 + 164.0 + 70.0 + 120.0);
+    assert_eq!(full, 50.0 + 132.0 + 50.0 + 88.0 + 160.0 * 3.0 + 100.0 + 120.0 + 164.0 + 70.0 + 120.0);
     assert!(v.needs_horizontal_scroll(1000.0), "12 columns do not fit 1000 px");
     for c in [ScanColumn::Direction, ScanColumn::NetEdge, ScanColumn::Okx, ScanColumn::Bybit, ScanColumn::Add, ScanColumn::Gross] {
         v.toggle(c);
@@ -285,6 +285,15 @@ fn the_gross_column_fits_the_value_and_both_labels_without_cutting_any() {
     }
     assert!(need(&[r.gross_text()]) <= ScanColumn::Gross.width());
     assert_eq!(GROSS_INTERVALS_DIFFER, "週期不同");
+}
+
+#[test]
+fn the_symbol_column_fits_the_longest_real_symbols_without_cutting_them() {
+    // 1000000BABYDOGEUSDT (19 characters) is a real Binance perpetual; the column is as wide as it needs
+    for symbol in ["1000000BABYDOGEUSDT", "1000000MOGUSDT", "BTCUSDT"] {
+        let n = need(&[symbol.to_string()]);
+        assert!(n <= ScanColumn::Symbol.width(), "{symbol} needs {n} px, the column is {} px", ScanColumn::Symbol.width());
+    }
 }
 
 #[test]

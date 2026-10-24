@@ -93,7 +93,7 @@ pub fn freshness_chip(label: &str, f: &Freshness) -> Div {
 /// `key` names the line (page and exchange) for the open state and the element id.
 pub fn disabled_note(n: &DisabledNote, key: &str, open: bool, on_toggle: ClickFn) -> Div {
     let Some(detail) = &n.detail else {
-        return div().child(small(n.text.clone(), DISABLED_TONE.color()));
+        return div().child(small(n.text.clone(), n.tone.color()));
     };
     let mut out = div().flex().flex_col().gap_1().child(
         div()
@@ -101,7 +101,7 @@ pub fn disabled_note(n: &DisabledNote, key: &str, open: bool, on_toggle: ClickFn
             .test_support()
             .cursor_pointer()
             .on_click(on_toggle)
-            .child(small(format!("{} {}", if open { "▾" } else { "▸" }, n.text), DISABLED_TONE.color())),
+            .child(small(format!("{} {}", if open { "▾" } else { "▸" }, n.text), n.tone.color())),
     );
     if open {
         out = out.child(small(detail.clone(), theme::TEXT_MUTED).pl(rx(14.0)));
@@ -291,6 +291,15 @@ fn legend(labels: Vec<(String, String)>) -> Div {
     col
 }
 
+/// The card of an exchange the risk settings left unticked but that still has exposure: the warning
+/// says so under the state the card already shows (ui-plain-language).
+fn with_disabled_note(card: Div, note: &Option<String>) -> Div {
+    match note {
+        Some(n) => card.child(small(n.clone(), theme::WARNING)),
+        None => card,
+    }
+}
+
 fn connected_card(c: &ConnectedCard) -> Div {
     let header = div()
         .flex()
@@ -380,9 +389,13 @@ pub fn dashboard_page(vm: &DashboardVm, notes: &Notes) -> Div {
     for c in &vm.cards {
         cards = match c {
             ExchangeCard::Connected(c) => cards.child(connected_card(c)),
-            ExchangeCard::NotConnected { exchange, reason } => cards.child(card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small(format!("● 未連線 · {reason}"), theme::NEGATIVE))),
-            ExchangeCard::Loading { exchange } => cards.child(card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small("載入中", theme::TEXT_MUTED))),
-            ExchangeCard::Failed { exchange, error, plain, at } => {
+            ExchangeCard::NotConnected { exchange, reason, disabled_note } => {
+                cards.child(with_disabled_note(card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small(format!("● 未連線 · {reason}"), theme::NEGATIVE)), disabled_note))
+            }
+            ExchangeCard::Loading { exchange, disabled_note } => {
+                cards.child(with_disabled_note(card().child(text(exchange.name(), theme::TEXT_PRIMARY)).child(small("載入中", theme::TEXT_MUTED)), disabled_note))
+            }
+            ExchangeCard::Failed { exchange, error, plain, at, disabled_note } => {
                 // plain words first; the exchange's own message stays as the secondary line
                 let mut failed = card()
                     .child(text(exchange.name(), theme::TEXT_PRIMARY))
@@ -390,7 +403,7 @@ pub fn dashboard_page(vm: &DashboardVm, notes: &Notes) -> Div {
                 if plain != error {
                     failed = failed.child(small(format!("原始訊息：{error}"), theme::TEXT_MUTED));
                 }
-                cards.child(failed)
+                cards.child(with_disabled_note(failed, disabled_note))
             }
             ExchangeCard::Disabled(n) => {
                 lines = lines.child(notes.line(n, "overview"));

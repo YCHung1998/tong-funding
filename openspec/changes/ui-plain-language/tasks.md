@@ -16,3 +16,10 @@
 ## 4. 驗證
 
 - [x] 4.1 `cargo test` 全套綠燈、`cargo clippy` 無新增警告、`openspec validate ui-plain-language --strict` 通過
+
+## 5. 審查修正（停用交易所不得隱藏真實曝險）
+
+- [x] 5.1 失敗測試先行：停用＋`positions_incomplete`、停用＋舊資料＋最新讀取失敗、停用＋Failed／未連線／載入中＋未結束配對（引擎配對與已儲存紀錄）、已結束配對不算、停用＋讀取成功且空仍為弱化單行；總覽、持倉、交易單、警示各頁
+- [x] 5.2 `vm/disabled.rs` 單一規則（`Quiet`／`Unconfirmed`／`Exposed`、未結束配對判斷、`holds_exposure`）；總覽、持倉、交易單、警示改用；`DisabledNote` 帶色調，無法確認時為警示色；註記文字改為「此交易所已停用，但仍有持倉或持倉狀態未確認」
+- [x] 5.3 低嚴重度：`FINALIZED` 說明改為「已平倉並已記錄損益（可能不完整）」；掃幣表 Symbol 欄寬容得下 `1000000BABYDOGEUSDT`，1,470 px 視窗（OKX 未勾選）仍達標
+- [x] 5.4 驗證：`cargo test -p tong-funding` 全綠、clippy 無新增警告、`openspec validate --all --strict`
