@@ -56,9 +56,8 @@ pub struct ContractVm {
     /// Above the global or an exchange's `max_leverage`: shown, never blocks saving (Node 0 decides).
     pub leverage_warning: Option<String>,
     pub can_save: bool,
-    /// The current `execution_mode` for the boundary table (`未知` while the engine is not running).
-    pub mode_label: &'static str,
-    /// The same world in plain words with the code after it (`Demo 帳戶（EXCHANGE_DEMO）`).
+    /// The current `execution_mode` in plain words with the code after it (`Demo 帳戶（EXCHANGE_DEMO）`;
+    /// `未知` while the engine is not running).
     pub mode_text: String,
 }
 
@@ -73,13 +72,6 @@ fn parse_positive(label: &str, raw: &str, errors: &mut Vec<String>) -> Option<De
             None
         }
         Ok(v) => Some(v),
-    }
-}
-
-fn mode_text(env: Option<EnvLabel>) -> &'static str {
-    match env {
-        Some(l) => l.env_name(),
-        None => "未知",
     }
 }
 
@@ -124,7 +116,6 @@ pub fn evaluate(form: &ContractForm, settings: &Settings, env: Option<EnvLabel>)
         can_save: errors.is_empty() && notional.is_some() && leverage.is_some(),
         errors,
         leverage_warning,
-        mode_label: mode_text(env),
         mode_text: env.map_or_else(|| "未知".to_string(), |l| execution_mode_text(l.identity, l.mode)),
     }
 }

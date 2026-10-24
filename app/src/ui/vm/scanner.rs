@@ -84,19 +84,6 @@ impl RateCell {
             RateCell::Rate { interval_secs, .. } => Some(format::interval_label(Some(*interval_secs))),
         }
     }
-    /// Secondary text: 8h equivalent (display only), stale marker.
-    pub fn notes(&self) -> Vec<String> {
-        match self {
-            RateCell::Rate { stale, .. } => {
-                let mut v: Vec<String> = self.second_line().into_iter().collect();
-                if *stale {
-                    v.push(STALE_NOTE.into());
-                }
-                v
-            }
-            _ => Vec::new(),
-        }
-    }
     pub fn tone(&self) -> Tone {
         match self {
             RateCell::Rate { rate, .. } => funding_tone(*rate),
@@ -184,14 +171,6 @@ impl Countdown {
             Countdown::Remaining { calibrated: false, .. } => Some("（未校時）".into()),
             Countdown::Settling => Some("待更新".into()),
             _ => None,
-        }
-    }
-    pub fn text(self) -> String {
-        match self {
-            Countdown::Remaining { ms, calibrated: true } => format::hms(ms),
-            Countdown::Remaining { ms, calibrated: false } => format!("{}（未校時）", format::hms(ms)),
-            Countdown::Settling => "結算中 · 待更新".into(),
-            Countdown::Unknown => DASH.into(),
         }
     }
 }

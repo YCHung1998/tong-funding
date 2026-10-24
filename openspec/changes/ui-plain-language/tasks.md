@@ -34,3 +34,16 @@
 - [x] 6.6 E6：`RATE_POSITIVE` 改為蘭紫 `0xDE8FE6`（與 `WARNING` 色相差 ≥ 40°、對比 ≥ 4.5:1），`theme_tests` 加色相差斷言（同步 `scanner-layout` 規格與設計）；`bench.rs` 的 Net Edge 欄改用 `pnl_tone`
 - [x] 6.7 E7：修正 `live.rs` 黏在一起的 doc 註解（`pair_entries` 與 `pair_records`）
 - [x] 6.8 驗證：`cargo test -p tong-funding` 全綠、clippy 對改動無新增、`openspec validate --all --strict`
+
+## 7. 簡潔性審查後的清理（ui-clarity，行為不變，F9 除外）
+
+- [x] 7.1 F1：刪除只剩測試用的 `StagedVm::mode_label`、`AttemptView.mode_label`、`ContractVm.mode_label`，測試改斷言 `mode_text`
+- [x] 7.2 F2：`labels::trigger_mode_text` 改用 `engine::gate::trigger_mode_str`，刪除重複的 `trigger_mode_code`
+- [x] 7.3 F3：刪除死碼 `RateCell::notes()`、`Countdown::text()`，測試改斷言 `first_line()`／`second_line()`
+- [x] 7.4 F4：`block_reason_label` 刪除到不了的分支（`Checks {`、`RiskLimits: live:`、`LeverageCap:`，這些一律帶 `failed_checks`）與對應測試
+- [x] 7.5 F5：刪除 `DISABLED_TONE` 別名，直接用 `Tone::Muted`
+- [x] 7.6 F6：`dashboard::build` 的停用折疊改為 match 前 `if fold { …; continue; }`，match 回到單一 arm
+- [x] 7.7 F7：白話對照（`pair_state_plain`／`pair_state_label`／`execution_mode_label`／`trigger_mode_label`／`pnl_status_label`）只回傳中文名稱，刪除從未顯示的說明句與測試；同步本變更的 spec／design／proposal；`staged_orders` 直接用 `pair_state_plain(PairState::Blocked)`
+- [x] 7.8 F8：寬度模型的輔助函式與常數（`est_text_px`、`CELL_*`）移到 `scan_view_tests.rs`；刪除同義反覆測試（`GROSS_INTERVALS_DIFFER` 字面值、列高常數比較、`needs_horizontal_scroll` 重述、寫死 hex 的 `rate_colours_are_the_decided_values`）與 `dashboard_tests` 中與 `disabled_tests` 重複的測試（合併、保留獨有斷言）
+- [x] 7.9 F9：風控頁執行模式（目前模式與選項按鈕）改用 `labels::execution_mode_text`（中文為主、代碼在括號）
+- [x] 7.10 驗證：`cargo test -p tong-funding` 全綠、clippy 無新增、`openspec validate --all --strict`

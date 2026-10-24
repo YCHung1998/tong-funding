@@ -238,20 +238,34 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
             excluded.push(e.name());
             unconfirmed.push(e.name());
         }
-        match snap.account(e) {
-            AccountState::Loaded { data, fetched_at, error } => {
-                let (assets, value, unvalued) = asset_rows(&data);
-                if fold {
-                    let detail = match verdict {
+        let account = snap.account(e);
+        if fold {
+            // an unticked exchange without exposure: one muted line, the page it would have drawn behind it
+            let detail = match account {
+                AccountState::Loaded { data, fetched_at, .. } => {
+                    let value = asset_rows(&data).1;
+                    match verdict {
                         Some(DisabledStatus::Unconfirmed { .. }) => format!("最後一次成功讀取是 {} 秒前；資產 {} USDT 未計入總資產", format::secs(now_ms - fetched_at), format::money(value, 2)),
                         _ => {
                             let age = disabled::read_age_note(snap, e, now_ms).map(|a| format!("（{a}）")).unwrap_or_default();
                             format!("已連線，沒有持倉{age}；資產 {} USDT 未計入總資產", format::money(value, 2))
                         }
-                    };
-                    cards.push(folded(detail));
-                    continue;
+                    }
                 }
+                AccountState::NotConnected { reason } => format!("未連線：{reason}"),
+                AccountState::Failed { error, at } => {
+                    let plain = plain_error(&error);
+                    let raw = if plain == error { String::new() } else { format!(" · 原始訊息：{error}") };
+                    format!("載入失敗：{plain}（{} UTC）{raw}", format::utc_hms(at))
+                }
+                AccountState::Loading => "載入中".into(),
+            };
+            cards.push(folded(detail));
+            continue;
+        }
+        match account {
+            AccountState::Loaded { data, fetched_at, error } => {
+                let (assets, value, unvalued) = asset_rows(&data);
                 let margin = margin_distribution(&data.positions);
                 used_total += used_margin(&margin);
                 pnl_total += data.positions.iter().filter_map(|p| p.unrealized_pnl).sum::<Decimal>();
@@ -269,26 +283,19 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
                     disabled_note: card_note,
                 }));
             }
-            AccountState::NotConnected { reason } if !fold => {
+            AccountState::NotConnected { reason } => {
                 excluded.push(e.name());
                 cards.push(ExchangeCard::NotConnected { exchange: e, reason, disabled_note: card_note });
             }
-            AccountState::NotConnected { reason } => cards.push(folded(format!("未連線：{reason}"))),
             AccountState::Failed { error, at } => {
                 let plain = plain_error(&error);
-                if !fold {
-                    excluded.push(e.name());
-                    cards.push(ExchangeCard::Failed { exchange: e, error, plain, at, disabled_note: card_note });
-                } else {
-                    let raw = if plain == error { String::new() } else { format!(" · 原始訊息：{error}") };
-                    cards.push(folded(format!("載入失敗：{plain}（{} UTC）{raw}", format::utc_hms(at))));
-                }
+                excluded.push(e.name());
+                cards.push(ExchangeCard::Failed { exchange: e, error, plain, at, disabled_note: card_note });
             }
-            AccountState::Loading if !fold => {
+            AccountState::Loading => {
                 excluded.push(e.name());
                 cards.push(ExchangeCard::Loading { exchange: e, disabled_note: card_note });
             }
-            AccountState::Loading => cards.push(folded("載入中".into())),
         }
     }
 

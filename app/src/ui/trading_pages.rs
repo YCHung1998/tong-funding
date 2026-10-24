@@ -398,10 +398,10 @@ fn warn_box(lines: Vec<String>) -> Div {
     d
 }
 
-fn mode_text(identity: crate::identity::ProcessIdentity, m: Option<ExecutionMode>) -> &'static str {
+fn mode_text(identity: crate::identity::ProcessIdentity, m: Option<ExecutionMode>) -> String {
     match m {
-        Some(m) => risk_settings::mode_label(identity, m),
-        None => "未知（引擎未啟動）",
+        Some(m) => super::labels::execution_mode_text(identity, m),
+        None => "未知（引擎未啟動）".to_string(),
     }
 }
 
@@ -1054,7 +1054,7 @@ impl Shell {
                     .flex()
                     .gap_2()
                     .items_center()
-                    .child(btn(SharedString::from(format!("mode-{}", risk_settings::mode_label(identity, m))), format!("{} {}", if on { "●" } else { "○" }, risk_settings::mode_label(identity, m)), enabled, self.click(cx, move |this, _| {
+                    .child(btn(SharedString::from(format!("mode-{}", risk_settings::mode_label(identity, m))), format!("{} {}", if on { "●" } else { "○" }, super::labels::execution_mode_text(identity, m)), enabled, self.click(cx, move |this, _| {
                         let Some(cur) = this.snap.engine.as_ref().map(|e| e.execution_mode) else { return };
                         match risk_settings::request_mode(this.snap.identity, cur, m, &this.snap.settings, this.snap.demo_keys.as_ref(), this.sink.as_ref()) {
                             Ok(risk_settings::ModeStep::Confirm(t)) => this.trading.mode_confirm = Some(t),

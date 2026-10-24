@@ -14,7 +14,7 @@ use super::banner::{BadgeVm, BannerItem, BannerVm, DrawerVm, Freshness, LoadView
 use super::bridge::ClockState;
 use super::dashboard::{self, ConnectedCard, DashboardVm, ExchangeCard, MarginDistribution};
 use super::format::{self, DASH};
-use super::labels::{DisabledNote, DISABLED_TONE};
+use super::labels::DisabledNote;
 use super::positions::{PairCard, PositionsVm, TableView};
 use super::scan_view::{ScanColumn, ScanEvent, SortDir, SortState};
 use super::scanner::{self, RateCell, ScanRow};
@@ -71,7 +71,7 @@ pub fn source_chip(c: &scanner::SourceChip) -> Div {
         row = row.child(div().size(px(6.0)).rounded_full().bg(rgb(fresh_color(status))));
     }
     match c {
-        scanner::SourceChip::Disabled { .. } => row = row.child(small(c.label(), DISABLED_TONE.color())),
+        scanner::SourceChip::Disabled { .. } => row = row.child(small(c.label(), Tone::Muted.color())),
         _ => row = row.child(small(c.label(), theme::TEXT_SECONDARY)).child(small(c.detail(), theme::TEXT_MUTED)),
     }
     div().child(row)

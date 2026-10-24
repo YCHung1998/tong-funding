@@ -28,7 +28,7 @@ fn leverage_mode_gives_margin_400_with_the_formula_and_pair_totals() {
     assert_eq!(vm.margin, Some(d("400")));
     assert_eq!(vm.formula.as_deref(), Some("1,200 ÷ 3 = 400 / leg"));
     assert_eq!((vm.pair_notional, vm.pair_margin), (Some(d("2400")), Some(d("800"))));
-    assert_eq!(vm.mode_label, "EXCHANGE_DEMO");
+    assert_eq!(vm.mode_text, "Demo 帳戶（EXCHANGE_DEMO）");
     assert!(vm.errors.is_empty() && vm.can_save);
 }
 
@@ -197,7 +197,7 @@ mod contract_quote {
 fn the_template_page_names_the_live_world_in_a_live_process() {
     let live = crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo);
     let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(live));
-    assert_eq!(vm.mode_label, "LIVE");
+    assert_eq!(vm.mode_text, "真錢（LIVE）");
 }
 
 // ---- ui-plain-language 2.2: the quote rows and an exchange the risk settings left unticked -----------
@@ -271,7 +271,7 @@ mod unticked_exchange {
 #[test]
 fn the_boundary_names_the_world_in_plain_words_with_the_code_after_it() {
     let vm = evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Demo, ExecutionMode::ExchangeDemo)));
-    assert_eq!((vm.mode_label, vm.mode_text.as_str()), ("EXCHANGE_DEMO", "Demo 帳戶（EXCHANGE_DEMO）"));
+    assert_eq!(vm.mode_text, "Demo 帳戶（EXCHANGE_DEMO）");
     let live = crate::ui::env_label::EnvLabel::of(crate::identity::ProcessIdentity::Live, ExecutionMode::ExchangeDemo);
     assert_eq!(evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), Some(live)).mode_text, "真錢（LIVE）");
     assert_eq!(evaluate(&form("1200", "3", "", CalcMode::LeverageToMargin), &Settings::default(), None).mode_text, "未知");

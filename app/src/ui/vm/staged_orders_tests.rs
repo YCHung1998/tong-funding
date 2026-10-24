@@ -106,7 +106,7 @@ fn staged_orders_rows_show_floored_quantities_and_the_net_edge() {
     assert_eq!(btc.net_edge_pct, Some(d("0.07")));
     assert_eq!((btc.notional, btc.leverage, btc.margin), (Some(d("1200")), Some(d("3")), Some(d("400"))));
     assert_eq!(btc.entry_in_ms, Some(T - 10_000 - NOW), "entry at T−10 s");
-    assert_eq!(vm.mode_label(), "SIMULATION");
+    assert_eq!(vm.mode_text(), "模擬（SIMULATION）");
 }
 
 #[test]
@@ -132,10 +132,10 @@ fn staged_orders_summary_is_hand_calculated() {
 }
 
 #[test]
-fn staged_orders_mode_label_follows_the_engine() {
+fn staged_orders_mode_text_follows_the_engine() {
     let mut s = snap();
     eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
-    assert_eq!(build(&s, &BTreeSet::new(), NOW).mode_label(), "EXCHANGE_DEMO");
+    assert_eq!(build(&s, &BTreeSet::new(), NOW).mode_text(), "Demo 帳戶（EXCHANGE_DEMO）");
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn a_simulation_result_is_labelled_and_shows_no_real_order_id() {
     s.trade_events = attempt("u-BTCUSDT", true, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": true, "outcome": "accepted", "client_order_id": "simso0001", "exchange_order_id": "sim-2"}), "RECONCILED");
     let vm = build(&s, &BTreeSet::new(), NOW);
     let a = &vm.last_results[0];
-    assert_eq!(a.mode_label, "SIMULATION");
+    assert_eq!(a.mode_text, "模擬（SIMULATION）");
     assert!(a.legs.iter().all(|l| l.order_id_text.starts_with("模擬")), "{:?}", a.legs);
     assert!(!a.needs_manual);
 }
@@ -282,7 +282,7 @@ fn an_exchange_demo_result_shows_the_exchange_order_id() {
     let mut s = snap();
     s.trade_events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "accepted", "client_order_id": "demoso0001", "exchange_order_id": "b-77"}), "RECONCILED");
     let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
-    assert_eq!(a.mode_label, "EXCHANGE_DEMO");
+    assert_eq!(a.mode_text, "Demo 帳戶（EXCHANGE_DEMO）");
     assert_eq!(a.legs[0].order_id_text, "8389765");
     assert_eq!(a.legs[1].order_id_text, "b-77");
 }
@@ -734,11 +734,11 @@ fn a_demo_confirmation_has_no_real_money_wording() {
 #[test]
 fn staged_vm_and_rows_name_the_live_world() {
     let vm = build(&live_snap(ExecutionMode::ExchangeDemo), &BTreeSet::new(), NOW);
-    assert_eq!(vm.mode_label(), "LIVE");
+    assert_eq!(vm.mode_text(), "真錢（LIVE）");
     assert!(vm.rows.iter().all(|r| r.badge == Some("LIVE")));
     let demo = build(&snap(), &BTreeSet::new(), NOW);
     assert!(demo.rows.iter().all(|r| r.badge.is_none()));
-    assert_eq!(build(&live_snap(ExecutionMode::Simulation), &BTreeSet::new(), NOW).mode_label(), "LIVE SIMULATION");
+    assert_eq!(build(&live_snap(ExecutionMode::Simulation), &BTreeSet::new(), NOW).mode_text(), "模擬（LIVE SIMULATION）");
 }
 
 #[test]
@@ -746,7 +746,7 @@ fn a_live_result_and_its_headline_say_live() {
     let mut s = live_snap(ExecutionMode::ExchangeDemo);
     s.trade_events = attempt("u-BTCUSDT", false, json!({"leg": "short", "action": "open", "exchange": "Bybit", "symbol": "BTCUSDT", "simulated": false, "outcome": "accepted", "client_order_id": "livedso1", "exchange_order_id": "b-77"}), "RECONCILED");
     let a = &build(&s, &BTreeSet::new(), NOW).last_results[0];
-    assert_eq!(a.mode_label, "LIVE");
+    assert_eq!(a.mode_text, "真錢（LIVE）");
     assert!(a.headline.ends_with(" · 真錢（LIVE）"), "a real-money result names its world on the headline: {}", a.headline);
     // a demo result keeps the plain headline of the spec (the world is on the secondary line)
     let mut d = snap();
@@ -1078,7 +1078,6 @@ mod plain_texts {
         let mut s = snap();
         let vm = build(&s, &BTreeSet::new(), NOW);
         assert_eq!((vm.mode_text().as_str(), vm.trigger_text().as_str()), ("模擬（SIMULATION）", "手動（MANUAL）"));
-        assert_eq!(vm.mode_label(), "SIMULATION", "the code itself is still available");
         eng(&mut s).execution_mode = ExecutionMode::ExchangeDemo;
         eng(&mut s).trigger_mode = TriggerMode::Auto;
         let vm = build(&s, &BTreeSet::new(), NOW);

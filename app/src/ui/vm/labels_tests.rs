@@ -14,18 +14,17 @@ use crate::ui::theme::Tone;
 
 #[test]
 fn the_three_states_the_spec_names_read_as_finalized_blocked_and_partial_failure() {
-    assert_eq!(pair_state_label("FINALIZED").0, "已完成");
-    assert_eq!(pair_state_label("BLOCKED").0, "被擋下");
-    assert_eq!(pair_state_label("PARTIAL_FAILURE").0, "單腿失敗");
+    assert_eq!(pair_state_label("FINALIZED"), "已完成");
+    assert_eq!(pair_state_label("BLOCKED"), "被擋下");
+    assert_eq!(pair_state_label("PARTIAL_FAILURE"), "單腿失敗");
 }
 
 #[test]
-fn every_pair_state_has_its_own_plain_name_and_a_sentence() {
+fn every_pair_state_has_its_own_plain_name() {
     let mut names = BTreeSet::new();
     for s in PairState::ALL {
-        let (name, note) = pair_state_label(s.as_str());
+        let name = pair_state_label(s.as_str());
         assert!(!name.is_empty() && name != s.as_str(), "{s}: the main text is Chinese, not the code: {name:?}");
-        assert!(!note.is_empty(), "{s} has no explanation");
         assert!(names.insert(name.clone()), "{s}: {name:?} is used by another state");
     }
     assert_eq!(names.len(), PairState::ALL.len());
@@ -49,25 +48,24 @@ fn the_wording_of_all_twelve_states_is_pinned() {
     ];
     assert_eq!(expected.len(), PairState::ALL.len(), "a new state needs a pinned name here too");
     for (state, name) in expected {
-        assert_eq!(pair_state_plain(state).0, name, "{state}");
+        assert_eq!(pair_state_plain(state), name, "{state}");
     }
 }
 
 #[test]
 fn the_typed_and_the_stored_code_lookups_agree() {
     for s in PairState::ALL {
-        let (name, note) = pair_state_plain(s);
-        assert_eq!(pair_state_label(s.as_str()), (name.to_string(), note.to_string()), "{s}");
+        assert_eq!(pair_state_label(s.as_str()), pair_state_plain(s), "{s}");
     }
 }
 
 #[test]
 fn an_unknown_state_code_is_shown_as_it_is_and_never_guessed() {
-    assert_eq!(pair_state_label("WAITING_FOR_GODOT"), ("WAITING_FOR_GODOT".to_string(), String::new()));
+    assert_eq!(pair_state_label("WAITING_FOR_GODOT"), "WAITING_FOR_GODOT");
     // the stored codes are exact: a different spelling is not "close enough"
-    assert_eq!(pair_state_label("finalized").0, "finalized");
-    assert_eq!(pair_state_label("未知").0, "未知");
-    assert_eq!(pair_state_label("").0, "");
+    assert_eq!(pair_state_label("finalized"), "finalized");
+    assert_eq!(pair_state_label("未知"), "未知");
+    assert_eq!(pair_state_label(""), "");
 }
 
 #[test]
@@ -82,19 +80,10 @@ fn the_code_stays_as_small_print_after_the_plain_name() {
 
 #[test]
 fn execution_worlds_read_as_simulation_demo_account_and_real_money() {
-    assert_eq!(execution_mode_label(Demo, ExecutionMode::Simulation).0, "模擬");
-    assert_eq!(execution_mode_label(Demo, ExecutionMode::ExchangeDemo).0, "Demo 帳戶");
-    assert_eq!(execution_mode_label(Live, ExecutionMode::ExchangeDemo).0, "真錢");
-    assert_eq!(execution_mode_label(Live, ExecutionMode::Simulation).0, "模擬");
-    for identity in [Demo, Live] {
-        for mode in [ExecutionMode::Simulation, ExecutionMode::ExchangeDemo] {
-            assert!(!execution_mode_label(identity, mode).1.is_empty(), "{identity:?} {mode:?} has no explanation");
-        }
-    }
-    // only the real-money world says it spends money; the others say they do not
-    assert!(execution_mode_label(Live, ExecutionMode::ExchangeDemo).1.contains("真錢"));
-    assert!(execution_mode_label(Demo, ExecutionMode::ExchangeDemo).1.contains("不涉及真錢"));
-    assert!(execution_mode_label(Live, ExecutionMode::Simulation).1.contains("不送出任何真實訂單"));
+    assert_eq!(execution_mode_label(Demo, ExecutionMode::Simulation), "模擬");
+    assert_eq!(execution_mode_label(Demo, ExecutionMode::ExchangeDemo), "Demo 帳戶");
+    assert_eq!(execution_mode_label(Live, ExecutionMode::ExchangeDemo), "真錢");
+    assert_eq!(execution_mode_label(Live, ExecutionMode::Simulation), "模擬");
 }
 
 #[test]
@@ -102,7 +91,7 @@ fn the_environment_code_comes_from_env_label_and_follows_the_plain_name() {
     for identity in [Demo, Live] {
         for mode in [ExecutionMode::Simulation, ExecutionMode::ExchangeDemo] {
             let code = EnvLabel::of(identity, mode).env_name();
-            let name = execution_mode_label(identity, mode).0;
+            let name = execution_mode_label(identity, mode);
             assert_eq!(execution_mode_text(identity, mode), format!("{name}（{code}）"), "{identity:?} {mode:?}");
         }
     }
@@ -110,9 +99,8 @@ fn the_environment_code_comes_from_env_label_and_follows_the_plain_name() {
 
 #[test]
 fn trigger_modes_read_as_automatic_and_manual() {
-    assert_eq!(trigger_mode_label(TriggerMode::Auto).0, "自動");
-    assert_eq!(trigger_mode_label(TriggerMode::Manual).0, "手動");
-    assert!(!trigger_mode_label(TriggerMode::Auto).1.is_empty() && !trigger_mode_label(TriggerMode::Manual).1.is_empty());
+    assert_eq!(trigger_mode_label(TriggerMode::Auto), "自動");
+    assert_eq!(trigger_mode_label(TriggerMode::Manual), "手動");
     assert_eq!(trigger_mode_text(TriggerMode::Auto), "自動（AUTO）");
     assert_eq!(trigger_mode_text(TriggerMode::Manual), "手動（MANUAL）");
 }
@@ -121,10 +109,9 @@ fn trigger_modes_read_as_automatic_and_manual() {
 
 #[test]
 fn pnl_statuses_read_as_complete_and_incomplete_and_unknown_ones_stay_as_they_are() {
-    assert_eq!(pnl_status_label("COMPLETE").0, "完整");
-    assert_eq!(pnl_status_label("INCOMPLETE").0, "不完整");
-    assert!(!pnl_status_label("COMPLETE").1.is_empty() && !pnl_status_label("INCOMPLETE").1.is_empty());
-    assert_eq!(pnl_status_label("PARTIAL"), ("PARTIAL".to_string(), String::new()));
+    assert_eq!(pnl_status_label("COMPLETE"), "完整");
+    assert_eq!(pnl_status_label("INCOMPLETE"), "不完整");
+    assert_eq!(pnl_status_label("PARTIAL"), "PARTIAL");
     assert_eq!(pnl_status_text("INCOMPLETE"), "不完整（INCOMPLETE）");
     assert_eq!(pnl_status_text("PARTIAL"), "PARTIAL");
 }
@@ -166,8 +153,6 @@ fn every_block_reason_the_engine_writes_has_a_plain_text() {
         (r#"InvalidEntry { reason: "leverage must be positive" }"#, "進場快照無法使用：leverage must be positive"),
         (r#"DataMismatch { reason: "quote is not of Bybit" }"#, "報價資料與配對不符：quote is not of Bybit"),
         (r#"ConfigIncomplete { missing: ["est_slippage_pct", "taker_fee_pct.Bybit"] }"#, "設定不完整：est_slippage_pct、taker_fee_pct.Bybit"),
-        ("RiskLimits: live: pair notional 120 is above the cap 100", "超過正式環境的風控上限：pair notional 120 is above the cap 100"),
-        ("LeverageCap: Bybit allows 3x, the pair uses 5x", "槓桿超過交易所上限：Bybit allows 3x, the pair uses 5x"),
         ("restart during the pre-trade check; no order was sent", "重啟時正在做送單前檢查，沒有送出任何訂單"),
         ("pre-trade check timed out", "送單前檢查逾時，沒有送出任何訂單"),
     ];
@@ -180,12 +165,6 @@ fn every_block_reason_the_engine_writes_has_a_plain_text() {
 fn a_block_reason_that_is_not_in_the_table_is_shown_as_it_is() {
     assert_eq!(block_reason_label("something the engine has not said before"), "something the engine has not said before");
     assert_eq!(block_reason_label(""), "");
-}
-
-#[test]
-fn the_checks_block_debug_text_lists_every_failed_check_by_plain_name() {
-    let raw = r#"Checks { failed: [PriceDrift, Margin], notes: ["long: account unreadable"] }"#;
-    assert_eq!(block_reason_label(raw), "送單前檢查未通過：價格漂移過大（PriceDrift）、可用保證金不足（Margin）");
 }
 
 #[test]
@@ -220,11 +199,6 @@ fn the_disabled_exchange_line_names_the_exchange_and_the_setting() {
 }
 
 #[test]
-fn the_disabled_line_is_drawn_muted_never_as_an_error() {
-    assert_eq!(DISABLED_TONE, Tone::Muted);
-}
-
-#[test]
 fn a_disabled_note_carries_the_line_and_keeps_the_detail_for_the_expanded_view() {
     let n = DisabledNote::new(Exchange::Okx, Some("載入失敗：OKX 帳戶模式不支援".into()));
     assert_eq!(n.exchange, Exchange::Okx);
@@ -243,9 +217,3 @@ fn an_unconfirmed_note_names_the_reason_in_the_warning_tone_and_never_says_no_po
     assert_eq!(n.detail.as_deref(), Some("原始訊息"));
 }
 
-#[test]
-fn finalized_does_not_promise_a_complete_pnl() {
-    // a finished pair can still have an INCOMPLETE PnL (the funding ledger was not all there)
-    let (name, note) = pair_state_label("FINALIZED");
-    assert_eq!((name.as_str(), note.as_str()), ("已完成", "已平倉並已記錄損益（可能不完整）"));
-}

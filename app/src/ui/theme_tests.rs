@@ -162,12 +162,6 @@ fn a_rate_colour_is_never_mistaken_for_the_warning_colour() {
 }
 
 #[test]
-fn rate_colours_are_the_decided_values() {
-    assert_eq!(RATE_POSITIVE, 0xDE8FE6); // orchid, not amber: amber reads as the WARNING colour
-    assert_eq!(RATE_NEGATIVE, 0x4FC3F7); // cyan
-}
-
-#[test]
 fn rate_colours_are_neither_green_nor_red_and_differ_from_success_and_danger() {
     for c in [RATE_POSITIVE, RATE_NEGATIVE] {
         assert!(c != POSITIVE && c != NEGATIVE, "{c:06X} must not be the success or danger colour");

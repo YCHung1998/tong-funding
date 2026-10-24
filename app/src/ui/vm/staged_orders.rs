@@ -143,7 +143,7 @@ impl DisabledReason {
             DisabledReason::ConfigIncomplete(m) => format!("設定不完整：{}", m.join("、")),
             DisabledReason::KillSwitchOn => "緊急停止中".into(),
             DisabledReason::Halted(r) => r.clone(),
-            DisabledReason::NotPrepared(s) => format!("已不是「{}」狀態：{}", pair_state_plain(PairState::Prepared).0, s.join("、")),
+            DisabledReason::NotPrepared(s) => format!("已不是「{}」狀態：{}", pair_state_plain(PairState::Prepared), s.join("、")),
             DisabledReason::EngineUnavailable => "引擎未啟動".into(),
         }
     }
@@ -246,7 +246,6 @@ pub struct AttemptView {
     pub symbol: String,
     pub at: i64,
     pub simulated: bool,
-    pub mode_label: &'static str,
     pub mode_text: String,
     pub legs: Vec<AttemptLeg>,
     pub state: String,
@@ -378,13 +377,6 @@ impl StagedVm {
         self.trigger_mode.map_or_else(|| "未知".to_string(), trigger_mode_text)
     }
 
-
-    pub fn mode_label(&self) -> &'static str {
-        match self.mode {
-            Some(m) => EnvLabel::of(self.identity, m).env_name(),
-            None => "未知",
-        }
-    }
 }
 
 fn dec_of(v: &Value, k: &str) -> Option<Decimal> {
@@ -649,12 +641,12 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
 
 /// `已排除（已不是「已暫存」狀態）：BTCUSDT`: pairs that left PREPARED while the confirmation was open.
 pub fn excluded_note(symbols: &[String]) -> String {
-    format!("已排除（已不是「{}」狀態）：{}", pair_state_plain(PairState::Prepared).0, symbols.join("、"))
+    format!("已排除（已不是「{}」狀態）：{}", pair_state_plain(PairState::Prepared), symbols.join("、"))
 }
 
 /// `進行中（持倉中）`: the title of the RECONCILED block.
 pub fn running_title() -> String {
-    format!("進行中（{}）", pair_state_plain(PairState::Reconciled).0)
+    format!("進行中（{}）", pair_state_plain(PairState::Reconciled))
 }
 
 /// "全選": every selectable row.
@@ -915,10 +907,8 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
             let alert_state = matches!(state.as_str(), "PARTIAL_FAILURE" | "IMBALANCED" | "UNRESOLVED");
             let leg_failed = legs.iter().any(|l| matches!(l.status, LegStatus::Rejected(_) | LegStatus::Unknown(_)));
             let needs_manual = alert_state || leg_failed;
-            let env = EnvLabel::of_pair(snap.identity, simulated);
-            let mode_label = env.env_name();
             let mode_text = execution_mode_text(snap.identity, if simulated { ExecutionMode::Simulation } else { ExecutionMode::ExchangeDemo });
-            let state_text = pair_state_label(&state).0;
+            let state_text = pair_state_label(&state);
             let net_pnl = net_pnl_text(snap, pair_id.as_deref(), &state);
             let when = format!("{} UTC", super::format::utc_md_hms(ts));
             let is_blocked = state == PairState::Blocked.as_str() || !failed_checks.is_empty();
@@ -932,8 +922,8 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
                     block_reason.as_deref().map(block_reason_label)
                 };
                 match why {
-                    Some(w) => format!("{}：{w}", pair_state_label(PairState::Blocked.as_str()).0),
-                    None => pair_state_label(PairState::Blocked.as_str()).0,
+                    Some(w) => format!("{}：{w}", pair_state_plain(PairState::Blocked)),
+                    None => pair_state_plain(PairState::Blocked).to_string(),
                 }
             } else {
                 state_text.clone()
@@ -951,7 +941,7 @@ pub fn last_results(snap: &UiSnapshot, limit: usize) -> Vec<AttemptView> {
             if let Some(raw) = &block_reason {
                 codes.push(format!("原始訊息 {raw}"));
             }
-            AttemptView { uuid: pair.to_string(), symbol, at: ts, simulated, mode_label, mode_text, legs, state, state_text, failed_checks, block_reason, needs_manual, when, headline, codes: codes.join(" · "), net_pnl }
+            AttemptView { uuid: pair.to_string(), symbol, at: ts, simulated, mode_text, legs, state, state_text, failed_checks, block_reason, needs_manual, when, headline, codes: codes.join(" · "), net_pnl }
         })
         .collect()
 }

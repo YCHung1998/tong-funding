@@ -58,9 +58,9 @@ fn four_hour_interval_shows_tag_and_display_only_8h_equivalent() {
     let c = cell(r, Binance);
     assert_eq!(c.text(), "0.0500");
     assert_eq!(c.tag().as_deref(), Some("4h"));
-    assert!(c.notes().contains(&"8h 等效 0.1000（僅供顯示）".to_string()), "{:?}", c.notes());
+    assert!(c.second_line().as_deref() == Some("8h 等效 0.1000（僅供顯示）"), "{:?}", c.second_line());
     assert_eq!(cell(r, Bybit).tag().as_deref(), Some("8h"));
-    assert!(cell(r, Bybit).notes().iter().all(|n| !n.contains("8h 等效")));
+    assert!(cell(r, Bybit).second_line().is_none());
     assert!(r.intervals_differ, "4h vs 8h legs get the 週期不同 mark");
 }
 
@@ -89,7 +89,7 @@ fn okx_largest_spread_is_chosen_like_any_other_exchange() {
     assert_eq!(r.direction, Some((Okx, Bybit)), "long the lowest rate (OKX), short the highest (Bybit)");
     assert_eq!(r.gross_text(), "0.5200");
     assert_eq!(r.qualified, Qualified::Yes);
-    assert!(cell(r, Okx).notes().iter().all(|n| !n.contains("僅比價")), "{:?}", cell(r, Okx).notes());
+    assert!(cell(r, Okx).second_line().iter().all(|n| !n.contains("僅比價")), "{:?}", cell(r, Okx).second_line());
     assert_eq!(cell(r, Okx).text(), "−0.5000");
     assert_eq!(r.coverage_text(), "3/3");
 }
@@ -254,8 +254,8 @@ fn rows_have_independent_countdowns() {
     s.market.get_mut(&Binance).unwrap().observations.push(obs(Binance, "BUSDT", "0.0001", 28_800, NOW + 12 * H, NOW));
     let vm = build(&s, NOW);
     let synced = ClockState::Synced { offset_ms: 0 };
-    assert_eq!(countdown(row(&vm, "AUSDT").countdown_target, synced, NOW).text(), "04:00:00");
-    assert_eq!(countdown(row(&vm, "BUSDT").countdown_target, synced, NOW).text(), "12:00:00");
+    assert_eq!(countdown(row(&vm, "AUSDT").countdown_target, synced, NOW).first_line(), "04:00:00");
+    assert_eq!(countdown(row(&vm, "BUSDT").countdown_target, synced, NOW).first_line(), "12:00:00");
 }
 
 #[test]
@@ -267,7 +267,7 @@ fn pair_countdown_targets_the_earlier_leg() {
     let vm = build(&s, now);
     let r = row(&vm, "BTCUSDT");
     assert_eq!(r.countdown_target.map(|t| t.0), Some(NOW));
-    assert_eq!(countdown(r.countdown_target, ClockState::Synced { offset_ms: 0 }, now).text(), "01:00:00");
+    assert_eq!(countdown(r.countdown_target, ClockState::Synced { offset_ms: 0 }, now).first_line(), "01:00:00");
 }
 
 #[test]
@@ -281,7 +281,7 @@ fn countdown_uses_the_calibrated_exchange_time() {
 fn countdown_past_zero_is_settling_never_negative() {
     let c = countdown(Some((NOW - 1, Binance)), ClockState::Synced { offset_ms: 0 }, NOW);
     assert_eq!(c, Countdown::Settling);
-    assert_eq!(c.text(), "結算中 · 待更新");
+    assert_eq!((c.first_line(), c.second_line().as_deref()), ("結算中".to_string(), Some("待更新")));
     assert_eq!(countdown(Some((NOW, Binance)), ClockState::Synced { offset_ms: 0 }, NOW), Countdown::Settling);
     let u = countdown(Some((NOW + 1_000, Binance)), ClockState::Unsynced, NOW);
     assert_eq!(u, Countdown::Remaining { ms: 1_000, calibrated: false });
@@ -318,8 +318,8 @@ fn loading_unavailable_and_partial_failure_are_distinct() {
     let vm = build(&partial, NOW + 2);
     assert_eq!(vm.state, TableState::Ready);
     assert_eq!(vm.source_errors, vec![(Bybit, "request timed out".to_string())]);
-    assert!(cell(row(&vm, "BTCUSDT"), Bybit).notes().contains(&"過期".to_string()));
-    assert!(!cell(row(&vm, "BTCUSDT"), Binance).notes().contains(&"過期".to_string()));
+    assert!(cell(row(&vm, "BTCUSDT"), Bybit).first_line().contains(&"過期".to_string()));
+    assert!(!cell(row(&vm, "BTCUSDT"), Binance).first_line().contains(&"過期".to_string()));
 }
 
 #[test]
