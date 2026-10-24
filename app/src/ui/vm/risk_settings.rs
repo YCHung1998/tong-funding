@@ -14,6 +14,7 @@ use super::bridge::{CommandSink, Settings};
 use super::env_label::EnvLabel;
 use crate::identity::ProcessIdentity;
 use crate::engine::command::Command;
+use crate::engine::watchdog_text;
 
 /// One editable number on the page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -35,6 +36,9 @@ pub enum Field {
     /// live-guardrails 4.2b: Live only (never shown or parsed by a Demo page); blank = not set.
     LiveMaxLegNotionalUsdt,
     LiveMaxPairsPerArming,
+    /// loss-circuit-breaker: global only, with defaults (never blank).
+    LossBreakerMaxLossUsdt,
+    LossBreakerMaxConsecutiveLosses,
 }
 
 /// Which way a field tightens the risk gate. The source of truth is the conservative merge in
@@ -98,7 +102,7 @@ pub const STALE_NOTE: &str = "建議 3000 ms：送單前檢查用的是送單前
 
 /// Global Limits, Layer 1 and Net Edge fields, in page order. Funding Threshold, Max Concurrent
 /// Trades (legs), Hedge Threshold and a single Max Slippage do not exist.
-pub const GLOBAL_FIELDS: [Field; 15] = [
+pub const GLOBAL_FIELDS: [Field; 17] = [
     Field::MaxLeverage,
     Field::MaxPriceDriftPct,
     Field::StaleDataThresholdMs,
@@ -114,6 +118,8 @@ pub const GLOBAL_FIELDS: [Field; 15] = [
     Field::TakerFee(Exchange::Bybit),
     Field::TakerFee(Exchange::Okx),
     Field::EarlyExitMinMovePct,
+    Field::LossBreakerMaxLossUsdt,
+    Field::LossBreakerMaxConsecutiveLosses,
 ];
 
 /// The two caps a Live process must fill in (live-guardrails 4.2b); global only, not overridable.
@@ -158,6 +164,8 @@ impl Field {
             Field::EarlyExitMinMovePct => "early_exit_min_move_pct".into(),
             Field::LiveMaxLegNotionalUsdt => "live_max_leg_notional_usdt".into(),
             Field::LiveMaxPairsPerArming => "live_max_pairs_per_arming".into(),
+            Field::LossBreakerMaxLossUsdt => "loss_breaker_max_loss_usdt".into(),
+            Field::LossBreakerMaxConsecutiveLosses => "loss_breaker_max_consecutive_losses".into(),
         }
     }
 
@@ -178,6 +186,8 @@ impl Field {
             Field::EarlyExitMinMovePct => "提早平倉最小有利幅度（0 = 停用）",
             Field::LiveMaxLegNotionalUsdt => "每腿名目上限 USDT（Live，天花板 100）",
             Field::LiveMaxPairsPerArming => "每次武裝最多進場筆數（Live，天花板 5）",
+            Field::LossBreakerMaxLossUsdt => "熔斷：累計虧損上限",
+            Field::LossBreakerMaxConsecutiveLosses => "熔斷：連續虧損筆數上限",
         }
     }
 
@@ -187,8 +197,8 @@ impl Field {
             Field::StaleDataThresholdMs => "ms",
             Field::MaxConcurrentPairs => "pairs",
             Field::OrderTimeoutSeconds => "秒",
-            Field::Min24hVolumeUsdt | Field::LiveMaxLegNotionalUsdt => "USDT",
-            Field::LiveMaxPairsPerArming => "筆",
+            Field::Min24hVolumeUsdt | Field::LiveMaxLegNotionalUsdt | Field::LossBreakerMaxLossUsdt => "USDT",
+            Field::LiveMaxPairsPerArming | Field::LossBreakerMaxConsecutiveLosses => "筆",
             Field::MaxPriceDriftPct
             | Field::MaxLegImbalancePct
             | Field::MinExpectedNetPnlPct
@@ -203,7 +213,7 @@ impl Field {
     pub fn strictness(self) -> Strictness {
         match self {
             Field::NetEdgeThresholdPct | Field::MinExpectedNetPnlPct | Field::SafetyMarginPct | Field::EstSlippagePct | Field::Min24hVolumeUsdt | Field::EarlyExitMinMovePct => Strictness::HigherStricter,
-            Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => Strictness::LowerStricter,
+            Field::MaxLeverage | Field::MaxPriceDriftPct | Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxLegImbalancePct | Field::MaxConcurrentPairs | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming | Field::LossBreakerMaxLossUsdt | Field::LossBreakerMaxConsecutiveLosses => Strictness::LowerStricter,
             Field::TakerFee(_) => Strictness::Fact,
         }
     }
@@ -247,6 +257,16 @@ impl Field {
                 formula: None,
                 affects: &[Pretrade, Execution],
             },
+            Field::LossBreakerMaxLossUsdt => FieldHelp {
+                meaning: "熔斷：自最近一次開放交易（kill switch 關閉，Live 為武裝）起，已平倉配對的累計虧損達此 USDT 數，就自動打開 kill switch，只停止開新倉；平倉與人工處理照常，進行中的配對提前出場會暫停、排程出場照常；Live 同時解除武裝，並在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）。每筆金額用 PnL 淨額，淨額未知時用價格損益扣兩邊手續費（暫計，不含資金費）；金額算不出來也會觸發。預設 15（新的 Live 資料庫預設 5），越低越嚴。",
+                formula: Some("區間內各筆金額加總 ≤ −上限 → 觸發；重新開放交易後重新計算"),
+                affects: &[Execution],
+            },
+            Field::LossBreakerMaxConsecutiveLosses => FieldHelp {
+                meaning: "熔斷：自最近一次開放交易起，結尾連續虧損（金額小於 0）的已平倉配對達此筆數，就自動打開 kill switch，只停止開新倉（提前出場會暫停、排程出場照常），並在 App 內顯示警示並記錄於系統日誌（尚未接上 macOS 系統通知）；獲利或持平的一筆會讓連虧歸零。預設 3（新的 Live 資料庫預設 2），越低越嚴。",
+                formula: Some("結尾連續虧損筆數 ≥ 上限 → 觸發"),
+                affects: &[Execution],
+            },
         }
     }
 
@@ -278,6 +298,8 @@ pub fn field_text(cfg: &RiskConfig, f: Field) -> String {
         Field::EarlyExitMinMovePct => dtext(cfg.early_exit_min_move_pct),
         Field::LiveMaxLegNotionalUsdt => cfg.live_max_leg_notional_usdt.map(dtext).unwrap_or_default(),
         Field::LiveMaxPairsPerArming => cfg.live_max_pairs_per_arming.map(|n| n.to_string()).unwrap_or_default(),
+        Field::LossBreakerMaxLossUsdt => dtext(cfg.loss_breaker_max_loss_usdt),
+        Field::LossBreakerMaxConsecutiveLosses => cfg.loss_breaker_max_consecutive_losses.to_string(),
     }
 }
 
@@ -360,7 +382,7 @@ fn override_value_of(o: &RiskOverride, f: Field) -> Option<String> {
         Field::NetEdgeThresholdPct => o.net_edge_threshold_pct.map(dtext),
         Field::EstSlippagePct => o.est_slippage_pct.map(dtext),
         Field::SafetyMarginPct => o.safety_margin_pct.map(dtext),
-        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => None,
+        Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming | Field::LossBreakerMaxLossUsdt | Field::LossBreakerMaxConsecutiveLosses => None,
     }
 }
 
@@ -478,6 +500,11 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                     cfg.order_timeout_seconds = v;
                 }
             }
+            Field::LossBreakerMaxConsecutiveLosses => {
+                if let Some(v) = parse_int::<u32>(f, &text, &mut errors, "") {
+                    cfg.loss_breaker_max_consecutive_losses = v;
+                }
+            }
             _ => {
                 if let Some(v) = parse_dec(f, &text, &mut errors, "") {
                     match (f, v) {
@@ -488,6 +515,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                         (Field::MinExpectedNetPnlPct, Some(v)) => cfg.min_expected_net_pnl_pct = v,
                         (Field::SafetyMarginPct, Some(v)) => cfg.safety_margin_pct = v,
                         (Field::EarlyExitMinMovePct, Some(v)) => cfg.early_exit_min_move_pct = v,
+                        (Field::LossBreakerMaxLossUsdt, Some(v)) => cfg.loss_breaker_max_loss_usdt = v,
                         (Field::NetEdgeThresholdPct, v) => cfg.net_edge_threshold_pct = v,
                         (Field::EstSlippagePct, v) => cfg.est_slippage_pct = v,
                         (Field::TakerFee(e), Some(v)) => {
@@ -554,7 +582,7 @@ pub fn evaluate(form: &RiskForm, base: &Settings) -> RiskVm {
                     Field::NetEdgeThresholdPct => o.net_edge_threshold_pct = v,
                     Field::EstSlippagePct => o.est_slippage_pct = v,
                     Field::SafetyMarginPct => o.safety_margin_pct = v,
-                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming => {}
+                    Field::StaleDataThresholdMs | Field::OrderTimeoutSeconds | Field::MaxConcurrentPairs | Field::MinExpectedNetPnlPct | Field::EarlyExitMinMovePct | Field::TakerFee(_) | Field::LiveMaxLegNotionalUsdt | Field::LiveMaxPairsPerArming | Field::LossBreakerMaxLossUsdt | Field::LossBreakerMaxConsecutiveLosses => {}
                 }
             }
         }
@@ -628,6 +656,119 @@ pub fn save(vm: &RiskVm, sink: &dyn CommandSink) -> bool {
     true
 }
 
+// ---- loss-circuit-breaker 3.3: groups and unsaved changes -----------------------------------------
+
+/// The page's blocks of fields (titles in Chinese). The "自動處理規則（授權 B）" block is not a group:
+/// it holds no field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// Net Edge threshold, minimum net profit, minimum 24h volume (and the allowed exchanges and coins, which are not `Field`s).
+    Entry,
+    /// Taker fees, estimated slippage, safety margin.
+    Cost,
+    /// Leverage, price drift, stale data, order timeout, leg imbalance, early exit.
+    Protection,
+    /// Concurrent pairs, the breaker, the Live caps.
+    Position,
+}
+
+impl Group {
+    pub const ALL: [Group; 4] = [Group::Entry, Group::Cost, Group::Protection, Group::Position];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Entry => "進場條件",
+            Group::Cost => "成本估計",
+            Group::Protection => "執行保護",
+            Group::Position => "部位與熔斷",
+        }
+    }
+
+    /// The fields of the block on the page of `identity`, in page order.
+    pub fn fields(self, identity: ProcessIdentity) -> Vec<Field> {
+        let mut out = match self {
+            Group::Entry => vec![Field::NetEdgeThresholdPct, Field::MinExpectedNetPnlPct, Field::Min24hVolumeUsdt],
+            Group::Cost => vec![Field::TakerFee(Exchange::Binance), Field::TakerFee(Exchange::Bybit), Field::TakerFee(Exchange::Okx), Field::EstSlippagePct, Field::SafetyMarginPct],
+            Group::Protection => vec![
+                Field::MaxLeverage,
+                Field::MaxPriceDriftPct,
+                Field::StaleDataThresholdMs,
+                Field::OrderTimeoutSeconds,
+                Field::MaxLegImbalancePct,
+                Field::EarlyExitMinMovePct,
+            ],
+            Group::Position => vec![Field::MaxConcurrentPairs, Field::LossBreakerMaxLossUsdt, Field::LossBreakerMaxConsecutiveLosses],
+        };
+        if self == Group::Position && identity.is_live() {
+            out.extend(LIVE_FIELDS);
+        }
+        out
+    }
+}
+
+/// The same number written differently (`15` and ` 15.0 `) is the same value.
+fn same_text(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    a == b || matches!((a.replace(',', "").parse::<Decimal>(), b.replace(',', "").parse::<Decimal>()), (Ok(x), Ok(y)) if x == y)
+}
+
+fn coin_set(text: &str) -> BTreeSet<String> {
+    text.split(',').map(|c| c.trim().to_ascii_uppercase()).filter(|c| !c.is_empty()).collect()
+}
+
+/// What the form holds that differs from the STORED settings, one entry per setting: field keys in page
+/// order, then `allowed_exchanges`, `allowed_coins`, then overrides (`overrides.<Exchange>.<field>`).
+pub fn changed_items(form: &RiskForm, base: &Settings) -> Vec<String> {
+    let identity = if form.live { ProcessIdentity::Live } else { ProcessIdentity::Demo };
+    let mut out: Vec<String> = global_fields(identity).into_iter().filter(|f| !same_text(&form.value(*f), &field_text(&base.risk, *f))).map(|f| f.key()).collect();
+    let stored_ex: BTreeSet<Exchange> = base.risk.allowed_exchanges.iter().copied().collect();
+    if form.allowed_exchanges != stored_ex {
+        out.push("allowed_exchanges".into());
+    }
+    if coin_set(&form.allowed_coins) != base.risk.allowed_coins.iter().map(|c| c.to_ascii_uppercase()).collect() {
+        out.push("allowed_coins".into());
+    }
+    let mut keys: BTreeSet<(Exchange, Field)> = form.overrides.keys().copied().collect();
+    for (ex, o) in &base.overrides {
+        keys.extend(OVERRIDE_FIELDS.iter().filter(|f| override_value_of(o, **f).is_some()).map(|f| (*ex, *f)));
+    }
+    for (ex, f) in keys {
+        let stored = base.overrides.get(&ex).and_then(|o| override_value_of(o, f));
+        let changed = match (form.overrides.get(&(ex, f)), stored) {
+            (None, None) => false,
+            (Some(a), Some(b)) => !same_text(a, &b),
+            _ => true,
+        };
+        if changed {
+            out.push(format!("overrides.{ex:?}.{}", f.key()));
+        }
+    }
+    out
+}
+
+/// The bar fixed at the bottom of the page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveBar {
+    /// 「有 N 項未儲存的變更」 or 「沒有未儲存的變更」.
+    pub text: String,
+    pub enabled: bool,
+    /// Why the save button is off (shown next to it); `None` when it can be pressed.
+    pub disabled_reason: Option<String>,
+}
+
+/// `changes` = `changed_items(..).len()`.
+pub fn save_bar(vm: &RiskVm, changes: usize) -> SaveBar {
+    let text = if changes == 0 { "沒有未儲存的變更".to_string() } else { format!("有 {changes} 項未儲存的變更") };
+    let errors: Vec<&String> = vm.field_errors.values().collect();
+    let disabled_reason = match (errors.as_slice(), changes) {
+        ([], 0) => Some("沒有變更可儲存".to_string()),
+        ([], _) => None,
+        ([one], _) => Some(format!("{one}，修正後才能儲存")),
+        (many, _) => Some(format!("有 {} 個欄位有錯誤，修正後才能儲存（{}）", many.len(), many[0])),
+    };
+    SaveBar { text, enabled: disabled_reason.is_none(), disabled_reason }
+}
+
 // ---- 3.4 execution mode ---------------------------------------------------------------------
 
 /// The only two modes the page offers (no LIVE).
@@ -686,6 +827,37 @@ pub fn request_mode(identity: ProcessIdentity, current: ExecutionMode, target: E
 /// After the confirmation: the engine switches (and records `EXECUTION_MODE_CHANGED`).
 pub fn send_mode(identity: ProcessIdentity, target: ExecutionMode, sink: &dyn CommandSink) {
     sink.send(format!("切換模式 → {}", mode_label(identity, target)), Command::SetExecutionMode(target));
+}
+
+/// The fixed "自動處理規則（授權 B）" block of the page (naked-leg-watchdog): the rules the system acts
+/// by on its own, always shown, with no way to collapse or switch it. Every word comes from
+/// `engine::watchdog_text`, the one source shared with the manual-handling card and the notifications.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AutoRulesBlock {
+    pub title: &'static str,
+    /// The rule paragraph; bold runs are emphasised on the page.
+    pub runs: Vec<watchdog_text::Run>,
+    /// Lines under the paragraph: an exchange overrides the order timeout, or the stored settings
+    /// could not be read (then the number above is the default, not a fact).
+    pub notes: Vec<String>,
+}
+
+impl AutoRulesBlock {
+    /// The paragraph without emphasis.
+    pub fn plain(&self) -> String {
+        watchdog_text::plain(&self.runs)
+    }
+}
+
+/// The block for the STORED settings (what the engine acts by), not for unsaved edits in the form.
+pub fn auto_rules_block(settings: &Settings) -> AutoRulesBlock {
+    let mut notes = Vec::new();
+    if let Some(e) = &settings.error {
+        notes.push(format!("風控設定讀取失敗（{e}）：上面的訂單逾時秒數是預設值，實際值未知。"));
+    }
+    let overridden: Vec<(Exchange, u32)> = settings.overrides.iter().filter_map(|(ex, o)| o.order_timeout_seconds.map(|s| (*ex, s))).collect();
+    notes.extend(watchdog_text::rules_override_note(&overridden));
+    AutoRulesBlock { title: watchdog_text::RULES_TITLE, runs: watchdog_text::rules_runs(settings.risk.order_timeout_seconds), notes }
 }
 
 #[cfg(test)]

@@ -14,11 +14,11 @@ use crate::identity::ProcessIdentity;
 
 const SOL: &str = "SOLUSDT";
 
-fn live_risk() -> RiskConfig {
+pub(super) fn live_risk() -> RiskConfig {
     RiskConfig { live_max_leg_notional_usdt: Some(dec("10")), live_max_pairs_per_arming: Some(2), ..risk() }
 }
 
-fn live_deps(trigger: &'static str, cfg: &RiskConfig) -> (Rig, EngineDeps) {
+pub(super) fn live_deps(trigger: &'static str, cfg: &RiskConfig) -> (Rig, EngineDeps) {
     let (rig, mut deps) = rig(Opts { trigger, ..Opts::default() });
     deps.identity = ProcessIdentity::Live;
     store_risk(&rig.db, cfg);
@@ -34,7 +34,7 @@ async fn live_started(cfg: &RiskConfig) -> (Rig, EngineHandle, Arc<FakeProbes>) 
     (rig, h, probes)
 }
 
-fn pair_n(uuid: &str, symbol: &str, notional: &str) -> NewPreparedPair {
+pub(super) fn pair_n(uuid: &str, symbol: &str, notional: &str) -> NewPreparedPair {
     let mut p = pair_at(uuid, symbol, T);
     p.entry["notional_usdt"] = json!(notional);
     p
@@ -44,7 +44,7 @@ fn of(db: &Db, label: &str) -> Vec<Value> {
     events(db).into_iter().filter(|(_, l, _)| l == label).map(|(_, _, p)| p).collect()
 }
 
-fn locked(rig: &Rig) -> bool {
+pub(super) fn locked(rig: &Rig) -> bool {
     rig.db.kill_switch_halted()
 }
 
@@ -65,7 +65,7 @@ fn arm_cmd(rep: &PreflightReport) -> Command {
 }
 
 /// Preflight and Arm with everything right.
-async fn arm_ok(h: &EngineHandle) {
+pub(super) async fn arm_ok(h: &EngineHandle) {
     let rep = preflight(h).await;
     assert!(rep.passed(), "{:?}", rep.failures());
     assert_eq!(ask(h, arm_cmd(&rep)).await, CommandReply::Accepted);
@@ -76,14 +76,14 @@ fn opens(rig: &Rig) -> Vec<OrderRequest> {
     rig.sim.submitted().into_iter().filter(|r| !r.reduce_only).collect()
 }
 
-fn why(r: &CommandReply) -> String {
+pub(super) fn why(r: &CommandReply) -> String {
     match r {
         CommandReply::Rejected(w) => w.clone(),
         other => panic!("expected a rejection, got {other:?}"),
     }
 }
 
-fn manual(reduce_only: bool, qty: &str) -> Command {
+pub(super) fn manual(reduce_only: bool, qty: &str) -> Command {
     Command::ManualOrder(ManualOrder {
         exchange: Exchange::Binance,
         symbol: SYM.into(),
@@ -194,6 +194,10 @@ async fn a_green_preflight_then_arm_lifts_the_kill_switch_freezes_the_caps_and_i
     let ev = of(&rig.db, LIVE_ARMED);
     assert_eq!(ev.len(), 1, "{ev:?}");
     assert_eq!(ev[0]["caps"]["live_max_leg_notional_usdt"], json!("10"));
+    // review round 2 (B6): the breaker limits in force at arming are on the record too
+    let risk = live_risk();
+    assert_eq!(ev[0]["caps"]["loss_breaker_max_loss_usdt"], json!(risk.loss_breaker_max_loss_usdt.normalize().to_string()));
+    assert_eq!(ev[0]["caps"]["loss_breaker_max_consecutive_losses"], json!(risk.loss_breaker_max_consecutive_losses));
     assert!(!ev[0].to_string().contains("真錢"), "the typed sentence is not stored: {}", ev[0]);
     // the preflight id is spent
     assert!(why(&ask(&h, arm_cmd(&rep)).await).contains("no preflight"), "single use");
@@ -537,16 +541,57 @@ async fn flatten_leg_closes_only_the_bare_leg_with_the_actual_position_while_loc
     assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the pair state is not changed");
     let ev = of(&rig.db, LEG_FLATTEN);
     assert!(ev.len() == 1 && ev[0]["leg"] == json!("long") && ev[0]["quantity"] == json!("0.09"), "{ev:?}");
+    assert_eq!(ev[0]["by"], json!("manual"), "naked-leg-watchdog: the button's order says who sent it: {ev:?}");
     // the other leg never had a fill: nothing to close, nothing sent
     assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Short }).await, CommandReply::Accepted);
     run_until(&rig.clock, T - 4_000).await;
     assert_eq!(rig.sim.submitted().iter().filter(|r| r.reduce_only).count(), 1);
     let aborted = of(&rig.db, LEG_FLATTEN_ABORTED);
     assert!(aborted.len() == 1 && aborted[0]["reason"].as_str().unwrap().contains("already flat"), "{aborted:?}");
+    assert_eq!(aborted[0]["by"], json!("manual"), "{aborted:?}");
     // flattening the same leg again finds it flat
     assert_eq!(ask(&h, Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }).await, CommandReply::Accepted);
     run_until(&rig.clock, T - 2_000).await;
     assert_eq!(rig.sim.submitted().iter().filter(|r| r.reduce_only).count(), 1, "no second close");
+}
+
+/// naked-leg-watchdog: the same bare leg, nobody presses the button. The watchdog flattens it in Live
+/// too, while the engine is locked and not armed (closing never needs the arming).
+#[tokio::test(start_paused = true)]
+async fn the_watchdog_flattens_the_bare_leg_of_a_locked_live_engine_without_the_button_or_the_arming() {
+    let (rig, h) = bare_long_leg().await;
+    assert!(locked(&rig) && !h.live.borrow().armed, "PARTIAL_FAILURE locked and disarmed the engine");
+    let since = ts_of(&rig.db, "PARTIAL_FAILURE")[0];
+    assert!(rig.sim.submitted().iter().all(|r| !r.reduce_only), "nothing closed yet");
+    run_until(&rig.clock, since + 5_000).await;
+    let closes: Vec<_> = rig.sim.submitted().into_iter().filter(|r| r.reduce_only).collect();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!((closes[0].exchange, closes[0].side, closes[0].quantity), (Exchange::Binance, OrderSide::Sell, dec("0.09")));
+    assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO);
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the pair state is not changed");
+    let ev = of(&rig.db, LEG_FLATTEN);
+    assert!(ev.len() == 1 && ev[0]["by"] == json!("watchdog") && ev[0]["quantity"] == json!("0.09"), "{ev:?}");
+    assert!(locked(&rig) && !h.live.borrow().armed, "the watchdog neither unlocks nor arms");
+    assert_eq!(opens(&rig).len(), 2, "and it opens nothing: only the pair's own two opening orders (one of them refused) ever reached the executor");
+}
+
+/// One check or flatten at a time per pair: while the watchdog works on a pair the user's button waits.
+#[tokio::test(start_paused = true)]
+async fn the_manual_flatten_waits_while_the_watchdog_works_on_the_pair() {
+    use tong_funding_core::pair::SystemEvent as Ev;
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    seed_state(&rig.db, UUID, SYM, PairState::FillMonitor);
+    let (_rig, mut actor, _h) = armed_actor((rig, deps));
+    assert_eq!(actor.land(UUID, Ev::TimeoutPartialFill, json!({})), Ok(PairState::PartialFailure));
+    let set_phase = |actor: &mut Actor, phase: naked_leg::Phase| {
+        actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).expect("tracked").phase = phase;
+    };
+    set_phase(&mut actor, naked_leg::Phase::Verifying);
+    let r = actor.dispatch(Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long });
+    assert!(why(&r).contains("watchdog"), "{r:?}");
+    assert!(!actor.flows[UUID].flatten_inflight[0], "the refused button started nothing");
+    set_phase(&mut actor, naked_leg::Phase::Idle);
+    assert_eq!(actor.dispatch(Command::FlattenLeg { pair: UUID.into(), leg: Leg::Long }), CommandReply::Accepted, "idle again: the button works as before");
 }
 
 #[tokio::test(start_paused = true)]
@@ -577,20 +622,20 @@ async fn flatten_leg_applies_only_to_a_locked_pair_in_live() {
 // ---- 3.4 automatic locks --------------------------------------------------------------------
 
 /// An Actor (not running) armed in memory with the stored caps, to drive `on_event` / `land` directly.
-fn armed_actor(rig_deps: (Rig, EngineDeps)) -> (Rig, Actor, EngineHandle) {
+pub(super) fn armed_actor(rig_deps: (Rig, EngineDeps)) -> (Rig, Actor, EngineHandle) {
     let (test_rig, deps) = rig_deps;
     let (mut actor, h) = Actor::with_probes(deps, FakeProbes::green());
     rearm(&test_rig, &mut actor);
     (test_rig, actor, h)
 }
 
-fn rearm(rig: &Rig, actor: &mut Actor) {
+pub(super) fn rearm(rig: &Rig, actor: &mut Actor) {
     let (risk, _) = load_risk_config(&rig.db).unwrap();
     actor.live.frozen = Some(FrozenCaps::from_risk(&risk).unwrap());
     rig.db.set_kill_switch(false).unwrap();
 }
 
-fn seed_state(db: &Db, uuid: &str, symbol: &str, state: PairState) {
+pub(super) fn seed_state(db: &Db, uuid: &str, symbol: &str, state: PairState) {
     let env = PairEnvelope { long_exchange: Exchange::Binance, short_exchange: Exchange::Bybit, settlement_ms: T + 3_600_000, simulated: true, scan: json!({}) };
     let p = crate::store::state::NewPair { internal_uuid: uuid.into(), pair_id: format!("pid-{uuid}"), symbol: symbol.into(), status: state, entry: serde_json::to_value(env).unwrap() };
     db.add_pair_if_not_pending(&p).unwrap();
@@ -873,4 +918,32 @@ async fn real_orders_carry_the_prefix_of_the_process_identity() {
         assert!(!sent.is_empty(), "{identity:?}: the real executor must receive the order");
         assert!(sent.iter().all(|r| r.client_order_id.starts_with(expect) && !r.client_order_id.starts_with(other)), "{identity:?}: {sent:?}");
     }
+}
+
+/// naked-leg-watchdog: an Unknown conclusion locks a Live engine the same way a manual lock does: the
+/// kill switch is ON and the engine is disarmed (the next trade needs preflight and Arm again).
+#[tokio::test(start_paused = true)]
+async fn an_unknown_watchdog_conclusion_disarms_and_locks_a_live_engine() {
+    use crate::engine::watchdog::{NAKED_LEG_WATCHDOG_LOCK, WatchdogProbe};
+    use tong_funding_core::pair::SystemEvent as Ev;
+    let (rig, deps) = live_deps("MANUAL", &live_risk());
+    seed_state(&rig.db, UUID, SYM, PairState::FillMonitor);
+    let (rig, mut actor, _h) = armed_actor((rig, deps));
+    actor.land(UUID, Ev::TimeoutPartialFill, json!({})).unwrap(); // PARTIAL_FAILURE locks a Live engine ...
+    rearm(&rig, &mut actor); // ... the user arms it again
+    assert!(actor.armed() && !locked(&rig), "armed before the round");
+    let entry_no = actor.flows[UUID].watchdog.as_ref().unwrap().entry_no;
+    {
+        // the third failed read in a row is the verdict (A7): the two before it are already counted
+        let w = actor.flows.get_mut(UUID).and_then(|f| f.watchdog.as_mut()).unwrap();
+        w.phase = naked_leg::Phase::Verifying;
+        w.counts.read_failed = 2;
+    }
+    let probe = WatchdogProbe::unreadable([(Leg::Long, Exchange::Binance), (Leg::Short, Exchange::Bybit)], "exchange unreachable (scripted)");
+    actor.on_event(Event::WatchdogProbed { pair: UUID.into(), entry_no, probe });
+    assert!(locked(&rig) && !actor.armed(), "kill switch ON and disarmed");
+    assert_eq!(count(&rig.db, NAKED_LEG_WATCHDOG_LOCK), 1);
+    let reason = actor.live_status().last_lock_reason.expect("the lock reason is shown with the arming panel");
+    assert!(reason.contains("watchdog") && reason.contains("unreachable"), "{reason}");
+    assert!(rig.sim.submitted().is_empty(), "nothing was sent");
 }

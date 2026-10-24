@@ -8,6 +8,7 @@ use tong_funding_core::types::{Decimal, Exchange};
 
 use super::preflight::PreflightReport;
 use super::ports::{FreshQuote, Leg, OrderAction, OrderRules, OrderSide, QueryOutcome, SubmitOutcome};
+use super::watchdog::WatchdogProbe;
 
 /// Saved risk settings (global + overrides), with before / after values, in the same transaction
 /// as the settings (ui-trading-pages 3.1).
@@ -196,6 +197,12 @@ pub enum Event {
     PreflightDone { report: PreflightReport },
     /// live-guardrails `FlattenLeg`: the leg's signed position and the pair's recorded fill on it.
     FlattenPositionFetched { pair: PairUuid, leg: Leg, position: Result<Decimal, String>, recorded: Result<Decimal, String> },
+    /// naked-leg-watchdog: what one verification round read on both legs. `entry_no` numbers the
+    /// alert entry that asked for it; the result of an older entry is dropped.
+    WatchdogProbed { pair: PairUuid, entry_no: u64, probe: WatchdogProbe },
+    /// naked-leg-watchdog: an own order that was not over was cancelled (`cancel` = what the cancel
+    /// call said) and looked up again (`after`). A record only: the next round verifies.
+    WatchdogCancelled { pair: PairUuid, exchange: Exchange, client_order_id: String, cancel: QueryOutcome, after: QueryOutcome },
 }
 
 /// What made a leg reach the early-exit threshold (recorded with the `LEG_EARLY_EXIT` event).
@@ -284,6 +291,8 @@ pub struct Snapshot {
     pub notices: Vec<Notice>,
     /// One per pair in an alert state (derived from the pairs; survives restarts).
     pub alerts: Vec<Alert>,
+    /// loss-circuit-breaker: what the status bar shows (trading allowed or why not, queue, breaker, pairs needing a person).
+    pub status: super::status::EngineStatus,
 }
 
 /// Reply to a command (sent on the command's oneshot, if any).

@@ -65,6 +65,9 @@ pub struct FrozenCaps {
     pub pairs_per_arming: u32,
     pub max_concurrent_pairs: u32,
     pub max_leverage: Decimal,
+    /// loss-circuit-breaker: while armed the breaker may be made stricter, never looser.
+    pub loss_breaker_max_loss_usdt: Decimal,
+    pub loss_breaker_max_consecutive_losses: u32,
 }
 
 impl FrozenCaps {
@@ -83,6 +86,8 @@ impl FrozenCaps {
             pairs_per_arming: pairs,
             max_concurrent_pairs: risk.max_concurrent_pairs,
             max_leverage: risk.max_leverage,
+            loss_breaker_max_loss_usdt: risk.loss_breaker_max_loss_usdt,
+            loss_breaker_max_consecutive_losses: risk.loss_breaker_max_consecutive_losses,
         })
     }
 
@@ -101,20 +106,29 @@ impl FrozenCaps {
         if new.max_leverage > self.max_leverage {
             return Some("max_leverage");
         }
+        if new.loss_breaker_max_loss_usdt > self.loss_breaker_max_loss_usdt {
+            return Some("loss_breaker_max_loss_usdt");
+        }
+        if new.loss_breaker_max_consecutive_losses > self.loss_breaker_max_consecutive_losses {
+            return Some("loss_breaker_max_consecutive_losses");
+        }
         None
     }
 }
 
-/// Hash of the four caps `Arm` is bound to (hex SHA-256). `None` while a live cap is unset.
+/// Hash of what `Arm` is bound to (hex SHA-256): the four caps and the two breaker limits, i.e. the
+/// fields of [`FrozenCaps`]. The UI and the engine both call this one function. `None` while a live cap is unset.
 pub fn caps_hash(risk: &RiskConfig) -> Option<String> {
     let leg = risk.live_max_leg_notional_usdt?;
     let pairs = risk.live_max_pairs_per_arming?;
     let text = format!(
-        "caps-v1|leg={}|pairs={}|concurrent={}|leverage={}",
+        "caps-v2|leg={}|pairs={}|concurrent={}|leverage={}|breaker_loss={}|breaker_losses={}",
         leg.normalize(),
         pairs,
         risk.max_concurrent_pairs,
-        risk.max_leverage.normalize()
+        risk.max_leverage.normalize(),
+        risk.loss_breaker_max_loss_usdt.normalize(),
+        risk.loss_breaker_max_consecutive_losses
     );
     Some(hex::encode(Sha256::digest(text.as_bytes())))
 }
@@ -236,7 +250,7 @@ pub fn classify_error(text: &str) -> Option<LockCause> {
 }
 
 /// What a freshly created live database starts with (`live_db_defaults`): MANUAL trigger, no early
-/// exit, a contract template below any cap. The live caps stay unset on purpose (no default, so
+/// exit, a loss breaker of 5 USDT or 2 losses, a contract template below any cap. The live caps stay unset on purpose (no default, so
 /// arming is impossible until the user fills them in).
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiveDbDefaults {
@@ -250,6 +264,9 @@ pub fn live_db_defaults() -> LiveDbDefaults {
     let risk = RiskConfig {
         trigger_mode: TriggerMode::Manual,
         early_exit_min_move_pct: Decimal::ZERO,
+        // loss-circuit-breaker: real money starts with a stricter breaker (5 USDT or 2 losses in a row).
+        loss_breaker_max_loss_usdt: Decimal::from(5),
+        loss_breaker_max_consecutive_losses: 2,
         ..RiskConfig::default()
     };
     LiveDbDefaults {
@@ -376,7 +393,18 @@ mod tests {
     }
 
     #[test]
-    fn caps_hash_binds_exactly_the_four_caps() {
+    fn the_two_breaker_limits_are_frozen_too_and_only_raising_them_is_detected() {
+        // review round 1 (A4): armed, the breaker may be made stricter, never looser
+        let r = RiskConfig { loss_breaker_max_loss_usdt: d("5"), loss_breaker_max_consecutive_losses: 2, ..risk("10", 2) };
+        let f = FrozenCaps::from_risk(&r).unwrap();
+        assert_eq!((f.loss_breaker_max_loss_usdt, f.loss_breaker_max_consecutive_losses), (d("5"), 2));
+        assert_eq!(f.first_raised_by(&RiskConfig { loss_breaker_max_loss_usdt: d("4.99"), loss_breaker_max_consecutive_losses: 1, ..r.clone() }), None);
+        assert_eq!(f.first_raised_by(&RiskConfig { loss_breaker_max_loss_usdt: d("5.01"), ..r.clone() }), Some("loss_breaker_max_loss_usdt"));
+        assert_eq!(f.first_raised_by(&RiskConfig { loss_breaker_max_consecutive_losses: 3, ..r.clone() }), Some("loss_breaker_max_consecutive_losses"));
+    }
+
+    #[test]
+    fn caps_hash_binds_exactly_the_four_caps_and_the_two_breaker_limits() {
         let r = risk("10", 2);
         let h = caps_hash(&r).unwrap();
         assert_eq!(h.len(), 64);
@@ -385,6 +413,10 @@ mod tests {
         assert_ne!(caps_hash(&risk("10", 3)), Some(h.clone()));
         assert_ne!(caps_hash(&RiskConfig { max_concurrent_pairs: 9, ..r.clone() }), Some(h.clone()));
         assert_ne!(caps_hash(&RiskConfig { max_leverage: d("7"), ..r.clone() }), Some(h.clone()));
+        // review round 2 (B6): the two breaker limits are frozen at arming, so they are part of what is armed
+        assert_ne!(caps_hash(&RiskConfig { loss_breaker_max_loss_usdt: d("4"), ..r.clone() }), Some(h.clone()));
+        assert_ne!(caps_hash(&RiskConfig { loss_breaker_max_consecutive_losses: 9, ..r.clone() }), Some(h.clone()));
+        assert_eq!(caps_hash(&RiskConfig { loss_breaker_max_loss_usdt: r.loss_breaker_max_loss_usdt * d("1.0"), ..r.clone() }), Some(h.clone()), "5 and 5.0 are the same");
         // anything else does not change it
         assert_eq!(caps_hash(&RiskConfig { stale_data_threshold_ms: 1, ..r.clone() }), Some(h));
         assert_eq!(caps_hash(&RiskConfig::default()), None);
@@ -439,5 +471,15 @@ mod tests {
         assert_eq!(d.risk.live_max_pairs_per_arming, None);
         assert!(d.template_notional_usdt > Decimal::ZERO && d.template_notional_usdt <= LIVE_CAP_CEILING_LEG_NOTIONAL_USDT);
         assert!(d.risk.validate().is_ok());
+    }
+
+    #[test]
+    fn a_new_live_database_starts_with_a_breaker_of_5_usdt_or_2_losses() {
+        // loss-circuit-breaker 1.2: stricter than the Demo default of 15 / 3
+        let d = live_db_defaults();
+        assert_eq!(d.risk.loss_breaker_max_loss_usdt, Decimal::from(5));
+        assert_eq!(d.risk.loss_breaker_max_consecutive_losses, 2);
+        assert!(d.risk.validate().is_ok());
+        assert_eq!(RiskConfig::default().loss_breaker_max_loss_usdt, Decimal::from(15), "the Demo default is untouched");
     }
 }

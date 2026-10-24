@@ -926,8 +926,16 @@ async fn a_scripted_short_reject_is_partial_failure_and_keeps_the_long_leg() {
         .unwrap()
         .2;
     assert_eq!(long_event["filled_quantity"], json!("10"), "{long_event}");
+    // naked-leg-watchdog (authorization B): nothing is sent in the 5 s after the pair entered the state ...
+    run_until(&rig.clock, T - 6_000).await;
+    assert_eq!(rig.sim.submitted().len(), 2, "no automatic action before the watchdog's 5 s are over");
+    // ... then the bare long leg is closed (reduce-only) and NOTHING else: the missing leg is never repaired
     run_until(&rig.clock, T + 30_000).await;
-    assert_eq!(rig.sim.submitted().len(), 2, "no automatic repair");
+    let sent = rig.sim.submitted();
+    assert_eq!(sent.len(), 3, "the two opening orders and the watchdog's one close: {sent:?}");
+    assert!(sent[2].reduce_only && (sent[2].exchange, sent[2].side, sent[2].quantity) == (Exchange::Binance, OrderSide::Sell, dec("10")), "{:?}", sent[2]);
+    assert!(sent.iter().filter(|r| r.exchange == Exchange::Bybit).count() == 1, "no further order on the short leg's exchange: no repair");
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "and the pair stays locked for the user's confirmation");
 }
 
 /// OKX orders are in contracts; fills are compared in base coin (contracts x ct_val).
@@ -2191,14 +2199,36 @@ async fn a_rejected_close_leg_is_partial_failure_and_a_manual_close_handles_only
     assert_eq!(rig.sim.position(Exchange::Binance, SYM), Decimal::ZERO, "the long leg closed");
     assert_eq!(rig.sim.position(Exchange::Bybit, SYM), dec("-10"));
     let sent_before = rig.sim.submitted().len();
-    run_until(&rig.clock, T + 40_000).await;
-    assert_eq!(rig.sim.submitted().len(), sent_before, "no automatic retry");
+    // naked-leg-watchdog: it waits 5 s after the pair entered PARTIAL_FAILURE (T + 15 s); until then no retry
+    run_until(&rig.clock, T + 19_000).await;
+    assert_eq!(rig.sim.submitted().len(), sent_before, "no automatic retry within the watchdog's 5 s");
 
     assert_eq!(ask(&h, Command::ManualClose { pair: UUID.into() }).await, CommandReply::Accepted);
     run_until(&rig.clock, T + 42_000).await;
     let new: Vec<OrderRequest> = rig.sim.submitted().into_iter().skip(sent_before).collect();
     assert_eq!(new.len(), 1, "only the remaining (short) leg: {new:?}");
     assert_eq!((new[0].exchange, new[0].side, new[0].quantity, new[0].reduce_only), (Exchange::Bybit, OrderSide::Buy, dec("10"), true));
+    assert_eq!(status(&rig.db, UUID), "FINALIZED");
+}
+
+/// naked-leg-watchdog: the same rejected close, nobody presses anything. 5 s after the pair entered
+/// PARTIAL_FAILURE the watchdog closes the remaining (short) leg, reduce-only and only that leg; the
+/// pair stays PARTIAL_FAILURE until the user confirms.
+#[tokio::test(start_paused = true)]
+async fn a_rejected_close_leg_is_closed_by_the_watchdog_five_seconds_later_and_the_user_still_confirms() {
+    let (rig, h) = started(Opts::default()).await;
+    rig.sim.script_prefix(&sim_id(Leg::Short, OrderAction::Close), SimBehavior::Reject("110090 risk limit (scripted)".into()));
+    run_until(&rig.clock, T + 16_000).await;
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "{:?}", labels(&rig.db));
+    let since = ts_of(&rig.db, "PARTIAL_FAILURE")[0];
+    let sent_before = rig.sim.submitted().len();
+    run_until(&rig.clock, since + 5_000).await;
+    let new: Vec<OrderRequest> = rig.sim.submitted().into_iter().skip(sent_before).collect();
+    assert_eq!(new.len(), 1, "only the remaining (short) leg, once: {new:?}");
+    assert_eq!((new[0].exchange, new[0].side, new[0].quantity, new[0].reduce_only), (Exchange::Bybit, OrderSide::Buy, dec("10"), true));
+    assert_eq!(rig.sim.position(Exchange::Bybit, SYM), Decimal::ZERO);
+    assert_eq!(status(&rig.db, UUID), "PARTIAL_FAILURE", "the watchdog never moves the pair: only the user's confirmation does");
+    assert_eq!(ask(&h, Command::ConfirmClosed { pair: UUID.into(), verified_flat: true }).await, CommandReply::Accepted);
     assert_eq!(status(&rig.db, UUID), "FINALIZED");
 }
 
@@ -2266,6 +2296,14 @@ mod spread_tag_tests;
 #[path = "live_guardrail_tests.rs"]
 mod live_guardrail_tests;
 
+// naked-leg-watchdog: verification rounds, the one-leg flatten, retries and the lock.
+#[path = "watchdog_tests.rs"]
+mod watchdog_tests;
+
+// loss-circuit-breaker: evaluation timing, the trip and what it does (and does not) stop.
+#[path = "loss_breaker_tests.rs"]
+mod loss_breaker_tests;
+
 // ---- candidate-readd-after-close: engine side ---------------------------------------------
 
 /// Recorded case NMRUSDT: flat confirmed, CLOSING while the funding PnL waits. The snapshot says so
@@ -2280,6 +2318,10 @@ async fn a_closing_pair_waiting_for_pnl_is_flat_confirmed_and_frees_its_concurre
     run_until(&rig.clock, T + 16_000).await;
     assert_eq!(status(&rig.db, UUID), "CLOSING", "waiting for the PnL");
     assert_eq!(flat(&h), Some(true), "CLOSE_CONFIRMED recorded, PnL pending");
+    // loss-circuit-breaker: FakeDemo fills carry no fee, so the closed pair's amount is unknown and the
+    // breaker stopped new entries; the user opens trading again (a new interval) before the second pair.
+    assert!(rig.db.kill_switch_halted(), "stopped by the breaker");
+    rig.db.set_kill_switch(false).unwrap();
 
     // The same symbol again, settling a minute later; the first pair is still CLOSING at its check.
     assert_eq!(ask(&h, Command::AddPrepared(pair_at("pair-0002", SYM, T + 60_000))).await, CommandReply::Accepted);

@@ -798,6 +798,9 @@ fn trade_events_query() -> EventQuery {
         engine_actor::MANUAL_ORDER_RESULT,
         engine_actor::MANUAL_CANCEL_RESULT,
         crate::engine::latency::ORDER_LATENCY,
+        // naked-leg-watchdog: the manual-handling card is rebuilt from these
+        crate::engine::watchdog::NAKED_LEG_WATCHDOG,
+        crate::engine::live_guard::LEG_FLATTEN,
     ];
     EventQuery { types: Some(types.iter().map(|t| t.to_string()).collect()), before: None, limit: 300 }
 }
@@ -914,8 +917,12 @@ where
         let (shared, mut rx) = (ctx.shared.clone(), handle.snapshots.clone());
         tokio::spawn(async move {
             loop {
-                let state = super::engine_view::engine_state(&rx.borrow_and_update());
+                let (state, status) = {
+                    let snapshot = rx.borrow_and_update();
+                    (super::engine_view::engine_state(&snapshot), snapshot.status.clone())
+                };
                 shared.push(SourceUpdate::Engine(state));
+                shared.push(SourceUpdate::EngineStatus(status));
                 if rx.changed().await.is_err() {
                     shared.push(SourceUpdate::EngineUnavailable("引擎已停止".into()));
                     break;
@@ -1426,5 +1433,15 @@ mod tests {
         assert_eq!(load_settings(&db).risk.net_edge_threshold_pct, Some(d("0.01")));
         db.config_set("risk_overrides", &json!({"Bybit": {"allowed_coins": []}}), None).unwrap();
         assert!(load_settings(&db).error.unwrap().contains("allowed_coins"));
+    }
+
+    /// naked-leg-watchdog: the manual-handling card is rebuilt from the stored events, so the page must
+    /// ask for the watchdog's records (and its flatten orders) next to the pair transitions.
+    #[test]
+    fn the_trading_pages_read_the_watchdog_events_too() {
+        let types = trade_events_query().types.expect("a type filter");
+        for t in ["PAIR_TRANSITION", "NAKED_LEG_WATCHDOG", "LEG_FLATTEN"] {
+            assert!(types.contains(t), "{t} missing from {types:?}");
+        }
     }
 }

@@ -46,6 +46,8 @@ pub mod symbol_options;
 pub mod risk_settings;
 #[path = "vm/staged_orders.rs"]
 pub mod staged_orders;
+#[path = "vm/status_bar.rs"]
+pub mod status_bar;
 #[path = "vm/dashboard.rs"]
 pub mod dashboard;
 #[path = "vm/env_label.rs"]
@@ -74,6 +76,10 @@ mod testkit;
 
 #[cfg(test)]
 mod risk_help_ui_tests;
+#[cfg(test)]
+mod risk_layout_ui_tests;
+#[cfg(test)]
+mod watchdog_ui_tests;
 #[cfg(test)]
 mod auto_add_ui_tests;
 #[cfg(test)]

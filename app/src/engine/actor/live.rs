@@ -54,22 +54,14 @@ impl Actor {
         self.publish_live();
     }
 
-    /// The one automatic lock: frozen caps dropped (disarmed in memory first), kill switch ON and a
-    /// `LIVE_AUTO_LOCK` event with the reason, in one transaction. Closing and cancelling stay open.
+    /// The Live automatic lock: `lock_new_entries` with `LIVE_AUTO_LOCK` and the reason. Closing and
+    /// cancelling stay open.
     pub(super) fn lock_live(&mut self, reason: &str) {
         if !self.live_on() {
             return;
         }
-        self.live.frozen = None;
-        self.live.last_lock_reason = Some(reason.to_string());
         let payload = json!({ "reason": reason, "pairs_entered": self.live.pairs_entered });
-        if let Err(e) = self.db.set_kill_switch_with_event(true, LIVE_AUTO_LOCK, &payload)
-            && !self.db.is_halted()
-        {
-            self.db.halt(HaltReason::KillSwitchReadFailed(format!("auto lock could not be written: {e}")));
-        }
-        self.dirty = true;
-        self.publish_live();
+        self.lock_new_entries(LIVE_AUTO_LOCK, &payload, reason.to_string());
     }
 
     /// Error texts of an event (HTTP status / exchange answers) that lock an armed engine:
@@ -322,6 +314,8 @@ impl Actor {
                 "live_max_pairs_per_arming": frozen.pairs_per_arming,
                 "max_concurrent_pairs": frozen.max_concurrent_pairs,
                 "max_leverage": frozen.max_leverage.normalize().to_string(),
+                "loss_breaker_max_loss_usdt": frozen.loss_breaker_max_loss_usdt.normalize().to_string(),
+                "loss_breaker_max_consecutive_losses": frozen.loss_breaker_max_consecutive_losses,
             },
         });
         if let Err(e) = self.db.set_kill_switch_with_event(false, LIVE_ARMED, &payload) {
@@ -337,6 +331,23 @@ impl Actor {
         CommandReply::Accepted
     }
 
+    /// The ONE way an automatic safeguard stops new entries (the watchdog, the breaker's trip, the breaker
+    /// that cannot read): kill switch ON together with its reason event in one transaction (a write
+    /// that fails halts the store: fail closed), a Live engine disarmed with `last_lock_reason` set so
+    /// the arming panel says why. Closing and manual handling stay open.
+    pub(super) fn lock_new_entries(&mut self, event_type: &str, payload: &Value, live_reason: String) {
+        if let Err(e) = self.db.set_kill_switch_with_event(true, event_type, payload)
+            && !self.db.is_halted()
+        {
+            self.db.halt(HaltReason::KillSwitchReadFailed(format!("{event_type} lock could not be written: {e}")));
+        }
+        if self.live_on() {
+            self.live.last_lock_reason = Some(live_reason);
+            self.live_disarm();
+        }
+        self.dirty = true;
+    }
+
     /// `SetKillSwitch { on: true }` by hand: disarmed in memory too.
     pub(super) fn live_disarm(&mut self) {
         if self.live_on() {
@@ -346,6 +357,16 @@ impl Actor {
     }
 
     // ---- FlattenLeg ----
+
+    /// The `client_order_id` of the pair's close order on `leg` when it is not over AND can still be in
+    /// flight: before its deadline (the flatten's own, else the order set's own order timeout).
+    pub(super) fn close_in_flight(&self, pair: &str, leg: Leg, now: i64) -> Option<String> {
+        let flow = self.flows.get(pair)?;
+        let set = flow.close.as_ref()?;
+        let o = set.legs[idx(leg)].as_ref().filter(|o| !o.is_over())?;
+        let deadline = flow.flattens.iter().find(|f| f.client_order_id == o.req.client_order_id).map_or_else(|| fill::timeout_at_ms(&set.eff, set.sent_at_ms), |f| f.deadline_ms);
+        (now < deadline).then(|| o.req.client_order_id.clone())
+    }
 
     pub(super) fn flatten_pending(&self, pair: &str) -> bool {
         self.flows.get(pair).is_some_and(|f| f.close.as_ref().is_some_and(|s| s.legs.iter().flatten().any(|o| !o.is_over())))
@@ -363,6 +384,10 @@ impl Actor {
         }
         if let Some(why) = self.executor_mismatch(&view) {
             return CommandReply::Rejected(why);
+        }
+        // one check or flatten at a time per pair: while the naked-leg watchdog works on it, the user waits
+        if self.watchdog_busy(pair) {
+            return CommandReply::Rejected("the naked-leg watchdog is checking or flattening this pair right now; try again in a few seconds".into());
         }
         let flow = self.flows.entry(pair.to_string()).or_default();
         if flow.flatten_inflight[idx(leg)] {
@@ -390,18 +415,68 @@ impl Actor {
         let (account, executor, tx) = (self.account_for(view.simulated), self.executor.clone(), self.event_tx.clone());
         let (sym, pair) = (view.symbol.clone(), pair.to_string());
         tokio::spawn(async move {
+            // a read task that ends without a result (a panic) still clears `flatten_inflight` and writes the abort
+            let lost = "the position read task ended without a result".to_string();
+            let mut guard = LostTaskGuard::new(tx.clone(), Event::FlattenPositionFetched { pair: pair.clone(), leg, position: Err(lost.clone()), recorded: Err(lost) });
             let (position, recorded) = tokio::join!(signed_position(account.as_ref(), exchange, &sym), recorded_fill(executor.as_ref(), exchange, &sym, &orders));
+            guard.disarm();
             let _ = tx.send(Event::FlattenPositionFetched { pair, leg, position, recorded }).await;
         });
         CommandReply::Accepted
     }
 
-    fn flatten_aborted(&mut self, pair: &str, leg: Leg, reason: String, detail: Option<Value>) {
-        let mut payload = json!({ "leg": leg.as_str(), "reason": reason });
+    pub(super) fn flatten_aborted(&mut self, pair: &str, leg: Leg, reason: String, detail: Option<Value>, by: FlattenBy) {
+        let mut payload = json!({ "leg": leg.as_str(), "reason": reason, "by": by.as_str() });
         if let Some(d) = detail {
             payload["detail"] = d;
         }
         self.note(LEG_FLATTEN_ABORTED, Some(pair), payload);
+    }
+
+    /// The one place a flatten order is sent, for the Live manual `FlattenLeg` and for the naked-leg
+    /// watchdog: a reduce-only market close of `qty` (already sized by `plan_leg_close`) of ONE leg.
+    /// The order intent is landed first; if that fails nothing is sent. The pair state is not changed.
+    /// Returns the `client_order_id`, or why nothing was sent.
+    pub(super) fn send_flatten(&mut self, view: &PairView, plan: FlattenPlan, eff: &EffectiveConfig, by: FlattenBy, attempt: Option<u32>) -> Result<String, String> {
+        let FlattenPlan { leg, qty, position } = plan;
+        let pair = view.internal_uuid.as_str();
+        let exchange = match leg {
+            Leg::Long => view.long_exchange,
+            Leg::Short => view.short_exchange,
+        };
+        let now = self.clock.now_ms();
+        // A close of this leg that is not over yet is never overwritten (nor doubled): refuse. Only while
+        // it can still be in flight (review round 2, B1): after its order timeout a result that never
+        // came is unknown, not "running", and the position this plan was sized from is fresh.
+        if let Some(open) = self.close_in_flight(pair, leg, now) {
+            return Err(format!("a close order of the {} leg ({}) is already in flight; nothing sent", leg.as_str(), open));
+        }
+        let prefix = self.id_prefix();
+        let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, qty);
+        // intent first: if it cannot be landed nothing is sent
+        intent::land_intents(&self.db, pair, &[(leg, &req)]).map_err(|why| format!("order intent not landed ({why}); nothing sent"))?;
+        let mut payload = json!({
+            "leg": leg.as_str(),
+            "exchange": exchange.name(),
+            "symbol": view.symbol,
+            "client_order_id": req.client_order_id,
+            "quantity": dstr(qty),
+            "position": dstr(position),
+            "simulated": view.simulated,
+            "by": by.as_str(),
+        });
+        if let Some(n) = attempt {
+            payload["attempt"] = json!(n);
+        }
+        self.note(LEG_FLATTEN, Some(pair), payload);
+        let client_order_id = req.client_order_id.clone();
+        let flow = self.flows.entry(pair.to_string()).or_default();
+        flow.close_triggered_ms = Some(now);
+        flow.flattens.push(SentFlatten { client_order_id: client_order_id.clone(), by, deadline_ms: fill::timeout_at_ms(eff, now) });
+        let set = flow.close.get_or_insert_with(|| OrderSet { sent_at_ms: now, eff: eff.clone(), legs: [None, None], cancel_started: false });
+        set.legs[idx(leg)] = Some(LegOrder::new(req.clone(), Decimal::ONE));
+        self.spawn_submit_inner(pair.to_string(), leg, OrderAction::Close, req, Some(now), true);
+        Ok(client_order_id)
     }
 
     /// Size the leg's reduce-only close with `plan_leg_close` (min of recorded fill and position,
@@ -410,13 +485,18 @@ impl Actor {
         if let Some(flow) = self.flows.get_mut(pair) {
             flow.flatten_inflight[idx(leg)] = false;
         }
+        let manual = FlattenBy::Manual;
         let Some(view) = self.pairs.get(pair).cloned() else { return };
+        // The watchdog got to the pair while the reads were out: it decides, one close only.
+        if self.watchdog_busy(pair) {
+            return self.flatten_aborted(pair, leg, "the naked-leg watchdog is checking or flattening this pair; nothing sent".into(), None, manual);
+        }
         if !alert::is_alert_state(view.state) {
-            return self.flatten_aborted(pair, leg, format!("pair is {} now; nothing sent", view.state), None);
+            return self.flatten_aborted(pair, leg, format!("pair is {} now; nothing sent", view.state), None, manual);
         }
         let position = match position {
             Ok(p) => p,
-            Err(e) => return self.flatten_aborted(pair, leg, format!("position unreadable: {e}; nothing sent"), None),
+            Err(e) => return self.flatten_aborted(pair, leg, format!("position unreadable: {e}; nothing sent"), None, manual),
         };
         // like every close: never held back by unreadable settings (defaults then)
         let (risk, overrides) = self.load_risk().unwrap_or_else(|_| (RiskConfig::default(), RiskOverrides::new()));
@@ -427,41 +507,46 @@ impl Actor {
         };
         let qty = match plan_leg_close(leg, exchange, &view.symbol, view.simulated, eff.max_leg_imbalance_pct, position, recorded) {
             Ok((qty, _residual)) => qty,
-            Err(LegClosePlanError::WrongSide(reason)) => return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), None),
+            Err(LegClosePlanError::WrongSide(reason)) => return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), None, manual),
             Err(LegClosePlanError::Mismatch(alert)) => {
                 self.note(CLOSE_QUANTITY_MISMATCH, Some(pair), alert.clone());
                 let reason = alert["reason"].as_str().unwrap_or("position and recorded fill disagree").to_string();
-                return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), Some(alert));
+                return self.flatten_aborted(pair, leg, format!("{reason}; nothing sent"), Some(alert), manual);
             }
         };
         if qty.is_zero() {
-            return self.flatten_aborted(pair, leg, "nothing to close on this leg (already flat)".into(), None);
+            return self.flatten_aborted(pair, leg, "nothing to close on this leg (already flat)".into(), None, manual);
         }
-        let prefix = self.id_prefix();
-        let req = self.close_request(prefix, pair, leg, exchange, &view.symbol, qty);
-        // intent first: if it cannot be landed nothing is sent
-        if let Err(why) = intent::land_intents(&self.db, pair, &[(leg, &req)]) {
-            return self.flatten_aborted(pair, leg, format!("order intent not landed ({why}); nothing sent"), None);
+        if let Err(why) = self.send_flatten(&view, FlattenPlan { leg, qty, position }, &eff, manual, None) {
+            self.flatten_aborted(pair, leg, why, None, manual);
         }
-        self.note(
-            LEG_FLATTEN,
-            Some(pair),
-            json!({
-                "leg": leg.as_str(),
-                "exchange": exchange.name(),
-                "symbol": view.symbol,
-                "client_order_id": req.client_order_id,
-                "quantity": dstr(qty),
-                "position": dstr(position),
-                "simulated": view.simulated,
-            }),
-        );
-        let now = self.clock.now_ms();
-        let flow = self.flows.entry(pair.to_string()).or_default();
-        flow.close_triggered_ms = Some(now);
-        let set = flow.close.get_or_insert_with(|| OrderSet { sent_at_ms: now, eff: eff.clone(), legs: [None, None], cancel_started: false });
-        set.legs[idx(leg)] = Some(LegOrder::new(req.clone(), Decimal::ONE));
-        self.spawn_submit_inner(pair.to_string(), leg, OrderAction::Close, req, Some(now), true);
+    }
+}
+
+/// What a flatten sends: the leg, how much (already sized by `plan_leg_close`) and the position it was
+/// sized against (for the record).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct FlattenPlan {
+    pub(super) leg: Leg,
+    pub(super) qty: Decimal,
+    pub(super) position: Decimal,
+}
+
+/// Who asked for a flatten order (written as `by` on `LEG_FLATTEN` / `LEG_FLATTEN_ABORTED`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FlattenBy {
+    /// The user pressed the flatten button (Live only).
+    Manual,
+    /// The naked-leg watchdog (authorization B).
+    Watchdog,
+}
+
+impl FlattenBy {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            FlattenBy::Manual => "manual",
+            FlattenBy::Watchdog => "watchdog",
+        }
     }
 }
 
@@ -530,6 +615,16 @@ fn event_errors(ev: &Event) -> Texts {
         Event::EarlyPositionFetched { position, recorded, .. } | Event::FlattenPositionFetched { position, recorded, .. } => {
             errs("position read", position, &mut out);
             errs("position read", recorded, &mut out);
+        }
+        Event::WatchdogProbed { probe, .. } => {
+            for l in &probe.legs {
+                errs("position read", &l.read.position, &mut out);
+                errs("order lookup", &l.read.recorded, &mut out);
+            }
+        }
+        Event::WatchdogCancelled { cancel, after, .. } => {
+            query_texts("order cancel", cancel, &mut out);
+            query_texts("order lookup", after, &mut out);
         }
         Event::OpenPrepared { result, .. } => errs("pre-send barrier", result, &mut out),
         Event::ReconciliationDone { result } => errs("reconciliation", result, &mut out),

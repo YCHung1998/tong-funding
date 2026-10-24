@@ -51,14 +51,14 @@
 
 ### Requirement: 需人工處理的警示要指出配對並可前往
 
-需人工處理的警示 SHALL 顯示配對的標的、兩腿的交易所、狀態名稱與「需人工處理，系統不會自動補單或平倉」。
+需人工處理的警示 SHALL 顯示配對的標的、兩腿的交易所、狀態名稱與「需人工處理：系統不會補另一腿，只在確認只有一腿成交時自動平掉該腿（授權 B）」。
 警示 SHALL 提供前往持倉頁的連結。
 警示 SHALL 在該配對離開上述三個狀態之前持續存在；橫幅 SHALL 只提供導覽連結，SHALL NOT 內含任何會改變配對狀態或倉位的控制項。
 
 #### Scenario: 單腿失敗的警示內容
 
 - **WHEN** BTCUSDT（long 在 Binance、short 在 Bybit）的狀態為 `PARTIAL_FAILURE`
-- **THEN** 橫幅顯示「BTCUSDT · Binance / Bybit · PARTIAL_FAILURE · 需人工處理，系統不會自動補單或平倉」與前往持倉頁的連結
+- **THEN** 橫幅顯示「BTCUSDT · Binance / Bybit · PARTIAL_FAILURE · 需人工處理：系統不會補另一腿，只在確認只有一腿成交時自動平掉該腿（授權 B）」與前往持倉頁的連結
 
 #### Scenario: 狀態被人工事件移出後消失
 

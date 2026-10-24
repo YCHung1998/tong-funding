@@ -238,7 +238,7 @@ fn strictness_classification_matches_spec() {
     for f in [Field::NetEdgeThresholdPct, Field::MinExpectedNetPnlPct, Field::SafetyMarginPct, Field::EstSlippagePct, Field::Min24hVolumeUsdt] {
         assert_eq!(f.strictness(), HigherStricter, "{}", f.key());
     }
-    for f in [Field::MaxLeverage, Field::MaxPriceDriftPct, Field::StaleDataThresholdMs, Field::OrderTimeoutSeconds, Field::MaxLegImbalancePct, Field::MaxConcurrentPairs] {
+    for f in [Field::MaxLeverage, Field::MaxPriceDriftPct, Field::StaleDataThresholdMs, Field::OrderTimeoutSeconds, Field::MaxLegImbalancePct, Field::MaxConcurrentPairs, Field::LossBreakerMaxLossUsdt, Field::LossBreakerMaxConsecutiveLosses] {
         assert_eq!(f.strictness(), LowerStricter, "{}", f.key());
     }
     for e in Exchange::ALL {
@@ -549,5 +549,362 @@ mod live_caps {
             assert!(f.label().contains("Live"));
         }
         assert_eq!((Field::LiveMaxLegNotionalUsdt.unit(), Field::LiveMaxPairsPerArming.unit()), ("USDT", "筆"));
+    }
+}
+
+// ---- naked-leg-watchdog: the fixed rules block ------------------------------------------------
+
+fn settings_with_timeout(seconds: u32) -> Settings {
+    let mut s = complete_settings("0.05");
+    s.risk.order_timeout_seconds = seconds;
+    s
+}
+
+#[test]
+fn the_rules_block_has_the_fixed_title_and_the_approved_words_with_the_stored_timeout() {
+    // spec: order_timeout_seconds 為 20 -> 區塊寫「訂單逾時 20 秒後再等 5 秒」
+    let b = auto_rules_block(&settings_with_timeout(20));
+    assert_eq!(b.title, "自動處理規則（授權 B）");
+    assert!(b.plain().contains("訂單逾時 20 秒後再等 5 秒"), "{}", b.plain());
+    assert_eq!(b.plain(), crate::engine::watchdog_text::rules_plain(20), "the page and every other place read the same function");
+    assert!(b.notes.is_empty(), "{:?}", b.notes);
+    let bold: Vec<&str> = b.runs.iter().filter(|r| r.bold).map(|r| r.text.as_str()).collect();
+    assert_eq!(bold, vec!["確認只有一腿成交", "只減倉的市價單", "不會", "不會動作"]);
+}
+
+#[test]
+fn the_number_follows_the_stored_setting_whenever_it_changes() {
+    for n in [3_u32, 15, 45] {
+        assert!(auto_rules_block(&settings_with_timeout(n)).plain().contains(&format!("訂單逾時 {n} 秒後再等 5 秒")), "{n}");
+    }
+}
+
+#[test]
+fn the_block_is_there_even_when_the_settings_are_incomplete_or_unreadable() {
+    let incomplete = auto_rules_block(&Settings::default());
+    assert_eq!(incomplete.title, "自動處理規則（授權 B）");
+    assert!(incomplete.plain().contains("訂單逾時 15 秒後再等 5 秒"), "the default timeout, which is what an incomplete config uses");
+    assert!(incomplete.notes.is_empty());
+    let unreadable = auto_rules_block(&Settings { error: Some("config.risk: bad json".into()), ..Settings::default() });
+    assert!(unreadable.notes.iter().any(|n| n.contains("讀取失敗") && n.contains("預設值")), "the number is the default, not a fact: {:?}", unreadable.notes);
+}
+
+#[test]
+fn an_exchange_that_overrides_the_timeout_adds_a_note_with_its_number() {
+    let mut s = settings_with_timeout(15);
+    s.overrides = parse_overrides(&serde_json::json!({ "Bybit": { "order_timeout_seconds": 7 } })).unwrap();
+    let b = auto_rules_block(&s);
+    assert!(b.notes.iter().any(|n| n.contains("Bybit 7 秒") && n.contains("較小")), "{:?}", b.notes);
+    assert!(b.plain().contains("訂單逾時 15 秒後再等 5 秒"), "the global number stays as it is");
+}
+
+// ---- loss-circuit-breaker 3.2: the two breaker fields ---------------------------------------------
+
+mod breaker_fields {
+    use super::*;
+
+    const BOTH: [Field; 2] = [Field::LossBreakerMaxLossUsdt, Field::LossBreakerMaxConsecutiveLosses];
+
+    #[test]
+    fn the_page_lists_both_fields_with_their_keys_units_and_stored_values() {
+        let f = RiskForm::from_settings(&Settings::default());
+        assert_eq!((f.value(BOTH[0]), f.value(BOTH[1])), ("15".to_string(), "3".to_string()), "the defaults of an older stored config");
+        assert_eq!(BOTH.map(Field::key), ["loss_breaker_max_loss_usdt".to_string(), "loss_breaker_max_consecutive_losses".to_string()]);
+        assert_eq!(BOTH.map(Field::unit), ["USDT", "筆"]);
+        for f in BOTH {
+            assert!(GLOBAL_FIELDS.contains(&f), "{f:?} is on both the Demo and the Live page");
+            assert!(global_fields(crate::identity::ProcessIdentity::Live).contains(&f));
+            assert!(!OVERRIDE_FIELDS.contains(&f) && !LIVE_FIELDS.contains(&f), "global only, not a Live-only cap");
+            assert!(!f.optional(), "they have defaults: blank is an error, never 'not set'");
+        }
+        let mut s = Settings::default();
+        s.risk.loss_breaker_max_loss_usdt = d("5");
+        s.risk.loss_breaker_max_consecutive_losses = 2;
+        let f = RiskForm::from_settings(&s);
+        assert_eq!((f.value(BOTH[0]), f.value(BOTH[1])), ("5".to_string(), "2".to_string()), "a Live database starts with 5 and 2");
+    }
+
+    #[test]
+    fn both_are_lower_is_stricter_like_the_core_semantics() {
+        for f in BOTH {
+            assert_eq!(f.strictness(), Strictness::LowerStricter, "{}", f.key());
+        }
+        // The merge table cannot cover them (global only), so the direction is locked to behaviour:
+        // a lower limit trips whenever a higher limit does (core::loss_breaker::evaluate).
+        use tong_funding_core::loss_breaker::evaluate;
+        let history = [Some(d("-3")), Some(d("-4")), Some(d("-2"))];
+        assert!(evaluate(&history, d("5"), 9).tripped && !evaluate(&history, d("15"), 9).tripped);
+        assert!(evaluate(&history, d("999"), 2).tripped && !evaluate(&history, d("999"), 4).tripped);
+    }
+
+    #[test]
+    fn every_other_strictness_assertion_still_holds() {
+        // the badge colours are not touched by this change
+        assert_eq!(Strictness::LowerStricter.badge(), "▼ 越低越嚴");
+        assert_eq!(Strictness::HigherStricter.badge(), "▲ 越高越嚴");
+    }
+
+    #[test]
+    fn values_are_saved_as_typed_and_reach_the_stored_config() {
+        let s = complete_settings("0.01");
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::LossBreakerMaxLossUsdt, "7.5");
+        f.set(Field::LossBreakerMaxConsecutiveLosses, "2");
+        let vm = evaluate(&f, &s);
+        assert!(vm.can_save, "{:?}", vm.field_errors);
+        let cfg = vm.result.as_ref().unwrap().0.clone();
+        assert_eq!((cfg.loss_breaker_max_loss_usdt, cfg.loss_breaker_max_consecutive_losses), (d("7.5"), 2));
+        let sink = Sink::default();
+        assert!(save(&vm, &sink));
+        let cmds = sink.0.borrow();
+        let Command::SaveRiskSettings { risk, .. } = &cmds[0] else { panic!("{:?}", cmds[0]) };
+        let back = RiskConfig::from_json(&risk.to_string()).unwrap();
+        assert_eq!((back.loss_breaker_max_loss_usdt, back.loss_breaker_max_consecutive_losses), (d("7.5"), 2));
+    }
+
+    #[test]
+    fn bad_values_are_refused_by_field_name_with_a_message_and_nothing_is_sent() {
+        let s = complete_settings("0.01");
+        for (field, text, expect) in [
+            (Field::LossBreakerMaxConsecutiveLosses, "0", "loss_breaker_max_consecutive_losses 必須為 ≥ 1 的整數"), // spec scenario
+            (Field::LossBreakerMaxConsecutiveLosses, "-1", "loss_breaker_max_consecutive_losses 必須為非負整數"),
+            (Field::LossBreakerMaxConsecutiveLosses, "1.5", "loss_breaker_max_consecutive_losses 必須為非負整數"),
+            (Field::LossBreakerMaxConsecutiveLosses, "", "loss_breaker_max_consecutive_losses 必須為非負整數"),
+            (Field::LossBreakerMaxLossUsdt, "0", "loss_breaker_max_loss_usdt 必須大於 0"),
+            (Field::LossBreakerMaxLossUsdt, "-5", "loss_breaker_max_loss_usdt 必須大於 0"),
+            (Field::LossBreakerMaxLossUsdt, "abc", "loss_breaker_max_loss_usdt 不是有效的數字"),
+            (Field::LossBreakerMaxLossUsdt, "", "loss_breaker_max_loss_usdt 必填"),
+        ] {
+            let mut f = RiskForm::from_settings(&s);
+            f.set(field, text);
+            let vm = evaluate(&f, &s);
+            assert!(!vm.can_save, "{text:?}");
+            assert_eq!(vm.field_errors.get(&field.key()).map(String::as_str), Some(expect), "{text:?}: {:?}", vm.field_errors);
+            let sink = Sink::default();
+            assert!(!save(&vm, &sink) && sink.0.borrow().is_empty(), "stored settings stay as they are");
+        }
+    }
+
+    #[test]
+    fn the_fields_have_help_with_the_rule_and_do_not_make_the_config_incomplete() {
+        for f in BOTH {
+            let h = f.help();
+            assert!(!h.meaning.trim().is_empty() && !h.affects.is_empty(), "{}", f.key());
+            assert!(h.meaning.contains("kill switch") || h.meaning.contains("開新倉"), "{}", h.meaning);
+        }
+        assert!(Field::LossBreakerMaxLossUsdt.help().meaning.contains("15") || Field::LossBreakerMaxLossUsdt.help().meaning.contains("USDT"));
+        // review round 1 (A9): what the stop really does to exits, and no promise of a system notification
+        for f in BOTH {
+            let m = f.help().meaning;
+            assert!(m.contains("提前出場會暫停") && m.contains("排程出場照常"), "{m}");
+            assert!(m.contains(crate::engine::watchdog_text::NOTIFY_NOTE) && !m.contains("通知你"), "{m}");
+        }
+        let mut s = complete_settings("0.01");
+        s.risk.loss_breaker_max_loss_usdt = d("0.5");
+        let vm = evaluate(&RiskForm::from_settings(&s), &s);
+        assert!(vm.missing.is_empty() && vm.incomplete_text.is_none());
+    }
+
+    #[test]
+    fn a_demo_save_and_a_live_save_both_carry_the_breaker_fields() {
+        let s = complete_settings("0.01");
+        for identity in [crate::identity::ProcessIdentity::Demo, crate::identity::ProcessIdentity::Live] {
+            let mut f = RiskForm::from_settings_for(&s, identity);
+            f.set(Field::LossBreakerMaxLossUsdt, "9");
+            let vm = evaluate(&f, &s);
+            assert_eq!(vm.result.as_ref().unwrap().0.loss_breaker_max_loss_usdt, d("9"), "{identity:?}");
+        }
+    }
+}
+
+// ---- loss-circuit-breaker 3.3: groups and the fixed save bar ---------------------------------------
+
+mod layout {
+    use super::*;
+    use crate::identity::ProcessIdentity::{Demo, Live};
+
+    #[test]
+    fn four_titled_groups_in_the_spec_order() {
+        assert_eq!(Group::ALL.map(Group::title), ["進場條件", "成本估計", "執行保護", "部位與熔斷"]);
+    }
+
+    #[test]
+    fn the_groups_hold_exactly_the_spec_fields() {
+        let keys = |g: Group, id| g.fields(id).iter().map(|f| f.key()).collect::<Vec<_>>();
+        assert_eq!(keys(Group::Entry, Demo), ["net_edge_threshold_pct", "min_expected_net_pnl_pct", "min_24h_volume_usdt"]);
+        assert_eq!(keys(Group::Cost, Demo), ["Binance taker_fee_pct", "Bybit taker_fee_pct", "OKX taker_fee_pct", "est_slippage_pct", "safety_margin_pct"]);
+        assert_eq!(
+            keys(Group::Protection, Demo),
+            ["max_leverage", "max_price_drift_pct", "stale_data_threshold_ms", "order_timeout_seconds", "max_leg_imbalance_pct", "early_exit_min_move_pct"]
+        );
+        assert_eq!(keys(Group::Position, Demo), ["max_concurrent_pairs", "loss_breaker_max_loss_usdt", "loss_breaker_max_consecutive_losses"]);
+        assert_eq!(
+            keys(Group::Position, Live),
+            ["max_concurrent_pairs", "loss_breaker_max_loss_usdt", "loss_breaker_max_consecutive_losses", "live_max_leg_notional_usdt", "live_max_pairs_per_arming"],
+            "the Live caps sit in the same group, after the breaker"
+        );
+    }
+
+    #[test]
+    fn every_field_of_the_page_is_in_exactly_one_group() {
+        for id in [Demo, Live] {
+            let mut grouped: Vec<Field> = Group::ALL.iter().flat_map(|g| g.fields(id)).collect();
+            let mut shown = global_fields(id);
+            grouped.sort();
+            shown.sort();
+            assert_eq!(grouped, shown, "{id:?}: nothing lost, nothing twice");
+            grouped.dedup();
+            assert_eq!(grouped.len(), shown.len());
+        }
+    }
+
+    #[test]
+    fn the_breaker_fields_are_in_the_position_and_breaker_group() {
+        // spec scenario 熔斷欄位的位置
+        let g = Group::ALL.into_iter().find(|g| g.fields(Demo).contains(&Field::LossBreakerMaxLossUsdt)).unwrap();
+        assert_eq!(g.title(), "部位與熔斷");
+        assert!(g.fields(Demo).contains(&Field::LossBreakerMaxConsecutiveLosses));
+    }
+
+    #[test]
+    fn grouping_changes_no_strictness_and_no_validation() {
+        // the direction badges and the rules are the ones of the fields themselves
+        for g in Group::ALL {
+            for f in g.fields(Live) {
+                let _ = f.strictness();
+            }
+        }
+        let s = complete_settings("0.01");
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::MaxLeverage, "0");
+        assert_eq!(evaluate(&f, &s).field_errors.get("max_leverage").map(String::as_str), Some("max_leverage 必須大於 0"));
+    }
+
+    // ---- unsaved changes
+
+    fn base() -> Settings {
+        complete_settings("0.01")
+    }
+
+    #[test]
+    fn a_form_as_loaded_has_no_changes() {
+        let s = base();
+        for id in [Demo, Live] {
+            assert!(changed_items(&RiskForm::from_settings_for(&s, id), &s).is_empty(), "{id:?}");
+        }
+    }
+
+    #[test]
+    fn each_edited_field_counts_once_and_editing_it_back_cancels() {
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::MaxLeverage, "3");
+        assert_eq!(changed_items(&f, &s), ["max_leverage"]);
+        f.set(Field::LossBreakerMaxLossUsdt, "9");
+        assert_eq!(changed_items(&f, &s).len(), 2);
+        f.set(Field::MaxLeverage, "5");
+        assert_eq!(changed_items(&f, &s), ["loss_breaker_max_loss_usdt"], "back to the stored value: not a change");
+    }
+
+    #[test]
+    fn writing_the_same_number_differently_is_not_a_change() {
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::LossBreakerMaxLossUsdt, " 15.0 ");
+        f.set(Field::MaxLeverage, "5.00");
+        assert!(changed_items(&f, &s).is_empty());
+    }
+
+    #[test]
+    fn a_text_that_is_not_a_number_is_a_change_too() {
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::MaxLeverage, "abc");
+        assert_eq!(changed_items(&f, &s), ["max_leverage"]);
+    }
+
+    #[test]
+    fn allowed_exchanges_coins_and_overrides_count_as_items() {
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.allowed_exchanges.remove(&Exchange::Okx);
+        assert_eq!(changed_items(&f, &s), ["allowed_exchanges"]);
+        f.allowed_exchanges.insert(Exchange::Okx);
+        f.allowed_coins = "btc, eth".into();
+        assert_eq!(changed_items(&f, &s), ["allowed_coins"]);
+        f.allowed_coins = String::new();
+        f.set_override(Exchange::Bybit, Field::MaxLeverage, true, &s);
+        assert_eq!(changed_items(&f, &s), ["overrides.Bybit.max_leverage"], "an override switched on (still at the global value) is a new setting");
+        f.set_override_value(Exchange::Bybit, Field::MaxLeverage, "4");
+        assert_eq!(changed_items(&f, &s).len(), 1, "the same item, however often edited");
+        f.set_override(Exchange::Bybit, Field::MaxLeverage, false, &s);
+        assert!(changed_items(&f, &s).is_empty());
+    }
+
+    #[test]
+    fn a_stored_override_that_is_removed_is_a_change() {
+        let mut s = base();
+        s.overrides = parse_overrides(&serde_json::json!({ "Bybit": { "max_leverage": "4" } })).unwrap();
+        let mut f = RiskForm::from_settings(&s);
+        assert!(changed_items(&f, &s).is_empty());
+        f.set_override(Exchange::Bybit, Field::MaxLeverage, false, &s);
+        assert_eq!(changed_items(&f, &s), ["overrides.Bybit.max_leverage"]);
+    }
+
+    #[test]
+    fn the_demo_page_ignores_live_only_fields() {
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::LiveMaxLegNotionalUsdt, "99"); // ignored by a Demo form
+        assert!(changed_items(&f, &s).is_empty());
+        let mut live = RiskForm::from_settings_for(&s, Live);
+        live.set(Field::LiveMaxLegNotionalUsdt, "99");
+        assert_eq!(changed_items(&live, &s), ["live_max_leg_notional_usdt"]);
+    }
+
+    // ---- the bar
+
+    #[test]
+    fn nothing_changed_the_save_is_off_and_says_why() {
+        let s = base();
+        let f = RiskForm::from_settings(&s);
+        let bar = save_bar(&evaluate(&f, &s), changed_items(&f, &s).len());
+        assert!(!bar.enabled);
+        assert_eq!(bar.text, "沒有未儲存的變更");
+        assert_eq!(bar.disabled_reason.as_deref(), Some("沒有變更可儲存"));
+    }
+
+    #[test]
+    fn one_valid_change_shows_the_count_and_can_be_saved() {
+        // spec scenario: edit one field, scroll back to the top -> 有 1 項未儲存的變更 and a pressable save
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::LossBreakerMaxLossUsdt, "9");
+        let bar = save_bar(&evaluate(&f, &s), changed_items(&f, &s).len());
+        assert_eq!((bar.text.as_str(), bar.enabled, bar.disabled_reason), ("有 1 項未儲存的變更", true, None));
+        f.set(Field::MaxLeverage, "3");
+        assert_eq!(save_bar(&evaluate(&f, &s), changed_items(&f, &s).len()).text, "有 2 項未儲存的變更");
+    }
+
+    #[test]
+    fn a_change_with_a_validation_error_keeps_the_count_but_cannot_be_saved_and_names_the_field() {
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::LossBreakerMaxConsecutiveLosses, "0");
+        let bar = save_bar(&evaluate(&f, &s), changed_items(&f, &s).len());
+        assert_eq!(bar.text, "有 1 項未儲存的變更");
+        assert!(!bar.enabled);
+        let why = bar.disabled_reason.expect("a reason");
+        assert!(why.contains("loss_breaker_max_consecutive_losses 必須為 ≥ 1 的整數"), "{why}");
+    }
+
+    #[test]
+    fn several_errors_are_counted_in_the_reason() {
+        let s = base();
+        let mut f = RiskForm::from_settings(&s);
+        f.set(Field::MaxLeverage, "abc");
+        f.set(Field::LossBreakerMaxLossUsdt, "xyz");
+        let why = save_bar(&evaluate(&f, &s), 2).disabled_reason.unwrap();
+        assert!(why.starts_with("有 2 個欄位有錯誤"), "{why}");
     }
 }

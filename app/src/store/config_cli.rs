@@ -13,7 +13,11 @@
 //!
 //! `set` validates with core (`RiskConfig::from_json` / `parse_overrides`) before writing, writes
 //! with optimistic locking and records a `CONFIG_UPDATED` event (`source: "cli"`). The value
-//! replaces the whole key. The database is single-instance: quit the app first.
+//! replaces the whole key. `set` takes the app's single-instance lock (review round 2, B3): while the app runs
+//! it is refused (exit 1) and says to close the app first; `show` (review round 3, C3) opens the database read-only: no
+//! write, no lock, no migration, no `apply_if_fresh`, and it never creates the file. The main database file is
+//! never modified, but SQLite may create `-shm` / `-wal` helper files next to it, so do not run `show` with
+//! `sudo` (they would then be owned by root).
 //! Exit codes: 0 ok, 1 refused or store error, 2 usage error.
 
 use std::io::Write;
@@ -26,7 +30,7 @@ use tong_funding_core::risk::{RiskConfig, parse_overrides};
 
 use crate::identity::ProcessIdentity;
 use crate::ports::{Clock, SystemClock};
-use crate::store::db::Db;
+use crate::store::db::{ConfigReader, Db};
 use crate::store::events::EventStore;
 
 pub const SUBCOMMAND: &str = "config";
@@ -36,7 +40,7 @@ pub const KEY_RISK: &str = "risk";
 pub const KEY_RISK_OVERRIDES: &str = "risk_overrides";
 pub const CONFIG_UPDATED: &str = "CONFIG_UPDATED";
 
-const USAGE: &str = "usage:\n  tong-funding config show [--live] [--db <funding.db>]\n  tong-funding config set <risk|risk_overrides> '<json>' [--live] [--db <funding.db>]\n\nexample:\n  tong-funding config set risk '{\"net_edge_threshold_pct\":\"0.01\",\"est_slippage_pct\":\"0.02\",\"taker_fee_pct\":{\"Binance\":\"0.05\",\"Bybit\":\"0.055\",\"Okx\":\"0.05\"}}'\n  tong-funding config set risk_overrides '{\"Bybit\":{\"est_slippage_pct\":\"0.03\"}}'";
+const USAGE: &str = "usage:\n  tong-funding config show [--live] [--db <funding.db>]\n  tong-funding config set <risk|risk_overrides> '<json>' [--live] [--db <funding.db>]\n\n`show` only reads: the database file is not modified, but SQLite may create -shm/-wal helper files next to it, so do not run it with sudo.\n\nexample:\n  tong-funding config set risk '{\"net_edge_threshold_pct\":\"0.01\",\"est_slippage_pct\":\"0.02\",\"taker_fee_pct\":{\"Binance\":\"0.05\",\"Bybit\":\"0.055\",\"Okx\":\"0.05\"}}'\n  tong-funding config set risk_overrides '{\"Bybit\":{\"est_slippage_pct\":\"0.03\"}}'";
 
 #[derive(Debug, PartialEq)]
 enum Cmd {
@@ -89,10 +93,12 @@ pub fn validate(key: &str, value: &Value) -> Result<(), String> {
 
 /// Runs the subcommand on the default (or `--db`) database; returns the process exit code.
 pub fn run(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    run_with_clock(args, Arc::new(SystemClock), out, err)
+    let lock_dir = crate::instance_lock::data_dir_from(std::env::var("HOME").ok().as_deref());
+    run_with_clock(args, Arc::new(SystemClock), lock_dir, out, err)
 }
 
-fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+/// `lock_dir` = where the single-instance lock of the app lives (`Err` = it cannot be told: `set` refuses).
+fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, lock_dir: Result<PathBuf, crate::instance_lock::LockError>, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let (cmd, path, identity) = match parse(args) {
         Ok(v) => v,
         Err(e) => {
@@ -100,16 +106,35 @@ fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, e
             return 2;
         }
     };
-    let db = match &path {
-        Some(p) => Db::open_for(identity, p, clock),
-        None => match Db::open_default_for(identity, clock) {
-            Ok(db) => db,
+    // `set` changes settings the running app reads and checks (frozen caps, the breaker): one program at a
+    // time, the same lock the app takes before it opens the database (review round 2, B3). `show` only reads.
+    let _lock = if matches!(cmd, Cmd::Set { .. }) {
+        match lock_dir.and_then(|d| crate::instance_lock::InstanceLock::acquire_in(&d)) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                let _ = writeln!(err, "{e}\nconfig set was refused, nothing was written: close the app first (it holds the database and checks these settings while it runs), then run it again");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+    let path = match path {
+        Some(p) => p,
+        None => match crate::store::db::default_db_path_for(identity, std::env::var("HOME").ok().as_deref()) {
+            Ok(p) => p,
             Err(e) => {
                 let _ = writeln!(err, "{e}");
                 return 1;
             }
         },
     };
+    // `show` only reads (review round 3, C3): no write, no database lock, nothing created
+    let (key, value) = match cmd {
+        Cmd::Show => return show(identity, &path, out, err),
+        Cmd::Set { key, value } => (key, value),
+    };
+    let db = Db::open_for(identity, &path, clock);
     if let Some(reason) = db.halt_reason() {
         let _ = writeln!(err, "store is halted, nothing was changed: {}", redact_secrets(&reason.to_string()));
         return 1;
@@ -119,17 +144,25 @@ fn run_with_clock(args: &[String], clock: Arc<dyn Clock>, out: &mut dyn Write, e
         let _ = writeln!(err, "{why}");
         return 1;
     }
-    match cmd {
-        Cmd::Show => show(&db, out, err),
-        Cmd::Set { key, value } => set(&db, &key, value, out, err),
-    }
+    set(&db, &key, value, out, err)
 }
 
-fn show(db: &Db, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
-    let _ = writeln!(out, "database: {}", db.path().display());
+fn show(identity: ProcessIdentity, path: &std::path::Path, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
+    let reader = match ConfigReader::open(identity, path) {
+        Ok(r) => r,
+        Err(reason) => {
+            let _ = writeln!(err, "cannot read the database: {}", redact_secrets(&reason.to_string()));
+            return 1;
+        }
+    };
+    if reader.is_some() {
+        let _ = writeln!(out, "database: {}", path.display());
+    } else {
+        let _ = writeln!(out, "database: {} (does not exist yet: nothing is set)", path.display());
+    }
     let mut risk = RiskConfig::default();
     for key in [KEY_RISK, KEY_RISK_OVERRIDES] {
-        match db.config_get(key) {
+        match reader.as_ref().map_or(Ok(None), |r| r.get(key)) {
             Ok(None) => {
                 let _ = writeln!(out, "{key}: (not set)");
             }
@@ -248,7 +281,7 @@ mod tests {
         full.push("--db".into());
         full.push(db.display().to_string());
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), &mut out, &mut err);
+        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), Ok(db.parent().unwrap().to_path_buf()), &mut out, &mut err);
         (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
     }
 
@@ -343,7 +376,7 @@ mod tests {
         full.push("--db".into());
         full.push(db.display().to_string());
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), &mut out, &mut err);
+        let code = run_with_clock(&full, Arc::new(ManualClock::new(1_000)), Ok(db.parent().unwrap().to_path_buf()), &mut out, &mut err);
         (code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
     }
 
@@ -479,5 +512,72 @@ mod tests {
         assert_eq!(code, 1);
         assert!(err.contains("halted"), "{err}");
         assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    // ---- review round 2, B3: `set` takes the single-instance lock, a running app keeps it out ----
+
+    #[test]
+    fn set_is_refused_while_the_app_holds_the_instance_lock_and_nothing_is_written() {
+        for live in [false, true] {
+            let dir = tempdir();
+            let p = dir.path().join(if live { "funding-live.db" } else { "funding.db" });
+            let app = crate::instance_lock::InstanceLock::acquire_in(dir.path()).expect("the running app");
+            let (code, _, err) = if live { call_live(&p, &["set", "risk", FULL]) } else { call(&p, &["set", "risk", FULL]) };
+            assert_eq!(code, 1, "live = {live}: {err}");
+            assert!(err.contains("already running") && err.contains("config set"), "says why and what to do: {err}");
+            assert!(!p.exists() || stored(&p, "risk").is_none(), "nothing was written");
+            // reading stays possible
+            let (code, out, _) = if live { call_live(&p, &["show"]) } else { call(&p, &["show"]) };
+            assert_eq!(code, 0, "show is read-only and needs no lock");
+            assert!(!out.contains("net_edge_threshold_pct\": \"0.01"), "the refused value is not there: {out}");
+            drop(app);
+            let (code, _, err) = if live { call_live(&p, &["set", "risk", FULL]) } else { call(&p, &["set", "risk", FULL]) };
+            assert_eq!(code, 0, "free again: {err}");
+        }
+    }
+
+    #[test]
+    fn set_cannot_tell_where_the_lock_is_so_it_refuses() {
+        let dir = tempdir();
+        let p = dir.path().join("funding.db");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let args = s(&["set", "risk", FULL, "--db", &p.display().to_string()]);
+        let unavailable = Err(crate::instance_lock::LockError::Unavailable("HOME is not set".into()));
+        assert_eq!(run_with_clock(&args, Arc::new(ManualClock::new(1_000)), unavailable, &mut out, &mut err), 1);
+        assert!(String::from_utf8(err).unwrap().contains("HOME is not set"));
+    }
+
+    // ---- review round 3, C3: `show` is read-only: no write, no database lock -------------------------
+
+    #[test]
+    fn show_writes_nothing_and_works_while_the_app_has_the_database_open() {
+        for live in [false, true] {
+            let dir = tempdir();
+            let p = dir.path().join(if live { "funding-live.db" } else { "funding.db" });
+            let identity = if live { ProcessIdentity::Live } else { ProcessIdentity::Demo };
+            // the running app: it holds the database (and its inode lock) for as long as this handle lives
+            let app = Db::open_for(identity, &p, Arc::new(ManualClock::new(1)));
+            assert!(!app.is_halted());
+            let events_before = EventStore::new(app.clone()).list(100).unwrap().len();
+            let (code, out, err) = if live { call_live(&p, &["show"]) } else { call(&p, &["show"]) };
+            assert_eq!(code, 0, "live = {live}: show must not need the lock the app holds: {err}");
+            assert!(out.contains("risk: (not set)"), "{out}");
+            assert!(app.config_get(KEY_RISK).unwrap().is_none(), "live = {live}: show must not write the Live defaults");
+            assert!(app.config_get(crate::engine::actor::CONFIG_CONTRACT_TEMPLATE).unwrap().is_none(), "live = {live}");
+            assert_eq!(EventStore::new(app.clone()).list(100).unwrap().len(), events_before, "live = {live}: no event written");
+        }
+    }
+
+    #[test]
+    fn show_on_a_database_that_does_not_exist_creates_nothing() {
+        for live in [false, true] {
+            let dir = tempdir();
+            let p = dir.path().join(if live { "funding-live.db" } else { "funding.db" });
+            let (code, out, err) = if live { call_live(&p, &["show"]) } else { call(&p, &["show"]) };
+            assert_eq!(code, 0, "{err}");
+            assert!(out.contains("risk: (not set)") && out.contains("does not exist"), "{out}");
+            assert!(!p.exists(), "live = {live}: show must not create the database");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "live = {live}: no file at all");
+        }
     }
 }

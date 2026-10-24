@@ -31,7 +31,7 @@ use super::staged_orders::{self, CloseConfirm, CostView, PendingConfirm, Running
 use super::symbol_options;
 use super::symbol_select::{CoinPicker, SymbolPicker};
 use super::theme;
-use super::units::rx;
+use super::units::{fs, rx};
 use crate::engine::command::{Command, CommandReply};
 use crate::engine::ports::OrderSide;
 
@@ -393,6 +393,29 @@ fn warn_box(lines: Vec<String>) -> Div {
         d = d.child(small(l, theme::WARNING));
     }
     d
+}
+
+/// A paragraph whose emphasised runs are bold (the words come from `engine::watchdog_text`).
+fn rich_paragraph(runs: &[crate::engine::watchdog_text::Run], color: u32) -> Div {
+    let mut at = 0;
+    let mut bold = Vec::new();
+    for r in runs {
+        let end = at + r.text.len();
+        if r.bold {
+            bold.push((at..end, HighlightStyle { font_weight: Some(FontWeight::BOLD), ..Default::default() }));
+        }
+        at = end;
+    }
+    div().text_color(rgb(color)).text_size(fs(10.0)).child(StyledText::new(crate::engine::watchdog_text::plain(runs)).with_highlights(bold))
+}
+
+/// The fixed "自動處理規則（授權 B）" block: always drawn, nothing to expand, collapse or switch.
+fn auto_rules_card(b: &risk_settings::AutoRulesBlock) -> impl IntoElement {
+    let mut c = card().id("naked-leg-rules").test_support().child(text(b.title, theme::TEXT_PRIMARY)).child(rich_paragraph(&b.runs, theme::TEXT_SECONDARY));
+    for n in &b.notes {
+        c = c.child(small(n.clone(), theme::WARNING));
+    }
+    c
 }
 
 fn mode_text(identity: crate::identity::ProcessIdentity, m: Option<ExecutionMode>) -> &'static str {
@@ -780,7 +803,9 @@ impl Shell {
         }
 
         if !vm.manual.is_empty() {
-            let mut m = card().border_color(rgb(theme::NEGATIVE)).child(text("需人工處理（系統不會自動補救）", theme::NEGATIVE));
+            // naked-leg-watchdog: the watchdog may have flattened a leg, so this heading no longer says
+            // "nothing is done automatically"; it says what is NOT done and where the rules are.
+            let mut m = card().border_color(rgb(theme::NEGATIVE)).child(text("需人工處理", theme::NEGATIVE)).child(small(crate::engine::watchdog_text::CARD_INTRO, theme::TEXT_SECONDARY));
             for h in &vm.manual {
                 let mut legs = div().flex().gap_3();
                 for (ex, q) in &h.legs {
@@ -805,7 +830,13 @@ impl Shell {
                 if let Err(why) = &h.confirm_closed {
                     actions = actions.child(small(why.clone(), theme::WARNING));
                 }
-                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs).child(actions);
+                m = m.child(small(format!("{} · {} · {}", h.symbol, h.state, h.env.env_name()), theme::TEXT_PRIMARY)).child(legs);
+                // what the watchdog did for this pair and what comes next (the words of watchdog_text)
+                let mut status = div().id(SharedString::from(format!("mwatchdog-{}", h.uuid))).test_support().flex().flex_col();
+                for line in &h.watchdog {
+                    status = status.child(small(line.clone(), h.watchdog_tone.color()));
+                }
+                m = m.child(status).child(actions);
                 // live-guardrails (Live only): the exchange pages and the flatten of one bare leg.
                 if let [(long, _), (short, _)] = h.legs[..] {
                     let mut links = div().flex().flex_wrap().gap_2();
@@ -861,6 +892,10 @@ impl Shell {
             hist = hist.child(small(format!("{} UTC · {}", format::utc_hms(a.at), a.headline), if a.needs_manual { theme::NEGATIVE } else { theme::TEXT_PRIMARY }));
             for l in &a.legs {
                 hist = hist.child(small(format!("  {} · {} · {} · {} · {}", l.leg, l.exchange, side_text(l.side), l.status.text(), l.order_id_text), theme::TEXT_SECONDARY));
+            }
+            // the one exception: what the watchdog really flattened is written down, with the confirmation still due
+            for line in &a.watchdog {
+                hist = hist.child(small(format!("  {line}"), theme::POSITIVE));
             }
         }
         page.child(hist)
@@ -958,47 +993,59 @@ impl Shell {
         if let Some(e) = &base.error {
             page = page.child(warn_box(vec![format!("已儲存的風控設定讀取失敗：{e}")]));
         }
-        let mut global = card().child(text("Global Limits · Layer 1 · Net Edge", theme::TEXT_PRIMARY));
-        let shown = risk_settings::global_fields(self.snap.identity);
-        for f in shown.iter().copied() {
-            let label = match f {
-                Field::TakerFee(e) => format!("{} Taker 費率 · 必填（請依帳戶手續費等級實填）", e.name()),
-                Field::NetEdgeThresholdPct | Field::EstSlippagePct => format!("{} · 必填", f.label()),
-                _ => f.label().to_string(),
-            };
-            let key = f.key();
-            if let Some(i) = self.trading.r_fields.get(&f) {
-                global = global.child(field_row_badged(Some(f.strictness()), format!("{label}（{key}）"), f.unit(), i, vm.field_errors.get(&key)));
-            }
-            if f == Field::StaleDataThresholdMs {
-                global = global.child(small(risk_settings::STALE_NOTE, theme::TEXT_MUTED));
-            }
-            if f == Field::MaxConcurrentPairs {
-                let open = self.snap.pairs.iter().filter(|p| p.state.is_ok()).count();
-                global = global.child(small(format!("目前 {open} / {} 組", base.risk.max_concurrent_pairs), theme::TEXT_MUTED));
-            }
-        }
-        let mut allowed = div().flex().gap_2().items_center().child(small("allowed_exchanges", theme::TEXT_SECONDARY).w(rx(260.0)));
-        for ex in Exchange::ALL {
-            let on = self.trading.r_allowed.contains(&ex);
-            allowed = allowed.child(btn(SharedString::from(format!("allow-{}", ex.name())), format!("{} {}", if on { "☑" } else { "☐" }, ex.name()), true, self.click(cx, move |this, _| {
-                if !this.trading.r_allowed.remove(&ex) {
-                    this.trading.r_allowed.insert(ex);
+        // naked-leg-watchdog: what the system does on its own (authorization B), for the stored settings
+        page = page.child(auto_rules_card(&risk_settings::auto_rules_block(&base)));
+        let identity = self.snap.identity;
+        let shown = risk_settings::global_fields(identity);
+        // loss-circuit-breaker 3.3: four titled blocks; the save button lives in the fixed bar (`risk_save_bar`).
+        for (i, g) in risk_settings::Group::ALL.into_iter().enumerate() {
+            let mut block = card().id(SharedString::from(format!("risk-group-{i}"))).test_support().child(text(g.title(), theme::TEXT_PRIMARY));
+            for f in g.fields(identity) {
+                let label = match f {
+                    Field::TakerFee(e) => format!("{} Taker 費率 · 必填（請依帳戶手續費等級實填）", e.name()),
+                    Field::NetEdgeThresholdPct | Field::EstSlippagePct => format!("{} · 必填", f.label()),
+                    _ => f.label().to_string(),
+                };
+                let key = f.key();
+                if let Some(i) = self.trading.r_fields.get(&f) {
+                    block = block.child(div().id(SharedString::from(format!("risk-field-{key}"))).test_support().child(field_row_badged(Some(f.strictness()), format!("{label}（{key}）"), f.unit(), i, vm.field_errors.get(&key))));
                 }
-            })));
-        }
-        global = global.child(allowed).child(pick_row("allowed_coins（可多選，空白 = 不限制）", self.trading.r_coins.element("不限制"), self.trading.r_coins.loaded(), "行情", Some(self.trading.r_coins.unlisted(cx).join(", ")).filter(|u| !u.is_empty()))).child(small(vm.formula.clone(), theme::TEXT_SECONDARY));
-        for (k, e) in &vm.field_errors {
-            if !shown.iter().any(|f| &f.key() == k) {
-                global = global.child(small(e.clone(), theme::NEGATIVE));
+                if f == Field::StaleDataThresholdMs {
+                    block = block.child(small(risk_settings::STALE_NOTE, theme::TEXT_MUTED));
+                }
+                if f == Field::MaxConcurrentPairs {
+                    let open = self.snap.pairs.iter().filter(|p| p.state.is_ok()).count();
+                    block = block.child(small(format!("目前 {open} / {} 組", base.risk.max_concurrent_pairs), theme::TEXT_MUTED));
+                }
             }
+            if g == risk_settings::Group::Entry {
+                let mut allowed = div().flex().gap_2().items_center().child(small("allowed_exchanges", theme::TEXT_SECONDARY).w(rx(260.0)));
+                for ex in Exchange::ALL {
+                    let on = self.trading.r_allowed.contains(&ex);
+                    allowed = allowed.child(btn(SharedString::from(format!("allow-{}", ex.name())), format!("{} {}", if on { "☑" } else { "☐" }, ex.name()), true, self.click(cx, move |this, _| {
+                        if !this.trading.r_allowed.remove(&ex) {
+                            this.trading.r_allowed.insert(ex);
+                        }
+                    })));
+                }
+                block = block.child(allowed).child(pick_row("allowed_coins（可多選，空白 = 不限制）", self.trading.r_coins.element("不限制"), self.trading.r_coins.loaded(), "行情", Some(self.trading.r_coins.unlisted(cx).join(", ")).filter(|u| !u.is_empty())));
+            }
+            if g == risk_settings::Group::Cost {
+                block = block.child(small(vm.formula.clone(), theme::TEXT_SECONDARY));
+            }
+            if g == risk_settings::Group::Position {
+                block = block.child(small("熔斷：自最近一次開放交易起累計；達到任一上限就停止開新倉，平倉與進行中的配對照常。重新開放交易後重新計算。", theme::TEXT_MUTED));
+            }
+            page = page.child(block);
         }
-        global = global.child(btn("risk-save", "儲存風控設定", vm.can_save, self.click(cx, |this, cx| {
-            let base = this.snap.settings.clone();
-            let vm = risk_settings::evaluate(&this.trading.risk_form(&base, this.snap.identity, cx), &base);
-            risk_settings::save(&vm, this.sink.as_ref());
-        })));
-        page = page.child(global);
+        let stray: Vec<_> = vm.field_errors.iter().filter(|(k, _)| !shown.iter().any(|f| &f.key() == *k)).collect();
+        if !stray.is_empty() {
+            let mut errors = card();
+            for (_, e) in stray {
+                errors = errors.child(small(e.clone(), theme::NEGATIVE));
+            }
+            page = page.child(errors);
+        }
 
         // Execution mode (the simulation and the exchange-ordering mode only).
         let current = self.snap.engine.as_ref().map(|e| e.execution_mode);
@@ -1091,6 +1138,37 @@ impl Shell {
             ));
         }
         page.child(ov).child(preview)
+    }
+
+    /// The bar fixed at the bottom of the risk page, outside the scrolling content (loss-circuit-breaker 3.3):
+    /// how many settings differ from the stored ones, the save button, and why it is off when it is.
+    pub(crate) fn risk_save_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let base = self.snap.settings.clone();
+        let form = self.trading.risk_form(&base, self.snap.identity, cx);
+        let vm = risk_settings::evaluate(&form, &base);
+        let bar = risk_settings::save_bar(&vm, risk_settings::changed_items(&form, &base).len());
+        let mut row = div()
+            .id("risk-save-bar")
+            .test_support()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_3()
+            .px_6()
+            .py_2()
+            .bg(rgb(theme::BG_BASE))
+            .border_t_1()
+            .border_color(rgb(theme::BORDER))
+            .child(text(bar.text.clone(), if bar.enabled { theme::WARNING } else { theme::TEXT_SECONDARY }))
+            .child(div().id("risk-save").test_support().child(btn("risk-save-button", "儲存風控設定", bar.enabled, self.click(cx, |this, cx| {
+                let base = this.snap.settings.clone();
+                let vm = risk_settings::evaluate(&this.trading.risk_form(&base, this.snap.identity, cx), &base);
+                risk_settings::save(&vm, this.sink.as_ref());
+            }))));
+        if let Some(why) = &bar.disabled_reason {
+            row = row.child(small(why.clone(), if vm.field_errors.is_empty() { theme::TEXT_MUTED } else { theme::NEGATIVE }));
+        }
+        row
     }
 
     // ---- manual order ---------------------------------------------------------------------------

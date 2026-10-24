@@ -114,6 +114,13 @@ pub struct RiskConfig {
     /// live-guardrails: most pairs entered per arming. Required for Live, no default; ignored by
     /// Demo. Must be in `1..=LIVE_CAP_CEILING_PAIRS_PER_ARMING`. Global only.
     pub live_max_pairs_per_arming: Option<u32>,
+    /// loss-circuit-breaker: cumulative loss (USDT) since trading was last opened at which the
+    /// breaker stops new entries. Must be > 0. Global only, default 15 (user decision 2026-10-22);
+    /// "lower is stricter"; never makes the config incomplete (an older stored config gets the default).
+    pub loss_breaker_max_loss_usdt: Decimal,
+    /// loss-circuit-breaker: consecutive losing pairs at which the breaker stops new entries.
+    /// Integer >= 1. Global only, default 3; "lower is stricter"; never makes the config incomplete.
+    pub loss_breaker_max_consecutive_losses: u32,
 }
 
 /// Absolute per-leg notional ceiling (USDT) baked into the program: neither the config nor the
@@ -144,6 +151,8 @@ impl Default for RiskConfig {
             early_exit_min_move_pct: Decimal::new(3, 1),
             live_max_leg_notional_usdt: None,
             live_max_pairs_per_arming: None,
+            loss_breaker_max_loss_usdt: Decimal::from(15),
+            loss_breaker_max_consecutive_losses: 3,
         }
     }
 }
@@ -195,6 +204,10 @@ impl RiskConfig {
                     format!("exceeds the built-in ceiling of {LIVE_CAP_CEILING_LEG_NOTIONAL_USDT} USDT"),
                 ));
             }
+        }
+        positive("loss_breaker_max_loss_usdt", self.loss_breaker_max_loss_usdt)?;
+        if self.loss_breaker_max_consecutive_losses < 1 {
+            return Err(invalid("loss_breaker_max_consecutive_losses", "must be an integer >= 1"));
         }
         if let Some(n) = self.live_max_pairs_per_arming {
             if n < 1 {

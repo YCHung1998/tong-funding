@@ -16,7 +16,7 @@ fn alert_accounts(snap: &UiSnapshot) -> Vec<Exchange> {
     Exchange::ALL.into_iter().filter(|e| *e != Exchange::Okx || snap.settings.risk.allowed_exchanges.contains(e)).collect()
 }
 
-pub const MANUAL_TEXT: &str = "需人工處理，系統不會自動補單或平倉";
+pub const MANUAL_TEXT: &str = "需人工處理：系統不會補另一腿，只在確認只有一腿成交時自動平掉該腿（授權 B）";
 
 /// Categories in descending severity (the declaration order is the display order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

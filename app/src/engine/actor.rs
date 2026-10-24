@@ -29,6 +29,12 @@
 //! - alerts: entering PARTIAL_FAILURE / IMBALANCED / UNRESOLVED writes one `PAIR_ALERT` and
 //!   notifies once (`alert`); the banner (`Snapshot::alerts`) is derived from the pair states.
 //!   "Confirm closed" is accepted only after a re-query shows both legs flat.
+//! - naked-leg-watchdog (`naked_leg`, authorization B): 5 s after a pair entered an alert state, then
+//!   every 5 s while something is pending, one round reads both legs (positions, every own order by
+//!   `client_order_id`) and concludes: flatten ONE leg with a reduce-only market order (only when
+//!   exactly that leg holds the pair's position and the other is proven empty and over; intent
+//!   first, at most 3 tries), nothing (hedged / flat), cancel and look again (an order not over), or
+//!   unknown (nothing sent, kill switch ON, notification). It never changes the pair's state.
 //!
 //! A panic inside the actor ends the task: every later `send` gets `Rejected("engine stopped")`
 //! and the snapshot stops updating. There is no automatic restart (design Risks; unverified).
@@ -76,6 +82,8 @@ use crate::store::state::{AddPairOutcome, ConfigChange, FLAG_EXECUTION_MODE, Int
 #[cfg(test)]
 pub(crate) mod flow_tests;
 mod live;
+mod loss_breaker;
+mod naked_leg;
 mod pnl_gate;
 
 /// Command queue bound: a UI that floods commands waits (backpressure) instead of growing memory.
@@ -384,18 +392,40 @@ struct EntryContext {
 
 type QuotePair = (Result<FreshQuote, String>, Result<FreshQuote, String>);
 
-/// Reports a manual order whose task ended without an answer (a panic), so its in-flight entry is cleared.
-/// The entry is cleared by a definite outcome or a lookup that settled an Unknown one (`resolved`); a lost task
-/// (this guard) leaves it to the safety-net expiry, like an Unknown outcome whose lookup failed.
-struct ManualDoneGuard {
+/// Review round 2 (B4), round 3 (C1): holds the event a task must report when it ends without its own result
+/// (a panic in an adapter): a lost watchdog round, a lost flatten read, a lost manual order. `disarm` once the
+/// real result is sent; dropped armed, the fallback is sent instead, so the pair is never left "in flight" by a
+/// lost task. A drop must not wait: `try_send` first, and when the event queue is full the send is handed to a
+/// spawned task, so the fallback still arrives once there is room.
+struct LostTaskGuard {
     tx: mpsc::Sender<Event>,
-    id: Option<String>,
+    fallback: Option<Event>,
 }
 
-impl Drop for ManualDoneGuard {
+impl LostTaskGuard {
+    fn new(tx: mpsc::Sender<Event>, fallback: Event) -> LostTaskGuard {
+        LostTaskGuard { tx, fallback: Some(fallback) }
+    }
+
+    fn disarm(&mut self) {
+        self.fallback = None;
+    }
+}
+
+impl Drop for LostTaskGuard {
     fn drop(&mut self) {
-        if let Some(client_order_id) = self.id.take() {
-            let _ = self.tx.try_send(Event::ManualSubmitted { client_order_id, outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() }, resolved: false });
+        let Some(event) = self.fallback.take() else { return };
+        match self.tx.try_send(event) {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                // a guard dropped outside any runtime (the engine is gone) has nothing left to tell
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let tx = self.tx.clone();
+                    runtime.spawn(async move {
+                        let _ = tx.send(event).await;
+                    });
+                }
+            }
         }
     }
 }
@@ -458,6 +488,21 @@ struct Flow {
     live_worst_price: [Option<Decimal>; 2],
     /// live-guardrails `FlattenLeg`: the position / recorded-fill read of a leg is in flight.
     flatten_inflight: [bool; 2],
+    /// naked-leg-watchdog: progress for the pair's current alert entry (`None` outside an alert state).
+    watchdog: Option<naked_leg::WatchdogFlow>,
+    /// Every flatten order (manual `FlattenLeg` or watchdog) sent for this pair, with the time after
+    /// which its result no longer counts as "in flight" (review round 2, B1): only these can hold the
+    /// watchdog back or refuse another flatten; an ordinary close order of unknown result cannot.
+    flattens: Vec<SentFlatten>,
+}
+
+/// One flatten order of a pair (see `Flow::flattens`).
+#[derive(Debug, Clone)]
+struct SentFlatten {
+    client_order_id: String,
+    by: live::FlattenBy,
+    /// `fill::timeout_at_ms` of the pair's effective settings at sending.
+    deadline_ms: i64,
 }
 
 /// Progress of one leg's early exit.
@@ -538,6 +583,11 @@ struct Actor {
     notify_started: BTreeSet<(PairUuid, i64)>,
     /// "Confirm closed" re-queries in flight, with the replies waiting for them.
     pending_confirms: BTreeMap<PairUuid, Vec<oneshot::Sender<CommandReply>>>,
+    /// naked-leg-watchdog: numbers each alert entry so a late result of an older entry is dropped.
+    watchdog_entries: u64,
+    /// loss-circuit-breaker: the highest watched event id at the last look, and what that look found.
+    breaker_mark: Option<i64>,
+    breaker: Option<crate::engine::loss_breaker::BreakerView>,
     cmd_rx: mpsc::Receiver<CommandMsg>,
     event_tx: mpsc::Sender<Event>,
     event_rx: mpsc::Receiver<Event>,
@@ -636,6 +686,9 @@ impl Actor {
             alert_reasons: BTreeMap::new(),
             notify_started: BTreeSet::new(),
             pending_confirms: BTreeMap::new(),
+            watchdog_entries: 0,
+            breaker_mark: None,
+            breaker: None,
             cmd_rx,
             event_tx,
             event_rx,
@@ -650,6 +703,10 @@ impl Actor {
         // Pairs already in an alert state at startup: banner from their state; PAIR_ALERT /
         // notification only for an entry that has none yet (never again after a restart).
         actor.sync_alerts();
+        // loss-circuit-breaker: an old Live database gets the Live limits first, then the interval start
+        // (the baseline on a first start) and a first look.
+        actor.live_backfill_breaker_defaults();
+        actor.breaker_check();
         let (snapshot_tx, snapshots) = watch::channel(actor.snapshot());
         actor.snapshot_tx = snapshot_tx;
         actor.publish_live();
@@ -669,6 +726,8 @@ impl Actor {
                 },
                 Some(ev) = self.event_rx.recv() => self.on_event(ev),
                 _ = tick.tick() => {
+                    // trip first, then enter: a close or a settings change seen now stops the entries of this very tick
+                    self.breaker_check();
                     let _ = self.dispatch(Command::Tick);
                 }
                 changed = self.market_rx.changed(), if self.market_open => match changed {
@@ -904,9 +963,13 @@ impl Actor {
                     self.poll(&id, OrderAction::Open);
                     self.check_fills(&id, now);
                 }
-                // live-guardrails: a FlattenLeg order of a locked pair is looked up like any close
-                PairState::PartialFailure | PairState::Imbalanced | PairState::Unresolved if !orphan && self.flatten_pending(&id) => {
-                    self.poll(&id, OrderAction::Close);
+                // live-guardrails: a FlattenLeg order of a locked pair is looked up like any close;
+                // naked-leg-watchdog: the watchdog's round / flatten for the pair runs on the same tick
+                PairState::PartialFailure | PairState::Imbalanced | PairState::Unresolved if !orphan => {
+                    if self.flatten_pending(&id) {
+                        self.poll(&id, OrderAction::Close);
+                    }
+                    self.watchdog_tick(&view, now);
                 }
                 PairState::Closing if !orphan && self.awaiting_pnl(&id) => self.finalize_closed(&id),
                 PairState::Closing if !orphan => {
@@ -2090,6 +2153,9 @@ impl Actor {
                 if self.events.append(CLOSE_CONFIRMED, Some(pair), payload).is_ok() {
                     // funding-pnl: FINALIZED also needs "PnL computed" (pnl_gate).
                     self.begin_pnl_wait(pair);
+                    // loss-circuit-breaker: the closed pair counts from its CLOSE_CONFIRMED on (price PnL minus
+                    // fees), with the PnL `begin_pnl_wait` may have written just now
+                    self.breaker_check();
                 }
             }
             // Position updates may lag: re-checked on the next tick until the close timeout.
@@ -2172,7 +2238,10 @@ impl Actor {
         let (db, executor, tx) = (self.db.clone(), self.executor.clone(), self.event_tx.clone());
         tokio::spawn(async move {
             // if this task ends without reporting (a panic), the guard still tells the actor
-            let mut guard = ManualDoneGuard { tx: tx.clone(), id: Some(id.clone()) };
+            let mut guard = LostTaskGuard::new(
+                tx.clone(),
+                Event::ManualSubmitted { client_order_id: id.clone(), outcome: SubmitOutcome::Unknown { reason: "the manual order task ended without a result".into() }, resolved: false },
+            );
             // The deadline covers only the part before an answer exists: gate + leverage + submit, each bounded by
             // a 5 s request timeout (<= 15 s, MANUAL_DEADLINE_MS 20 s). The lookup after an Unknown answer is NOT cut.
             let (outcome, resolved) = match intent::land_intent(&db, &key, leg, &req) {
@@ -2200,7 +2269,7 @@ impl Actor {
                     }
                 }
             };
-            guard.id = None;
+            guard.disarm();
             let _ = tx.send(Event::ManualSubmitted { client_order_id: id, outcome, resolved }).await;
         });
         CommandReply::Accepted
@@ -2415,6 +2484,8 @@ impl Actor {
             Event::EarlyPositionFetched { pair, leg, position, recorded, trigger } => self.on_early_position(&pair, leg, position, recorded, trigger),
             Event::PreflightDone { report } => self.on_preflight_done(report),
             Event::FlattenPositionFetched { pair, leg, position, recorded } => self.on_flatten_position(&pair, leg, position, recorded),
+            Event::WatchdogProbed { pair, entry_no, probe } => self.on_watchdog_probed(&pair, entry_no, probe),
+            Event::WatchdogCancelled { pair, exchange, client_order_id, cancel, after } => self.on_watchdog_cancelled(&pair, exchange, &client_order_id, &cancel, &after),
         }
     }
 
@@ -2558,6 +2629,7 @@ impl Actor {
                 } else if from == PairState::OrderSubmit {
                     self.live_pair_left_order_submit(pair);
                 }
+                self.watchdog_state_changed(pair, to);
                 self.sync_alert_for(pair);
                 Ok(to)
             }
@@ -2869,12 +2941,15 @@ impl Actor {
     }
 
     fn snapshot(&self) -> Snapshot {
+        let pairs: Vec<PairView> = self.pairs.values().map(|v| PairView { flat_confirmed: v.state == PairState::Closing && self.awaiting_pnl(&v.internal_uuid), ..v.clone() }).collect();
+        let blockers = gate::current_blockers(&self.db, self.reconciliation_pending.as_deref());
+        let status = self.engine_status(&pairs, &blockers);
         Snapshot {
             now_ms: self.clock.now_ms(),
             trigger_mode: self.trigger_mode,
             execution_mode: self.execution_mode,
-            pairs: self.pairs.values().map(|v| PairView { flat_confirmed: v.state == PairState::Closing && self.awaiting_pnl(&v.internal_uuid), ..v.clone() }).collect(),
-            blockers: gate::current_blockers(&self.db, self.reconciliation_pending.as_deref()),
+            pairs,
+            blockers,
             prices: self.market_rx.borrow().iter().map(|((e, s), p)| (*e, s.clone(), *p)).collect(),
             notices: self.notices.clone(),
             alerts: self
@@ -2890,6 +2965,23 @@ impl Actor {
                     reason: self.alert_reasons.get(&v.internal_uuid).cloned(),
                 })
                 .collect(),
+            status,
+        }
+    }
+
+    /// loss-circuit-breaker 2.4: the status bar's data (trading allowed or why not, queue, breaker, pairs needing a person).
+    fn engine_status(&self, pairs: &[PairView], blockers: &[Blocker]) -> super::status::EngineStatus {
+        use super::status;
+        let cause = if blockers.contains(&Blocker::KillSwitch) { status::latest_kill_cause(&self.db) } else { status::StopReason::Manual };
+        let live_armed = self.live_on().then(|| self.armed());
+        let stop_reason = status::stop_reason(blockers, self.execution_mode, cause, live_armed);
+        let (queued_pairs, next_entry_ms) = status::queue_summary(pairs, &self.timings);
+        status::EngineStatus {
+            stop_reason,
+            queued_pairs,
+            next_entry_ms,
+            breaker: self.breaker.clone(),
+            needs_handling: status::needs_handling(pairs),
         }
     }
 
@@ -3215,7 +3307,7 @@ struct PairOrder {
 
 /// Why a leg cannot be closed on the strength of its position and the pair's recorded fill.
 #[derive(Debug, Clone, PartialEq)]
-enum LegClosePlanError {
+pub(crate) enum LegClosePlanError {
     /// The position is on the wrong side of the leg (reason text); left for the user.
     WrongSide(String),
     /// Position and recorded fill disagree (or the fill is unknown): the `CLOSE_QUANTITY_MISMATCH` payload.
@@ -3225,7 +3317,7 @@ enum LegClosePlanError {
 /// Close quantity of one leg = min(the pair's recorded fill, |actual position|), plus the signed
 /// position expected to remain (exposure that is not the pair's). Shared by the scheduled close
 /// and the early exit (decision 2026-10-05 evening). `pos` is signed (long positive).
-fn plan_leg_close(
+pub(crate) fn plan_leg_close(
     leg: Leg,
     exchange: Exchange,
     symbol: &str,
@@ -3360,6 +3452,7 @@ fn dummy_snapshot() -> Snapshot {
         prices: Vec::new(),
         notices: Vec::new(),
         alerts: Vec::new(),
+        status: super::status::EngineStatus::default(),
     }
 }
 
