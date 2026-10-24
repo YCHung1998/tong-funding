@@ -1,8 +1,9 @@
 //! What a page may say about an exchange the risk settings left unticked (change ui-plain-language,
 //! review fix). ONE rule for every page, so none of them can fold real exposure into a quiet line:
 //!
-//! - `Quiet`: the latest read succeeded, found no position, the position list is complete and no
-//!   unfinished pair has a leg there. Only then is the exchange one muted line.
+//! - `Quiet`: the latest read succeeded and is recent (three account polls at most), found no position,
+//!   the position list is complete, the stored pairs could be read and no unfinished pair has a leg
+//!   there. Only then is the exchange one muted line.
 //! - `Unconfirmed`: the read failed, is missing or still loading, and no unfinished pair needs the
 //!   exchange. One line in the warning tone: "無法確認持倉", never "沒有持倉".
 //! - `Exposed`: it holds positions, its position list is incomplete, or an unfinished pair has a leg
@@ -17,7 +18,8 @@ use std::str::FromStr;
 use tong_funding_core::pair::PairState;
 use tong_funding_core::types::Exchange;
 
-use super::bridge::{AccountState, UiSnapshot};
+use super::bridge::{AccountState, UiSnapshot, NOT_CONNECTED_ERROR_PREFIX};
+use super::format;
 use super::labels::plain_error;
 
 /// How much of an error message the one visible line carries (the rest stays behind the line).
@@ -73,20 +75,39 @@ pub fn holds_exposure(snap: &UiSnapshot, e: Exchange) -> bool {
     on_account || !unfinished_pair_symbols(snap, e).is_empty()
 }
 
+/// How old a quiet verdict may be: three account polls (the feed-health stale rule for a poll).
+pub const QUIET_MAX_AGE_MS: i64 = 3 * crate::ui::live::ACCOUNT_POLL_MS;
+
+/// `N 秒前讀取` for an account that has been read, to sit beside a quiet verdict.
+pub fn read_age_note(snap: &UiSnapshot, e: Exchange, now_ms: i64) -> Option<String> {
+    match snap.account(e) {
+        AccountState::Loaded { fetched_at, .. } => Some(format!("{} 秒前讀取", format::secs(now_ms - fetched_at))),
+        _ => None,
+    }
+}
+
 fn short(raw: &str) -> String {
     let plain = plain_error(raw);
     if plain.chars().count() <= REASON_CHARS { plain } else { format!("{}…", plain.chars().take(REASON_CHARS).collect::<String>()) }
 }
 
 /// The verdict for `e`, assuming it is not in `allowed_exchanges` (a ticked exchange has no verdict).
-pub fn status(snap: &UiSnapshot, e: Exchange) -> DisabledStatus {
+/// `Quiet` also needs a recent read (`QUIET_MAX_AGE_MS`) and readable stored pairs.
+pub fn status(snap: &UiSnapshot, e: Exchange, now_ms: i64) -> DisabledStatus {
     if holds_exposure(snap, e) {
         return DisabledStatus::Exposed;
     }
     let reason = match snap.account(e) {
         AccountState::Loaded { fetched_at, error, .. } => match latest_error(fetched_at, &error) {
-            Some(err) => format!("最新讀取失敗：{}", short(err)),
-            None => return DisabledStatus::Quiet,
+            Some(err) => match err.strip_prefix(NOT_CONNECTED_ERROR_PREFIX) {
+                Some(why) => format!("{NOT_CONNECTED_ERROR_PREFIX}{}", short(why)),
+                None => format!("最新讀取失敗：{}", short(err)),
+            },
+            None if now_ms - fetched_at > QUIET_MAX_AGE_MS => format!("最後一次成功讀取是 {} 秒前", format::secs(now_ms - fetched_at)),
+            None => match &snap.pair_records_error {
+                Some(why) => format!("無法讀取配對紀錄：{}", short(why)),
+                None => return DisabledStatus::Quiet,
+            },
         },
         AccountState::NotConnected { reason } => format!("未連線：{}", short(&reason)),
         AccountState::Failed { error, .. } => short(&error),

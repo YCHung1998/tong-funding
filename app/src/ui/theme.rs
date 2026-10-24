@@ -34,10 +34,11 @@ pub const NEGATIVE: u32 = 0xF18B91;
 pub const INFO: u32 = 0x789BDE;
 
 // Funding rate colours (scanner-layout). A rate's sign is not good or bad (a negative rate is income
-// for the long leg), so these are deliberately neither the green/red of POSITIVE/NEGATIVE: amber for
-// above zero, cyan for below. Both keep >= 4.5:1 on every background. POSITIVE/NEGATIVE stay for
-// Net Edge and profit/loss.
-pub const RATE_POSITIVE: u32 = 0xF0A050;
+// for the long leg), so these are deliberately neither the green/red of POSITIVE/NEGATIVE, nor the
+// amber of WARNING (red-team E6: an amber rate looked like a warning): orchid for above zero, cyan for
+// below. Both keep >= 4.5:1 on every background and >= 40 degrees of hue from WARNING.
+// POSITIVE/NEGATIVE stay for Net Edge and profit/loss.
+pub const RATE_POSITIVE: u32 = 0xDE8FE6;
 pub const RATE_NEGATIVE: u32 = 0x4FC3F7;
 
 // Risk-settings direction badges (spec design-tokens). Box fills only, text on them is TEXT_PRIMARY;

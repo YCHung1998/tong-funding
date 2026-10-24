@@ -605,10 +605,13 @@ pub fn build(snap: &UiSnapshot, selection: &BTreeSet<String>, now_ms: i64) -> St
         }
         // a line only when its positions are confirmed to be nothing or cannot be confirmed; an
         // exchange with exposure keeps its margin row, with the note
-        match disabled::status(snap, ex) {
+        match disabled::status(snap, ex, now_ms) {
             DisabledStatus::Exposed => margins.push((ex, format!("{text} · {DISABLED_WITH_EXPOSURE}"))),
             DisabledStatus::Unconfirmed { reason } => disabled_exchanges.push(DisabledNote::unconfirmed(ex, &reason, Some(format!("可用保證金：{text}")))),
-            DisabledStatus::Quiet => disabled_exchanges.push(DisabledNote::new(ex, Some(format!("可用保證金：{text}")))),
+            DisabledStatus::Quiet => {
+                let age = disabled::read_age_note(snap, ex, now_ms).map(|a| format!(" · {a}")).unwrap_or_default();
+                disabled_exchanges.push(DisabledNote::new(ex, Some(format!("可用保證金：{text}{age}"))));
+            }
         }
     }
     let manual = pairs.iter().filter(|p| is_alert(p.state)).map(|p| handling(snap, p)).collect();

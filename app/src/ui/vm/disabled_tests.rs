@@ -16,24 +16,24 @@ fn record(id: &str, long: Option<Exchange>, short: Option<Exchange>, status: &st
 fn a_successful_empty_read_is_quiet() {
     let mut s = UiSnapshot::default();
     s.accounts.insert(Okx, loaded(vec![], vec![], NOW));
-    assert_eq!(status(&s, Okx), DisabledStatus::Quiet);
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Quiet);
 }
 
 #[test]
 fn positions_an_incomplete_list_or_an_unfinished_pair_are_exposure() {
     let mut s = UiSnapshot::default();
     s.accounts.insert(Okx, loaded(vec![], vec![position(Okx, "ETHUSDT", "-0.07", "1500", "1500", "3", "0", None)], NOW));
-    assert_eq!(status(&s, Okx), DisabledStatus::Exposed);
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Exposed);
     let mut okx = loaded(vec![], vec![], NOW);
     if let AccountState::Loaded { data, .. } = &mut okx {
         data.positions_incomplete = Some("ctVal 未知".into());
     }
     s.accounts.insert(Okx, okx);
-    assert_eq!(status(&s, Okx), DisabledStatus::Exposed);
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Exposed);
     let mut s = UiSnapshot::default();
     s.accounts.insert(Okx, AccountState::Failed { error: "x".into(), at: NOW });
     s.pairs = vec![pair("p1", "SOLUSDT", Binance, Okx, PairState::Closing)];
-    assert_eq!(status(&s, Okx), DisabledStatus::Exposed);
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Exposed);
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn a_stored_record_with_no_exchange_could_be_on_any_of_them() {
 #[test]
 fn a_read_that_is_not_good_is_unconfirmed_with_a_short_reason() {
     let mut s = UiSnapshot::default();
-    let reason = |s: &UiSnapshot| match status(s, Okx) {
+    let reason = |s: &UiSnapshot| match status(s, Okx, NOW) {
         DisabledStatus::Unconfirmed { reason } => reason,
         other => panic!("{other:?}"),
     };
@@ -91,4 +91,69 @@ fn a_read_that_is_not_good_is_unconfirmed_with_a_short_reason() {
     }
     s.accounts.insert(Okx, stale);
     assert_eq!(reason(&s), "最新讀取失敗：request timed out");
+}
+
+// ---- ui-clarity red-team E1 / E2 / E5 ----
+
+#[test]
+fn a_known_position_is_still_exposure_after_the_exchange_turns_not_connected() {
+    let mut s = UiSnapshot::default();
+    let mut held = loaded(vec![], vec![position(Okx, "ETHUSDT", "-0.07", "1500", "1500", "3", "0", None)], NOW - 5_000);
+    if let AccountState::Loaded { error, .. } = &mut held {
+        *error = Some((format!("{}Keychain 沒有 API key", crate::ui::bridge::NOT_CONNECTED_ERROR_PREFIX), NOW));
+    }
+    s.accounts.insert(Okx, held);
+    assert!(holds_exposure(&s, Okx));
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Exposed);
+    // with nothing known to hold, the reason reads as a lost connection, not as a failed read
+    s.accounts.insert(Okx, {
+        let mut empty = loaded(vec![], vec![], NOW - 5_000);
+        if let AccountState::Loaded { error, .. } = &mut empty {
+            *error = Some((format!("{}Keychain 沒有 API key", crate::ui::bridge::NOT_CONNECTED_ERROR_PREFIX), NOW));
+        }
+        empty
+    });
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Unconfirmed { reason: "未連線：Keychain 沒有 API key".into() });
+}
+
+#[test]
+fn a_quiet_read_must_be_recent_or_it_is_unconfirmed() {
+    let mut s = UiSnapshot::default();
+    let limit = 3 * crate::ui::live::ACCOUNT_POLL_MS;
+    assert_eq!(QUIET_MAX_AGE_MS, limit);
+    s.accounts.insert(Okx, loaded(vec![], vec![], NOW - limit));
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Quiet, "exactly at the limit is still recent");
+    s.accounts.insert(Okx, loaded(vec![], vec![], NOW - limit - 1_000));
+    match status(&s, Okx, NOW) {
+        DisabledStatus::Unconfirmed { reason } => assert!(reason.contains("91 秒前"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    // old data that shows a position is exposure whatever its age
+    s.accounts.insert(Okx, loaded(vec![], vec![position(Okx, "ETHUSDT", "-0.07", "1500", "1500", "3", "0", None)], NOW - 10 * limit));
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Exposed);
+    assert_eq!(read_age_note(&s, Okx, NOW).as_deref(), Some("900 秒前讀取"));
+    s.accounts.insert(Okx, AccountState::Loading);
+    assert_eq!(read_age_note(&s, Okx, NOW), None, "no read, no age");
+}
+
+#[test]
+fn stored_pairs_that_could_not_be_read_make_a_quiet_exchange_unconfirmed() {
+    let mut s = UiSnapshot::default();
+    s.accounts.insert(Okx, loaded(vec![], vec![], NOW));
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Quiet);
+    s.pair_records_error = Some("database is locked".into());
+    match status(&s, Okx, NOW) {
+        DisabledStatus::Unconfirmed { reason } => assert!(reason.contains("配對紀錄") && reason.contains("database is locked"), "{reason}"),
+        other => panic!("{other:?}"),
+    }
+    // a position is still exposure; a good read of the pairs clears the doubt
+    s.accounts.insert(Okx, loaded(vec![], vec![position(Okx, "ETHUSDT", "-0.07", "1500", "1500", "3", "0", None)], NOW));
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Exposed);
+    s.accounts.insert(Okx, loaded(vec![], vec![], NOW));
+    crate::ui::bridge::apply_update(&mut s, crate::ui::bridge::SourceUpdate::PairRecords(Default::default()));
+    assert_eq!(s.pair_records_error, None);
+    assert_eq!(status(&s, Okx, NOW), DisabledStatus::Quiet);
+    crate::ui::bridge::apply_update(&mut s, crate::ui::bridge::SourceUpdate::PairRecordsError("x".into()));
+    assert_eq!(s.pair_records_error.as_deref(), Some("x"));
+    assert!(s.pair_records.is_empty(), "the last good records stay");
 }

@@ -5,7 +5,7 @@
 
 use tong_funding_core::types::Exchange;
 
-use super::bridge::{AccountState, ClockState, KillSwitchState, SourceHealth, SourceId, UiSnapshot};
+use super::bridge::{AccountState, ClockState, KillSwitchState, SourceHealth, SourceId, UiSnapshot, NOT_CONNECTED_ERROR_PREFIX};
 use super::format;
 use crate::exchange::signed::signing::RECV_WINDOW_MS;
 use crate::ui::nav::Page;
@@ -15,7 +15,13 @@ use crate::ui::nav::Page;
 /// positions or is on a leg of an unfinished pair (the risk page lets it be unticked then, and a
 /// lost connection to it must not go quiet).
 fn alert_accounts(snap: &UiSnapshot) -> Vec<Exchange> {
-    Exchange::ALL.into_iter().filter(|e| *e != Exchange::Okx || snap.settings.risk.allowed_exchanges.contains(e) || super::disabled::holds_exposure(snap, *e)).collect()
+    // only the exchanges this process trades: a stored record that names no exchange is "possibly
+    // there" for every exchange, but a Live process has no path to OKX
+    super::bridge::tradable_exchanges(snap.identity)
+        .iter()
+        .copied()
+        .filter(|e| *e != Exchange::Okx || snap.settings.risk.allowed_exchanges.contains(e) || super::disabled::holds_exposure(snap, *e))
+        .collect()
 }
 
 pub const MANUAL_TEXT: &str = "需人工處理，系統不會自動補單或平倉";
@@ -202,6 +208,11 @@ pub fn alerts(snap: &UiSnapshot, now_ms: i64) -> Vec<Alert> {
         let source = SourceId::Account(e).label();
         match snap.account(e) {
             AccountState::NotConnected { reason } => push(Category::Disconnected, source, format!("{} 帳戶未連線：{reason}", e.name()), None, None),
+            // The last known data is kept when a poll finds the account not connected: still a lost connection.
+            AccountState::Loaded { fetched_at, error: Some((err, at)), .. } if at >= fetched_at && err.starts_with(NOT_CONNECTED_ERROR_PREFIX) => {
+                let reason = &err[NOT_CONNECTED_ERROR_PREFIX.len()..];
+                push(Category::Disconnected, source, format!("{} 帳戶未連線：{reason}", e.name()), None, None);
+            }
             // An account the system cannot use by its own setting (not a lost connection).
             AccountState::Failed { error, at } if error.contains("unsupported") => push(Category::Setting, source, format!("{} 帳戶設定不支援：{error}", e.name()), Some((now_ms - at).max(0)), None),
             AccountState::Failed { error, at } => push(Category::Disconnected, source, format!("{} 帳戶讀取失敗：{error}", e.name()), Some((now_ms - at).max(0)), None),

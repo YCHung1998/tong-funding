@@ -213,6 +213,8 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
     let grouped = group(snap);
     let mut cards = Vec::new();
     let mut excluded = Vec::new();
+    // unticked exchanges whose positions cannot be confirmed (named in the exposure summary)
+    let mut unconfirmed: Vec<&str> = Vec::new();
     let mut unvalued_total = 0;
     let mut used_total = Decimal::ZERO;
     let mut pnl_total = Decimal::ZERO;
@@ -221,7 +223,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
         // about its exposure is open: muted when the latest read found nothing, in the warning tone
         // when the positions cannot be confirmed. Positions, an incomplete list or an unfinished pair
         // keep the card, with a note (exposure is never hidden).
-        let verdict = (!snap.exchange_enabled(e)).then(|| disabled::status(snap, e));
+        let verdict = (!snap.exchange_enabled(e)).then(|| disabled::status(snap, e, now_ms));
         let exposed = verdict == Some(DisabledStatus::Exposed);
         let folded = |detail: String| -> ExchangeCard {
             ExchangeCard::Disabled(match &verdict {
@@ -231,13 +233,21 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
         };
         let card_note = exposed.then(|| format!("{} · {DISABLED_WITH_EXPOSURE}", disabled_exchange_line(e)));
         let fold = verdict.is_some() && !exposed;
+        if matches!(verdict, Some(DisabledStatus::Unconfirmed { .. })) {
+            // its value is not in the total and its positions are not known: say so in the notes
+            excluded.push(e.name());
+            unconfirmed.push(e.name());
+        }
         match snap.account(e) {
             AccountState::Loaded { data, fetched_at, error } => {
                 let (assets, value, unvalued) = asset_rows(&data);
                 if fold {
                     let detail = match verdict {
                         Some(DisabledStatus::Unconfirmed { .. }) => format!("最後一次成功讀取是 {} 秒前；資產 {} USDT 未計入總資產", format::secs(now_ms - fetched_at), format::money(value, 2)),
-                        _ => format!("已連線，沒有持倉；資產 {} USDT 未計入總資產", format::money(value, 2)),
+                        _ => {
+                            let age = disabled::read_age_note(snap, e, now_ms).map(|a| format!("（{a}）")).unwrap_or_default();
+                            format!("已連線，沒有持倉{age}；資產 {} USDT 未計入總資產", format::money(value, 2))
+                        }
                     };
                     cards.push(folded(detail));
                     continue;
@@ -297,8 +307,9 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
     let pairs = grouped.grouping.groups.len();
     let unhedged = grouped.grouping.ungrouped.len();
     let legs = if unhedged == 0 { "無未避險單腿".to_string() } else { format!("{unhedged} 個未避險單腿") };
+    let unconfirmed_note = if unconfirmed.is_empty() { String::new() } else { format!("（{} 持倉無法確認）", unconfirmed.join("、")) };
     let exposure = format!(
-        "{} · 已用保證金 {} USDT · 未實現 PnL {} USDT · {legs}",
+        "{} · 已用保證金 {} USDT · 未實現 PnL {} USDT · {legs}{unconfirmed_note}",
         pairs_phrase(&grouped),
         format::money(used_total, 2),
         format::money(pnl_total, 2)
@@ -319,7 +330,7 @@ pub fn build(snap: &UiSnapshot, now_ms: i64) -> DashboardVm {
         positions_note: format!("{pairs} 對避險組合 · {open_positions} 個交易所倉位"),
         exposure,
         unhedged,
-        exposure_tone: if unhedged > 0 { Tone::Warning } else { Tone::Muted },
+        exposure_tone: if unhedged > 0 || !unconfirmed.is_empty() { Tone::Warning } else { Tone::Muted },
         refresh_text,
     }
 }

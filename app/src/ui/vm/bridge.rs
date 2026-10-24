@@ -36,6 +36,10 @@ pub const ACCOUNT_EXCHANGES: [Exchange; 3] = Exchange::ALL;
 /// live-process 5.2: a live process trades Binance and Bybit only (OKX has no live path).
 pub const LIVE_TRADABLE_EXCHANGES: [Exchange; 2] = [Exchange::Binance, Exchange::Bybit];
 
+/// Starts the error of a `Loaded` account whose latest poll found it not connected (the last known
+/// data is kept, so a position it showed is not forgotten); the rest is the reason.
+pub const NOT_CONNECTED_ERROR_PREFIX: &str = "未連線：";
+
 /// The exchanges the pages and account reads cover under `identity`.
 pub fn tradable_exchanges(identity: crate::identity::ProcessIdentity) -> &'static [Exchange] {
     if identity.is_live() { &LIVE_TRADABLE_EXCHANGES } else { &TRADABLE_EXCHANGES }
@@ -382,6 +386,9 @@ pub struct UiSnapshot {
     pub pairs: Vec<PairInfo>,
     /// Every stored pair by internal uuid, closed ones included (the engine's snapshot drops them on restart).
     pub pair_records: BTreeMap<String, PairRecord>,
+    /// Why the stored pairs could not be read on the latest store tick; `None` = they were read. While
+    /// set, `pair_records` is the last good read, so "no unfinished pair" cannot be trusted.
+    pub pair_records_error: Option<String>,
     pub system: SystemFlags,
     /// This run's `SCAN_RUN` buffer (oldest first) and its capacity.
     pub scan_runs: Vec<ScanRecord>,
@@ -464,6 +471,8 @@ pub enum SourceUpdate {
     Pairs(Vec<PairInfo>),
     /// Replaces the stored pair records.
     PairRecords(BTreeMap<String, PairRecord>),
+    /// The stored pairs could not be read: the last good records stay, marked as not trustworthy.
+    PairRecordsError(String),
     System(SystemFlags),
     ScanRuns { records: Vec<ScanRecord>, capacity: usize },
     Engine(EngineState),
@@ -546,7 +555,11 @@ pub fn apply_update(snap: &mut UiSnapshot, update: SourceUpdate) {
         }
         SourceUpdate::Settings(s) => snap.settings = s,
         SourceUpdate::Pairs(p) => snap.pairs = p,
-        SourceUpdate::PairRecords(m) => snap.pair_records = m,
+        SourceUpdate::PairRecords(m) => {
+            snap.pair_records = m;
+            snap.pair_records_error = None;
+        }
+        SourceUpdate::PairRecordsError(why) => snap.pair_records_error = Some(why),
         SourceUpdate::System(s) => snap.system = s,
         SourceUpdate::ScanRuns { records, capacity } => {
             snap.scan_runs = records;

@@ -446,7 +446,7 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
             notices.extend(lines);
             continue;
         }
-        match rule::status(snap, e) {
+        match rule::status(snap, e, now_ms) {
             // exposure stays visible: the yellow notices and a note that says the exchange is unticked
             DisabledStatus::Exposed => {
                 notices.extend(lines.iter().cloned());
@@ -460,7 +460,11 @@ pub fn build(snap: &UiSnapshot, filter: &Filter, now_ms: i64) -> PositionsVm {
                 notices.push(format!("{} · {DISABLED_WITH_EXPOSURE}", disabled_exchange_line(e)));
             }
             DisabledStatus::Unconfirmed { reason } => disabled.push(DisabledNote::unconfirmed(e, &reason, detail_of(&lines, raw_error.as_ref()))),
-            DisabledStatus::Quiet => disabled.push(DisabledNote::new(e, detail_of(&lines, raw_error.as_ref()))),
+            DisabledStatus::Quiet => {
+                // behind the quiet line: what was said, and how old the read that made it quiet is
+                let detail = [detail_of(&lines, raw_error.as_ref()), rule::read_age_note(snap, e, now_ms)].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+                disabled.push(DisabledNote::new(e, (!detail.is_empty()).then_some(detail)));
+            }
         }
     }
 

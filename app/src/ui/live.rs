@@ -721,7 +721,9 @@ async fn run(shared: Arc<Shared>, db: Option<Db>, gate: RefreshGate, mut refresh
                     *ctx.enabled.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = settings.risk.allowed_exchanges.iter().copied().collect();
                     ctx.shared.push(SourceUpdate::Settings(settings));
                     ctx.shared.push(SourceUpdate::System(read_system_flags(db, clock_now(&ctx.clock))));
-                    if let Ok(rows) = db.list_pairs() {
+                    // A failed read says so (the unfinished-pair checks must not trust the old records).
+                    let listed = db.list_pairs().map_err(|e| ctx.shared.push(SourceUpdate::PairRecordsError(e.to_string())));
+                    if let Ok(rows) = listed {
                         // With the engine running, its snapshot is the source of the pairs.
                         if !engine_running {
                             ctx.shared.push(SourceUpdate::Pairs(pair_infos(&rows)));
@@ -803,7 +805,6 @@ fn trade_events_query() -> EventQuery {
     EventQuery { types: Some(types.iter().map(|t| t.to_string()).collect()), before: None, limit: 300 }
 }
 
-/// `pairs.entry_json.scan` by internal uuid (the engine's envelope keeps the scan snapshot there).
 /// Every stored pair, closed ones too, by internal uuid: the symbol and exchanges the history views
 /// (last execution results) need after the engine's snapshot has dropped the pair.
 pub fn pair_records(rows: &[PairRow]) -> BTreeMap<String, crate::ui::bridge::PairRecord> {
@@ -822,6 +823,7 @@ pub fn pair_records(rows: &[PairRow]) -> BTreeMap<String, crate::ui::bridge::Pai
         .collect()
 }
 
+/// `pairs.entry_json.scan` by internal uuid (the engine's envelope keeps the scan snapshot there).
 pub fn pair_entries(rows: &[PairRow]) -> BTreeMap<String, serde_json::Value> {
     rows.iter().map(|r| (r.internal_uuid.clone(), r.entry.get("scan").cloned().unwrap_or(serde_json::Value::Null))).collect()
 }
@@ -1145,19 +1147,32 @@ fn push_health(ctx: &Ctx, ws: &FeedHealth, bybit_ws: Option<&FeedHealth>) {
     ctx.shared.push(SourceUpdate::Health(list));
 }
 
+/// What a failed account poll shows. Every failure, a lost connection included, keeps the last good
+/// data with the error (never zero for a failure, and a known position is never forgotten).
+fn failed_account_state(error: &AdapterError, reason: Option<NotConnectedReason>, last: Option<(AccountData, i64)>, now: i64) -> AccountState {
+    if matches!(error, AdapterError::NotConnected) {
+        let text = not_connected_text(reason);
+        // The last known data stays (it may show a position that is still open): only the error says
+        // the account is not connected any more. With nothing known there is only the state.
+        return match last {
+            Some((data, fetched_at)) => AccountState::Loaded { data, fetched_at, error: Some((format!("{}{text}", crate::ui::bridge::NOT_CONNECTED_ERROR_PREFIX), now)) },
+            None => AccountState::NotConnected { reason: text },
+        };
+    }
+    match last {
+        Some((data, fetched_at)) => AccountState::Loaded { data, fetched_at, error: Some((error.to_string(), now)) },
+        None => AccountState::Failed { error: error.to_string(), at: now },
+    }
+}
+
 /// A failed account poll: keeps the last good data (never shows zero for a failure).
 fn account_failed(ctx: &Ctx, ex: Exchange, error: &AdapterError, reason: Option<NotConnectedReason>) {
     let now = clock_now(&ctx.clock);
-    let state = if matches!(error, AdapterError::NotConnected) {
-        AccountState::NotConnected { reason: not_connected_text(reason) }
-    } else {
+    if !matches!(error, AdapterError::NotConnected) {
         ctx.account_health[&ex].on_failure(error);
-        match ctx.last_accounts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ex).cloned() {
-            Some((data, fetched_at)) => AccountState::Loaded { data, fetched_at, error: Some((error.to_string(), now)) },
-            None => AccountState::Failed { error: error.to_string(), at: now },
-        }
-    };
-    ctx.shared.push(SourceUpdate::Account { exchange: ex, state });
+    }
+    let last = ctx.last_accounts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ex).cloned();
+    ctx.shared.push(SourceUpdate::Account { exchange: ex, state: failed_account_state(error, reason, last, now) });
 }
 
 fn account_loaded(ctx: &Ctx, ex: Exchange, data: AccountData) {
@@ -1446,6 +1461,20 @@ mod tests {
         assert_eq!((a.pair_id.as_str(), a.symbol.as_str(), a.status.as_str()), ("p1", "BTCUSDT", "BLOCKED"));
         assert_eq!((a.long_exchange, a.short_exchange), (Some(Exchange::Bybit), Some(Exchange::Okx)));
         assert_eq!((r["u2"].long_exchange, r["u2"].short_exchange), (None, None), "an unreadable entry names no exchange");
+    }
+
+    // ---- ui-clarity red-team E1: a lost connection never makes a known position forgotten ----
+
+    #[test]
+    fn a_not_connected_poll_keeps_the_last_known_account_and_says_why() {
+        let marks: HashMap<String, Decimal> = HashMap::new();
+        let held = vec![position(Exchange::Okx, "ETHUSDT", "-0.07", "1500", "1500", "3", "0", None)];
+        let data = account_data(&[bal("USDT", "100", None)], held, None, &marks, "DEMO");
+        let kept = failed_account_state(&AdapterError::NotConnected, Some(NotConnectedReason::NoKey), Some((data.clone(), 5)), 9);
+        assert_eq!(kept, AccountState::Loaded { data, fetched_at: 5, error: Some(("未連線：Keychain 沒有 API key".into(), 9)) });
+        // nothing known yet: the plain connection state, and a real failure without data stays a failure
+        assert_eq!(failed_account_state(&AdapterError::NotConnected, None, None, 9), AccountState::NotConnected { reason: "未連線".into() });
+        assert_eq!(failed_account_state(&AdapterError::Timeout, None, None, 9), AccountState::Failed { error: "request timed out".into(), at: 9 });
     }
 
     #[test]

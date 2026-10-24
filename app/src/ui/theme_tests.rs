@@ -147,9 +147,23 @@ fn hue(x: u32) -> f64 {
     h * 60.0
 }
 
+/// Distance between two hues on the colour wheel, in degrees (0..=180).
+fn hue_gap(a: u32, b: u32) -> f64 {
+    let d = (hue(a) - hue(b)).abs();
+    d.min(360.0 - d)
+}
+
+#[test]
+fn a_rate_colour_is_never_mistaken_for_the_warning_colour() {
+    // ui-clarity red-team E6: amber for a rate above zero sat next to the WARNING amber (hue gap ~10 degrees)
+    for c in [RATE_POSITIVE, RATE_NEGATIVE] {
+        assert!(hue_gap(c, WARNING) >= 40.0, "{c:06X} is only {} degrees from WARNING", hue_gap(c, WARNING));
+    }
+}
+
 #[test]
 fn rate_colours_are_the_decided_values() {
-    assert_eq!(RATE_POSITIVE, 0xF0A050); // amber
+    assert_eq!(RATE_POSITIVE, 0xDE8FE6); // orchid, not amber: amber reads as the WARNING colour
     assert_eq!(RATE_NEGATIVE, 0x4FC3F7); // cyan
 }
 
@@ -158,12 +172,12 @@ fn rate_colours_are_neither_green_nor_red_and_differ_from_success_and_danger() {
     for c in [RATE_POSITIVE, RATE_NEGATIVE] {
         assert!(c != POSITIVE && c != NEGATIVE, "{c:06X} must not be the success or danger colour");
         let h = hue(c);
-        assert!((25.0..=75.0).contains(&h) || (170.0..=250.0).contains(&h), "hue {h} of {c:06X} is in a green or red range");
+        assert!((190.0..=330.0).contains(&h), "hue {h} of {c:06X} is in a green, red or amber range");
         for good_bad in [POSITIVE, NEGATIVE] {
-            assert!((hue(c) - hue(good_bad)).abs() > 40.0, "{c:06X} is too close in hue to {good_bad:06X}");
+            assert!(hue_gap(c, good_bad) >= 40.0, "{c:06X} is too close in hue to {good_bad:06X}");
         }
     }
-    assert!((hue(RATE_POSITIVE) - hue(RATE_NEGATIVE)).abs() > 90.0, "the two rate colours must be easy to tell apart");
+    assert!(hue_gap(RATE_POSITIVE, RATE_NEGATIVE) > 90.0, "the two rate colours must be easy to tell apart");
 }
 
 #[test]

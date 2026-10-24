@@ -849,7 +849,12 @@ mod unticked_exchange {
         let vm = build(&s, &BTreeSet::new(), NOW);
         assert_eq!(vm.disabled_exchanges.len(), 1);
         assert_eq!(vm.disabled_exchanges[0].tone, crate::ui::theme::Tone::Muted);
-        assert_eq!(vm.disabled_exchanges[0].detail.as_deref(), Some("可用保證金：1,000.00 USDT"));
+        assert_eq!(vm.disabled_exchanges[0].detail.as_deref(), Some("可用保證金：1,000.00 USDT · 0 秒前讀取"));
+        // an old read is no longer a quiet line
+        s.accounts.insert(Exchange::Okx, crate::ui::testkit::loaded(vec![], vec![], NOW - 100_000));
+        let vm = build(&s, &BTreeSet::new(), NOW);
+        assert_eq!(vm.disabled_exchanges[0].tone, crate::ui::theme::Tone::Warning);
+        assert!(!vm.disabled_exchanges[0].text.contains("沒有持倉"), "{}", vm.disabled_exchanges[0].text);
     }
 
     #[test]

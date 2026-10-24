@@ -308,7 +308,7 @@ fn an_unticked_okx_that_fails_is_one_muted_line_and_no_error_card() {
     assert_eq!(n.text, "OKX 已停用 · 無法確認持倉（OKX 帳戶模式不支援（在 OKX 改為單幣種或跨幣種保證金模式））");
     assert_eq!(n.tone, Tone::Warning);
     assert!(no_error_card_for(&vm, Okx), "no red error card for an exchange nobody trades on: {:?}", vm.cards);
-    assert_eq!(vm.excluded_note, None, "it is not a lost connection either");
+    assert_eq!(vm.excluded_note.as_deref(), Some("不含未連線的交易所：OKX"), "its positions are unconfirmed and its value is not in the total, so it is named");
     // the error is only behind the line: plain words with the fix, and the raw message after them
     let detail = n.detail.as_deref().expect("detail for the expanded line");
     assert!(detail.contains("OKX 帳戶模式不支援") && detail.contains("在 OKX 改為單幣種或跨幣種保證金模式"), "{detail}");
@@ -344,12 +344,12 @@ fn the_total_description_lists_only_the_exchanges_it_counts() {
 }
 
 #[test]
-fn an_unticked_exchange_is_not_named_in_the_unconnected_note() {
+fn an_unticked_exchange_that_cannot_be_confirmed_is_named_in_the_unconnected_note_too() {
     let mut s = snap_with(figma_binance(), AccountState::NotConnected { reason: "金鑰不存在".into() });
     s.accounts.insert(Okx, AccountState::Failed { error: OKX_SPOT.into(), at: NOW });
     unticked_okx(&mut s);
     let vm = build(&s, NOW);
-    assert_eq!(vm.excluded_note.as_deref(), Some("不含未連線的交易所：Bybit"));
+    assert_eq!(vm.excluded_note.as_deref(), Some("不含未連線的交易所：Bybit、OKX"));
     assert!(disabled_note(&vm, Okx).is_some());
 }
 
@@ -564,4 +564,67 @@ fn a_successful_empty_read_with_no_unfinished_pair_is_the_quiet_muted_line() {
     }
     s.accounts.insert(Okx, a);
     assert_eq!(disabled_note(&build(&s, NOW), Okx).map(|n| n.tone), Some(Tone::Muted));
+}
+
+// ---- ui-clarity red-team E2 / E4 ----
+
+fn empty_two() -> UiSnapshot {
+    snap_with(loaded(vec![asset("USDT", "100", None, None)], vec![], NOW), loaded(vec![asset("USDT", "100", None, None)], vec![], NOW))
+}
+
+#[test]
+fn the_exposure_summary_says_when_an_unticked_exchanges_positions_cannot_be_confirmed() {
+    let mut s = empty_two();
+    s.accounts.insert(Okx, AccountState::Failed { error: OKX_SPOT.into(), at: NOW });
+    unticked_okx(&mut s);
+    let vm = build(&s, NOW);
+    assert!(vm.exposure.ends_with("（OKX 持倉無法確認）"), "{}", vm.exposure);
+    assert_eq!(vm.exposure_tone, Tone::Warning, "nothing unhedged, yet the line must not read as all clear");
+    assert_eq!(vm.excluded_note.as_deref(), Some("不含未連線的交易所：OKX"));
+    // two such exchanges are both named
+    s.settings.risk.allowed_exchanges = vec![Binance];
+    s.accounts.insert(Bybit, AccountState::NotConnected { reason: "x".into() });
+    let vm = build(&s, NOW);
+    assert!(vm.exposure.ends_with("（Bybit、OKX 持倉無法確認）"), "{}", vm.exposure);
+    assert_eq!(vm.excluded_note.as_deref(), Some("不含未連線的交易所：Bybit、OKX"));
+    // a confirmed-quiet unticked exchange adds nothing
+    let mut s = empty_two();
+    unticked_okx(&mut s);
+    let vm = build(&s, NOW);
+    assert!(!vm.exposure.contains("無法確認"), "{}", vm.exposure);
+    assert_eq!((vm.exposure_tone, vm.excluded_note), (Tone::Muted, None));
+}
+
+#[test]
+fn a_quiet_line_says_how_old_the_read_is_and_an_old_read_is_not_quiet() {
+    let mut s = empty_two();
+    s.accounts.insert(Okx, loaded(vec![], vec![], NOW - 12_000));
+    unticked_okx(&mut s);
+    let n = disabled_note(&build(&s, NOW), Okx).cloned().expect("a line");
+    assert_eq!(n.tone, Tone::Muted);
+    assert!(n.detail.as_deref().is_some_and(|d| d.contains("已連線，沒有持倉") && d.contains("12 秒前讀取")), "{n:?}");
+    // older than three account polls: warning, and the age is said
+    s.accounts.insert(Okx, loaded(vec![], vec![], NOW - 100_000));
+    let vm = build(&s, NOW);
+    let n = disabled_note(&vm, Okx).cloned().expect("a line");
+    assert_eq!(n.tone, Tone::Warning);
+    assert!(n.text.starts_with("OKX 已停用 · 無法確認持倉（") && !n.text.contains("沒有持倉"), "{}", n.text);
+    assert!(n.detail.as_deref().is_some_and(|d| d.contains("100 秒前")), "{n:?}");
+    assert!(vm.exposure.ends_with("（OKX 持倉無法確認）"), "{}", vm.exposure);
+}
+
+#[test]
+fn a_lost_connection_keeps_the_card_of_an_unticked_exchange_that_held_a_position() {
+    let mut s = empty_two();
+    let mut held = okx_connected();
+    if let AccountState::Loaded { error, .. } = &mut held {
+        *error = Some((format!("{}Keychain 沒有 API key", crate::ui::bridge::NOT_CONNECTED_ERROR_PREFIX), NOW));
+    }
+    s.accounts.insert(Okx, held);
+    unticked_okx(&mut s);
+    let vm = build(&s, NOW);
+    assert!(disabled_note(&vm, Okx).is_none(), "{:?}", vm.cards);
+    let c = connected(&vm, Okx);
+    assert!(c.disabled_note.as_deref().is_some_and(|n| n.contains(DISABLED_WITH_EXPOSURE)));
+    assert!(c.stale_note.as_deref().is_some_and(|n| n.contains("可能已過期")));
 }

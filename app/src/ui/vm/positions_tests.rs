@@ -433,7 +433,7 @@ mod unticked_exchange {
         unticked_okx(&mut s);
         let vm = build(&s, &Filter::default(), NOW);
         assert_eq!(vm.disabled.len(), 1);
-        assert_eq!((vm.disabled[0].exchange, vm.disabled[0].detail.clone()), (Okx, None), "nothing to open");
+        assert_eq!((vm.disabled[0].exchange, vm.disabled[0].detail.clone()), (Okx, Some("0 秒前讀取".into())), "only the age of the read is behind it");
         // and still-loading / not-connected states sit behind the line
         s.accounts.remove(&Okx);
         let vm = build(&s, &Filter::default(), NOW);
@@ -442,6 +442,19 @@ mod unticked_exchange {
         let vm = build(&s, &Filter::default(), NOW);
         assert!(vm.disabled[0].detail.as_deref().is_some_and(|d| d.contains("OKX 未連線：Keychain 沒有 API key")), "{:?}", vm.disabled);
         assert!(vm.notices.iter().all(|n| !n.contains("OKX")));
+    }
+
+    #[test]
+    fn an_old_quiet_read_is_a_warning_line_not_a_quiet_one() {
+        let mut s = four();
+        s.accounts.insert(Okx, loaded(vec![], vec![], NOW - 12_000));
+        unticked_okx(&mut s);
+        let vm = build(&s, &Filter::default(), NOW);
+        assert_eq!((vm.disabled[0].tone, vm.disabled[0].detail.as_deref()), (Tone::Muted, Some("12 秒前讀取")));
+        s.accounts.insert(Okx, loaded(vec![], vec![], NOW - 100_000));
+        let vm = build(&s, &Filter::default(), NOW);
+        assert_eq!(vm.disabled[0].tone, Tone::Warning);
+        assert!(vm.disabled[0].text.starts_with("OKX 已停用 · 無法確認持倉（") && !vm.disabled[0].text.contains("沒有持倉"), "{}", vm.disabled[0].text);
     }
 
     const INCOMPLETE: &str = "ETHUSDT 空 7 張（無法換算：ctVal 未知）";
